@@ -88,6 +88,8 @@ public:
 
   /// Weight tensors by GGUF name, in GGUF order (all F32, on the backend).
   std::vector<std::pair<std::string, ggml_tensor *>> weights() const;
+  /// The backend buffer holding every weight tensor (one allocation).
+  ggml_backend_buffer_t weight_buffer() const { return weight_buffer_; }
 
   const std::map<int, int> &species_to_index() const { return species_to_index_; }
   const std::map<int, float> &composition_energies() const { return composition_energies_; }

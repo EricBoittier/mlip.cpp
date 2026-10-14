@@ -19,7 +19,7 @@ int main(int argc, char **argv) {
                "          [--gpus {}] [--lr {}] [--warmup-fraction {}] [--grad-clip {}] [--seed {}]\n"
                "          [--threads {}] [--cache-dir DIR] [--max-steps N] [--log-every {}]\n"
                "          [--mb-growth {}] [--mb-budget {}] [--tile-nb-ratio R] [--tile-atom-ratio {}]\n"
-               "          [--graph-cache {}] [--prefetch {}] [--optimizer adam|muon] [--muon-momentum {}]\n"
+               "          [--graph-cache {}] [--prefetch {}] [--pack step|worker] [--optimizer adam|muon] [--muon-momentum {}]\n"
                "          [--muon-lr-scale {}] [--muon-ns-steps {}]\n"
                "--tile-nb-ratio > 1 pads micro-batches to a geometric grid of shapes and\n"
                "replays cached graphs (CUDA graphs);\n"
@@ -51,6 +51,7 @@ int main(int argc, char **argv) {
     else if (a == "--mb-budget") o.mb_budget = std::stod(val());
     else if (a == "--tile-nb-ratio") o.tile_nb_ratio = std::stod(val());
     else if (a == "--tile-atom-ratio") o.tile_atom_ratio = std::stod(val());
+    else if (a == "--pack") o.pack = val();
     else if (a == "--prefetch") o.prefetch = std::stoi(val());
     else if (a == "--graph-cache") o.graph_cache = std::stoi(val());
     else if (a == "--optimizer") o.optimizer = val();

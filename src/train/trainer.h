@@ -33,6 +33,10 @@ struct TrainOptions {
   // micro-batching (see make_microbatches): exact full-batch gradients
   double mb_growth = 4.0;  // max ratio of padded neighbour counts in one micro-batch
   double mb_budget = 5e7;  // max n_atoms * (max_nb+1)^2 per micro-batch
+  // "step": all workers' structures packed together by a fitted cost model
+  // (make_step_batches; loss = full-step mean); "worker": each worker packs
+  // its own batch (make_microbatches; DDP mean of per-worker means)
+  std::string pack = "step";
   // fixed-shape tiles + cached graphs (see Tiling); 0 = dynamic shapes
   double tile_nb_ratio = 0, tile_atom_ratio = 1.25;
   int prefetch = 4;       // steps packed ahead of the GPUs
@@ -77,6 +81,8 @@ public:
   ggml_tensor *grad_flat() const { return acc_flat_; }
 
   void set_params(const std::vector<float> &flat);
+  /// The whole weight buffer as one byte tensor (for one-copy broadcasts).
+  ggml_tensor *weights_blob() const { return weights_blob_; }
   std::vector<float> get_params() const;
 
   runtime::GraphModel &model() { return model_; }
@@ -128,6 +134,7 @@ private:
 
   runtime::GraphModel model_;
   std::vector<ggml_tensor *> params_;
+  ggml_tensor *weights_blob_ = nullptr;
   size_t n_params_ = 0;
   ggml_gallocr_t galloc_ = nullptr;
   // gradient accumulator: one flat F32 tensor, viewed per parameter
@@ -150,8 +157,13 @@ public:
   Optimizer(std::vector<std::unique_ptr<Worker>> &workers, double clip, bool muon = false,
             double muon_momentum = 0.95, double muon_lr_scale = 1.0, int ns_steps = 5);
   ~Optimizer();
-  /// One step at learning rate `lr`; returns the global gradient norm (of
-  /// the averaged gradient, before clipping).
+  /// Copy worker w's (w > 0) gradients to device 0 now, from w's thread as
+  /// soon as it is done, so the copy overlaps the other workers' compute.
+  void stage(size_t w);
+  /// One step at learning rate `lr` (gradients not staged yet are copied
+  /// first); returns the global gradient norm (of the averaged gradient,
+  /// before clipping). Updated weights go to the other workers as one copy
+  /// of the weight buffer when the layouts match.
   double step(double lr);
 
 private:
@@ -162,6 +174,8 @@ private:
   ggml_cgraph *graph_ = nullptr;
   std::vector<ggml_tensor *> staging_; // other workers' gradients, on device 0
   ggml_tensor *pars_ = nullptr, *norm_ = nullptr, *muon_lr_ = nullptr;
+  std::vector<char> staged_;   // per worker: gradients already on device 0
+  bool blob_broadcast_ = false; // weight buffers laid out identically
   double muon_lr_scale_ = 1.0;
   int64_t t_ = 0;
 

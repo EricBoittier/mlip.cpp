@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <future>
+#include <limits>
 #include <numbers>
 #include <numeric>
 #include <stdexcept>
@@ -243,6 +245,99 @@ std::vector<Batch> make_microbatches(const MemmapSplit &split, const NeighborCac
     g_atoms += split.n_atoms(s);
   }
   flush();
+  return out;
+}
+
+std::vector<std::vector<Batch>> make_step_batches(const MemmapSplit &split, const NeighborCache &nl,
+                                                  const std::vector<int64_t> &ids,
+                                                  const std::vector<std::array<float, 9>> &rotations,
+                                                  const std::map<int, int> &species_to_index,
+                                                  const TargetScaling &scaling, float cutoff,
+                                                  int n_workers, const CostModel &cost,
+                                                  double preload_ms, double budget,
+                                                  const Tiling &tiling) {
+  const size_t K = ids.size();
+  const int W = std::max(1, n_workers);
+  std::vector<size_t> order(K);
+  std::iota(order.begin(), order.end(), 0);
+  std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+    return nl.max_neighbors[ids[a]] < nl.max_neighbors[ids[b]];
+  });
+  std::vector<int64_t> atoms(K + 1, 0); // prefix sums in sorted order
+  for (size_t k = 0; k < K; k++) atoms[k + 1] = atoms[k] + split.n_atoms(ids[order[k]]);
+  // group = sorted structures [i, j): its largest neighbour count is the last one's
+  auto nb = [&](size_t j) { return std::max(1, nl.max_neighbors[ids[order[j - 1]]]); };
+  auto group_cost = [&](size_t i, size_t j) {
+    double n = static_cast<double>(atoms[j] - atoms[i]), m = nb(j);
+    if (tiling.enabled())
+      n = Tiling::bucket(static_cast<int>(n), 32, tiling.atom_ratio), m = Tiling::bucket(nb(j), 8, tiling.nb_ratio);
+    return cost(n, m);
+  };
+
+  using Groups = std::vector<std::pair<size_t, size_t>>;
+  auto plan = [&](double cap) -> Groups {
+    const double inf = std::numeric_limits<double>::infinity();
+    std::vector<double> best(K + 1, inf);
+    std::vector<size_t> cut(K + 1, 0);
+    best[0] = 0;
+    for (size_t j = 1; j <= K; j++) {
+      const double m1 = nb(j) + 1.0;
+      for (size_t i = j; i-- > 0;) {
+        const int64_t n = atoms[j] - atoms[i];
+        const double c = group_cost(i, j);
+        // a single structure is always allowed; groups grow monotonically in n and cost
+        if (j - i > 1 && (n * m1 * m1 > budget || c > cap)) break;
+        // never a single-atom micro-batch (see make_microbatches)
+        if (n >= 2 && best[i] + c < best[j]) best[j] = best[i] + c, cut[j] = i;
+      }
+    }
+    if (!std::isfinite(best[K])) return {};
+    Groups g;
+    for (size_t j = K; j > 0; j = cut[j]) g.emplace_back(cut[j], j);
+    return g;
+  };
+  Groups groups = plan(std::numeric_limits<double>::infinity());
+  if (groups.empty()) groups = {{0, K}};
+  if (W > 1) { // no micro-batch longer than one worker's share of the step
+    double total = preload_ms;
+    for (auto [i, j] : groups) total += group_cost(i, j);
+    Groups capped = plan(1.05 * total / W);
+    if (!capped.empty()) groups = std::move(capped);
+  }
+
+  // longest first onto the least loaded worker
+  std::vector<std::pair<double, size_t>> by_cost;
+  for (size_t g = 0; g < groups.size(); g++) by_cost.emplace_back(group_cost(groups[g].first, groups[g].second), g);
+  std::sort(by_cost.rbegin(), by_cost.rend());
+  std::vector<double> load(W, 0.0);
+  load[0] = preload_ms;
+  std::vector<int> owner(groups.size());
+  for (auto [c, g] : by_cost) {
+    const int w = static_cast<int>(std::min_element(load.begin(), load.end()) - load.begin());
+    owner[g] = w, load[w] += c;
+  }
+
+  std::vector<std::future<Batch>> built;
+  for (const auto &grp : groups)
+    built.push_back(std::async(std::launch::async, [&, i = grp.first, j = grp.second] {
+      std::vector<int64_t> g_ids;
+      std::vector<std::array<float, 9>> g_rot;
+      for (size_t k = i; k < j; k++) {
+        g_ids.push_back(ids[order[k]]);
+        if (!rotations.empty()) g_rot.push_back(rotations[order[k]]);
+      }
+      int pad_atoms = 0, pad_nb = 0;
+      if (tiling.enabled())
+        pad_atoms = Tiling::bucket(static_cast<int>(atoms[j] - atoms[i]), 32, tiling.atom_ratio),
+        pad_nb = Tiling::bucket(nb(j), 8, tiling.nb_ratio);
+      Batch b = make_batch(split, nl, g_ids, g_rot, species_to_index, scaling, cutoff, pad_atoms,
+                           pad_nb, tiling.enabled() ? tiling.systems : 0);
+      b.energy_norm = static_cast<float>(W) / K;
+      b.force_norm = static_cast<float>(W) / (3.0f * atoms[K]);
+      return b;
+    }));
+  std::vector<std::vector<Batch>> out(W);
+  for (size_t g = 0; g < groups.size(); g++) out[owner[g]].push_back(built[g].get());
   return out;
 }
 

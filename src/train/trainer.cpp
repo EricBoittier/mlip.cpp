@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <mutex>
 #include <filesystem>
 #include <functional>
 #include <future>
@@ -98,6 +99,77 @@ void write_gguf(const std::string &src, const std::string &dst, Worker &w,
 }
 
 
+/// Online least squares for CostModel: decayed normal equations over the
+/// measured micro-batch times, non-negative coefficients (features with a
+/// negative fit are dropped, most negative first).
+class CostFit {
+public:
+  void add(double n, double m, double ms) {
+    const auto f = scaled(n, m);
+    for (int a = 0; a < 3; a++) {
+      for (int b = 0; b < 3; b++) A_[a][b] = decay_ * A_[a][b] + f[a] * f[b];
+      y_[a] = decay_ * y_[a] + f[a] * ms;
+    }
+    n_++;
+  }
+  /// Fitted model, or false while too few samples / no admissible fit.
+  bool fit(CostModel &out) const {
+    if (n_ < 30) return false;
+    std::array<bool, 3> on = {true, true, true};
+    for (int pass = 0; pass < 3; pass++) {
+      std::array<double, 3> c{};
+      if (!solve(on, c)) return false;
+      int worst = -1;
+      for (int k = 0; k < 3; k++)
+        if (on[k] && c[k] < 0 && (worst < 0 || c[k] < c[worst])) worst = k;
+      if (worst < 0) {
+        for (int k = 0; k < 3; k++) out.c[k] = c[k] * scale_[k];
+        return true;
+      }
+      on[worst] = false;
+    }
+    return false;
+  }
+
+private:
+  static constexpr std::array<double, 3> scale_ = {1.0, 1e-6, 1e-4}; // features to O(1)
+  std::array<double, 3> scaled(double n, double m) const {
+    auto f = CostModel::features(n, m);
+    for (int k = 0; k < 3; k++) f[k] *= scale_[k];
+    return f;
+  }
+  bool solve(const std::array<bool, 3> &on, std::array<double, 3> &c) const {
+    std::vector<int> idx;
+    for (int k = 0; k < 3; k++)
+      if (on[k]) idx.push_back(k);
+    const int d = static_cast<int>(idx.size());
+    if (d == 0) return false;
+    double M[3][4];
+    for (int a = 0; a < d; a++) {
+      for (int b = 0; b < d; b++) M[a][b] = A_[idx[a]][idx[b]];
+      M[a][d] = y_[idx[a]];
+    }
+    for (int col = 0; col < d; col++) { // Gauss-Jordan, partial pivoting
+      int piv = col;
+      for (int r = col + 1; r < d; r++)
+        if (std::abs(M[r][col]) > std::abs(M[piv][col])) piv = r;
+      if (std::abs(M[piv][col]) < 1e-12) return false;
+      std::swap(M[col], M[piv]);
+      for (int r = 0; r < d; r++) {
+        if (r == col) continue;
+        const double f = M[r][col] / M[col][col];
+        for (int k = col; k <= d; k++) M[r][k] -= f * M[col][k];
+      }
+    }
+    c = {};
+    for (int a = 0; a < d; a++) c[idx[a]] = M[a][d] / M[a][a];
+    return std::isfinite(c[0]) && std::isfinite(c[1]) && std::isfinite(c[2]);
+  }
+  static constexpr double decay_ = 0.995; // ~200 micro-batches of memory
+  double A_[3][3] = {}, y_[3] = {};
+  int64_t n_ = 0;
+};
+
 /// Run `f(w)` on every worker in its own thread.
 template <typename F> void for_workers(std::vector<std::unique_ptr<Worker>> &ws, F f) {
   std::vector<std::thread> ts;
@@ -153,7 +225,7 @@ Worker::Worker(const std::string &gguf, int device, size_t cache_graphs) : cache
   }
   galloc_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model_.backend()));
 
-  acc_ctx_ = ggml_init({ggml_tensor_overhead() * (params_.size() + 1), nullptr, true});
+  acc_ctx_ = ggml_init({ggml_tensor_overhead() * (params_.size() + 2), nullptr, true});
   acc_flat_ = ggml_new_tensor_1d(acc_ctx_, GGML_TYPE_F32, n_params_);
   ggml_set_name(acc_flat_, "grad_flat");
   size_t off = 0;
@@ -166,6 +238,12 @@ Worker::Worker(const std::string &gguf, int device, size_t cache_graphs) : cache
   acc_buf_ = ggml_backend_alloc_ctx_tensors(acc_ctx_, model_.backend());
   if (!acc_buf_) throw std::runtime_error("cannot allocate the gradient accumulator");
   zero_grads();
+  // a byte view of the whole weight buffer, created after the accumulator
+  // allocation so that it is placed on the weights, not allocated
+  ggml_backend_buffer_t wbuf = model_.weight_buffer();
+  weights_blob_ = ggml_new_tensor_1d(acc_ctx_, GGML_TYPE_I8,
+                                     static_cast<int64_t>(ggml_backend_buffer_get_size(wbuf)));
+  ggml_backend_tensor_alloc(wbuf, weights_blob_, ggml_backend_buffer_get_base(wbuf));
 }
 
 Worker::~Worker() {
@@ -491,6 +569,18 @@ Optimizer::Optimizer(std::vector<std::unique_ptr<Worker>> &workers, double clip,
     v.push_back(ggml_dup_tensor(ctx_, p));
   }
   for (int w = 1; w < W; w++) staging_.push_back(ggml_dup_tensor(ctx_, w0.grad_flat()));
+  staged_.assign(W, 0);
+  // one-copy weight broadcast: every parameter at the same offset of a
+  // same-size weight buffer on every worker (same GGUF, same allocator)
+  blob_broadcast_ = true;
+  for (int w = 1; w < W; w++) {
+    Worker &ww = *workers_[w];
+    if (ggml_nbytes(ww.weights_blob()) != ggml_nbytes(w0.weights_blob())) blob_broadcast_ = false;
+    for (size_t k = 0; k < params.size(); k++)
+      if (static_cast<char *>(params[k]->data) - static_cast<char *>(w0.weights_blob()->data) !=
+          static_cast<char *>(ww.params()[k]->data) - static_cast<char *>(ww.weights_blob()->data))
+        blob_broadcast_ = false;
+  }
   pars_ = ggml_new_tensor_1d(ctx_, GGML_TYPE_F32, 7);
   ggml_tensor *one = ggml_new_tensor_1d(ctx_, GGML_TYPE_F32, 1);
   ggml_tensor *eps = ggml_new_tensor_1d(ctx_, GGML_TYPE_F32, 1);
@@ -571,17 +661,28 @@ double Optimizer::step(double lr) {
   ggml_backend_tensor_set(pars_, pars, 0, sizeof pars);
   const float mlr = static_cast<float>(lr * muon_lr_scale_);
   ggml_backend_tensor_set(muon_lr_, &mlr, 0, sizeof mlr);
-  for (size_t w = 1; w < workers_.size(); w++)
-    ggml_backend_tensor_copy(workers_[w]->grad_flat(), staging_[w - 1]); // peer copy
+  for (size_t w = 1; w < workers_.size(); w++) stage(w);
   if (ggml_backend_graph_compute(w0.model().backend(), graph_) != GGML_STATUS_SUCCESS)
     throw std::runtime_error("optimizer step failed");
   float norm = 0;
   ggml_backend_tensor_get(norm_, &norm, 0, sizeof norm);
-  for (size_t w = 1; w < workers_.size(); w++)
-    for (size_t k = 0; k < w0.params().size(); k++)
-      ggml_backend_tensor_copy(w0.params()[k], workers_[w]->params()[k]);
+  for (size_t w = 1; w < workers_.size(); w++) {
+    if (blob_broadcast_) {
+      ggml_backend_tensor_copy(w0.weights_blob(), workers_[w]->weights_blob());
+    } else {
+      for (size_t k = 0; k < w0.params().size(); k++)
+        ggml_backend_tensor_copy(w0.params()[k], workers_[w]->params()[k]);
+    }
+  }
   for (auto &w : workers_) w->zero_grads();
+  std::fill(staged_.begin(), staged_.end(), 0);
   return norm;
+}
+
+void Optimizer::stage(size_t w) {
+  if (w == 0 || staged_[w]) return;
+  ggml_backend_tensor_copy(workers_[w]->grad_flat(), staging_[w - 1]); // peer copy
+  staged_[w] = 1;
 }
 
 void train(const TrainOptions &o) {
@@ -675,8 +776,37 @@ void train(const TrainOptions &o) {
                      1e3 * std::sqrt(s.se_force / s.n_force_components)};
   };
 
-  // batches of a step: worker w gets perm[(step*W + w)*B, +B), rotated
+  // step packing: the cost model is refitted to measured micro-batch times
+  // after every step and shared with the packing threads; worker 0 is
+  // preloaded with the optimizer time
+  const bool step_pack = o.pack == "step";
+  if (!step_pack && o.pack != "worker") throw std::runtime_error("--pack must be step or worker");
+  const Tiling step_tiling{o.tile_nb_ratio, o.tile_atom_ratio, W * B};
+  std::mutex plan_mu;
+  CostModel plan_cost;
+  double plan_preload_ms = 0;
+  CostFit cost_fit;
+
+  // batches of a step: structures perm[step*W*B, +W*B); worker w's rotation
+  // stream covers its B of them (the same augmentation in both pack modes).
+  // "worker": worker w gets its B structures; "step": all packed together
   auto make_step = [&](const std::vector<int64_t> &perm, int64_t step, uint64_t rng_seed) {
+    if (step_pack) {
+      std::vector<int64_t> ids(perm.begin() + step * W * B, perm.begin() + (step + 1) * W * B);
+      std::vector<std::array<float, 9>> rot(ids.size());
+      for (int w = 0; w < W; w++) {
+        std::mt19937_64 rng(rng_seed * 0x9E3779B97F4A7C15ULL + w);
+        for (int k = 0; k < B; k++) rot[w * B + k] = random_o3(rng);
+      }
+      CostModel cost;
+      double preload;
+      {
+        std::lock_guard<std::mutex> lock(plan_mu);
+        cost = plan_cost, preload = plan_preload_ms;
+      }
+      return make_step_batches(train_split, nl_train, ids, rot, species, scaling, cutoff, W, cost,
+                               preload, o.mb_budget, step_tiling);
+    }
     std::vector<std::future<std::vector<Batch>>> fs;
     for (int w = 0; w < W; w++) {
       fs.push_back(std::async(std::launch::async, [&, w] {
@@ -725,11 +855,14 @@ void train(const TrainOptions &o) {
       // each worker: its micro-batches, gradients summed (= full-batch gradient)
       std::vector<StepStats> st(W);
       std::vector<double> wb(W, 0.0), wc(W, 0.0);
+      std::vector<std::vector<std::array<double, 3>>> samples(W); // (n, m, ms) per micro-batch
       for_workers(workers, [&](size_t w) {
         for (const Batch &mb : batches[w]) {
           st[w] += workers[w]->run(mb, scaling.energy_scale, true);
           wb[w] += workers[w]->t_build, wc[w] += workers[w]->t_compute;
+          samples[w].push_back({double(mb.n_atoms), double(mb.max_neighbors), 1e3 * workers[w]->t_compute});
         }
+        optimizer.stage(w); // ship the gradients while the other workers still compute
       });
       t_gpu += seconds_since(t);
       for (int w = 0; w < W; w++) t_build += wb[w] / W, t_compute += wc[w] / W;
@@ -740,20 +873,37 @@ void train(const TrainOptions &o) {
       const double lr = o.lr * lr_factor(global_step, total_steps, warmup);
       const double norm = optimizer.step(lr);
       if (!std::isfinite(norm)) throw std::runtime_error(fmt::format("non-finite gradient at step {}", global_step));
-      t_sync += seconds_since(t);
+      const double dt_sync = seconds_since(t);
+      t_sync += dt_sync;
+      if (step_pack) {
+        for (auto &sw : samples)
+          for (auto [n, m, ms] : sw) cost_fit.add(n, m, ms);
+        CostModel fitted;
+        const bool ok = cost_fit.fit(fitted);
+        std::lock_guard<std::mutex> lock(plan_mu);
+        if (ok) plan_cost = fitted;
+        plan_preload_ms = 0.9 * plan_preload_ms + 0.1 * 1e3 * dt_sync;
+      }
 
-      for (auto &s : st) ep += s;
+      StepStats step_total;
+      for (auto &s : st) ep += s, step_total += s;
       if ((step + 1) % o.log_every == 0) {
         const double el = seconds_since(t_epoch);
         fmt::print("epoch {} step {}/{}: loss {:.4g} (E {:.4g}, F {:.4g}) lr {:.3g} |g| {:.3g} | "
                    "{:.1f} struct/s; per step: wait {:.1f} ms, gpu {:.1f} (build {:.1f}, compute {:.1f}), "
                    "sync {:.1f} ms; {:.2f} micro-batches/worker; graphs {} cached ({:.1f} GB buffer), {} misses, {} flushes\n",
-                   epoch, step + 1, steps_per_epoch, st[0].loss, st[0].loss_energy, st[0].loss_force,
+                   epoch, step + 1, steps_per_epoch, step_total.loss / W, step_total.loss_energy / W,
+                   step_total.loss_force / W,
                    lr, norm, (step + 1) * W * B / el, 1e3 * t_wait / (step + 1),
                    1e3 * t_gpu / (step + 1), 1e3 * t_build / (step + 1),
                    1e3 * t_compute / (step + 1), 1e3 * t_sync / (step + 1),
                    double(n_micro) / ((step + 1) * W), w0.cache_size(), w0.compute_buffer_bytes() / 1e9,
                    w0.cache_misses, w0.cache_flushes);
+        if (step_pack) {
+          std::lock_guard<std::mutex> lock(plan_mu);
+          fmt::print("  packing cost model: {:.2f} ms + {:.3g} n(m+1)^2 + {:.3g} n(m+1); optimizer preload {:.1f} ms\n",
+                     plan_cost.c[0], plan_cost.c[1], plan_cost.c[2], plan_preload_ms);
+        }
         std::fflush(stdout);
       }
     }

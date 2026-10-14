@@ -113,6 +113,44 @@ int main(int argc, char **argv) {
     if (!(worst < 1e-3)) mb_failed = true;
   }
 
+  // step packing for 2 workers (cost-model cuts, longest-first dealing): all
+  // micro-batches of both "workers" run here; their summed gradient / 2 is
+  // the full-batch gradient, and the metrics add up exactly
+  if (!node_grads_on) {
+    auto per = make_step_batches(split, nl, ids, {}, worker.model().species_to_index(), sc,
+                                 worker.model().cutoff(), 2, CostModel{}, 5.0, 5e7);
+    double loss = 0;
+    StepStats sum_st;
+    std::string plan;
+    worker.zero_grads();
+    for (size_t w = 0; w < per.size(); w++) {
+      plan += fmt::format(" w{}:", w);
+      for (const Batch &mb : per[w]) {
+        StepStats s1 = worker.run(mb, sc.energy_scale, true);
+        loss += s1.loss, sum_st += s1;
+        plan += fmt::format(" {}x{}", mb.n_atoms, mb.max_neighbors);
+      }
+    }
+    const std::vector<float> sum = worker.get_grads();
+    double worst = 0;
+    size_t off = 0;
+    for (auto *p : worker.params()) {
+      double d2 = 0, r2 = 0;
+      for (int64_t i = 0; i < ggml_nelements(p); i++, off++)
+        d2 += std::pow(0.5 * sum[off] - grads[off], 2), r2 += std::pow(double(grads[off]), 2);
+      if (r2 > 0) worst = std::max(worst, std::sqrt(d2 / r2));
+    }
+    auto close = [](double a, double b) { return std::abs(a - b) <= 1e-4 * std::abs(b); };
+    fmt::print("step packing (2 workers):{}; loss/2 {:.8g} vs {:.8g}, worst relative gradient "
+               "difference {:.2e}; se E {:.6g} vs {:.6g}, se F {:.6g} vs {:.6g}\n", plan, loss / 2,
+               st.loss, worst, sum_st.se_energy_per_atom, st.se_energy_per_atom, sum_st.se_force,
+               st.se_force);
+    if (!(worst < 1e-3) || !close(loss / 2, st.loss) || !close(sum_st.se_force, st.se_force) ||
+        !close(sum_st.se_energy_per_atom, st.se_energy_per_atom) || sum_st.n_systems != st.n_systems ||
+        sum_st.n_force_components != st.n_force_components)
+      mb_failed = true;
+  }
+
   // tiles: padded fixed-shape micro-batches through a graph-caching worker
   // (CUDA graphs replay from the second call on) must give the same loss and
   // gradients on every repetition

@@ -95,4 +95,34 @@ std::vector<Batch> make_microbatches(const MemmapSplit &split, const NeighborCac
                                      double budget = 5e7, double growth = 1.5,
                                      const Tiling &tiling = {});
 
+/// Modelled compute time (ms) of a micro-batch of n atoms padded to m
+/// neighbours: per micro-batch overhead, attention ~ n (m+1)^2, edges ~ n (m+1).
+struct CostModel {
+  std::array<double, 3> c = {2.0, 2e-6, 2e-4};
+  static std::array<double, 3> features(double n, double m) {
+    return {1.0, n * (m + 1) * (m + 1), n * (m + 1)};
+  }
+  double operator()(double n, double m) const {
+    const auto f = features(n, m);
+    return c[0] * f[0] + c[1] * f[1] + c[2] * f[2];
+  }
+};
+
+/// All structures `ids` of a step (n_workers x batch) packed together:
+/// sorted by neighbour count and cut into contiguous micro-batches that
+/// minimise the modelled total cost (dynamic programming; none above
+/// `budget` = n (m+1)^2 nor above one worker's share), then dealt to the
+/// workers longest first, worker 0 starting at `preload_ms` (it also runs
+/// the optimizer). Loss normalisation is the mean over the whole step:
+/// summing every worker's gradient and dividing by n_workers gives the
+/// full-batch gradient. A worker may get no micro-batch.
+std::vector<std::vector<Batch>> make_step_batches(const MemmapSplit &split, const NeighborCache &nl,
+                                                  const std::vector<int64_t> &ids,
+                                                  const std::vector<std::array<float, 9>> &rotations,
+                                                  const std::map<int, int> &species_to_index,
+                                                  const TargetScaling &scaling, float cutoff,
+                                                  int n_workers, const CostModel &cost,
+                                                  double preload_ms = 0, double budget = 5e7,
+                                                  const Tiling &tiling = {});
+
 } // namespace mlipcpp::train
