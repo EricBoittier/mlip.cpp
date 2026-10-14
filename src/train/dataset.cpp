@@ -276,6 +276,14 @@ NeighborCache NeighborCache::load_or_build(const MemmapSplit &split, float cutof
       write_vec(f, nc.slot);
       write_vec(f, nc.reverse);
       write_vec(f, nc.vector);
+      f.close();
+      if (!f) {
+        // e.g. quota or disk full: never leave a large partial file behind
+        std::error_code ec;
+        std::filesystem::remove(tmp, ec);
+        log::warn("neighbour lists: could not write the cache {} (not cached)", cache_path);
+        return nc;
+      }
     }
     std::filesystem::rename(tmp, cache_path); // atomic: readers never see a partial file
     log::info("neighbour lists: cached to {}", cache_path);
