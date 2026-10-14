@@ -6,6 +6,7 @@
 #include <ggml.h>
 #include <functional>
 #include <map>
+#include <set>
 #include <memory>
 #include <string>
 #include <vector>
@@ -42,6 +43,11 @@ public:
   // Initialize pending constants (call after graph allocation)
   void init_constants();
 
+  // Flag pending constants as graph inputs (call before allocating with a
+  // ggml_gallocr): inputs are placed first and never share memory, so values
+  // written by init_constants() survive until compute.
+  void mark_constants_as_inputs();
+
   // Get summary of the loaded graph
   std::string summary() const;
 
@@ -50,6 +56,9 @@ public:
 
   // Get the GIR graph for inspection
   const GIRGraph &graph() const { return graph_; }
+
+  // Output tensor of every built node, by GIR node id (valid until next build)
+  const std::map<int, ggml_tensor *> &node_outputs() const { return node_outputs_; }
 
   // Debug mode: set output directory for dumping intermediate tensors
   void set_debug_output_dir(const std::string &dir);
@@ -100,6 +109,8 @@ private:
     float value;
   };
   std::vector<PendingConstant> pending_constants_;
+  // tensors built by NEW_ZEROS (lets WHERE skip a zero operand)
+  std::set<ggml_tensor *> zeros_;
 
   // Debug mode
   bool debug_mode_ = false;

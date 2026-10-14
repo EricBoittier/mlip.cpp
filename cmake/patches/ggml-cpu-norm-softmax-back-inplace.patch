@@ -1,0 +1,38 @@
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+index 0b5d6c6d..2d2c3f1e 100644
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -3926,11 +3926,13 @@ static void ggml_compute_forward_rms_norm_back_f32(
+                 float * dx = (float *) ((char *) dst->data + i01*nb1 + i02*nb2 + i03*nb3);
+ 
+                 // dx[i00] = (x*(-sum_xdz/sum_eps) + dz) / sqrtf(mean_eps)
+-                ggml_vec_cpy_f32  (ne00, dx, x);
+-                // ggml_vec_scale_f32(ne00, dx, -mean_xdz/mean_eps);
+-                ggml_vec_scale_f32(ne00, dx, (float)(-sum_xdz)/sum_eps);
+-                ggml_vec_acc_f32  (ne00, dx, dz);
+-                ggml_vec_scale_f32(ne00, dx, rrms);
++                // element-wise, so dx may alias dz or x (ggml-alloc runs
++                // RMS_NORM_BACK in place): copying x into dx first would
++                // clobber dz before it is read
++                const float sx = (float)(-sum_xdz)/sum_eps;
++                for (int64_t i00 = 0; i00 < ne00; i00++) {
++                    dx[i00] = (dz[i00] + x[i00]*sx)*rrms;
++                }
+             }
+         }
+     }
+@@ -5432,10 +5434,10 @@ static void ggml_compute_forward_soft_max_ext_back_f32(
+         // linear runtime, no additional memory
+         float dot_y_dy = 0;
+         ggml_vec_dot_f32  (nc, &dot_y_dy, 0, y, 0, dy, 0, 1);
+-        ggml_vec_cpy_f32  (nc, dx, dy);
+-        ggml_vec_acc1_f32 (nc, dx, -dot_y_dy);
+-        ggml_vec_mul_f32  (nc, dx, dx, y);
+-        ggml_vec_scale_f32(nc, dx, scale);
++        // element-wise, so dx may alias dy or y (in-place allocation)
++        for (int64_t i = 0; i < nc; i++) {
++            dx[i] = scale*y[i]*(dy[i] - dot_y_dy);
++        }
+ 
+ #ifndef NDEBUG
+         for (int i = 0; i < nc; ++i) {

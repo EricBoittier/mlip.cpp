@@ -84,6 +84,9 @@ def load_pet_model(model_name: str):
     Returns:
         The raw PET model (with gnn_layers, node_embedders, etc.)
     """
+    if Path(model_name).is_file():
+        return _unwrap_to_pet(load_local_model(model_name))
+
     if model_name == "pet-mad-1.0.2":
         from pet_mad._models import get_pet_mad
         atomistic = get_pet_mad(version="1.0.2")
@@ -142,6 +145,17 @@ def load_pet_model(model_name: str):
         pet_model = load_metatrain_model(path)
 
     return _unwrap_to_pet(pet_model)
+
+
+def load_local_model(path):
+    """A metatrain checkpoint (.ckpt / exported .pt) or a `make_init.py` dump."""
+    obj = torch.load(path, map_location="cpu", weights_only=False)
+    if isinstance(obj, dict) and isinstance(obj.get("model"), torch.nn.Module):
+        return obj["model"]
+    from metatrain.utils.io import load_model as load_metatrain_model
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore")
+        return load_metatrain_model(path)
 
 
 def _unwrap_to_pet(model):
@@ -230,6 +244,11 @@ def get_species_mapping(pet_model):
             species_to_index[int(Z)] = idx
         return species_to_index
 
+    # PETBackend keeps the inverse map as a buffer
+    if hasattr(pet_model, 'species_to_species_index'):
+        return {Z: int(i) for Z, i in enumerate(pet_model.species_to_species_index.tolist())
+                if i >= 0}
+
     # Default: atomic numbers 1-85 map to indices 0-84
     return {Z: Z - 1 for Z in range(1, 86)}
 
@@ -304,8 +323,9 @@ class PETFullModel(torch.nn.Module):
 
     def __init__(self, pet_model, n_atoms: int, max_neighbors: int, d_pet: int,
                  forces: bool = False, cutoff: float = 4.5, cutoff_width: float = 0.2,
-                 cutoff_function: str = "cosine"):
+                 cutoff_function: str = "cosine", nc_forces: bool = False):
         super().__init__()
+        self.nc_forces = nc_forces
 
         # Store dimensions for tracing
         self.n_atoms = n_atoms
@@ -348,6 +368,31 @@ class PETFullModel(torch.nn.Module):
             pet_model.edge_last_layers['energy'][i]['energy___0']
             for i in range(self.num_readout_layers)
         ])
+
+        if nc_forces and self.featurizer_type != 'feedforward':
+            raise NotImplementedError("nc-force export supports the feedforward featurizer only")
+        if nc_forces:
+            # direct (non-conservative) force head: node and edge heads, then a
+            # Linear(d_head, 3) per readout layer; edges masked, cutoff-weighted
+            # and summed over neighbours (metatrain pet/modules/backend.py)
+            name = 'non_conservative_force'
+            self.node_force_heads = pet_model.node_heads[name]
+            self.edge_force_heads = pet_model.edge_heads[name]
+            (key,) = pet_model.node_last_layers[name][0].keys()
+            self.node_force_final = torch.nn.ModuleList([
+                pet_model.node_last_layers[name][i][key] for i in range(self.num_readout_layers)
+            ])
+            self.edge_force_final = torch.nn.ModuleList([
+                pet_model.edge_last_layers[name][i][key] for i in range(self.num_readout_layers)
+            ])
+
+    def _readout(self, node_heads, node_final, edge_heads, edge_final, i,
+                 node_feat, edge_feat, padding_mask, cutoff_factors):
+        """Node + cutoff-weighted edge contribution of readout layer i: [n_atoms, k]."""
+        node = node_final[i](node_heads[i](node_feat))
+        edge = edge_final[i](edge_heads[i](edge_feat))
+        edge = torch.where(padding_mask.unsqueeze(-1), torch.zeros_like(edge), edge)
+        return node + (edge * cutoff_factors.unsqueeze(-1)).sum(dim=1)
 
     def _compute_cutoff_factors(self, edge_distances, cutoff_values=None):
         """Cutoff function computed in-graph for gradient flow.
@@ -579,7 +624,14 @@ class PETFullModel(torch.nn.Module):
 
         # Total atomic energies
         atomic_energies = node_e.squeeze(-1) + edge_e_sum
-        return atomic_energies
+        if not self.nc_forces:
+            return atomic_energies
+        forces = self._readout(self.node_force_heads, self.node_force_final,
+                               self.edge_force_heads, self.edge_force_final, 0,
+                               input_node_embeddings, input_messages,
+                               padding_mask, cutoff_factors)
+        # one output keeps the IR single-output: [n_atoms, 4] = (energy | force)
+        return torch.cat([atomic_energies.unsqueeze(-1), forces], dim=-1)
 
 
 def compute_reverse_neighbor_index(n_atoms: int, max_neighbors: int,

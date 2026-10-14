@@ -56,11 +56,13 @@ public:
    * Create a backend provider with the specified preference
    *
    * @param pref Backend preference (Auto, CPU, Metal, CUDA, etc.)
+   * @param device Index among the GPUs matching `pref` (one process or
+   *        thread per GPU in data-parallel training)
    * @return Backend provider instance
    * @throws std::runtime_error if requested backend is not available
    */
   static std::shared_ptr<BackendProvider>
-  create(BackendPreference pref = BackendPreference::Auto);
+  create(BackendPreference pref = BackendPreference::Auto, int device = 0);
 
   // Accessors
   ggml_backend_t primary() const { return primary_; }

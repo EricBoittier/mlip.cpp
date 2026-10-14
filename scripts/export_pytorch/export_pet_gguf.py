@@ -25,7 +25,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from export_pytorch.fx_converter import export_torch_model
 from export_pytorch.export_pet_full import (
-    PETFullModel, load_pet_model, get_model_params,
+    PETFullModel, load_pet_model, get_model_params, load_local_model,
     get_species_mapping, get_composition_energies, get_energy_scale,
 )
 
@@ -230,6 +230,90 @@ class GGUFWriter:
         f.write(encoded)
 
 
+def example_export_args(n_atoms: int, max_neighbors: int, cutoff: float, forces: bool = True):
+    """Tracing inputs, their names and the torch.export dynamic shapes. Shared
+    with scripts/train/compare_node_grads.py, which must export the exact same
+    graph (same FX node names) to compare per-node gradients."""
+    # Create test inputs for tracing
+    torch.manual_seed(42)
+    species = torch.zeros(n_atoms, dtype=torch.long)
+    neighbor_species = torch.zeros(n_atoms, max_neighbors, dtype=torch.long)
+    edge_vectors = torch.randn(n_atoms, max_neighbors, 3)
+    padding_mask = torch.ones(n_atoms, max_neighbors, dtype=torch.bool)
+    reverse_neighbor_index = torch.arange(n_atoms * max_neighbors, dtype=torch.long)
+
+    if forces:
+        cutoff_values_input = torch.full((n_atoms, max_neighbors), cutoff)
+        example_inputs = (species, neighbor_species, edge_vectors,
+                         padding_mask, reverse_neighbor_index, cutoff_values_input)
+        input_names = ["species", "neighbor_species", "edge_vectors",
+                       "padding_mask", "reverse_neighbor_index", "cutoff_values"]
+    else:
+        edge_distances = torch.rand(n_atoms, max_neighbors) * 3.0
+        cutoff_factors = torch.ones(n_atoms, max_neighbors)
+        example_inputs = (species, neighbor_species, edge_vectors, edge_distances,
+                         padding_mask, reverse_neighbor_index, cutoff_factors)
+        input_names = ["species", "neighbor_species", "edge_vectors", "edge_distances",
+                       "padding_mask", "reverse_neighbor_index", "cutoff_factors"]
+
+    # Use symbolic dynamic dimensions instead of numeric post-substitution.
+    n_atoms_dim = torch.export.Dim("n_atoms", min=1, max=max(2, n_atoms))
+    max_neighbors_dim = torch.export.Dim(
+        "max_neighbors", min=1, max=max(2, max_neighbors)
+    )
+    n_edges_dim = torch.export.Dim(
+        "n_edges", min=1, max=max(2, n_atoms * max_neighbors)
+    )
+
+    if forces:
+        dynamic_shapes = (
+            {0: n_atoms_dim},                      # species
+            {0: n_atoms_dim, 1: max_neighbors_dim},  # neighbor_species
+            {0: n_atoms_dim, 1: max_neighbors_dim},  # edge_vectors
+            (                                       # *args
+                {0: n_atoms_dim, 1: max_neighbors_dim},  # padding_mask
+                {0: n_edges_dim},                       # reverse_neighbor_index
+                {0: n_atoms_dim, 1: max_neighbors_dim},  # cutoff_values
+            ),
+        )
+    else:
+        dynamic_shapes = (
+            {0: n_atoms_dim},                      # species
+            {0: n_atoms_dim, 1: max_neighbors_dim},  # neighbor_species
+            {0: n_atoms_dim, 1: max_neighbors_dim},  # edge_vectors
+            (                                       # *args
+                {0: n_atoms_dim, 1: max_neighbors_dim},  # edge_distances
+                {0: n_atoms_dim, 1: max_neighbors_dim},  # padding_mask
+                {0: n_edges_dim},                       # reverse_neighbor_index
+                {0: n_atoms_dim, 1: max_neighbors_dim},  # cutoff_factors
+            ),
+        )
+
+
+    return example_inputs, input_names, dynamic_shapes
+
+
+def metatrain_baselines(model):
+    """Fitted composition (Z -> eV), energy scale and per-species
+    non-conservative force scales of a metatrain >= 2026.5 PET (outer model,
+    with `additive_models` and `scaler`). Empty dicts / None where absent."""
+    def by_type(block):
+        Z = block.samples.values[:, 0].tolist()
+        return {int(z): float(v) for z, v in zip(Z, block.values.reshape(len(Z), -1)[:, 0])}
+
+    comp, e_scale, f_scales = {}, None, {}
+    for additive in getattr(model, "additive_models", []):
+        weights = getattr(getattr(additive, "model", None), "weights", {})
+        if "energy" in weights:
+            comp = by_type(weights["energy"].block(0))
+    scales = getattr(getattr(getattr(model, "scaler", None), "model", None), "scales", {})
+    if "energy" in scales:
+        e_scale = float(scales["energy"].block(0).values.reshape(-1)[0])
+    if "non_conservative_force" in scales:
+        f_scales = by_type(scales["non_conservative_force"].block(0))
+    return comp, e_scale, f_scales
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Export PET model to GGUF with computation graph"
@@ -240,7 +324,12 @@ def main():
     )
     parser.add_argument(
         "--model", type=str, default="pet-mad-1.0.2",
-        help="Model name: 'pet-mad-1.0.2' (legacy) or upet name like 'pet-mad-s'",
+        help="Model name: 'pet-mad-1.0.2' (legacy), upet name like 'pet-mad-s', "
+             "or a local metatrain checkpoint / make_init.py dump",
+    )
+    parser.add_argument(
+        "--nc-forces", action="store_true",
+        help="Also output the direct non-conservative force head: [n_atoms, 4] = (energy | force)",
     )
     parser.add_argument(
         "--no-forces", action="store_true",
@@ -279,64 +368,12 @@ def main():
     wrapper = PETFullModel(
         pet, n_atoms=n_atoms, max_neighbors=max_neighbors, d_pet=d_pet,
         forces=not args.no_forces, cutoff=cutoff, cutoff_width=cutoff_width,
-        cutoff_function=cutoff_function,
+        cutoff_function=cutoff_function, nc_forces=args.nc_forces,
     )
     wrapper.eval()
 
-    # Create test inputs for tracing
-    torch.manual_seed(42)
-    species = torch.zeros(n_atoms, dtype=torch.long)
-    neighbor_species = torch.zeros(n_atoms, max_neighbors, dtype=torch.long)
-    edge_vectors = torch.randn(n_atoms, max_neighbors, 3)
-    padding_mask = torch.ones(n_atoms, max_neighbors, dtype=torch.bool)
-    reverse_neighbor_index = torch.arange(n_atoms * max_neighbors, dtype=torch.long)
-
-    if not args.no_forces:
-        cutoff_values_input = torch.full((n_atoms, max_neighbors), cutoff)
-        example_inputs = (species, neighbor_species, edge_vectors,
-                         padding_mask, reverse_neighbor_index, cutoff_values_input)
-        input_names = ["species", "neighbor_species", "edge_vectors",
-                       "padding_mask", "reverse_neighbor_index", "cutoff_values"]
-    else:
-        edge_distances = torch.rand(n_atoms, max_neighbors) * 3.0
-        cutoff_factors = torch.ones(n_atoms, max_neighbors)
-        example_inputs = (species, neighbor_species, edge_vectors, edge_distances,
-                         padding_mask, reverse_neighbor_index, cutoff_factors)
-        input_names = ["species", "neighbor_species", "edge_vectors", "edge_distances",
-                       "padding_mask", "reverse_neighbor_index", "cutoff_factors"]
-
-    # Use symbolic dynamic dimensions instead of numeric post-substitution.
-    n_atoms_dim = torch.export.Dim("n_atoms", min=1, max=max(2, n_atoms))
-    max_neighbors_dim = torch.export.Dim(
-        "max_neighbors", min=1, max=max(2, max_neighbors)
-    )
-    n_edges_dim = torch.export.Dim(
-        "n_edges", min=1, max=max(2, n_atoms * max_neighbors)
-    )
-
-    if not args.no_forces:
-        dynamic_shapes = (
-            {0: n_atoms_dim},                      # species
-            {0: n_atoms_dim, 1: max_neighbors_dim},  # neighbor_species
-            {0: n_atoms_dim, 1: max_neighbors_dim},  # edge_vectors
-            (                                       # *args
-                {0: n_atoms_dim, 1: max_neighbors_dim},  # padding_mask
-                {0: n_edges_dim},                       # reverse_neighbor_index
-                {0: n_atoms_dim, 1: max_neighbors_dim},  # cutoff_values
-            ),
-        )
-    else:
-        dynamic_shapes = (
-            {0: n_atoms_dim},                      # species
-            {0: n_atoms_dim, 1: max_neighbors_dim},  # neighbor_species
-            {0: n_atoms_dim, 1: max_neighbors_dim},  # edge_vectors
-            (                                       # *args
-                {0: n_atoms_dim, 1: max_neighbors_dim},  # edge_distances
-                {0: n_atoms_dim, 1: max_neighbors_dim},  # padding_mask
-                {0: n_edges_dim},                       # reverse_neighbor_index
-                {0: n_atoms_dim, 1: max_neighbors_dim},  # cutoff_factors
-            ),
-        )
+    example_inputs, input_names, dynamic_shapes = example_export_args(
+        n_atoms, max_neighbors, cutoff, forces=not args.no_forces)
 
     # Export via torch.export
     print("\nExporting graph via torch.export...")
@@ -354,6 +391,13 @@ def main():
     )
     print(f"  Graph: {len(graph.nodes)} nodes, {len(weights)} weights")
 
+    # trainable tensors (mlipcpp-train): parameters only, never buffers or
+    # lifted constants, and each exactly once
+    named = list(wrapper.named_parameters(remove_duplicate=False))
+    if len({id(p) for _, p in named}) != len(named):
+        raise ValueError("shared parameters would be untied by mlipcpp-train")
+    param_names = [n.replace(".", "_") for n, _ in named if n.replace(".", "_") in weights]
+
     graph_json = json.dumps(graph.to_dict())
     print(f"  Graph JSON: {len(graph_json)} bytes")
 
@@ -361,6 +405,11 @@ def main():
     species_to_index = get_species_mapping(pet)
     composition_energies = get_composition_energies(pet)
     energy_scale = get_energy_scale(pet)
+    nc_force_scales = {}
+    if Path(args.model).is_file():  # local metatrain model: its fitted baselines
+        comp, e_scale, nc_force_scales = metatrain_baselines(load_local_model(args.model))
+        composition_energies = comp or composition_energies
+        energy_scale = e_scale if e_scale is not None else energy_scale
 
     print(f"  Species mapped: {len(species_to_index)}")
     print(f"  Composition energies: {len(composition_energies)}")
@@ -390,6 +439,10 @@ def main():
     writer.add_float32("pet.energy_scale", energy_scale)
     writer.add_string("pet.cutoff_function", cutoff_function)
     writer.add_int32("pet.forces_mode", 1 if not args.no_forces else 0)
+    writer.add_int32("pet.nc_forces", 1 if args.nc_forces else 0)
+    if nc_force_scales:
+        writer.add_array_int32("pet.nc_force_scale_keys", list(nc_force_scales))
+        writer.add_array_float32("pet.nc_force_scale_values", list(nc_force_scales.values()))
     writer.add_float32("pet.num_neighbors_adaptive",
                        float(num_neighbors_adaptive) if num_neighbors_adaptive is not None else 0.0)
 
@@ -406,6 +459,7 @@ def main():
 
     # Computation graph as JSON string
     writer.add_string("graph.json", graph_json)
+    writer.add_string("train.param_names", json.dumps(param_names))
 
     # Weight shapes as JSON (for loader to reconstruct tensors)
     weight_shapes = {name: list(t.shape) for name, t in weights.items()}

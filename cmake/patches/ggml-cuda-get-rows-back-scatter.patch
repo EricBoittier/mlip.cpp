@@ -1,0 +1,50 @@
+diff --git a/src/ggml-cuda/getrows.cu b/src/ggml-cuda/getrows.cu
+index 2fab3324..a5c33856 100644
+--- a/src/ggml-cuda/getrows.cu
++++ b/src/ggml-cuda/getrows.cu
+@@ -71,24 +71,16 @@ static __global__ void k_get_rows_float(
+ template<typename grad_t, typename dst_t>
+ static __global__ void k_get_rows_back_float(
+         const grad_t * __restrict__ grad, const int32_t * __restrict__ rows, dst_t * __restrict__ dst, const int64_t ncols, const int64_t nrows_grad) {
+-    const int col = blockIdx.x*blockDim.x + threadIdx.x;
+-
+-    if (col >= ncols) {
++    // scatter-add: one thread per gradient element, O(nrows_grad*ncols); the
++    // gather form (one block row per destination row scanning every gradient
++    // row) is O(nrows_dst*nrows_grad*ncols) and exceeds gridDim.y = 65535
++    const int64_t idx = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
++    if (idx >= nrows_grad*ncols) {
+         return;
+     }
+-
+-    const int dst_row = blockIdx.y*blockDim.y + threadIdx.y;
+-
+-    float sum = 0.0f;
+-
+-    for (int64_t i = 0; i < nrows_grad; ++i) {
+-        if (rows[i] != dst_row) {
+-            continue;
+-        }
+-        sum += grad[i*ncols + col];
+-    }
+-
+-    dst[dst_row*ncols + col] = sum;
++    const int64_t i   = idx / ncols;
++    const int64_t col = idx - i*ncols;
++    atomicAdd(dst + (int64_t) rows[i]*ncols + col, (dst_t) grad[idx]);
+ }
+ 
+ template<int qk, int qr, dequantize_kernel_t dq, typename dst_t>
+@@ -278,9 +270,10 @@ void ggml_cuda_op_get_rows_back(ggml_backend_cuda_context & ctx, ggml_tensor * d
+     GGML_ASSERT(ne12*ne13 == 1);
+     GGML_ASSERT(ne2*ne3 == 1);
+ 
++    CUDA_CHECK(cudaMemsetAsync(dst_d, 0, ggml_nbytes(dst), stream));
++    const int64_t n = ne00*ne10;
+     const dim3 block_dims(CUDA_GET_ROWS_BACK_BLOCK_SIZE, 1, 1);
+-    const int block_num_x = (ne00 + CUDA_GET_ROWS_BACK_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BACK_BLOCK_SIZE;
+-    const dim3 block_nums(block_num_x, ne1, 1);
++    const dim3 block_nums((n + CUDA_GET_ROWS_BACK_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BACK_BLOCK_SIZE, 1, 1);
+ 
+     k_get_rows_back_float<<<block_nums, block_dims, 0, stream>>>(src0_d, src1_d, dst_d, ne00, ne10);
+ }

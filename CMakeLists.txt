@@ -26,6 +26,7 @@ option(MLIPCPP_BUILD_EXAMPLES "Build examples" ON)
 option(MLIPCPP_BUILD_TESTS "Build tests" OFF)
 option(MLIPCPP_BUILD_FORTRAN "Build Fortran bindings" OFF)
 option(MLIPCPP_BUILD_PYTHON "Build Python bindings" OFF)
+option(MLIPCPP_BUILD_TRAINING "Build the PET trainer (mlipcpp-train, POSIX only)" ON)
 option(MLIPCPP_INSTALL "Generate install target" OFF)
 option(MLIPCPP_USE_CUDA "Enable CUDA backend via ggml" OFF)
 option(MLIPCPP_USE_HIP "Enable HIP/ROCm backend via ggml (AMD)" OFF)
@@ -193,6 +194,16 @@ else()
         NAME ggml
         GITHUB_REPOSITORY peterspackman/ggml
         GIT_TAG 9be7b7f8
+        # CUDA GET_ROWS_BACK as a scatter-add: the upstream gather launches one
+        # grid row per destination row (> 65535 for PET edge batches) and is
+        # O(rows^2)
+        # CPU RMS_NORM_BACK / SOFT_MAX_BACK: ggml-alloc runs them in place,
+        # but the kernels copied one input over the other before reading it
+        PATCHES "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-get-rows-back-scatter.patch"
+                "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cpu-norm-softmax-back-inplace.patch"
+        # CUDA REPEAT_BACK (every bias / broadcast gradient): split the
+        # reduction across the grid instead of one serial thread per output
+                "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-repeat-back-split.patch"
         EXCLUDE_FROM_ALL YES
     )
 endif()

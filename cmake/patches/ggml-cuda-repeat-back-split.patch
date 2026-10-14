@@ -1,0 +1,78 @@
+diff --git a/src/ggml-cuda/binbcast.cu b/src/ggml-cuda/binbcast.cu
+index 7339fe0c..8cc5c795 100644
+--- a/src/ggml-cuda/binbcast.cu
++++ b/src/ggml-cuda/binbcast.cu
+@@ -1,4 +1,5 @@
+ #include "binbcast.cuh"
++#include <algorithm>
+ #include <cstdint>
+ #include <utility>
+ 
+@@ -345,6 +346,39 @@ static __global__ void k_repeat_back(
+     dst[tid3*ne2*ne1*ne0 + tid2*ne1*ne0 + tid1*ne0 + tid0] = sum;
+ }
+ 
++// repeat_back with the reduction split over blockIdx.y: k_repeat_back gives
++// each dst element a single thread that sums the whole repeated range
++// serially, i.e. 128 threads for a bias gradient of a [128, m, n] tensor.
++// Here ~64k threads share the work and combine with one atomicAdd each.
++static __global__ void k_repeat_back_split_f32(
++        const float * __restrict__ src, float * __restrict__ dst,
++        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3,
++        const int64_t r0, const int64_t r1, const int64_t r2,
++        const size_t s00, const size_t s01, const size_t s02, const size_t s03,
++        const int64_t E, const int64_t R, const int64_t chunk) {
++    const int64_t d = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
++    if (d >= E) {
++        return;
++    }
++    int64_t t = d;
++    const int64_t i0 = t % ne0; t /= ne0;
++    const int64_t i1 = t % ne1; t /= ne1;
++    const int64_t i2 = t % ne2;
++    const int64_t i3 = t / ne2;
++    const int64_t rb = int64_t(blockIdx.y)*chunk;
++    const int64_t re = rb + chunk < R ? rb + chunk : R;
++    float sum = 0.0f;
++    for (int64_t r = rb; r < re; r++) {
++        int64_t u = r;
++        const int64_t k0 = u % r0; u /= r0;
++        const int64_t k1 = u % r1; u /= r1;
++        const int64_t k2 = u % r2;
++        const int64_t k3 = u / r2;
++        sum += src[(i0 + k0*ne0)*s00 + (i1 + k1*ne1)*s01 + (i2 + k2*ne2)*s02 + (i3 + k3*ne3)*s03];
++    }
++    atomicAdd(dst + d, sum);
++}
++
+ template <float (*bin_op)(const float, const float), int n_fuse = 1>
+ struct bin_bcast_cuda {
+     template<typename src0_t, typename src1_t, typename dst_t>
+@@ -483,8 +517,6 @@ void ggml_cuda_op_repeat_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+ 
+     GGML_TENSOR_UNARY_OP_LOCALS;
+ 
+-    GGML_ASSERT(ne2*ne3 <= (1 << 15));
+-
+     const size_t ts = ggml_type_size(src0->type);
+     const size_t s00 = nb00 / ts;
+     const size_t s01 = nb01 / ts;
+@@ -495,7 +527,17 @@ void ggml_cuda_op_repeat_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+         case GGML_TYPE_F32: {
+             const float * src0_d = (const float *) src0->data;
+             float       * dst_d  = (float       *) dst->data;
+-            repeat_back_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s00, s01, s02, s03, ne0, ne1, ne2, ne3, stream);
++            const int64_t E = ne0*ne1*ne2*ne3;
++            const int64_t R = (ne00/ne0)*(ne01/ne1)*(ne02/ne2)*(ne03/ne3);
++            const int64_t splits = std::min<int64_t>(R, std::max<int64_t>(1, 32768/E)); // gridDim.y <= 65535
++            const int64_t chunk = (R + splits - 1)/splits;
++            const int64_t nby = (R + chunk - 1)/chunk;
++            CUDA_CHECK(cudaMemsetAsync(dst_d, 0, ggml_nbytes(dst), stream));
++            const dim3 block_dims(256, 1, 1);
++            const dim3 block_nums((E + 255)/256, nby, 1);
++            k_repeat_back_split_f32<<<block_nums, block_dims, 0, stream>>>(
++                src0_d, dst_d, ne0, ne1, ne2, ne3, ne00/ne0, ne01/ne1, ne02/ne2,
++                s00, s01, s02, s03, E, R, chunk);
+         } break;
+         default: {
+             GGML_ASSERT(false);

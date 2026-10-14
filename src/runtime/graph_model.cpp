@@ -370,6 +370,10 @@ bool GraphModel::load_from_gguf(const std::string &path) {
   energy_scale_ = loader.get_float32("pet.energy_scale", 1.0f);
   cutoff_function_ = loader.get_string("pet.cutoff_function", "cosine");
   forces_mode_ = (loader.get_int32("pet.forces_mode", 0) != 0);
+  nc_forces_ = (loader.get_int32("pet.nc_forces", 0) != 0);
+  param_names_ = json::parse(loader.get_string("train.param_names", "[]"))
+                     .get<std::vector<std::string>>();
+  gguf_path_ = path;
   num_neighbors_adaptive_ = loader.get_float32("pet.num_neighbors_adaptive", 0.0f);
 
   // Update neighbor list builder with loaded cutoff
@@ -400,9 +404,14 @@ bool GraphModel::load_from_gguf(const std::string &path) {
   for (size_t i = 0; i < comp_keys.size(); i++) {
     composition_energies_[comp_keys[i]] = comp_vals[i];
   }
+  auto ncs_keys = loader.get_array_int32("pet.nc_force_scale_keys");
+  auto ncs_vals = loader.get_array_float32("pet.nc_force_scale_values");
+  for (size_t i = 0; i < std::min(ncs_keys.size(), ncs_vals.size()); i++) {
+    nc_force_scales_[ncs_keys[i]] = ncs_vals[i];
+  }
 
   // Create backend
-  backend_provider_ = BackendProvider::create(backend_preference_);
+  backend_provider_ = BackendProvider::create(backend_preference_, device_);
 
   // Load weight shapes from metadata (PyTorch shapes, need reversal for GGML)
   std::string shapes_json = loader.get_string("graph.weight_shapes", "");
@@ -454,6 +463,7 @@ bool GraphModel::load_from_gguf(const std::string &path) {
     }
 
     ggml_set_name(t, name.c_str());
+    weight_names_.push_back(name);
   }
 
   // Allocate backend buffer for weights
@@ -484,6 +494,14 @@ bool GraphModel::load_from_gguf(const std::string &path) {
   }
 
   return true;
+}
+
+std::vector<std::pair<std::string, ggml_tensor *>> GraphModel::weights() const {
+  std::vector<std::pair<std::string, ggml_tensor *>> out;
+  for (const auto &name : weight_names_) {
+    out.emplace_back(name, ggml_get_tensor(ctx_weights_, name.c_str()));
+  }
+  return out;
 }
 
 void GraphModel::load_graph_file(const std::string &path) {
@@ -807,6 +825,15 @@ ModelResult GraphModel::predict_single(
     ggml_free(input_ctx);
     throw std::runtime_error("Failed to build computation graph");
   }
+  // nc-force models output [n_atoms, 4] = (energy | force): split the columns
+  ggml_tensor *nc_output = nullptr;
+  if (nc_forces_) {
+    ggml_tensor *full = output;
+    output = ggml_cont(compute_ctx, ggml_view_2d(compute_ctx, full, 1, n_atoms, full->nb[1], 0));
+    nc_output = ggml_cont(compute_ctx, ggml_view_2d(compute_ctx, full, 3, n_atoms, full->nb[1],
+                                                    sizeof(float)));
+    ggml_set_output(nc_output);
+  }
   ggml_set_output(output);
 
   ggml_cgraph *cgraph = nullptr;
@@ -819,6 +846,7 @@ ModelResult GraphModel::predict_single(
 
     cgraph = ggml_new_graph_custom(compute_ctx, 32768, true);
     ggml_build_forward_expand(cgraph, output);
+    if (nc_output) ggml_build_forward_expand(cgraph, nc_output);
     ggml_build_forward_expand(cgraph, total_energy);
     ggml_build_backward_expand(compute_ctx, cgraph, nullptr);
 
@@ -831,6 +859,7 @@ ModelResult GraphModel::predict_single(
   } else {
     cgraph = ggml_new_graph(compute_ctx);
     ggml_build_forward_expand(cgraph, output);
+    if (nc_output) ggml_build_forward_expand(cgraph, nc_output);
   }
 
   ggml_backend_buffer_t compute_buffer =
@@ -882,6 +911,18 @@ ModelResult GraphModel::predict_single(
   }
 
   result.energy = scaled_energy + composition_energy;
+
+  if (nc_output) {
+    result.nc_forces.resize(n_atoms * 3);
+    ggml_backend_tensor_get(nc_output, result.nc_forces.data(), 0,
+                            result.nc_forces.size() * sizeof(float));
+    for (int i = 0; i < n_atoms; i++) {
+      auto it = nc_force_scales_.find(atomic_numbers[i]);
+      const float s = it != nc_force_scales_.end() ? it->second : 1.0f;
+      for (int k = 0; k < 3; k++) result.nc_forces[3 * i + k] *= s;
+    }
+    result.has_nc_forces = true;
+  }
 
   // Extract forces
   if (compute_forces) {

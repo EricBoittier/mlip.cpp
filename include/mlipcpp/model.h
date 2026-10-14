@@ -13,8 +13,11 @@ struct ModelResult {
   std::vector<float> forces; // [n_atoms * 3], flattened
   std::vector<float> stress; // [6] in Voigt notation (xx, yy, zz, yz, xz, xy)
 
+  std::vector<float> nc_forces; // [n_atoms * 3], direct force head
+
   bool has_forces = false;
   bool has_stress = false;
+  bool has_nc_forces = false;
 };
 
 /// Base interface for all MLIP models

@@ -121,7 +121,7 @@ BackendProvider &BackendProvider::operator=(BackendProvider &&other) noexcept {
 }
 
 std::shared_ptr<BackendProvider>
-BackendProvider::create(BackendPreference pref) {
+BackendProvider::create(BackendPreference pref, int device) {
   auto provider = std::shared_ptr<BackendProvider>(new BackendProvider());
   provider->preference_ = pref;
 
@@ -208,15 +208,16 @@ BackendProvider::create(BackendPreference pref) {
       }
     }
 #endif
-    if (!gpu && !gpu_devs.empty()) {
-      gpu = ggml_backend_dev_init(gpu_devs[0], nullptr);
+    if (!gpu && device < static_cast<int>(gpu_devs.size())) {
+      gpu = ggml_backend_dev_init(gpu_devs[device], nullptr);
     }
   } else {
-    // Specific GPU preference: scan devices until one matches.
+    // Specific GPU preference: take the device-th matching GPU.
+    int matched = 0;
     for (auto d : gpu_devs) {
       ggml_backend_t b = ggml_backend_dev_init(d, nullptr);
       if (!b) continue;
-      if (gpu_matches_preference(b)) {
+      if (gpu_matches_preference(b) && matched++ == device) {
         gpu = b;
         break;
       }

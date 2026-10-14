@@ -78,6 +78,30 @@ public:
    */
   const GraphInterpreter &interpreter() const { return interp_; }
 
+  // --- Training access (src/train) ---
+
+  /// GPU index among those matching the backend preference; set before load.
+  void set_device(int device) { device_ = device; }
+
+  GraphInterpreter &interpreter() { return interp_; }
+  ggml_backend_t backend() const { return compute_backend_; }
+
+  /// Weight tensors by GGUF name, in GGUF order (all F32, on the backend).
+  std::vector<std::pair<std::string, ggml_tensor *>> weights() const;
+
+  const std::map<int, int> &species_to_index() const { return species_to_index_; }
+  const std::map<int, float> &composition_energies() const { return composition_energies_; }
+  const std::map<int, float> &nc_force_scales() const { return nc_force_scales_; }
+  float energy_scale() const { return energy_scale_; }
+  float cutoff_width() const { return cutoff_width_; }
+  bool forces_mode() const { return forces_mode_; }
+  /// Graph output is [n_atoms, 4] = (energy | non-conservative force).
+  bool nc_forces() const { return nc_forces_; }
+  const std::string &gguf_path() const { return gguf_path_; }
+  /// Names of the trainable tensors (GGUF "train.param_names"; buffers and
+  /// constants excluded). Empty for exports that predate it.
+  const std::vector<std::string> &param_names() const { return param_names_; }
+
   /**
    * Run inference and invoke `cb` after the graph compute completes, while
    * the compute buffer is still alive. The callback typically calls
@@ -98,6 +122,11 @@ private:
   float energy_scale_ = 1.0f;
   std::string cutoff_function_ = "cosine";
   bool forces_mode_ = false;
+  bool nc_forces_ = false;
+  int device_ = 0;
+  std::string gguf_path_;
+  std::vector<std::string> weight_names_;
+  std::vector<std::string> param_names_;
   float num_neighbors_adaptive_ = 0.0f;
 
   BackendPreference backend_preference_ = BackendPreference::Auto;
@@ -113,6 +142,9 @@ private:
 
   // Composition energies (atomic reference energies)
   std::map<int, float> composition_energies_;
+
+  // Per-species scale of the non-conservative force head
+  std::map<int, float> nc_force_scales_;
 
   // Neighbor list builder
   NeighborListBuilder neighbor_builder_;

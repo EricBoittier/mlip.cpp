@@ -110,3 +110,30 @@ if(MLIPCPP_BUILD_FORTRAN)
             $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/mlipcpp/fortran>
     )
 endif()
+
+# =============================================================================
+# PET training (mlipcpp-train)
+# =============================================================================
+if(MLIPCPP_BUILD_TRAINING AND UNIX AND NOT EMSCRIPTEN)
+    find_package(Threads REQUIRED)
+    add_library(mlipcpp_train STATIC
+        train/dataset.cpp
+        train/batch.cpp
+        train/trainer.cpp
+    )
+    target_include_directories(mlipcpp_train PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${ggml_SOURCE_DIR}/include
+                               PRIVATE ${ggml_SOURCE_DIR}/src) # ggml-impl.h: ggml_graph_view
+    target_link_libraries(mlipcpp_train PUBLIC mlipcpp ggml fmt::fmt nlohmann_json::nlohmann_json Threads::Threads)
+    target_compile_options(mlipcpp_train PRIVATE -Wall -Wextra)
+
+    add_executable(mlipcpp-train bin/mlipcpp_train.cpp)
+    target_link_libraries(mlipcpp-train PRIVATE mlipcpp_train)
+    target_link_options(mlipcpp-train PRIVATE -rdynamic) # names in crash backtraces
+
+    add_executable(mlipcpp-op-test bin/mlipcpp_op_test.cpp)
+    target_link_libraries(mlipcpp-op-test PRIVATE mlipcpp_train)
+
+    add_executable(mlipcpp-train-check bin/mlipcpp_train_check.cpp)
+    target_link_libraries(mlipcpp-train-check PRIVATE mlipcpp_train)
+    target_link_options(mlipcpp-train-check PRIVATE -rdynamic)
+endif()

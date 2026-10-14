@@ -1,5 +1,6 @@
 #include "graph_interpreter.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -177,6 +178,12 @@ void GraphInterpreter::set_input(const std::string &name, ggml_tensor *tensor) {
   inputs_[name] = tensor;
 }
 
+void GraphInterpreter::mark_constants_as_inputs() {
+  for (const auto &pc : pending_constants_) {
+    if (pc.tensor) ggml_set_input(pc.tensor);
+  }
+}
+
 void GraphInterpreter::init_constants() {
   // Set constant values after graph allocation. Use ggml_backend_tensor_set
   // so this works for non-CPU backends (Metal, WebGPU, ...) where tensor->data
@@ -243,6 +250,7 @@ ggml_tensor *GraphInterpreter::build(ggml_context *ctx) {
   output_ = nullptr;
   node_outputs_.clear();
   pending_constants_.clear();
+  zeros_.clear();
 
   // Build nodes in order (they should already be topologically sorted)
   for (const auto &node : graph_.nodes) {
@@ -828,7 +836,10 @@ ggml_tensor *GraphInterpreter::build_transpose(ggml_context *ctx,
 
   int64_t py_dim0 = dims[0];
   int64_t py_dim1 = dims[1];
-  int n_dims = ggml_n_dims(a);
+  // PyTorch rank from the IR: ggml_n_dims drops trailing size-1 axes (e.g. a
+  // batch of one atom), which would map the dims onto the wrong ggml axes
+  int n_dims = node.output_shape.empty() ? ggml_n_dims(a)
+                                         : static_cast<int>(node.output_shape.size());
 
   // Normalize negative dimensions (PyTorch convention: -1 = last dim)
   if (py_dim0 < 0)
@@ -978,6 +989,27 @@ ggml_tensor *GraphInterpreter::build_sum_rows(ggml_context *ctx,
     throw std::runtime_error("SUM_ROWS requires at least 1 input");
   }
   ggml_tensor *a = resolve_input(ctx, node.inputs[0]);
+
+  // ggml_sum_rows reduces the innermost axis (the last PyTorch dim). For any
+  // other `dims=[d]`, rotate GGML axis R-1-d to the front first, keeping the
+  // other axes in order, so the reshape below sees the PyTorch layout.
+  if (has_param(node, "dims")) {
+    auto dims = get_int_array_param(node, "dims");
+    // rank from the IR, not ggml_n_dims (which drops size-1 axes)
+    const bool keepdim = get_param<bool>(node, "keepdim", false);
+    const int R = static_cast<int>(node.output_shape.size()) + (keepdim ? 0 : 1);
+    if (dims.size() == 1) {
+      const int d = static_cast<int>(dims[0] < 0 ? dims[0] + R : dims[0]);
+      const int ax = R - 1 - d;
+      if (ax > 0) {
+        int p[4] = {0, 1, 2, 3};
+        for (int i = 0; i < 4; i++) p[i] = i < ax ? i + 1 : (i == ax ? 0 : i);
+        a = ggml_cont(ctx, ggml_permute(ctx, a, p[0], p[1], p[2], p[3]));
+      }
+    } else if (dims.size() > 1) {
+      throw std::runtime_error("SUM_ROWS over several dims is not supported");
+    }
+  }
   ggml_tensor *result = ggml_sum_rows(ctx, a);
 
   // ggml_sum_rows reduces ne[0] to 1, producing shape [1, ne[1], ...].
@@ -1282,7 +1314,9 @@ ggml_tensor *GraphInterpreter::build_concat(ggml_context *ctx,
 
   // GGML ggml_concat concatenates along a GGML dimension
   // Convert PyTorch dim to GGML dim (reversed order)
-  int n_dims = ggml_n_dims(tensors[0]);
+  // PyTorch rank from the IR (see build_transpose)
+  int n_dims = node.output_shape.empty() ? ggml_n_dims(tensors[0])
+                                         : static_cast<int>(node.output_shape.size());
   int ggml_dim = n_dims - 1 - py_dim;
 
   // Handle negative dimension
@@ -1390,6 +1424,7 @@ ggml_tensor *GraphInterpreter::build_new_zeros(ggml_context *ctx,
   ggml_set_input(result);
   // Store for later initialization to zero
   pending_constants_.push_back({result, 0.0f});
+  zeros_.insert(result);
 
   return result;
 }
@@ -1445,8 +1480,19 @@ ggml_tensor *GraphInterpreter::build_linear(ggml_context *ctx,
   ggml_tensor *input = resolve_input(ctx, node.inputs[0]);
   ggml_tensor *weight = resolve_input(ctx, node.inputs[1]);
 
+  // Batched inputs ([..., rows, in]) are flattened to one 2-D product: ggml
+  // would otherwise broadcast the weight over the batch dims, and its
+  // backward then needs a batched per-row-block product followed by a
+  // REPEAT_BACK reduction for the weight gradient (most of a training step).
+  ggml_tensor *x = input;
+  const bool batched = input->ne[2] * input->ne[3] > 1;
+  if (batched) {
+    if (!ggml_is_contiguous(x)) x = ggml_cont(ctx, x);
+    x = ggml_reshape_2d(ctx, x, x->ne[0], ggml_nrows(x));
+  }
+
   // GGML mul_mat: (weight @ input.T).T = input @ weight.T
-  ggml_tensor *result = ggml_mul_mat(ctx, weight, input);
+  ggml_tensor *result = ggml_mul_mat(ctx, weight, x);
 
   // Add bias if present
   if (node.inputs.size() > 2) {
@@ -1454,6 +1500,9 @@ ggml_tensor *GraphInterpreter::build_linear(ggml_context *ctx,
     result = ggml_add(ctx, result, bias);
   }
 
+  if (batched) {
+    result = ggml_reshape_4d(ctx, result, result->ne[0], input->ne[1], input->ne[2], input->ne[3]);
+  }
   return result;
 }
 
@@ -1716,7 +1765,11 @@ ggml_tensor *GraphInterpreter::build_where(ggml_context *ctx,
 
   // condition is a float tensor where 1.0 = true, 0.0 = false
   // result = x * condition + y * (1 - condition)
-  ggml_tensor *x_masked = ggml_mul(ctx, x, condition);
+  // where(c, 0, y) / where(c, x, 0) (PET's padding masks): one product with
+  // the small mask instead of materialising a full-size zeros operand
+  const bool x_zero = zeros_.count(x) > 0, y_zero = zeros_.count(y) > 0;
+  if (y_zero) return ggml_mul(ctx, x, condition);
+  ggml_tensor *x_masked = x_zero ? nullptr : ggml_mul(ctx, x, condition);
   ggml_tensor *ones = nullptr;
   switch (ggml_n_dims(condition)) {
   case 1:
@@ -1744,7 +1797,7 @@ ggml_tensor *GraphInterpreter::build_where(ggml_context *ctx,
   ggml_tensor *inv_condition = ggml_sub(ctx, ones, condition);
   ggml_tensor *y_masked = ggml_mul(ctx, y, inv_condition);
 
-  return ggml_add(ctx, x_masked, y_masked);
+  return x_zero ? y_masked : ggml_add(ctx, x_masked, y_masked);
 }
 
 std::string GraphInterpreter::summary() const {
