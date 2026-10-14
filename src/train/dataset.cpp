@@ -229,33 +229,39 @@ NeighborCache NeighborCache::load_or_build(const MemmapSplit &split, float cutof
   }
 
   const NeighborListBuilder builder(NeighborListOptions{cutoff, true, false});
-  std::vector<LocalEdges> parts(ns);
-  std::atomic<int64_t> next{0};
-  std::vector<std::thread> pool;
-  for (int t = 0; t < std::max(1, n_threads); t++) {
-    pool.emplace_back([&] {
-      for (int64_t s; (s = next.fetch_add(1)) < ns;) parts[s] = build_one(split, s, builder);
-    });
-  }
-  for (auto &t : pool) t.join();
-
+  auto parallel = [&](auto &&f) {
+    std::atomic<int64_t> next{0};
+    std::vector<std::thread> pool;
+    for (int t = 0; t < std::max(1, n_threads); t++)
+      pool.emplace_back([&] {
+        for (int64_t s; (s = next.fetch_add(1)) < ns;) f(s);
+      });
+    for (auto &t : pool) t.join();
+  };
+  // two passes, so that peak memory is the final arrays (one allocation)
+  // plus per-thread scratch: 2^24 structures hold ~4e9 edges (~120 GB).
+  // Pass 1: edge counts (neighbour search only); pass 2: build every
+  // structure straight into its slice of the final arrays.
+  std::vector<int64_t> count(ns);
+  parallel([&](int64_t s) { count[s] = builder.build(split.system(s)).num_pairs(); });
   nc.edge_offset.assign(ns + 1, 0);
-  nc.max_neighbors.resize(ns);
-  for (int64_t s = 0; s < ns; s++) {
-    nc.edge_offset[s + 1] = nc.edge_offset[s] + parts[s].center.size();
-    nc.max_neighbors[s] = parts[s].max_neighbors;
-  }
+  for (int64_t s = 0; s < ns; s++) nc.edge_offset[s + 1] = nc.edge_offset[s] + count[s];
   const int64_t E = nc.edge_offset.back();
-  nc.center.reserve(E), nc.neighbor.reserve(E), nc.slot.reserve(E);
-  nc.reverse.reserve(E), nc.vector.reserve(E);
-  for (auto &p : parts) {
-    nc.center.insert(nc.center.end(), p.center.begin(), p.center.end());
-    nc.neighbor.insert(nc.neighbor.end(), p.neighbor.begin(), p.neighbor.end());
-    nc.slot.insert(nc.slot.end(), p.slot.begin(), p.slot.end());
-    nc.reverse.insert(nc.reverse.end(), p.reverse.begin(), p.reverse.end());
-    nc.vector.insert(nc.vector.end(), p.vector.begin(), p.vector.end());
-    p = LocalEdges{};
-  }
+  nc.max_neighbors.resize(ns);
+  nc.center.resize(E), nc.neighbor.resize(E), nc.slot.resize(E);
+  nc.reverse.resize(E), nc.vector.resize(E);
+  parallel([&](int64_t s) {
+    LocalEdges p = build_one(split, s, builder);
+    if (static_cast<int64_t>(p.center.size()) != count[s])
+      throw std::runtime_error("neighbour lists: edge count changed between passes");
+    const int64_t o = nc.edge_offset[s];
+    std::copy(p.center.begin(), p.center.end(), nc.center.begin() + o);
+    std::copy(p.neighbor.begin(), p.neighbor.end(), nc.neighbor.begin() + o);
+    std::copy(p.slot.begin(), p.slot.end(), nc.slot.begin() + o);
+    std::copy(p.reverse.begin(), p.reverse.end(), nc.reverse.begin() + o);
+    std::copy(p.vector.begin(), p.vector.end(), nc.vector.begin() + o);
+    nc.max_neighbors[s] = p.max_neighbors;
+  });
   log::info("neighbour lists: built {} edges for {} structures", E, ns);
 
   if (!cache_path.empty()) {
