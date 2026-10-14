@@ -6,6 +6,7 @@
 #include "train/crash.h"
 #include "train/trainer.h"
 
+#include <cstdlib>
 #include <fmt/core.h>
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
@@ -40,6 +41,10 @@ int main(int argc, char **argv) {
     else if (a == "--profile") profile = v == "1";
     else if (a == "--tile-nb-ratio") tile_ratio = std::stod(v);
   }
+  // the node-by-node profile computes one-node graph views; ggml's CUDA graph
+  // cache (keyed by the first node's address) could replay a stale capture
+  // into a later graph's view -> no CUDA graphs when profiling (read once)
+  if (profile) setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 1);
   if (data.empty() || init.empty() || out.empty()) {
     fmt::print(stderr, "usage: {} --data DIR --init INIT.gguf --out DIR [--n 64] [--gpus 1] [--cache-dir DIR] [--node-grads 0|1]\n", argv[0]);
     return 2;
