@@ -184,6 +184,14 @@ void GraphInterpreter::mark_constants_as_inputs() {
   }
 }
 
+std::vector<std::pair<ggml_tensor *, float>> GraphInterpreter::take_constants() {
+  std::vector<std::pair<ggml_tensor *, float>> out;
+  for (const auto &pc : pending_constants_)
+    if (pc.tensor) out.emplace_back(pc.tensor, pc.value);
+  pending_constants_.clear();
+  return out;
+}
+
 void GraphInterpreter::init_constants() {
   // Set constant values after graph allocation. Use ggml_backend_tensor_set
   // so this works for non-CPU backends (Metal, WebGPU, ...) where tensor->data

@@ -27,6 +27,7 @@ int main(int argc, char **argv) {
   std::string data, init, out, cache_dir;
   int n = 64, gpus = 1;
   bool node_grads_on = false, mb_failed = false, profile = false;
+  double tile_ratio = 1.25;
   for (int i = 1; i + 1 < argc; i += 2) {
     const std::string a = argv[i], v = argv[i + 1];
     if (a == "--data") data = v;
@@ -37,6 +38,7 @@ int main(int argc, char **argv) {
     else if (a == "--gpus") gpus = std::stoi(v);
     else if (a == "--node-grads") node_grads_on = v == "1";
     else if (a == "--profile") profile = v == "1";
+    else if (a == "--tile-nb-ratio") tile_ratio = std::stod(v);
   }
   if (data.empty() || init.empty() || out.empty()) {
     fmt::print(stderr, "usage: {} --data DIR --init INIT.gguf --out DIR [--n 64] [--gpus 1] [--cache-dir DIR] [--node-grads 0|1]\n", argv[0]);
@@ -109,6 +111,42 @@ int main(int argc, char **argv) {
     fmt::print("micro-batches: {} (growth 2), loss {:.8g} vs {:.8g}, worst relative gradient "
                "difference {:.2e}\n", mbs.size(), loss, st.loss, worst);
     if (!(worst < 1e-3)) mb_failed = true;
+  }
+
+  // tiles: padded fixed-shape micro-batches through a graph-caching worker
+  // (CUDA graphs replay from the second call on) must give the same loss and
+  // gradients on every repetition
+  if (!node_grads_on && tile_ratio > 1) {
+    Worker tiled(init, gpus > 0 ? 0 : -1, size_t(8) << 30);
+    tiled.set_params(worker.get_params());
+    const Tiling tiling{tile_ratio, 2.0, n};
+    const double growths[] = {2.0, 1e9};
+    for (double growth : growths) {
+      auto mbs = make_microbatches(split, nl, ids, {}, worker.model().species_to_index(), sc,
+                                   worker.model().cutoff(), 5e7, growth, tiling);
+      for (int rep = 0; rep < 4; rep++) {
+        auto t0 = std::chrono::steady_clock::now();
+        double loss = 0;
+        tiled.zero_grads();
+        for (const Batch &mb : mbs) loss += tiled.run(mb, sc.energy_scale, true).loss;
+        const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        const std::vector<float> sum = tiled.get_grads();
+        double worst = 0;
+        size_t off = 0;
+        for (auto *p : worker.params()) {
+          double d2 = 0, r2 = 0;
+          for (int64_t i = 0; i < ggml_nelements(p); i++, off++)
+            d2 += std::pow(double(sum[off]) - grads[off], 2), r2 += std::pow(double(grads[off]), 2);
+          if (r2 > 0) worst = std::max(worst, std::sqrt(d2 / r2));
+        }
+        std::string shapes;
+        for (const Batch &mb : mbs) shapes += fmt::format(" {}x{}", mb.n_atoms, mb.max_neighbors);
+        fmt::print("tiles (growth {:g}, rep {}):{}; loss {:.8g} vs {:.8g}, worst relative gradient "
+                   "difference {:.2e}; wall {:.1f} ms\n", growth, rep, shapes, loss, st.loss, worst,
+                   1e3 * wall);
+        if (!(worst < 1e-3) || !(std::abs(loss - st.loss) < 1e-4 * std::abs(st.loss))) mb_failed = true;
+      }
+    }
   }
 
   if (profile) {

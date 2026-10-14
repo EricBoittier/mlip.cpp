@@ -9,6 +9,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace mlipcpp::train {
@@ -32,6 +33,14 @@ struct TrainOptions {
   // micro-batching (see make_microbatches): exact full-batch gradients
   double mb_growth = 4.0;  // max ratio of padded neighbour counts in one micro-batch
   double mb_budget = 5e7;  // max n_atoms * (max_nb+1)^2 per micro-batch
+  // fixed-shape tiles + cached graphs (see Tiling); 0 = dynamic shapes
+  double tile_nb_ratio = 0, tile_atom_ratio = 2;
+  double graph_cache_gb = 24; // per-device memory for cached graphs
+  // optimizer: "adam" (torch.optim.Adam) or "muon" (2-D hidden weights; Adam for the rest)
+  std::string optimizer = "adam";
+  double muon_momentum = 0.95;
+  double muon_lr_scale = 1.0; // Muon lr = lr * this (updates are RMS-matched to Adam)
+  int muon_ns_steps = 5;
 };
 
 /// Squared errors of one batch: scaled (the loss) and physical (metrics).
@@ -49,7 +58,9 @@ struct StepStats {
 /// allocator. Weights stay resident on the device.
 class Worker {
 public:
-  Worker(const std::string &gguf, int device); // device < 0: CPU
+  /// `cache_bytes` > 0 keeps the graph of every batch shape (with its own
+  /// allocation) for replay, least recently used first out.
+  Worker(const std::string &gguf, int device, size_t cache_bytes = 0); // device < 0: CPU
   ~Worker();
 
   /// Forward, and backward if `backward`: the parameter gradients are added
@@ -80,8 +91,32 @@ public:
 
   /// Per-phase wall time of the last run(), in seconds.
   double t_build = 0, t_alloc = 0, t_upload = 0, t_compute = 0, t_download = 0;
+  int64_t cache_hits = 0, cache_misses = 0;
+  size_t cache_bytes_used() const { return cache_used_; }
+  size_t cache_size() const { return cache_.size(); }
 
 private:
+  /// The loss graph of one batch shape, with its inputs and outputs.
+  struct StepGraph {
+    ggml_context *ctx = nullptr;
+    ggml_cgraph *gf = nullptr;
+    ggml_gallocr_t galloc = nullptr; // own buffer when cached
+    std::map<std::string, ggml_tensor *> in;
+    ggml_tensor *d_energy = nullptr, *d_force = nullptr, *loss_e = nullptr, *loss_f = nullptr,
+                *loss = nullptr, *loss_grad = nullptr;
+    int n_forward = 0;
+    std::vector<std::pair<ggml_tensor *, float>> constants;
+    size_t bytes = 0;
+    uint64_t last_use = 0;
+    ~StepGraph();
+  };
+  std::unique_ptr<StepGraph> build_graph(int n, int m, int S, bool backward, bool cached);
+  StepGraph &cached_graph(int n, int m, int S, bool backward);
+
+  std::map<std::tuple<int, int, int, bool>, std::unique_ptr<StepGraph>> cache_;
+  size_t cache_limit_ = 0, cache_used_ = 0;
+  uint64_t clock_ = 0;
+
   runtime::GraphModel model_;
   std::vector<ggml_tensor *> params_;
   size_t n_params_ = 0;
@@ -100,7 +135,11 @@ private:
 /// all accumulators.
 class Optimizer {
 public:
-  Optimizer(std::vector<std::unique_ptr<Worker>> &workers, double clip);
+  /// `muon`: 2-D hidden weights (both dims >= 16, not embeddings) take Muon
+  /// steps -- momentum, Newton-Schulz orthogonalisation, update RMS matched
+  /// to Adam (0.2 sqrt(max dim)) -- at lr * muon_lr_scale; the rest Adam.
+  Optimizer(std::vector<std::unique_ptr<Worker>> &workers, double clip, bool muon = false,
+            double muon_momentum = 0.95, double muon_lr_scale = 1.0, int ns_steps = 5);
   ~Optimizer();
   /// One step at learning rate `lr`; returns the global gradient norm (of
   /// the averaged gradient, before clipping).
@@ -113,8 +152,12 @@ private:
   ggml_gallocr_t galloc_ = nullptr;
   ggml_cgraph *graph_ = nullptr;
   std::vector<ggml_tensor *> staging_; // other workers' gradients, on device 0
-  ggml_tensor *pars_ = nullptr, *norm_ = nullptr;
+  ggml_tensor *pars_ = nullptr, *norm_ = nullptr, *muon_lr_ = nullptr;
+  double muon_lr_scale_ = 1.0;
   int64_t t_ = 0;
+
+public:
+  size_t n_muon_tensors = 0;
 };
 
 /// Neighbour-list cache file of `split` under `cache_dir` ("" if no dir).

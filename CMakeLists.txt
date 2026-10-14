@@ -129,6 +129,9 @@ set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 # Configure ggml backend options based on mlipcpp options
 if(MLIPCPP_USE_CUDA)
     set(GGML_CUDA ON CACHE BOOL "" FORCE)
+    # replay of captured graphs: the trainer's tiled shapes build each graph
+    # once (mlipcpp-train --tile-nb-ratio)
+    set(GGML_CUDA_GRAPHS ON CACHE BOOL "" FORCE)
 endif()
 if(MLIPCPP_USE_HIP)
     set(GGML_HIP ON CACHE BOOL "" FORCE)

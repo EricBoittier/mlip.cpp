@@ -107,18 +107,28 @@ std::array<float, 9> random_o3(std::mt19937_64 &rng) {
   return out;
 }
 
+int Tiling::bucket(int x, int lo, double ratio) {
+  int v = lo;
+  while (v < x) v = std::max(v + 8, static_cast<int>(std::ceil(v * ratio / 8.0)) * 8);
+  return v;
+}
+
 Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
                  const std::vector<int64_t> &ids,
                  const std::vector<std::array<float, 9>> &rotations,
                  const std::map<int, int> &species_to_index,
-                 const TargetScaling &scaling, float cutoff) {
+                 const TargetScaling &scaling, float cutoff, int pad_atoms,
+                 int pad_neighbors, int pad_systems) {
   Batch b;
-  b.n_systems = static_cast<int>(ids.size());
+  b.n_real_systems = static_cast<int>(ids.size());
+  int n_real = 0;
   for (int64_t s : ids) {
-    b.n_atoms += split.n_atoms(s);
+    n_real += split.n_atoms(s);
     b.max_neighbors = std::max(b.max_neighbors, nl.max_neighbors[s]);
   }
-  b.max_neighbors = std::max(b.max_neighbors, 1);
+  b.max_neighbors = std::max({b.max_neighbors, 1, pad_neighbors});
+  b.n_atoms = std::max(n_real, pad_atoms);
+  b.n_systems = std::max(b.n_real_systems, pad_systems);
   const int n = b.n_atoms, m = b.max_neighbors;
 
   auto index_of = [&](int Z) {
@@ -128,20 +138,24 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
     return it->second;
   };
 
-  b.species.resize(n);
   b.neighbor_species.assign(n * m, 0);
   b.edge_vectors.assign(n * m * 3, 0.0f);
   b.padding_mask.assign(n * m, 1.0f);
   b.reverse_neighbor_index.assign(n * m, 0);
   b.cutoff_values.assign(n * m, cutoff);
   b.atom_weight.assign(static_cast<size_t>(b.n_systems) * n, 0.0f);
-  b.energy_target.resize(b.n_systems);
-  b.force_target.resize(n * 3);
-  b.force_scale.resize(n);
-  b.n_per_system.resize(b.n_systems);
+  b.energy_target.assign(b.n_systems, 0.0f);
+  b.force_target.assign(n * 3, 0.0f);
+  b.force_scale.assign(n, 0.0f);
+  b.force_mask.assign(n, 0.0f);
+  b.n_per_system.assign(b.n_systems, 0);
+  b.species.assign(n, 0);
+  // padding atoms: no neighbours, so every slot is padded and points to itself
+  for (int a = n_real; a < n; a++)
+    for (int j = 0; j < m; j++) b.reverse_neighbor_index[a * m + j] = a * m + j;
 
   int offset = 0;
-  for (int k = 0; k < b.n_systems; k++) {
+  for (int k = 0; k < b.n_real_systems; k++) {
     const int64_t s = ids[k];
     const int ns = split.n_atoms(s);
     const int32_t *Z = split.numbers(s);
@@ -158,6 +172,7 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
       b.atom_weight[static_cast<size_t>(k) * n + a] = 1.0f / ns;
       const double fs = scaling.fscale(Z[i]);
       b.force_scale[a] = static_cast<float>(fs);
+      b.force_mask[a] = 1.0f;
       float f[3];
       rotate(F + 3 * i, f);
       for (int r = 0; r < 3; r++) b.force_target[3 * a + r] = static_cast<float>(f[r] / fs);
@@ -186,7 +201,7 @@ std::vector<Batch> make_microbatches(const MemmapSplit &split, const NeighborCac
                                      const std::vector<std::array<float, 9>> &rotations,
                                      const std::map<int, int> &species_to_index,
                                      const TargetScaling &scaling, float cutoff, double budget,
-                                     double growth) {
+                                     double growth, const Tiling &tiling) {
   std::vector<size_t> order(ids.size());
   std::iota(order.begin(), order.end(), 0);
   std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
@@ -202,7 +217,15 @@ std::vector<Batch> make_microbatches(const MemmapSplit &split, const NeighborCac
   double g_min = 0;
   auto flush = [&] {
     if (g_ids.empty()) return;
-    out.push_back(make_batch(split, nl, g_ids, g_rot, species_to_index, scaling, cutoff));
+    int pad_atoms = 0, pad_nb = 0;
+    if (tiling.enabled()) {
+      int atoms = 0, nb = 1;
+      for (int64_t s : g_ids) atoms += split.n_atoms(s), nb = std::max(nb, nl.max_neighbors[s]);
+      pad_atoms = Tiling::bucket(atoms, 32, tiling.atom_ratio);
+      pad_nb = Tiling::bucket(nb, 8, tiling.nb_ratio);
+    }
+    out.push_back(make_batch(split, nl, g_ids, g_rot, species_to_index, scaling, cutoff, pad_atoms,
+                             pad_nb, tiling.enabled() ? tiling.systems : 0));
     out.back().energy_norm = 1.0f / ids.size();
     out.back().force_norm = 1.0f / (3.0f * n_total);
     g_ids.clear(), g_rot.clear(), g_atoms = 0;

@@ -18,11 +18,16 @@ int main(int argc, char **argv) {
                "usage: {} --data DIR --init INIT.gguf -o OUT.gguf [--epochs {}] [--batch-size {}]\n"
                "          [--gpus {}] [--lr {}] [--warmup-fraction {}] [--grad-clip {}] [--seed {}]\n"
                "          [--threads {}] [--cache-dir DIR] [--max-steps N] [--log-every {}]\n"
-               "          [--mb-growth {}] [--mb-budget {}]\n"
+               "          [--mb-growth {}] [--mb-budget {}] [--tile-nb-ratio R] [--tile-atom-ratio {}]\n"
+               "          [--graph-cache-gb {}] [--optimizer adam|muon] [--muon-momentum {}]\n"
+               "          [--muon-lr-scale {}] [--muon-ns-steps {}]\n"
+               "--tile-nb-ratio > 1 pads micro-batches to a geometric grid of shapes and\n"
+               "replays cached graphs (CUDA graphs);\n"
                "--gpus 0 trains on the CPU; --batch-size counts structures per GPU;\n"
                "--epochs 0 only evaluates --init on val/ and test/ (-o is ignored).\n",
                argv[0], o.epochs, o.batch_size, o.n_gpus, o.lr, o.warmup_fraction,
-               o.grad_clip, o.seed, o.n_threads, o.log_every, o.mb_growth, o.mb_budget);
+               o.grad_clip, o.seed, o.n_threads, o.log_every, o.mb_growth, o.mb_budget,
+               o.tile_atom_ratio, o.graph_cache_gb, o.muon_momentum, o.muon_lr_scale, o.muon_ns_steps);
     std::exit(2);
   };
   for (int i = 1; i < argc; i++) {
@@ -44,6 +49,13 @@ int main(int argc, char **argv) {
     else if (a == "--log-every") o.log_every = std::stoi(val());
     else if (a == "--mb-growth") o.mb_growth = std::stod(val());
     else if (a == "--mb-budget") o.mb_budget = std::stod(val());
+    else if (a == "--tile-nb-ratio") o.tile_nb_ratio = std::stod(val());
+    else if (a == "--tile-atom-ratio") o.tile_atom_ratio = std::stod(val());
+    else if (a == "--graph-cache-gb") o.graph_cache_gb = std::stod(val());
+    else if (a == "--optimizer") o.optimizer = val();
+    else if (a == "--muon-momentum") o.muon_momentum = std::stod(val());
+    else if (a == "--muon-lr-scale") o.muon_lr_scale = std::stod(val());
+    else if (a == "--muon-ns-steps") o.muon_ns_steps = std::stoi(val());
     else usage();
   }
   if (o.data_dir.empty() || o.init_gguf.empty() || o.output.empty()) usage();

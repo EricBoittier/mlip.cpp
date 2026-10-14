@@ -48,6 +48,12 @@ public:
   // written by init_constants() survive until compute.
   void mark_constants_as_inputs();
 
+  // Hand the pending constants (tensor, fill value) of the last build to the
+  // caller, which then owns their initialisation. A graph that is built once
+  // and computed many times flags them as outputs (never reused by the
+  // allocator) and fills them once.
+  std::vector<std::pair<ggml_tensor *, float>> take_constants();
+
   // Get summary of the loaded graph
   std::string summary() const;
 
