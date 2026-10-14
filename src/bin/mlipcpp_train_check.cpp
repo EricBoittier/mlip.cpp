@@ -117,9 +117,9 @@ int main(int argc, char **argv) {
   // (CUDA graphs replay from the second call on) must give the same loss and
   // gradients on every repetition
   if (!node_grads_on && tile_ratio > 1) {
-    Worker tiled(init, gpus > 0 ? 0 : -1, size_t(8) << 30);
+    Worker tiled(init, gpus > 0 ? 0 : -1, 256);
     tiled.set_params(worker.get_params());
-    const Tiling tiling{tile_ratio, 2.0, n};
+    const Tiling tiling{tile_ratio, 1.25, n};
     const double growths[] = {2.0, 1e9};
     for (double growth : growths) {
       auto mbs = make_microbatches(split, nl, ids, {}, worker.model().species_to_index(), sc,
@@ -127,8 +127,12 @@ int main(int argc, char **argv) {
       for (int rep = 0; rep < 4; rep++) {
         auto t0 = std::chrono::steady_clock::now();
         double loss = 0;
+        StepStats sum_st;
         tiled.zero_grads();
-        for (const Batch &mb : mbs) loss += tiled.run(mb, sc.energy_scale, true).loss;
+        for (const Batch &mb : mbs) {
+          StepStats s1 = tiled.run(mb, sc.energy_scale, true);
+          loss += s1.loss, sum_st += s1;
+        }
         const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         const std::vector<float> sum = tiled.get_grads();
         double worst = 0;
@@ -142,9 +146,15 @@ int main(int argc, char **argv) {
         std::string shapes;
         for (const Batch &mb : mbs) shapes += fmt::format(" {}x{}", mb.n_atoms, mb.max_neighbors);
         fmt::print("tiles (growth {:g}, rep {}):{}; loss {:.8g} vs {:.8g}, worst relative gradient "
-                   "difference {:.2e}; wall {:.1f} ms\n", growth, rep, shapes, loss, st.loss, worst,
-                   1e3 * wall);
-        if (!(worst < 1e-3) || !(std::abs(loss - st.loss) < 1e-4 * std::abs(st.loss))) mb_failed = true;
+                   "difference {:.2e}; se E {:.6g} vs {:.6g}, se F {:.6g} vs {:.6g}, {} systems, {} force "
+                   "components; wall {:.1f} ms\n", growth, rep, shapes, loss, st.loss, worst,
+                   sum_st.se_energy_per_atom, st.se_energy_per_atom, sum_st.se_force, st.se_force,
+                   sum_st.n_systems, sum_st.n_force_components, 1e3 * wall);
+        auto close = [](double a, double b) { return std::abs(a - b) <= 1e-4 * std::abs(b); };
+        if (!(worst < 1e-3) || !close(loss, st.loss) || !close(sum_st.se_force, st.se_force) ||
+            !close(sum_st.se_energy_per_atom, st.se_energy_per_atom) ||
+            sum_st.n_systems != st.n_systems || sum_st.n_force_components != st.n_force_components)
+          mb_failed = true;
       }
     }
   }

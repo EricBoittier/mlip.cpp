@@ -34,8 +34,9 @@ struct TrainOptions {
   double mb_growth = 4.0;  // max ratio of padded neighbour counts in one micro-batch
   double mb_budget = 5e7;  // max n_atoms * (max_nb+1)^2 per micro-batch
   // fixed-shape tiles + cached graphs (see Tiling); 0 = dynamic shapes
-  double tile_nb_ratio = 0, tile_atom_ratio = 2;
-  double graph_cache_gb = 24; // per-device memory for cached graphs
+  double tile_nb_ratio = 0, tile_atom_ratio = 1.25;
+  int prefetch = 4;       // steps packed ahead of the GPUs
+  int graph_cache = 512; // cached graph shapes per device (they share one compute buffer)
   // optimizer: "adam" (torch.optim.Adam) or "muon" (2-D hidden weights; Adam for the rest)
   std::string optimizer = "adam";
   double muon_momentum = 0.95;
@@ -58,9 +59,11 @@ struct StepStats {
 /// allocator. Weights stay resident on the device.
 class Worker {
 public:
-  /// `cache_bytes` > 0 keeps the graph of every batch shape (with its own
-  /// allocation) for replay, least recently used first out.
-  Worker(const std::string &gguf, int device, size_t cache_bytes = 0); // device < 0: CPU
+  /// `cache_graphs` > 0 keeps the graph of up to that many batch shapes for
+  /// replay (CUDA graphs), least recently used first out. All cached graphs
+  /// share one compute buffer (they run one at a time); each keeps its
+  /// inputs and constants in a small buffer of its own.
+  Worker(const std::string &gguf, int device, size_t cache_graphs = 0); // device < 0: CPU
   ~Worker();
 
   /// Forward, and backward if `backward`: the parameter gradients are added
@@ -91,8 +94,8 @@ public:
 
   /// Per-phase wall time of the last run(), in seconds.
   double t_build = 0, t_alloc = 0, t_upload = 0, t_compute = 0, t_download = 0;
-  int64_t cache_hits = 0, cache_misses = 0;
-  size_t cache_bytes_used() const { return cache_used_; }
+  int64_t cache_hits = 0, cache_misses = 0, cache_flushes = 0;
+  size_t compute_buffer_bytes() const;
   size_t cache_size() const { return cache_.size(); }
 
 private:
@@ -100,22 +103,28 @@ private:
   struct StepGraph {
     ggml_context *ctx = nullptr;
     ggml_cgraph *gf = nullptr;
-    ggml_gallocr_t galloc = nullptr; // own buffer when cached
-    std::map<std::string, ggml_tensor *> in;
-    ggml_tensor *d_energy = nullptr, *d_force = nullptr, *loss_e = nullptr, *loss_f = nullptr,
-                *loss = nullptr, *loss_grad = nullptr;
+    std::vector<ggml_tensor *> inputs; // in upload order (see upload_inputs)
+    // (loss, loss_e, loss_f, physical force squared error): one download
+    ggml_tensor *stats = nullptr, *loss_grad = nullptr;
     int n_forward = 0;
     std::vector<std::pair<ggml_tensor *, float>> constants;
-    size_t bytes = 0;
+    // cached graphs: inputs packed at the start of `persist` (one upload
+    // through `blob`), then the constants (filled once)
+    ggml_backend_buffer_t persist = nullptr;
+    ggml_tensor *blob = nullptr;
+    size_t blob_bytes = 0;
     uint64_t last_use = 0;
     ~StepGraph();
   };
   std::unique_ptr<StepGraph> build_graph(int n, int m, int S, bool backward, bool cached);
   StepGraph &cached_graph(int n, int m, int S, bool backward);
+  void upload_inputs(StepGraph &g, const Batch &b);
 
   std::map<std::tuple<int, int, int, bool>, std::unique_ptr<StepGraph>> cache_;
-  size_t cache_limit_ = 0, cache_used_ = 0;
+  size_t cache_limit_ = 0;
   uint64_t clock_ = 0;
+  size_t ctx_bytes_[2] = {0, 0};  // graph context size (forward, backward); measured on the first build
+  std::vector<uint8_t> staging_;   // host side of the input blob
 
   runtime::GraphModel model_;
   std::vector<ggml_tensor *> params_;

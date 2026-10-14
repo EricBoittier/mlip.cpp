@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <functional>
 #include <future>
@@ -45,18 +46,6 @@ ggml_tensor *input(ggml_context *ctx, ggml_type type, std::initializer_list<int6
   ggml_set_name(t, name);
   ggml_set_input(t);
   return t;
-}
-
-template <typename V> void upload(ggml_tensor *t, const std::vector<V> &v) {
-  if (ggml_nbytes(t) != v.size() * sizeof(V))
-    throw std::logic_error(std::string("upload size mismatch for ") + ggml_get_name(t));
-  ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
-}
-
-float read_scalar(ggml_tensor *t) {
-  float v;
-  ggml_backend_tensor_get(t, &v, 0, sizeof v);
-  return v;
 }
 
 /// metatrain's schedule: linear warmup from 0, then cosine to 0; step k
@@ -148,7 +137,7 @@ StepStats &StepStats::operator+=(const StepStats &o) {
   return *this;
 }
 
-Worker::Worker(const std::string &gguf, int device, size_t cache_bytes) : cache_limit_(cache_bytes) {
+Worker::Worker(const std::string &gguf, int device, size_t cache_graphs) : cache_limit_(cache_graphs) {
   model_.set_backend_preference(device < 0 ? BackendPreference::CPU : BackendPreference::Auto);
   model_.set_device(std::max(device, 0));
   model_.load_from_gguf(gguf);
@@ -213,80 +202,11 @@ std::vector<float> Worker::get_params() const {
 }
 
 Worker::StepGraph::~StepGraph() {
-  if (galloc) ggml_gallocr_free(galloc);
   if (ctx) ggml_free(ctx);
+  if (persist) ggml_backend_buffer_free(persist);
 }
 
-std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, bool backward, bool cached) {
-  auto g = std::make_unique<StepGraph>();
-  auto &interp = model_.interpreter();
-  interp.set_dimension("n_atoms", n);
-  interp.set_dimension("max_neighbors", m);
-  interp.set_dimension("n_edges", int64_t(n) * m);
-  interp.set_dimension("max_neighbors_plus_one", m + 1);
-
-  g->ctx = ggml_init({ggml_tensor_overhead() * GRAPH_SIZE * 2 +
-                          ggml_graph_overhead_custom(GRAPH_SIZE, true),
-                      nullptr, /*no_alloc=*/true});
-  ggml_context *ctx = g->ctx;
-  auto in = [&](ggml_type type, std::initializer_list<int64_t> ne, const char *name) {
-    return g->in[name] = input(ctx, type, ne, name);
-  };
-  // ggml shapes are the reversed PyTorch shapes
-  for (const char *name : {"species"}) in(GGML_TYPE_I32, {n}, name);
-  in(GGML_TYPE_I32, {m, n}, "neighbor_species");
-  in(GGML_TYPE_F32, {3, m, n}, "edge_vectors");
-  in(GGML_TYPE_F32, {m, n}, "padding_mask");
-  in(GGML_TYPE_I32, {int64_t(n) * m}, "reverse_neighbor_index");
-  in(GGML_TYPE_F32, {m, n}, "cutoff_values");
-  ggml_tensor *atom_weight = in(GGML_TYPE_F32, {n, S}, "atom_weight");
-  ggml_tensor *energy_target = in(GGML_TYPE_F32, {S, 1}, "energy_target");
-  ggml_tensor *force_target = in(GGML_TYPE_F32, {3, n}, "force_target");
-  ggml_tensor *force_mask = in(GGML_TYPE_F32, {1, n}, "force_mask");
-  // per-step loss normalisation (1/S, 1/3N of the whole step): inputs, so a
-  // cached graph serves every step
-  ggml_tensor *e_norm = in(GGML_TYPE_F32, {1}, "energy_norm");
-  ggml_tensor *f_norm = in(GGML_TYPE_F32, {1}, "force_norm");
-  for (const char *name : {"species", "neighbor_species", "edge_vectors", "padding_mask",
-                           "reverse_neighbor_index", "cutoff_values"})
-    interp.set_input(name, g->in[name]);
-
-  // out: [n_atoms, 4] = (energy | force) per atom; ggml ne = (4, n)
-  ggml_tensor *out = interp.build(ctx);
-  ggml_tensor *energy = ggml_reshape_2d(
-      ctx, ggml_cont(ctx, ggml_view_2d(ctx, out, 1, n, out->nb[1], 0)), n, 1);
-  ggml_tensor *force = ggml_cont(ctx, ggml_view_2d(ctx, out, 3, n, out->nb[1], sizeof(float)));
-  // metatrain's average_by_num_atoms: per-structure Σ_i e_i / N
-  g->d_energy = ggml_sub(ctx, ggml_mul_mat(ctx, atom_weight, energy), energy_target);
-  g->d_force = ggml_mul(ctx, ggml_sub(ctx, force, force_target), force_mask);
-  g->loss_e = ggml_mul(ctx, ggml_sum(ctx, ggml_sqr(ctx, g->d_energy)), e_norm);
-  g->loss_f = ggml_mul(ctx, ggml_sum(ctx, ggml_sqr(ctx, g->d_force)), f_norm);
-  g->loss = ggml_add(ctx, g->loss_e, g->loss_f);
-  for (ggml_tensor *t : {g->d_energy, g->d_force, g->loss_e, g->loss_f, g->loss}) ggml_set_output(t);
-
-  g->gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, backward);
-  ggml_build_forward_expand(g->gf, g->loss);
-  g->n_forward = ggml_graph_n_nodes(g->gf);
-  if (backward) {
-    ggml_set_loss(g->loss);
-    // parameter gradients accumulate in place into the persistent views
-    std::vector<ggml_tensor *> accs(ggml_graph_n_nodes(g->gf), nullptr);
-    for (int i = 0; i < ggml_graph_n_nodes(g->gf); i++) {
-      auto it = acc_.find(ggml_graph_node(g->gf, i));
-      if (it != acc_.end()) accs[i] = it->second;
-    }
-    ggml_build_backward_expand(ctx, g->gf, accs.data());
-    g->loss_grad = ggml_graph_get_grad_acc(g->gf, g->loss);
-    ggml_set_input(g->loss_grad);
-  }
-  // constants (and dL/dL = 1): a cached graph keeps them out of the
-  // allocator's reuse (outputs) and fills them once; otherwise inputs
-  g->constants = interp.take_constants();
-  if (g->loss_grad) g->constants.emplace_back(g->loss_grad, 1.0f);
-  for (auto &[t, v] : g->constants) cached ? ggml_set_output(t) : ggml_set_input(t);
-  if (after_build) after_build(g->gf);
-  return g;
-}
+size_t Worker::compute_buffer_bytes() const { return ggml_gallocr_get_buffer_size(galloc_, 0); }
 
 namespace {
 void fill_constants(const std::vector<std::pair<ggml_tensor *, float>> &cs) {
@@ -297,7 +217,122 @@ void fill_constants(const std::vector<std::pair<ggml_tensor *, float>> &cs) {
     ggml_backend_tensor_set(t, staging.data(), 0, ggml_nbytes(t));
   }
 }
+
+/// Loss normalisations of a micro-batch: (1/S, 1/3N) of the whole step batch.
+std::pair<float, float> loss_norms(const Batch &b) {
+  const float e_norm = b.energy_norm > 0 ? b.energy_norm : 1.0f / b.n_real_systems;
+  float f_norm = b.force_norm;
+  if (!(f_norm > 0)) {
+    double n_real = 0;
+    for (float w : b.force_mask) n_real += w;
+    f_norm = static_cast<float>(1.0 / (3.0 * n_real));
+  }
+  return {e_norm, f_norm};
+}
 } // namespace
+
+std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, bool backward, bool cached) {
+  auto g = std::make_unique<StepGraph>();
+  auto &interp = model_.interpreter();
+  interp.set_dimension("n_atoms", n);
+  interp.set_dimension("max_neighbors", m);
+  interp.set_dimension("n_edges", int64_t(n) * m);
+  interp.set_dimension("max_neighbors_plus_one", m + 1);
+
+  // every shape has the same topology: the first build measures the context
+  // (cached graphs keep theirs, so it is kept tight)
+  size_t &ctx_bytes = ctx_bytes_[backward];
+  const bool measure = ctx_bytes == 0;
+  g->ctx = ggml_init({measure ? ggml_tensor_overhead() * GRAPH_SIZE * 2 +
+                                    ggml_graph_overhead_custom(GRAPH_SIZE, true)
+                              : ctx_bytes,
+                      nullptr, /*no_alloc=*/true});
+  ggml_context *ctx = g->ctx;
+  auto in = [&](ggml_type type, std::initializer_list<int64_t> ne, const char *name) {
+    ggml_tensor *t = input(ctx, type, ne, name);
+    g->inputs.push_back(t);
+    return t;
+  };
+  // ggml shapes are the reversed PyTorch shapes; order = upload_inputs
+  interp.set_input("species", in(GGML_TYPE_I32, {n}, "species"));
+  interp.set_input("neighbor_species", in(GGML_TYPE_I32, {m, n}, "neighbor_species"));
+  interp.set_input("edge_vectors", in(GGML_TYPE_F32, {3, m, n}, "edge_vectors"));
+  interp.set_input("padding_mask", in(GGML_TYPE_F32, {m, n}, "padding_mask"));
+  interp.set_input("reverse_neighbor_index",
+                   in(GGML_TYPE_I32, {int64_t(n) * m}, "reverse_neighbor_index"));
+  interp.set_input("cutoff_values", in(GGML_TYPE_F32, {m, n}, "cutoff_values"));
+  ggml_tensor *atom_weight = in(GGML_TYPE_F32, {n, S}, "atom_weight");
+  ggml_tensor *energy_target = in(GGML_TYPE_F32, {S, 1}, "energy_target");
+  ggml_tensor *force_target = in(GGML_TYPE_F32, {3, n}, "force_target");
+  ggml_tensor *force_mask = in(GGML_TYPE_F32, {1, n}, "force_mask");
+  ggml_tensor *force_scale = in(GGML_TYPE_F32, {1, n}, "force_scale");
+  // per-step loss normalisation (1/S, 1/3N of the whole step): inputs, so a
+  // cached graph serves every step
+  ggml_tensor *norms = in(GGML_TYPE_F32, {2}, "loss_norms");
+  ggml_tensor *e_norm = ggml_view_1d(ctx, norms, 1, 0);
+  ggml_tensor *f_norm = ggml_view_1d(ctx, norms, 1, sizeof(float));
+
+  // out: [n_atoms, 4] = (energy | force) per atom; ggml ne = (4, n)
+  ggml_tensor *out = interp.build(ctx);
+  ggml_tensor *energy = ggml_reshape_2d(
+      ctx, ggml_cont(ctx, ggml_view_2d(ctx, out, 1, n, out->nb[1], 0)), n, 1);
+  ggml_tensor *force = ggml_cont(ctx, ggml_view_2d(ctx, out, 3, n, out->nb[1], sizeof(float)));
+  // metatrain's average_by_num_atoms: per-structure Σ_i e_i / N
+  ggml_tensor *d_energy = ggml_sub(ctx, ggml_mul_mat(ctx, atom_weight, energy), energy_target);
+  ggml_tensor *d_force = ggml_mul(ctx, ggml_sub(ctx, force, force_target), force_mask);
+  ggml_tensor *loss_e = ggml_mul(ctx, ggml_sum(ctx, ggml_sqr(ctx, d_energy)), e_norm);
+  ggml_tensor *loss_f = ggml_mul(ctx, ggml_sum(ctx, ggml_sqr(ctx, d_force)), f_norm);
+  ggml_tensor *loss = ggml_add(ctx, loss_e, loss_f);
+  // physical force squared error, for the metrics (not differentiated)
+  ggml_tensor *se_f = ggml_sum(ctx, ggml_sqr(ctx, ggml_mul(ctx, d_force, force_scale)));
+  g->stats = ggml_concat(ctx, ggml_concat(ctx, ggml_concat(ctx, loss, loss_e, 0), loss_f, 0), se_f, 0);
+  ggml_set_output(g->stats);
+
+  g->gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, backward);
+  ggml_build_forward_expand(g->gf, g->stats);
+  g->n_forward = ggml_graph_n_nodes(g->gf);
+  if (backward) {
+    ggml_set_loss(loss);
+    // parameter gradients accumulate in place into the persistent views
+    std::vector<ggml_tensor *> accs(ggml_graph_n_nodes(g->gf), nullptr);
+    for (int i = 0; i < ggml_graph_n_nodes(g->gf); i++) {
+      auto it = acc_.find(ggml_graph_node(g->gf, i));
+      if (it != acc_.end()) accs[i] = it->second;
+    }
+    ggml_build_backward_expand(ctx, g->gf, accs.data());
+    g->loss_grad = ggml_graph_get_grad_acc(g->gf, loss);
+    ggml_set_input(g->loss_grad);
+  }
+  g->constants = interp.take_constants();
+  if (g->loss_grad) g->constants.emplace_back(g->loss_grad, 1.0f);
+  for (auto &c : g->constants) ggml_set_input(c.first);
+
+  if (cached) {
+    // inputs (packed: one upload) and constants live in a buffer of their
+    // own; the allocator skips tensors that already have memory
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(model_.backend());
+    const size_t align = ggml_backend_buft_get_alignment(buft);
+    size_t size = 0;
+    std::vector<std::pair<ggml_tensor *, size_t>> place;
+    auto reserve = [&](ggml_tensor *t) {
+      place.emplace_back(t, size);
+      size += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), align);
+    };
+    for (ggml_tensor *t : g->inputs) reserve(t);
+    g->blob_bytes = size;
+    for (auto &c : g->constants) reserve(c.first);
+    g->persist = ggml_backend_buft_alloc_buffer(buft, size);
+    if (!g->persist) throw std::runtime_error("cannot allocate graph inputs");
+    char *base = static_cast<char *>(ggml_backend_buffer_get_base(g->persist));
+    g->blob = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, static_cast<int64_t>(g->blob_bytes));
+    ggml_backend_tensor_alloc(g->persist, g->blob, base);
+    for (auto &[t, off] : place) ggml_backend_tensor_alloc(g->persist, t, base + off);
+    fill_constants(g->constants);
+  }
+  if (measure) ctx_bytes = ggml_used_mem(ctx) * 5 / 4 + ggml_tensor_overhead() * 256;
+  if (after_build) after_build(g->gf);
+  return g;
+}
 
 Worker::StepGraph &Worker::cached_graph(int n, int m, int S, bool backward) {
   const auto key = std::make_tuple(n, m, S, backward);
@@ -308,25 +343,47 @@ Worker::StepGraph &Worker::cached_graph(int n, int m, int S, bool backward) {
     return *it->second;
   }
   cache_misses++;
-  auto g = build_graph(n, m, S, backward, true);
-  g->galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model_.backend()));
-  if (!ggml_gallocr_reserve(g->galloc, g->gf))
-    throw std::runtime_error(fmt::format("cannot allocate the graph ({} atoms x {} neighbours)", n, m));
-  g->bytes = ggml_gallocr_get_buffer_size(g->galloc, 0);
-  // least recently used out until the new graph fits
-  while (cache_used_ + g->bytes > cache_limit_ && !cache_.empty()) {
-    auto lru = std::min_element(cache_.begin(), cache_.end(), [](auto &a, auto &b) {
+  while (cache_.size() >= cache_limit_ && !cache_.empty()) // least recently used out
+    cache_.erase(std::min_element(cache_.begin(), cache_.end(), [](auto &a, auto &b) {
       return a.second->last_use < b.second->last_use;
-    });
-    cache_used_ -= lru->second->bytes;
-    cache_.erase(lru);
-  }
-  if (!ggml_gallocr_alloc_graph(g->galloc, g->gf))
+    }));
+  auto g = build_graph(n, m, S, backward, true);
+  // all cached graphs share the compute buffer (they run one at a time); when
+  // it has to grow, the old buffer is freed and every other graph dangles
+  const size_t before = compute_buffer_bytes();
+  if (!ggml_gallocr_alloc_graph(galloc_, g->gf))
     throw std::runtime_error(fmt::format("cannot allocate the graph ({} atoms x {} neighbours)", n, m));
-  fill_constants(g->constants);
-  cache_used_ += g->bytes;
+  if (compute_buffer_bytes() != before && !cache_.empty()) cache_.clear(), cache_flushes++;
   g->last_use = ++clock_;
   return *(cache_[key] = std::move(g));
+}
+
+void Worker::upload_inputs(StepGraph &g, const Batch &b) {
+  const auto [e_norm, f_norm] = loss_norms(b);
+  const float norms[2] = {e_norm, f_norm};
+  auto span = [](const auto &v) {
+    return std::pair<const void *, size_t>(v.data(), v.size() * sizeof(v[0]));
+  };
+  const std::pair<const void *, size_t> src[] = {
+      span(b.species),        span(b.neighbor_species), span(b.edge_vectors),
+      span(b.padding_mask),   span(b.reverse_neighbor_index), span(b.cutoff_values),
+      span(b.atom_weight),    span(b.energy_target),   span(b.force_target),
+      span(b.force_mask),     span(b.force_scale),      {norms, sizeof norms}};
+  if (std::size(src) != g.inputs.size()) throw std::logic_error("upload_inputs: input count");
+  for (size_t i = 0; i < g.inputs.size(); i++)
+    if (ggml_nbytes(g.inputs[i]) != src[i].second)
+      throw std::logic_error(std::string("upload size mismatch for ") + ggml_get_name(g.inputs[i]));
+  if (g.blob) {
+    staging_.resize(g.blob_bytes);
+    const char *base = static_cast<const char *>(g.blob->data);
+    for (size_t i = 0; i < g.inputs.size(); i++)
+      std::memcpy(staging_.data() + (static_cast<const char *>(g.inputs[i]->data) - base),
+                  src[i].first, src[i].second);
+    ggml_backend_tensor_set(g.blob, staging_.data(), 0, g.blob_bytes);
+  } else {
+    for (size_t i = 0; i < g.inputs.size(); i++)
+      ggml_backend_tensor_set(g.inputs[i], src[i].first, 0, src[i].second);
+  }
 }
 
 StepStats Worker::run(const Batch &b, double energy_scale, bool backward) {
@@ -344,30 +401,12 @@ StepStats Worker::run(const Batch &b, double energy_scale, bool backward) {
     t0 = clock_type::now();
     if (!ggml_gallocr_alloc_graph(galloc_, g->gf))
       throw std::runtime_error(fmt::format("cannot allocate the graph ({} atoms x {} neighbours)", n, m));
+    fill_constants(g->constants);
     t_alloc = seconds_since(t0);
   }
 
   t0 = clock_type::now();
-  upload(g->in["species"], b.species);
-  upload(g->in["neighbor_species"], b.neighbor_species);
-  upload(g->in["edge_vectors"], b.edge_vectors);
-  upload(g->in["padding_mask"], b.padding_mask);
-  upload(g->in["reverse_neighbor_index"], b.reverse_neighbor_index);
-  upload(g->in["cutoff_values"], b.cutoff_values);
-  upload(g->in["atom_weight"], b.atom_weight);
-  upload(g->in["energy_target"], b.energy_target);
-  upload(g->in["force_target"], b.force_target);
-  upload(g->in["force_mask"], b.force_mask);
-  const float e_norm = b.energy_norm > 0 ? b.energy_norm : 1.0f / b.n_real_systems;
-  float f_norm = b.force_norm;
-  if (!(f_norm > 0)) {
-    double n_real = 0;
-    for (float w : b.force_mask) n_real += w;
-    f_norm = static_cast<float>(1.0 / (3.0 * n_real));
-  }
-  ggml_backend_tensor_set(g->in["energy_norm"], &e_norm, 0, sizeof e_norm);
-  ggml_backend_tensor_set(g->in["force_norm"], &f_norm, 0, sizeof f_norm);
-  if (once) fill_constants(g->constants);
+  upload_inputs(*g, b);
   t_upload = seconds_since(t0);
 
   t0 = clock_type::now();
@@ -389,16 +428,15 @@ StepStats Worker::run(const Batch &b, double energy_scale, bool backward) {
   if (after_compute) after_compute(gf);
 
   t0 = clock_type::now();
+  float stats[4];
+  ggml_backend_tensor_get(g->stats, stats, 0, sizeof stats);
   StepStats st;
-  st.loss = read_scalar(g->loss);
-  st.loss_energy = read_scalar(g->loss_e);
-  st.loss_force = read_scalar(g->loss_f);
-  std::vector<float> de(S), df(3 * n);
-  ggml_backend_tensor_get(g->d_energy, de.data(), 0, de.size() * sizeof(float));
-  ggml_backend_tensor_get(g->d_force, df.data(), 0, df.size() * sizeof(float));
-  for (float d : de) st.se_energy_per_atom += std::pow(d * energy_scale, 2);
-  for (int i = 0; i < n; i++)
-    for (int k = 0; k < 3; k++) st.se_force += std::pow(double(df[3 * i + k]) * b.force_scale[i], 2);
+  st.loss = stats[0];
+  st.loss_energy = stats[1];
+  st.loss_force = stats[2];
+  // Σ d_e^2 = loss_e / e_norm, in units of the energy scale
+  st.se_energy_per_atom = double(stats[1]) / loss_norms(b).first * energy_scale * energy_scale;
+  st.se_force = stats[3];
   st.n_systems = b.n_real_systems;
   for (float w : b.force_mask) st.n_force_components += 3 * static_cast<int64_t>(w);
   t_download = seconds_since(t0);
@@ -413,16 +451,19 @@ bool is_muon_param(const ggml_tensor *p) {
          std::string(ggml_get_name(p)).find("embed") == std::string::npos;
 }
 
-/// Newton-Schulz quintic iteration (Muon): approximately U V^T of g = U S V^T.
-/// ggml (ne0, ne1) = PyTorch (cols, rows); the Gram matrix is taken over the
-/// longer side.
+/// Newton-Schulz quintic iteration (Muon): approximately U V^T of each
+/// g[:, :, i] = U S V^T. ggml (ne0, ne1) = PyTorch (cols, rows); the Gram
+/// matrix is taken over the shorter side. Same-shape matrices are stacked
+/// along ne2 and orthogonalised together (batched mul_mat).
 ggml_tensor *orthogonalize(ggml_context *ctx, ggml_tensor *g, int steps) {
   const float a = 3.4445f, b = -4.7750f, c = 2.0315f;
   const bool tall = g->ne[0] < g->ne[1]; // more rows than cols: work on g^T
   ggml_tensor *x = tall ? ggml_cont(ctx, ggml_transpose(ctx, g)) : g;
-  ggml_tensor *norm = ggml_sqrt(ctx, ggml_sum(ctx, ggml_sqr(ctx, x)));
-  x = ggml_div(ctx, x, ggml_scale_bias(ctx, norm, 1.0f, 1e-7f));
-  for (int k = 0; k < steps; k++) {
+  const int64_t cols = x->ne[0], rows = x->ne[1], k = x->ne[2];
+  // per-matrix Frobenius norm
+  ggml_tensor *n2 = ggml_sum_rows(ctx, ggml_reshape_2d(ctx, ggml_sqr(ctx, x), cols * rows, k));
+  x = ggml_div(ctx, x, ggml_reshape_3d(ctx, ggml_scale_bias(ctx, ggml_sqrt(ctx, n2), 1.0f, 1e-7f), 1, 1, k));
+  for (int it = 0; it < steps; it++) {
     ggml_tensor *A = ggml_mul_mat(ctx, x, x);                                      // X X^T
     ggml_tensor *B = ggml_add(ctx, ggml_scale(ctx, A, b), ggml_scale(ctx, ggml_mul_mat(ctx, A, A), c));
     ggml_tensor *BX = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, x)), B); // B X (B symmetric)
@@ -476,6 +517,8 @@ Optimizer::Optimizer(std::vector<std::unique_ptr<Worker>> &workers, double clip,
   graph_ = ggml_new_graph_custom(gctx_, n_nodes, false);
   ggml_set_output(norm_);
   ggml_build_forward_expand(graph_, norm_);
+  // Muon: (param, Nesterov momentum) per matrix shape, orthogonalised per group
+  std::map<std::pair<int64_t, int64_t>, std::vector<std::pair<ggml_tensor *, ggml_tensor *>>> muon_groups;
   size_t off = 0;
   for (size_t k = 0; k < params.size(); k++) {
     ggml_tensor *p = params[k];
@@ -486,17 +529,26 @@ Optimizer::Optimizer(std::vector<std::unique_ptr<Worker>> &workers, double clip,
       const float mu = static_cast<float>(muon_momentum);
       ggml_tensor *buf = ggml_add(gctx_, ggml_scale(gctx_, m[k], mu), ggml_scale(gctx_, gk, 1 - mu));
       ggml_build_forward_expand(graph_, ggml_cpy(gctx_, buf, m[k]));
-      ggml_tensor *u = ggml_add(gctx_, ggml_scale(gctx_, gk, 1 - mu), ggml_scale(gctx_, buf, mu));
-      ggml_tensor *o = orthogonalize(gctx_, ggml_cont(gctx_, u), ns_steps);
-      // RMS of o ~ 1/sqrt(max dim); 0.2 sqrt(max dim) matches Adam's update RMS
-      const float rms = 0.2f * std::sqrt(static_cast<float>(std::max(p->ne[0], p->ne[1])));
-      ggml_tensor *step = ggml_mul(gctx_, ggml_scale(gctx_, o, rms), muon_lr_);
-      ggml_build_forward_expand(graph_, ggml_cpy(gctx_, ggml_sub(gctx_, p, step), p));
+      muon_groups[{p->ne[0], p->ne[1]}].emplace_back(
+          p, ggml_add(gctx_, ggml_scale(gctx_, gk, 1 - mu), ggml_scale(gctx_, buf, mu)));
       n_muon_tensors++;
     } else {
       ggml_build_forward_expand(graph_, ggml_opt_step_adamw(gctx_, p, gk, m[k], v[k], pars_));
     }
     off += ggml_nelements(p);
+  }
+  for (auto &[shape, group] : muon_groups) {
+    ggml_tensor *u = group[0].second;
+    for (size_t i = 1; i < group.size(); i++) u = ggml_concat(gctx_, u, group[i].second, 2);
+    ggml_tensor *o = orthogonalize(gctx_, ggml_cont(gctx_, u), ns_steps);
+    // RMS of o ~ 1/sqrt(max dim); 0.2 sqrt(max dim) matches Adam's update RMS
+    const float rms = 0.2f * std::sqrt(static_cast<float>(std::max(shape.first, shape.second)));
+    for (size_t i = 0; i < group.size(); i++) {
+      ggml_tensor *p = group[i].first;
+      ggml_tensor *oi = ggml_view_2d(gctx_, o, p->ne[0], p->ne[1], o->nb[1], i * o->nb[2]);
+      ggml_tensor *step = ggml_mul(gctx_, ggml_scale(gctx_, oi, rms), muon_lr_);
+      ggml_build_forward_expand(graph_, ggml_cpy(gctx_, ggml_sub(gctx_, p, step), p));
+    }
   }
   galloc_ = ggml_gallocr_new(buft);
   if (!ggml_gallocr_alloc_graph(galloc_, graph_)) throw std::runtime_error("cannot allocate the optimizer graph");
@@ -546,7 +598,7 @@ void train(const TrainOptions &o) {
   for (int w = 0; w < std::max(1, o.n_gpus); w++)
     workers.push_back(std::make_unique<Worker>(
         o.init_gguf, o.n_gpus == 0 ? -1 : w,
-        o.tile_nb_ratio > 1 ? static_cast<size_t>(o.graph_cache_gb * (1ull << 30)) : 0));
+        o.tile_nb_ratio > 1 ? static_cast<size_t>(o.graph_cache) : 0));
   Worker &w0 = *workers[0];
   const float cutoff = w0.model().cutoff();
   const auto &species = w0.model().species_to_index();
@@ -596,8 +648,8 @@ void train(const TrainOptions &o) {
                                                  o.muon_lr_scale, o.muon_ns_steps)
                                    : "",
              tiling.enabled() ? fmt::format("tiles: neighbour ratio {}, atom ratio {}, {} systems, "
-                                            "graph cache {} GB/device",
-                                            o.tile_nb_ratio, o.tile_atom_ratio, B, o.graph_cache_gb)
+                                            "graph cache {} shapes/device",
+                                            o.tile_nb_ratio, o.tile_atom_ratio, B, o.graph_cache)
                               : std::string("dynamic shapes"));
   fmt::print("setup: {:.1f} s; {} steps/epoch of {} x {} structures, warmup {} steps\n",
              seconds_since(t_setup), steps_per_epoch, W, B, warmup);
@@ -651,13 +703,22 @@ void train(const TrainOptions &o) {
     StepStats ep;
     double t_wait = 0, t_gpu = 0, t_sync = 0, t_build = 0, t_compute = 0;
     int64_t n_micro = 0;
-    auto next = std::async(std::launch::async, make_step, std::cref(perm), 0, o.seed + epoch * 1000003ULL);
+    // packing runs `prefetch` steps ahead of the GPUs
+    std::deque<std::future<std::vector<std::vector<Batch>>>> ahead;
+    int64_t queued = 0;
+    auto refill = [&] {
+      while (queued < steps_per_epoch && static_cast<int>(ahead.size()) < std::max(1, o.prefetch)) {
+        ahead.push_back(std::async(std::launch::async, make_step, std::cref(perm), queued,
+                                   o.seed + epoch * 1000003ULL + queued));
+        queued++;
+      }
+    };
+    refill();
     for (int64_t step = 0; step < steps_per_epoch && global_step != o.max_steps; step++, global_step++) {
       auto t = clock_type::now();
-      std::vector<std::vector<Batch>> batches = next.get();
-      if (step + 1 < steps_per_epoch)
-        next = std::async(std::launch::async, make_step, std::cref(perm), step + 1,
-                          o.seed + epoch * 1000003ULL + step + 1);
+      std::vector<std::vector<Batch>> batches = ahead.front().get();
+      ahead.pop_front();
+      refill();
       t_wait += seconds_since(t);
 
       t = clock_type::now();
@@ -686,13 +747,13 @@ void train(const TrainOptions &o) {
         const double el = seconds_since(t_epoch);
         fmt::print("epoch {} step {}/{}: loss {:.4g} (E {:.4g}, F {:.4g}) lr {:.3g} |g| {:.3g} | "
                    "{:.1f} struct/s; per step: wait {:.1f} ms, gpu {:.1f} (build {:.1f}, compute {:.1f}), "
-                   "sync {:.1f} ms; {:.2f} micro-batches/worker; graphs {} cached ({:.1f} GB), {} misses\n",
+                   "sync {:.1f} ms; {:.2f} micro-batches/worker; graphs {} cached ({:.1f} GB buffer), {} misses, {} flushes\n",
                    epoch, step + 1, steps_per_epoch, st[0].loss, st[0].loss_energy, st[0].loss_force,
                    lr, norm, (step + 1) * W * B / el, 1e3 * t_wait / (step + 1),
                    1e3 * t_gpu / (step + 1), 1e3 * t_build / (step + 1),
                    1e3 * t_compute / (step + 1), 1e3 * t_sync / (step + 1),
-                   double(n_micro) / ((step + 1) * W), w0.cache_size(), w0.cache_bytes_used() / 1e9,
-                   w0.cache_misses);
+                   double(n_micro) / ((step + 1) * W), w0.cache_size(), w0.compute_buffer_bytes() / 1e9,
+                   w0.cache_misses, w0.cache_flushes);
         std::fflush(stdout);
       }
     }
