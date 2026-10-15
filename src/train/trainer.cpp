@@ -444,9 +444,9 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, bool
   g->stats = ggml_concat(ctx, ggml_concat(ctx, ggml_concat(ctx, loss, loss_e, 0), loss_f, 0), se_f, 0);
   ggml_set_output(g->stats);
   // per structure: energy error and the atom-mean physical force squared error
-  ggml_tensor *se_f_atom = ggml_reshape_2d(
-      ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, ggml_mul(ctx, d_force, force_scale))), n, 1);
-  g->per_system = ggml_concat(ctx, d_energy, ggml_mul_mat(ctx, atom_weight, se_f_atom), 1);
+  g->per_atom = ggml_sum_rows(ctx, ggml_sqr(ctx, ggml_mul(ctx, d_force, force_scale)));
+  ggml_set_output(g->per_atom);
+  g->per_system = ggml_concat(ctx, d_energy, ggml_mul_mat(ctx, atom_weight, ggml_reshape_2d(ctx, g->per_atom, n, 1)), 1);
   ggml_set_output(g->per_system);
 
   g->gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, backward);
@@ -627,6 +627,12 @@ StepStats Worker::run(const Batch &b, double energy_scale, bool backward) {
     for (int k = 0; k < b.n_real_systems; k++)
       system_errors->push_back({b.ids[k], -1, b.n_per_system[k], static_cast<float>(ps[k] * energy_scale),
                                 ps[S + k] * b.n_per_system[k]});
+    if (atom_errors) { // real atoms come first, structure by structure
+      const int n_real = std::accumulate(b.n_per_system.begin(), b.n_per_system.begin() + b.n_real_systems, 0);
+      const size_t at = atom_errors->size();
+      atom_errors->resize(at + n_real);
+      ggml_backend_tensor_get(g->per_atom, atom_errors->data() + at, 0, n_real * sizeof(float));
+    }
   }
   t_download = seconds_since(t0);
   return st;
@@ -1281,8 +1287,12 @@ void train(const TrainOptions &o) {
 
   // per-structure records of the workers (--dump-errors / --log-errors)
   std::vector<std::vector<SystemError>> errors(W);
-  auto collect_errors = [&](bool on) {
-    for (int w = 0; w < W; w++) workers[w]->system_errors = on ? &errors[w] : nullptr;
+  std::vector<std::vector<float>> atom_errors(W);
+  auto collect_errors = [&](bool on, bool atoms = false) {
+    for (int w = 0; w < W; w++) {
+      workers[w]->system_errors = on ? &errors[w] : nullptr;
+      workers[w]->atom_errors = on && atoms ? &atom_errors[w] : nullptr;
+    }
   };
   auto drain_errors = [&](std::FILE *f, int32_t step) {
     for (auto &e : errors) {
@@ -1472,14 +1482,21 @@ void train(const TrainOptions &o) {
   // --dump-errors PREFIX: PREFIX.val.bin and PREFIX.test.bin (SystemError records)
   auto dump = [&](const char *name, auto &&run) {
     if (o.dump_errors.empty()) return run();
-    collect_errors(true);
+    collect_errors(true, true);
     auto st = run();
     collect_errors(false);
-    const std::string path = fmt::format("{}.{}.bin", o.dump_errors, name);
-    std::unique_ptr<std::FILE, int (*)(std::FILE *)> f(std::fopen(path.c_str(), "wb"), std::fclose);
-    if (!f) throw std::runtime_error("cannot open " + path);
+    const std::string path = fmt::format("{}.{}.bin", o.dump_errors, name),
+                      apath = fmt::format("{}.{}.atoms.bin", o.dump_errors, name);
+    std::unique_ptr<std::FILE, int (*)(std::FILE *)> f(std::fopen(path.c_str(), "wb"), std::fclose),
+        fa(std::fopen(apath.c_str(), "wb"), std::fclose);
+    if (!f || !fa) throw std::runtime_error("cannot open " + path + " / " + apath);
+    for (auto &a : atom_errors) { // the same worker order as drain_errors' records
+      if (!a.empty() && std::fwrite(a.data(), sizeof(float), a.size(), fa.get()) != a.size())
+        throw std::runtime_error("cannot write the per-atom errors");
+      a.clear();
+    }
     drain_errors(f.get(), -1);
-    fmt::print("wrote {}\n", path);
+    fmt::print("wrote {} and {}\n", path, apath);
     return st;
   };
   if (eval_only || !o.dump_errors.empty()) {

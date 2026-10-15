@@ -60,7 +60,9 @@ struct TrainOptions {
 /// One structure's errors: energy per atom (prediction - target, eV/atom) and
 /// the summed squared force error over its atoms ((eV/A)^2). 24-byte records;
 /// numpy dtype [('id','<i8'),('step','<i4'),('n','<i4'),('de','<f4'),('fse','<f4')]
-/// (step: the training step, -1 for an evaluation).
+/// (step: the training step, -1 for an evaluation). --dump-errors also writes
+/// PREFIX.<split>.atoms.bin: float32 |dF|^2 of every atom, record by record,
+/// each structure's atoms in its memmap order.
 struct SystemError {
   int64_t id;
   int32_t step, n;
@@ -126,6 +128,8 @@ public:
   bool profile = false;
   /// when set, run() appends one record per real structure (step = -1)
   std::vector<SystemError> *system_errors = nullptr;
+  /// when set too, run() appends each real atom's |dF|^2 ((eV/A)^2), in the order of the records
+  std::vector<float> *atom_errors = nullptr;
   std::map<std::string, OpStats> profile_ops;
   std::map<std::string, OpStats> profile_copies; // CONT / CPY nodes by the view chain they copy
   std::vector<std::pair<double, std::string>> profile_nodes; // (ms, "fwd:OP name [shape]") per node
@@ -153,6 +157,7 @@ private:
     // (loss, loss_e, loss_f, physical force squared error): one download
     ggml_tensor *stats = nullptr, *loss_grad = nullptr;
     ggml_tensor *per_system = nullptr; // [S, 2]: d_energy (scaled, per atom), mean |dF|^2 per atom (physical)
+    ggml_tensor *per_atom = nullptr;   // [1, n]: |dF|^2 per atom (physical)
     int n_forward = 0;
     std::vector<std::pair<ggml_tensor *, float>> constants;
     // cached graphs: inputs packed at the start of `persist` (one upload
