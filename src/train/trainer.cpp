@@ -623,6 +623,39 @@ namespace {
 
 constexpr float ns_a = 3.4445f, ns_b = -4.7750f, ns_c = 2.0315f;
 
+/// Polar Express (Amsel et al. 2025): per-iteration minimax quintics, from
+/// optimal_composition(l=1e-3, num_iters=10, degree=5, safety_factor_eps=1e-2,
+/// cushion=0.02) of github.com/NoahAmsel/PolarExpress (polar_express.py)
+constexpr std::array<std::array<float, 3>, 10> polar_express = {{
+    {8.237312490495555f, -23.1577474145582f, 16.680568411445915f},
+    {4.082441999064829f, -2.8930477353325843f, 0.5252849256975644f},
+    {3.9263479922546485f, -2.854746803476524f, 0.5318022422894979f},
+    {3.2982187133085197f, -2.4245419810267106f, 0.4863200835884415f},
+    {2.2970369434552587f, -1.6366255812590325f, 0.4002628455953631f},
+    {1.8763805351440381f, -1.23478965777222f, 0.3589188750166826f},
+    {1.856442348565278f, -1.2132449881003775f, 0.3568003487859341f},
+    {1.85643356156706f, -1.2132336029471178f, 0.3567976320793584f},
+    {1.8564311647224787f, -1.2132289037487436f, 0.3567953287942881f},
+    {1.8749954775631825f, -1.249990955148181f, 0.37499547758499846f},
+}};
+
+/// (a, b, c) per Newton-Schulz iteration: Muon's fixed quintic, or with
+/// MLIPCPP_NS_POLAR=1 the Polar Express sequence (the last one repeated past
+/// 10). Its 1.01 norm cushion, X / (1.01 |X|), is folded into the first
+/// iteration: p(x / s) = (a / s) x + (b / s^3) x^3 + (c / s^5) x^5.
+std::vector<std::array<float, 3>> ns_coeffs(int steps) {
+  static const bool polar = std::getenv("MLIPCPP_NS_POLAR") != nullptr;
+  std::vector<std::array<float, 3>> v;
+  for (int i = 0; i < steps; i++)
+    v.push_back(polar ? polar_express[std::min<size_t>(i, polar_express.size() - 1)]
+                      : std::array<float, 3>{ns_a, ns_b, ns_c});
+  if (polar && steps > 0) {
+    const float s = 1.01f;
+    v[0] = {v[0][0] / s, v[0][1] / (s * s * s), v[0][2] / (s * s * s * s * s)};
+  }
+  return v;
+}
+
 /// ggml_opt_step_sgd as an in-place axpby on an intermediate: x <- x (1 - lr wd) - lr y.
 /// The PARAM flag it asserts only matters to backward construction, and this
 /// graph is forward only.
@@ -631,20 +664,24 @@ ggml_tensor *axpby_inplace(ggml_context *ctx, ggml_tensor *x, ggml_tensor *y, gg
   return ggml_opt_step_sgd(ctx, x, y, lr_wd);
 }
 
-/// (lr, wd) for both axpbys: B = c A^2 + b A, X = B X + a X
-std::array<float, 4> ns_axpby_values() { return {-ns_b, (1 - ns_c) / -ns_b, -ns_a, 0.0f}; }
+/// per iteration, (lr, wd) for both axpbys: B = c A^2 + b A, X = B X + a X
+std::vector<float> ns_axpby_values(int steps) {
+  std::vector<float> v;
+  for (auto [a, b, c] : ns_coeffs(steps)) v.insert(v.end(), {-b, (1 - c) / -b, -a, 0.0f});
+  return v;
+}
 
 /// Newton-Schulz quintic iteration (Muon): approximately U V^T of each
 /// g[:, :, i] = U S V^T. ggml (ne0, ne1) = PyTorch (cols, rows); the Gram
 /// matrix is taken over the shorter side. Same-shape matrices are stacked
 /// along ne2 and orthogonalised together (batched mul_mat).
 /// (The GPU default is the fused op instead: orthogonalize_all.)
-/// `axpby` (optional): the two (lr, wd) pairs of ns_axpby_values(); then each
+/// `axpby` (optional): ns_axpby_values(steps) (4 per iteration); then each
 /// iteration's two linear combinations run as in-place ggml_opt_step_sgd
 /// (one kernel each instead of scale, scale, add / scale, add);
 /// MLIPCPP_NS_SCALE_ADD=1: the separate ops (A/B).
 ggml_tensor *orthogonalize(ggml_context *ctx, ggml_tensor *g, int steps, ggml_tensor *axpby = nullptr) {
-  const float a = ns_a, b = ns_b, c = ns_c;
+  const std::vector<std::array<float, 3>> abc = ns_coeffs(steps);
   static const bool scale_add = std::getenv("MLIPCPP_NS_SCALE_ADD") != nullptr;
   if (scale_add) axpby = nullptr;
   const bool tall = g->ne[0] < g->ne[1]; // more rows than cols: work on g^T
@@ -654,11 +691,13 @@ ggml_tensor *orthogonalize(ggml_context *ctx, ggml_tensor *g, int steps, ggml_te
   ggml_tensor *n2 = ggml_sum_rows(ctx, ggml_reshape_2d(ctx, ggml_sqr(ctx, x), cols * rows, k));
   x = ggml_div(ctx, x, ggml_reshape_3d(ctx, ggml_scale_bias(ctx, ggml_sqrt(ctx, n2), 1.0f, 1e-7f), 1, 1, k));
   for (int it = 0; it < steps; it++) {
+    const auto [a, b, c] = abc[it];
     ggml_tensor *A = ggml_mul_mat(ctx, x, x); // X X^T
     if (axpby) {
-      ggml_tensor *B = axpby_inplace(ctx, ggml_mul_mat(ctx, A, A), A, ggml_view_1d(ctx, axpby, 2, 0));
+      const size_t o = 4 * it * sizeof(float);
+      ggml_tensor *B = axpby_inplace(ctx, ggml_mul_mat(ctx, A, A), A, ggml_view_1d(ctx, axpby, 2, o));
       ggml_tensor *BX = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, x)), B); // B symmetric
-      x = axpby_inplace(ctx, BX, x, ggml_view_1d(ctx, axpby, 2, 2 * sizeof(float)));
+      x = axpby_inplace(ctx, BX, x, ggml_view_1d(ctx, axpby, 2, o + 2 * sizeof(float)));
       continue;
     }
     ggml_tensor *B = ggml_add(ctx, ggml_scale(ctx, A, b), ggml_scale(ctx, ggml_mul_mat(ctx, A, A), c));
@@ -676,14 +715,16 @@ ggml_tensor *orthogonalize(ggml_context *ctx, ggml_tensor *g, int steps, ggml_te
 std::vector<ggml_tensor *> orthogonalize_all(ggml_context *ctx, ggml_backend_t backend, const std::vector<ggml_tensor *> &us,
                                              int steps, ggml_tensor *axpby) {
   std::vector<ggml_tensor *> os;
+  const std::vector<std::array<float, 3>> abc = ns_coeffs(steps);
   ggml_backend_dev_t dev = ggml_backend_get_device(backend);
-  if (std::getenv("MLIPCPP_NS_OPS") || !dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+  if (std::getenv("MLIPCPP_NS_OPS") || steps > GGML_NS_MAX_STEPS || !dev ||
+      ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
     for (ggml_tensor *u : us) os.push_back(orthogonalize(ctx, u, steps, axpby));
     return os;
   }
   for (size_t i0 = 0; i0 < us.size(); i0 += GGML_MAX_SRC) {
     std::vector<ggml_tensor *> xs(us.begin() + i0, us.begin() + std::min(us.size(), i0 + GGML_MAX_SRC));
-    ggml_tensor *o = ggml_newton_schulz_multi(ctx, xs.data(), static_cast<int>(xs.size()), steps, ns_a, ns_b, ns_c);
+    ggml_tensor *o = ggml_newton_schulz_multi_coeffs(ctx, xs.data(), static_cast<int>(xs.size()), steps, abc.data()->data());
     size_t off = 0;
     for (ggml_tensor *x : xs) {
       os.push_back(ggml_view_3d(ctx, o, x->ne[0], x->ne[1], x->ne[2], x->nb[1], x->nb[2], off));
@@ -824,15 +865,15 @@ Optimizer::Optimizer(std::vector<std::unique_ptr<Worker>> &workers, double clip,
   const float mu = static_cast<float>(muon_momentum);
   const float mom_vals[2] = {-(1 - mu), -1.0f};
   const float nest_vals[2] = {-1.0f, mu > 0 ? (1 - mu) / mu - 1 : 0.0f}; // Nesterov axpby
-  const std::array<float, 4> ns_vals = ns_axpby_values();                // Newton-Schulz axpbys
+  const std::vector<float> ns_vals = ns_axpby_values(ns_steps);         // Newton-Schulz axpbys, per iteration
   auto muon_constants = [&](ggml_context *ctx) {
     return std::array<ggml_tensor *, 3>{ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2), ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2),
-                                        ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4)};
+                                        ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4 * std::max(1, ns_steps))};
   };
   auto set_muon_constants = [&](const std::array<ggml_tensor *, 3> &c) {
     ggml_backend_tensor_set(c[0], mom_vals, 0, sizeof mom_vals);
     ggml_backend_tensor_set(c[1], nest_vals, 0, sizeof nest_vals);
-    ggml_backend_tensor_set(c[2], ns_vals.data(), 0, sizeof ns_vals);
+    if (!ns_vals.empty()) ggml_backend_tensor_set(c[2], ns_vals.data(), 0, ns_vals.size() * sizeof(float));
   };
   const auto [mom_pars, nest_pars, ns_pars] = muon_constants(ctx_);
   // per group (lr * muon_lr_scale * rms, wd = 0) for the SGD update, set by step()

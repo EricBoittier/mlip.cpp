@@ -1,5 +1,5 @@
 diff --git a/include/ggml.h b/include/ggml.h
-index 24a3470..09fc697 100644
+index 24a3470..1aac6c7 100644
 --- a/include/ggml.h
 +++ b/include/ggml.h
 @@ -579,6 +579,7 @@ extern "C" {
@@ -10,7 +10,7 @@ index 24a3470..09fc697 100644
  
          GGML_OP_COUNT,
      };
-@@ -1781,6 +1782,30 @@ extern "C" {
+@@ -1781,6 +1782,40 @@ extern "C" {
              int                   n_head,
              float                 scale);
  
@@ -25,6 +25,16 @@ index 24a3470..09fc697 100644
 +            float                 a,
 +            float                 b,
 +            float                 c);
++
++    // per-iteration coefficients: iteration i uses abc[3 i .. 3 i + 2]
++    // (steps <= GGML_NS_MAX_STEPS)
++    #define GGML_NS_MAX_STEPS 5
++    GGML_API struct ggml_tensor * ggml_newton_schulz_multi_coeffs(
++            struct ggml_context * ctx,
++            struct ggml_tensor ** xs,
++            int                   n,
++            int                   steps,
++            const float         * abc);
 +
 +    // the same on n <= GGML_MAX_SRC stacks at once (shapes may differ); the
 +    // result is 1-D: the results of xs[0], xs[1], ... concatenated, each laid
@@ -65,10 +75,10 @@ index 6b07f8b..a490e2d 100644
          case GGML_OP_ROPE_BACK:
          case GGML_OP_ADD_REL_POS:
 diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
-index abcd370..6bd4018 100644
+index abcd370..572e800 100644
 --- a/src/ggml-cpu/ops.cpp
 +++ b/src/ggml-cpu/ops.cpp
-@@ -11305,3 +11305,54 @@ void ggml_compute_forward_pet_attn_back(const ggml_compute_params * params, ggml
+@@ -11305,3 +11305,55 @@ void ggml_compute_forward_pet_attn_back(const ggml_compute_params * params, ggml
          }
      }
  }
@@ -83,7 +93,6 @@ index abcd370..6bd4018 100644
 +    for (int si = 0; si < GGML_MAX_SRC && dst->src[si]; si++) {
 +    const ggml_tensor * src = dst->src[si];
 +    const int     steps = ggml_get_op_params_i32(dst, 0);
-+    const float   a = ggml_get_op_params_f32(dst, 1), b = ggml_get_op_params_f32(dst, 2), c = ggml_get_op_params_f32(dst, 3);
 +    const int64_t ne0 = src->ne[0], ne1 = src->ne[1], k = src->ne[2];
 +    const bool    wide = ne1 <= ne0;
 +    const int64_t n = wide ? ne1 : ne0;
@@ -97,6 +106,8 @@ index abcd370..6bd4018 100644
 +        for (int64_t i = 0; i < ne0 * ne1; i++) X[i] = s[i] * inv;
 +        auto x = [&](int64_t r, int64_t col) -> float & { return X[col * ne0 + r]; }; // M(r, col), r < ne0, col < ne1
 +        for (int it = 0; it < steps; it++) {
++            const float a = ggml_get_op_params_f32(dst, 1 + 3 * it), b = ggml_get_op_params_f32(dst, 2 + 3 * it),
++                        c = ggml_get_op_params_f32(dst, 3 + 3 * it);
 +            for (int64_t i = 0; i < n; i++)
 +                for (int64_t j = 0; j < n; j++) {
 +                    double acc = 0;
@@ -168,10 +179,10 @@ index c9e8c57..543b967 100644
                  return true;
 diff --git a/src/ggml-cuda/newton-schulz.cu b/src/ggml-cuda/newton-schulz.cu
 new file mode 100644
-index 0000000..7d5d152
+index 0000000..fe798a5
 --- /dev/null
 +++ b/src/ggml-cuda/newton-schulz.cu
-@@ -0,0 +1,224 @@
+@@ -0,0 +1,226 @@
 +#include "newton-schulz.cuh"
 +
 +#include <cuda_bf16.h>
@@ -286,8 +297,7 @@ index 0000000..7d5d152
 +// GEMM per src instead.
 +template <typename T>
 +static void ns_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ns_groups & g, const int64_t xtot) {
-+    const int   steps = ggml_get_op_params_i32(dst, 0);
-+    const float a = ggml_get_op_params_f32(dst, 1), b = ggml_get_op_params_f32(dst, 2), c = ggml_get_op_params_f32(dst, 3);
++    const int steps = ggml_get_op_params_i32(dst, 0); // then (a, b, c) per iteration
 +    constexpr bool bf16 = std::is_same<T, nv_bfloat16>::value;
 +    const cudaDataType_t dtype = bf16 ? CUDA_R_16BF : CUDA_R_32F;
 +    static const cublasComputeType_t compute =
@@ -315,7 +325,7 @@ index 0000000..7d5d152
 +            const int64_t sx = g.mat[i], sg = g.gram[i];
 +            if (kind == 0) v.push_back(wide ? ns_gemm{ CUBLAS_OP_T, CUBLAS_OP_N, n, n, e0, e0, e0, n, k, xp, xp, gp, sx, sx, sg, 1.0f, 0.0f }
 +                                            : ns_gemm{ CUBLAS_OP_N, CUBLAS_OP_T, n, n, e1, e0, e0, n, k, xp, xp, gp, sx, sx, sg, 1.0f, 0.0f });
-+            if (kind == 1) v.push_back(ns_gemm{ CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, n, n, n, k, gp, gp, bp, sg, sg, sg, c, 1.0f });
++            if (kind == 1) v.push_back(ns_gemm{ CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, n, n, n, k, gp, gp, bp, sg, sg, sg, 0.0f, 1.0f }); // alpha: c of the iteration
 +            if (kind == 2) v.push_back(wide ? ns_gemm{ CUBLAS_OP_N, CUBLAS_OP_N, e0, e1, e1, e0, n, e0, k, xp, bp, xn, sx, sg, sx, 1.0f, 0.0f }
 +                                            : ns_gemm{ CUBLAS_OP_N, CUBLAS_OP_N, e0, e1, e0, n, e0, e0, k, bp, xp, xn, sg, sx, sx, 1.0f, 0.0f });
 +        }
@@ -343,8 +353,9 @@ index 0000000..7d5d152
 +            k_ns_ptrs<<<(nmat + 63) / 64, 64, 0, stream>>>(job, (const void **) base, (const void **) base + nmat, base + 2 * nmat);
 +        }
 +    }
-+    auto gemm = [&](int st) {
-+        const std::vector<ns_gemm> & v = stages[st];
++    auto gemm = [&](int st, float c = 0.0f) {
++        std::vector<ns_gemm> & v = stages[st];
++        if (st == 2) for (ns_gemm & q : v) q.alpha = c;
 +        if (loop) {
 +            for (const ns_gemm & q : v)
 +                CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, q.ta, q.tb, q.m, q.n, q.k, &q.alpha, q.A, dtype, q.lda, q.sA,
@@ -367,9 +378,11 @@ index 0000000..7d5d152
 +    k_ns_normalize<T><<<nmat, 256, 0, stream>>>(g, X[0]);
 +    int p = 0;
 +    for (int it = 0; it < steps; it++) {
++        const float a = ggml_get_op_params_f32(dst, 1 + 3 * it), b = ggml_get_op_params_f32(dst, 2 + 3 * it),
++                    c = ggml_get_op_params_f32(dst, 3 + 3 * it);
 +        gemm(p);                                                                     // G = Gram(X[p])
 +        k_ns_init_b<T><<<(gtot + 255) / 256, 256, 0, stream>>>(g, G.get(), B.get(), a, b); // B = b G + a I
-+        gemm(2);                                                                     // B += c G G
++        gemm(2, c);                                                                  // B += c G G
 +        gemm(3 + p);                                                                 // X[1 - p] = X[p] B / B X[p]
 +        p = 1 - p;
 +    }
@@ -408,7 +421,7 @@ index 0000000..731b71d
 +bool ggml_cuda_newton_schulz_supported(const ggml_tensor * op);
 +void ggml_cuda_op_newton_schulz(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/src/ggml.c b/src/ggml.c
-index e37dcec..c29605f 100644
+index e37dcec..1250c48 100644
 --- a/src/ggml.c
 +++ b/src/ggml.c
 @@ -1066,9 +1066,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
@@ -435,11 +448,37 @@ index e37dcec..c29605f 100644
  
  static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
  
-@@ -4119,6 +4121,47 @@ struct ggml_tensor * ggml_pet_attn_back(
+@@ -4119,6 +4121,57 @@ struct ggml_tensor * ggml_pet_attn_back(
      return dqkv;
  }
  
 +// ggml_newton_schulz
++
++struct ggml_tensor * ggml_newton_schulz_multi_coeffs(
++        struct ggml_context * ctx,
++        struct ggml_tensor ** xs,
++        int                   n,
++        int                   steps,
++        const float         * abc) {
++    GGML_ASSERT(n >= 1 && n <= GGML_MAX_SRC && steps >= 0 && steps <= GGML_NS_MAX_STEPS);
++    int64_t ne = 0;
++    for (int i = 0; i < n; i++) {
++        GGML_ASSERT(xs[i]->type == GGML_TYPE_F32 && ggml_is_contiguous(xs[i]) && xs[i]->ne[3] == 1);
++        ne += ggml_nelements(xs[i]);
++    }
++
++    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne);
++
++    // op params: steps, then (a, b, c) per iteration
++    int32_t params[1 + 3 * GGML_NS_MAX_STEPS] = { steps };
++    memcpy(params + 1, abc, 3 * steps * sizeof(float));
++    ggml_set_op_params(result, params, sizeof(params));
++
++    result->op = GGML_OP_NEWTON_SCHULZ;
++    for (int i = 0; i < n; i++) result->src[i] = xs[i];
++
++    return result;
++}
 +
 +struct ggml_tensor * ggml_newton_schulz_multi(
 +        struct ggml_context * ctx,
@@ -449,25 +488,9 @@ index e37dcec..c29605f 100644
 +        float                 a,
 +        float                 b,
 +        float                 c) {
-+    GGML_ASSERT(n >= 1 && n <= GGML_MAX_SRC && steps >= 0);
-+    int64_t ne = 0;
-+    for (int i = 0; i < n; i++) {
-+        GGML_ASSERT(xs[i]->type == GGML_TYPE_F32 && ggml_is_contiguous(xs[i]) && xs[i]->ne[3] == 1);
-+        ne += ggml_nelements(xs[i]);
-+    }
-+
-+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne);
-+
-+    int32_t params[4] = { steps, 0, 0, 0 };
-+    memcpy(params + 1, &a, sizeof(float));
-+    memcpy(params + 2, &b, sizeof(float));
-+    memcpy(params + 3, &c, sizeof(float));
-+    ggml_set_op_params(result, params, sizeof(params));
-+
-+    result->op = GGML_OP_NEWTON_SCHULZ;
-+    for (int i = 0; i < n; i++) result->src[i] = xs[i];
-+
-+    return result;
++    float abc[3 * GGML_NS_MAX_STEPS];
++    for (int i = 0; i < steps && i < GGML_NS_MAX_STEPS; i++) abc[3 * i] = a, abc[3 * i + 1] = b, abc[3 * i + 2] = c;
++    return ggml_newton_schulz_multi_coeffs(ctx, xs, n, steps, abc);
 +}
 +
 +struct ggml_tensor * ggml_newton_schulz(
