@@ -1,5 +1,5 @@
 diff --git a/include/ggml.h b/include/ggml.h
-index 24a3470..18944e5 100644
+index 24a3470..09fc697 100644
 --- a/include/ggml.h
 +++ b/include/ggml.h
 @@ -579,6 +579,7 @@ extern "C" {
@@ -10,7 +10,7 @@ index 24a3470..18944e5 100644
  
          GGML_OP_COUNT,
      };
-@@ -1781,6 +1782,18 @@ extern "C" {
+@@ -1781,6 +1782,30 @@ extern "C" {
              int                   n_head,
              float                 scale);
  
@@ -21,6 +21,18 @@ index 24a3470..18944e5 100644
 +    GGML_API struct ggml_tensor * ggml_newton_schulz(
 +            struct ggml_context * ctx,
 +            struct ggml_tensor  * x,
++            int                   steps,
++            float                 a,
++            float                 b,
++            float                 c);
++
++    // the same on n <= GGML_MAX_SRC stacks at once (shapes may differ); the
++    // result is 1-D: the results of xs[0], xs[1], ... concatenated, each laid
++    // out as its input
++    GGML_API struct ggml_tensor * ggml_newton_schulz_multi(
++            struct ggml_context * ctx,
++            struct ggml_tensor ** xs,
++            int                   n,
 +            int                   steps,
 +            float                 a,
 +            float                 b,
@@ -53,10 +65,10 @@ index 6b07f8b..a490e2d 100644
          case GGML_OP_ROPE_BACK:
          case GGML_OP_ADD_REL_POS:
 diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
-index abcd370..cbb292a 100644
+index abcd370..6bd4018 100644
 --- a/src/ggml-cpu/ops.cpp
 +++ b/src/ggml-cpu/ops.cpp
-@@ -11305,3 +11305,50 @@ void ggml_compute_forward_pet_attn_back(const ggml_compute_params * params, ggml
+@@ -11305,3 +11305,54 @@ void ggml_compute_forward_pet_attn_back(const ggml_compute_params * params, ggml
          }
      }
  }
@@ -67,7 +79,9 @@ index abcd370..cbb292a 100644
 +
 +void ggml_compute_forward_newton_schulz(const ggml_compute_params * params, ggml_tensor * dst) {
 +    if (params->ith != 0) return;
-+    const ggml_tensor * src = dst->src[0];
++    float * out = (float *) dst->data;
++    for (int si = 0; si < GGML_MAX_SRC && dst->src[si]; si++) {
++    const ggml_tensor * src = dst->src[si];
 +    const int     steps = ggml_get_op_params_i32(dst, 0);
 +    const float   a = ggml_get_op_params_f32(dst, 1), b = ggml_get_op_params_f32(dst, 2), c = ggml_get_op_params_f32(dst, 3);
 +    const int64_t ne0 = src->ne[0], ne1 = src->ne[1], k = src->ne[2];
@@ -76,7 +90,7 @@ index abcd370..cbb292a 100644
 +    std::vector<float> G(n * n), B(n * n), Y(ne0 * ne1);
 +    for (int64_t m = 0; m < k; m++) {
 +        const float * s = (const float *) src->data + m * ne0 * ne1;
-+        float * X = (float *) dst->data + m * ne0 * ne1;
++        float * X = out + m * ne0 * ne1;
 +        double ss = 0;
 +        for (int64_t i = 0; i < ne0 * ne1; i++) ss += (double) s[i] * s[i];
 +        const float inv = 1.0f / ((float) sqrt(ss) + 1e-7f);
@@ -105,6 +119,8 @@ index abcd370..cbb292a 100644
 +                }
 +            std::copy(Y.begin(), Y.end(), X);
 +        }
++    }
++    out += ne0 * ne1 * k;
 +    }
 +}
 diff --git a/src/ggml-cpu/ops.h b/src/ggml-cpu/ops.h
@@ -152,18 +168,44 @@ index c9e8c57..543b967 100644
                  return true;
 diff --git a/src/ggml-cuda/newton-schulz.cu b/src/ggml-cuda/newton-schulz.cu
 new file mode 100644
-index 0000000..da6334c
+index 0000000..7d5d152
 --- /dev/null
 +++ b/src/ggml-cuda/newton-schulz.cu
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,224 @@
 +#include "newton-schulz.cuh"
 +
-+#include <cstdlib>
++#include <cuda_bf16.h>
 +
-+// dst = src / (|src|_F + 1e-7), one block per matrix
-+static __global__ void k_ns_normalize(const float * src, float * dst, const int64_t n) {
-+    const float * s = src + blockIdx.x * n;
-+    float       * d = dst + blockIdx.x * n;
++#include <cstdlib>
++#include <vector>
++
++// The groups of one GGML_OP_NEWTON_SCHULZ (src[g]: k[g] stacked ne0 x ne1
++// matrices), by value into the kernels. Matrices are numbered globally:
++// group g holds [first[g], first[g + 1]); X / dst and G / B are the
++// concatenation of the groups (offsets xoff / goff, in elements).
++struct ns_groups {
++    int           n;
++    const float * src[GGML_MAX_SRC];
++    int64_t       mat[GGML_MAX_SRC];  // elements per matrix: ne0 ne1
++    int64_t       gram[GGML_MAX_SRC]; // elements per Gram matrix: s^2
++    int64_t       s[GGML_MAX_SRC];    // Gram size (the shorter side)
++    int64_t       xoff[GGML_MAX_SRC], goff[GGML_MAX_SRC + 1];
++    int           first[GGML_MAX_SRC + 1];
++};
++
++static __device__ int ns_group_of_matrix(const ns_groups & g, const int m) {
++    int i = 0;
++    while (i + 1 < g.n && m >= g.first[i + 1]) i++;
++    return i;
++}
++
++// X = src / (|src|_F + 1e-7) in the storage type, one block per matrix
++template <typename T>
++static __global__ void k_ns_normalize(const ns_groups g, T * X) {
++    const int     gi = ns_group_of_matrix(g, blockIdx.x);
++    const int64_t n  = g.mat[gi], j = blockIdx.x - g.first[gi];
++    const float * s  = g.src[gi] + j * n;
++    T           * d  = X + g.xoff[gi] + j * n;
 +    float acc = 0.0f;
 +    for (int64_t i = threadIdx.x; i < n; i += blockDim.x) acc += s[i] * s[i];
 +    __shared__ float part[32];
@@ -177,76 +219,182 @@ index 0000000..da6334c
 +    }
 +    __syncthreads();
 +    const float inv = 1.0f / (sqrtf(part[0]) + 1e-7f);
-+    for (int64_t i = threadIdx.x; i < n; i += blockDim.x) d[i] = s[i] * inv;
++    for (int64_t i = threadIdx.x; i < n; i += blockDim.x) d[i] = T(s[i] * inv);
 +}
 +
-+// B[:, :, i] += a I (n x n matrices)
-+static __global__ void k_ns_add_diag(float * B, const int n, const int k, const float a) {
++// B = b G + a I over every Gram matrix of every group (the GEMM then adds c G^2)
++template <typename T>
++static __global__ void k_ns_init_b(const ns_groups g, const T * G, T * B, const float a, const float b) {
++    const int64_t e = blockIdx.x * (int64_t) blockDim.x + threadIdx.x;
++    if (e >= g.goff[g.n]) return;
++    int gi = 0;
++    while (gi + 1 < g.n && e >= g.goff[gi + 1]) gi++;
++    const int64_t r = (e - g.goff[gi]) % g.gram[gi];
++    B[e] = T(b * float(G[e]) + (r % (g.s[gi] + 1) == 0 ? a : 0.0f));
++}
++
++template <typename T>
++static __global__ void k_ns_to_f32(const T * X, float * dst, const int64_t n) {
 +    const int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x;
-+    if (i >= (int64_t) n * k) return;
-+    const int64_t m = i / n, j = i % n;
-+    B[m * n * n + j * n + j] += a;
++    if (i < n) dst[i] = float(X[i]);
++}
++
++// One GEMM stage: per group, k strided matrices C = alpha op(A) op(B) + beta C
++struct ns_gemm {
++    cublasOperation_t ta, tb;
++    int               m, n, k, lda, ldb, ldc, count;
++    const void *      A; const void * B; void * C;
++    int64_t           sA, sB, sC; // strides in elements
++    float             alpha, beta;
++};
++
++// device pointer arrays of a grouped GEMM: per matrix j of group i
++struct ns_ptr_job {
++    int      n, first[GGML_MAX_SRC + 1];
++    char *   A[GGML_MAX_SRC]; char * B[GGML_MAX_SRC]; char * C[GGML_MAX_SRC];
++    int64_t  sA[GGML_MAX_SRC], sB[GGML_MAX_SRC], sC[GGML_MAX_SRC]; // bytes
++};
++
++static __global__ void k_ns_ptrs(const ns_ptr_job job, const void ** A, const void ** B, void ** C) {
++    const int j = blockIdx.x * blockDim.x + threadIdx.x;
++    if (j >= job.first[job.n]) return;
++    int gi = 0;
++    while (gi + 1 < job.n && j >= job.first[gi + 1]) gi++;
++    const int64_t q = j - job.first[gi];
++    A[j] = job.A[gi] + q * job.sA[gi];
++    B[j] = job.B[gi] + q * job.sB[gi];
++    C[j] = job.C[gi] + q * job.sC[gi];
 +}
 +
 +bool ggml_cuda_newton_schulz_supported(const ggml_tensor * op) {
-+    const ggml_tensor * x = op->src[0];
-+    return x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && x->ne[3] == 1;
++    for (int i = 0; i < GGML_MAX_SRC && op->src[i]; i++) {
++        const ggml_tensor * x = op->src[i];
++        if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[3] != 1) return false;
++    }
++    return true;
 +}
 +
-+// Quintic Newton-Schulz on each x[:, :, i] (ggml ne0 x ne1 = PyTorch rows ne1,
-+// cols ne0; column-major M = X^T with leading dimension ne0). Gram over the
-+// shorter side, and the update folded into one GEMM:
++// Quintic Newton-Schulz on every matrix of every src (ggml ne0 x ne1 =
++// PyTorch rows ne1, cols ne0; column-major M = X^T with leading dimension
++// ne0). Gram over the shorter side, and the update folded into one GEMM:
 +//   wide (ne1 <= ne0): G = M^T M, B = c G^2 + b G + a I, M' = M B
 +//   tall (ne1 >  ne0): G = M M^T, B = c G^2 + b G + a I, M' = B M
-+// GEMMs are batched over the k matrices; TF32 by default, bf16 tensor cores
-+// with GGML_NS_BF16=1, full FP32 with GGML_CUDA_NO_TF32=1.
-+void ggml_cuda_op_newton_schulz(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-+    const ggml_tensor * src = dst->src[0];
-+    const int     steps = ggml_get_op_params_i32(dst, 0);
-+    const float   a = ggml_get_op_params_f32(dst, 1), b = ggml_get_op_params_f32(dst, 2), c = ggml_get_op_params_f32(dst, 3);
-+    const int64_t ne0 = src->ne[0], ne1 = src->ne[1], k = src->ne[2];
-+    const bool    wide = ne1 <= ne0;
-+    const int64_t n = wide ? ne1 : ne0; // Gram size
++// X, G and B are stored in bf16 (fp32 accumulation, as Muon's reference);
++// GGML_NS_F32=1: fp32 storage with TF32 GEMMs (full FP32 with
++// GGML_CUDA_NO_TF32=1). Each stage is one grouped cuBLAS GEMM over all the
++// srcs (cublasGemmGroupedBatchedEx); GGML_NS_LOOP=1: one strided-batched
++// GEMM per src instead.
++template <typename T>
++static void ns_run(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ns_groups & g, const int64_t xtot) {
++    const int   steps = ggml_get_op_params_i32(dst, 0);
++    const float a = ggml_get_op_params_f32(dst, 1), b = ggml_get_op_params_f32(dst, 2), c = ggml_get_op_params_f32(dst, 3);
++    constexpr bool bf16 = std::is_same<T, nv_bfloat16>::value;
++    const cudaDataType_t dtype = bf16 ? CUDA_R_16BF : CUDA_R_32F;
++    static const cublasComputeType_t compute =
++        bf16 ? CUBLAS_COMPUTE_32F : getenv("GGML_CUDA_NO_TF32") ? CUBLAS_COMPUTE_32F : CUBLAS_COMPUTE_32F_FAST_TF32;
++    static const bool loop = getenv("GGML_NS_LOOP") != nullptr;
 +
 +    cudaStream_t   stream = ctx.stream();
 +    cublasHandle_t handle = ctx.cublas_handle();
 +    CUBLAS_CHECK(cublasSetStream(handle, stream));
 +
-+    static const cublasComputeType_t compute =
-+        getenv("GGML_NS_BF16") ? CUBLAS_COMPUTE_32F_FAST_16BF :
-+        getenv("GGML_CUDA_NO_TF32") ? CUBLAS_COMPUTE_32F : CUBLAS_COMPUTE_32F_FAST_TF32;
++    const int64_t gtot = g.goff[g.n];
++    const int     nmat = g.first[g.n];
++    ggml_cuda_pool_alloc<T> X0(ctx.pool(), xtot), X1(ctx.pool(), xtot), G(ctx.pool(), gtot), B(ctx.pool(), gtot);
++    T * X[2] = { X0.get(), X1.get() };
 +
-+    ggml_cuda_pool_alloc<float> G(ctx.pool(), n * n * k), B(ctx.pool(), n * n * k), Y(ctx.pool(), ne0 * ne1 * k);
-+    float * X   = (float *) dst->data;
-+    float * Xn  = Y.get();
-+    k_ns_normalize<<<k, 256, 0, stream>>>((const float *) src->data, X, ne0 * ne1);
++    // the stages: Gram (X[p] -> G) and update (X[p], B -> X[1 - p]) for both
++    // parities p, and B += c G G
++    auto stage = [&](int kind, int p) {
++        std::vector<ns_gemm> v;
++        for (int i = 0; i < g.n; i++) {
++            const ggml_tensor * x = dst->src[i];
++            const int  e0 = (int) x->ne[0], e1 = (int) x->ne[1], k = (int) x->ne[2], n = (int) g.s[i];
++            const bool wide = e1 <= e0;
++            T * xp = X[p] + g.xoff[i], * xn = X[1 - p] + g.xoff[i], * gp = G.get() + g.goff[i], * bp = B.get() + g.goff[i];
++            const int64_t sx = g.mat[i], sg = g.gram[i];
++            if (kind == 0) v.push_back(wide ? ns_gemm{ CUBLAS_OP_T, CUBLAS_OP_N, n, n, e0, e0, e0, n, k, xp, xp, gp, sx, sx, sg, 1.0f, 0.0f }
++                                            : ns_gemm{ CUBLAS_OP_N, CUBLAS_OP_T, n, n, e1, e0, e0, n, k, xp, xp, gp, sx, sx, sg, 1.0f, 0.0f });
++            if (kind == 1) v.push_back(ns_gemm{ CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, n, n, n, k, gp, gp, bp, sg, sg, sg, c, 1.0f });
++            if (kind == 2) v.push_back(wide ? ns_gemm{ CUBLAS_OP_N, CUBLAS_OP_N, e0, e1, e1, e0, n, e0, k, xp, bp, xn, sx, sg, sx, 1.0f, 0.0f }
++                                            : ns_gemm{ CUBLAS_OP_N, CUBLAS_OP_N, e0, e1, e0, n, e0, e0, k, bp, xp, xn, sg, sx, sx, 1.0f, 0.0f });
++        }
++        return v;
++    };
++    // stage index: 0, 1 Gram (parity), 2 B, 3, 4 update (parity)
++    std::vector<ns_gemm> stages[5] = { stage(0, 0), stage(0, 1), stage(1, 0), stage(2, 0), stage(2, 1) };
 +
-+    const float one = 1.0f, zero = 0.0f;
-+    const long long sX = ne0 * ne1, sG = n * n;
++    // grouped: device pointer arrays for all 5 stages, filled by one kernel each
++    ggml_cuda_pool_alloc<void *> ptrs(ctx.pool(), loop ? 1 : 5 * 3 * nmat);
++    std::vector<int> m, n, k, lda, ldb, ldc, cnt;
++    std::vector<cublasOperation_t> opa, opb;
++    std::vector<float> alpha, beta;
++    if (!loop) {
++        for (int st = 0; st < 5; st++) {
++            ns_ptr_job job{};
++            job.n = g.n;
++            for (int i = 0; i < g.n; i++) {
++                const ns_gemm & q = stages[st][i];
++                job.first[i + 1] = job.first[i] + q.count;
++                job.A[i] = (char *) q.A; job.B[i] = (char *) q.B; job.C[i] = (char *) q.C;
++                job.sA[i] = q.sA * sizeof(T); job.sB[i] = q.sB * sizeof(T); job.sC[i] = q.sC * sizeof(T);
++            }
++            void ** base = ptrs.get() + st * 3 * nmat;
++            k_ns_ptrs<<<(nmat + 63) / 64, 64, 0, stream>>>(job, (const void **) base, (const void **) base + nmat, base + 2 * nmat);
++        }
++    }
++    auto gemm = [&](int st) {
++        const std::vector<ns_gemm> & v = stages[st];
++        if (loop) {
++            for (const ns_gemm & q : v)
++                CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, q.ta, q.tb, q.m, q.n, q.k, &q.alpha, q.A, dtype, q.lda, q.sA,
++                    q.B, dtype, q.ldb, q.sB, &q.beta, q.C, dtype, q.ldc, q.sC, q.count, compute, CUBLAS_GEMM_DEFAULT));
++            return;
++        }
++        opa.clear(); opb.clear(); m.clear(); n.clear(); k.clear(); lda.clear(); ldb.clear(); ldc.clear(); cnt.clear();
++        alpha.clear(); beta.clear();
++        for (const ns_gemm & q : v) {
++            opa.push_back(q.ta); opb.push_back(q.tb); m.push_back(q.m); n.push_back(q.n); k.push_back(q.k);
++            lda.push_back(q.lda); ldb.push_back(q.ldb); ldc.push_back(q.ldc); cnt.push_back(q.count);
++            alpha.push_back(q.alpha); beta.push_back(q.beta);
++        }
++        void ** base = ptrs.get() + st * 3 * nmat;
++        CUBLAS_CHECK(cublasGemmGroupedBatchedEx(handle, opa.data(), opb.data(), m.data(), n.data(), k.data(), alpha.data(),
++            (const void * const *) base, dtype, lda.data(), (const void * const *) base + nmat, dtype, ldb.data(),
++            beta.data(), base + 2 * nmat, dtype, ldc.data(), g.n, cnt.data(), compute));
++    };
++
++    k_ns_normalize<T><<<nmat, 256, 0, stream>>>(g, X[0]);
++    int p = 0;
 +    for (int it = 0; it < steps; it++) {
-+        if (wide) {
-+            CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, n, n, ne0, &one,
-+                X, CUDA_R_32F, ne0, sX, X, CUDA_R_32F, ne0, sX, &zero, G.get(), CUDA_R_32F, n, sG, k, compute, CUBLAS_GEMM_DEFAULT));
-+        } else {
-+            CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, CUBLAS_OP_N, CUBLAS_OP_T, n, n, ne1, &one,
-+                X, CUDA_R_32F, ne0, sX, X, CUDA_R_32F, ne0, sX, &zero, G.get(), CUDA_R_32F, n, sG, k, compute, CUBLAS_GEMM_DEFAULT));
-+        }
-+        CUDA_CHECK(cudaMemcpyAsync(B.get(), G.get(), n * n * k * sizeof(float), cudaMemcpyDeviceToDevice, stream));
-+        CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, &c,
-+            G.get(), CUDA_R_32F, n, sG, G.get(), CUDA_R_32F, n, sG, &b, B.get(), CUDA_R_32F, n, sG, k, compute, CUBLAS_GEMM_DEFAULT));
-+        k_ns_add_diag<<<(n * k + 255) / 256, 256, 0, stream>>>(B.get(), n, k, a);
-+        if (wide) {
-+            CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, ne0, ne1, ne1, &one,
-+                X, CUDA_R_32F, ne0, sX, B.get(), CUDA_R_32F, n, sG, &zero, Xn, CUDA_R_32F, ne0, sX, k, compute, CUBLAS_GEMM_DEFAULT));
-+        } else {
-+            CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, ne0, ne1, ne0, &one,
-+                B.get(), CUDA_R_32F, n, sG, X, CUDA_R_32F, ne0, sX, &zero, Xn, CUDA_R_32F, ne0, sX, k, compute, CUBLAS_GEMM_DEFAULT));
-+        }
-+        std::swap(X, Xn);
++        gemm(p);                                                                     // G = Gram(X[p])
++        k_ns_init_b<T><<<(gtot + 255) / 256, 256, 0, stream>>>(g, G.get(), B.get(), a, b); // B = b G + a I
++        gemm(2);                                                                     // B += c G G
++        gemm(3 + p);                                                                 // X[1 - p] = X[p] B / B X[p]
++        p = 1 - p;
 +    }
-+    if (X != (float *) dst->data) {
-+        CUDA_CHECK(cudaMemcpyAsync(dst->data, X, ne0 * ne1 * k * sizeof(float), cudaMemcpyDeviceToDevice, stream));
++    k_ns_to_f32<T><<<(xtot + 255) / 256, 256, 0, stream>>>(X[p], (float *) dst->data, xtot);
++}
++
++void ggml_cuda_op_newton_schulz(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    ns_groups g{};
++    int64_t xtot = 0;
++    for (int i = 0; i < GGML_MAX_SRC && dst->src[i]; i++) {
++        const ggml_tensor * x = dst->src[i];
++        const int64_t ne0 = x->ne[0], ne1 = x->ne[1], s = ne1 <= ne0 ? ne1 : ne0;
++        g.src[i]       = (const float *) x->data;
++        g.mat[i]       = ne0 * ne1;
++        g.s[i]         = s;
++        g.gram[i]      = s * s;
++        g.xoff[i]      = xtot;
++        g.first[i + 1] = g.first[i] + (int) x->ne[2];
++        g.goff[i + 1]  = g.goff[i] + s * s * x->ne[2];
++        xtot          += ne0 * ne1 * x->ne[2];
++        g.n            = i + 1;
 +    }
++    static const bool f32 = getenv("GGML_NS_F32") != nullptr;
++    if (f32) ns_run<float>(ctx, dst, g, xtot);
++    else     ns_run<nv_bfloat16>(ctx, dst, g, xtot);
 +}
 diff --git a/src/ggml-cuda/newton-schulz.cuh b/src/ggml-cuda/newton-schulz.cuh
 new file mode 100644
@@ -260,7 +408,7 @@ index 0000000..731b71d
 +bool ggml_cuda_newton_schulz_supported(const ggml_tensor * op);
 +void ggml_cuda_op_newton_schulz(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/src/ggml.c b/src/ggml.c
-index e37dcec..3475497 100644
+index e37dcec..c29605f 100644
 --- a/src/ggml.c
 +++ b/src/ggml.c
 @@ -1066,9 +1066,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
@@ -287,11 +435,40 @@ index e37dcec..3475497 100644
  
  static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
  
-@@ -4119,6 +4121,31 @@ struct ggml_tensor * ggml_pet_attn_back(
+@@ -4119,6 +4121,47 @@ struct ggml_tensor * ggml_pet_attn_back(
      return dqkv;
  }
  
 +// ggml_newton_schulz
++
++struct ggml_tensor * ggml_newton_schulz_multi(
++        struct ggml_context * ctx,
++        struct ggml_tensor ** xs,
++        int                   n,
++        int                   steps,
++        float                 a,
++        float                 b,
++        float                 c) {
++    GGML_ASSERT(n >= 1 && n <= GGML_MAX_SRC && steps >= 0);
++    int64_t ne = 0;
++    for (int i = 0; i < n; i++) {
++        GGML_ASSERT(xs[i]->type == GGML_TYPE_F32 && ggml_is_contiguous(xs[i]) && xs[i]->ne[3] == 1);
++        ne += ggml_nelements(xs[i]);
++    }
++
++    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne);
++
++    int32_t params[4] = { steps, 0, 0, 0 };
++    memcpy(params + 1, &a, sizeof(float));
++    memcpy(params + 2, &b, sizeof(float));
++    memcpy(params + 3, &c, sizeof(float));
++    ggml_set_op_params(result, params, sizeof(params));
++
++    result->op = GGML_OP_NEWTON_SCHULZ;
++    for (int i = 0; i < n; i++) result->src[i] = xs[i];
++
++    return result;
++}
 +
 +struct ggml_tensor * ggml_newton_schulz(
 +        struct ggml_context * ctx,
@@ -300,20 +477,7 @@ index e37dcec..3475497 100644
 +        float                 a,
 +        float                 b,
 +        float                 c) {
-+    GGML_ASSERT(x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && x->ne[3] == 1 && steps >= 0);
-+
-+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, x->ne);
-+
-+    int32_t params[4] = { steps, 0, 0, 0 };
-+    memcpy(params + 1, &a, sizeof(float));
-+    memcpy(params + 2, &b, sizeof(float));
-+    memcpy(params + 3, &c, sizeof(float));
-+    ggml_set_op_params(result, params, sizeof(params));
-+
-+    result->op     = GGML_OP_NEWTON_SCHULZ;
-+    result->src[0] = x;
-+
-+    return result;
++    return ggml_reshape(ctx, ggml_newton_schulz_multi(ctx, &x, 1, steps, a, b, c), x);
 +}
 +
  // ggml_soft_max_ext_back

@@ -214,9 +214,10 @@ else()
         # as OUT_PROD GEMMs on the flattened rows, without the transposed
         # copies of activation, gradient and weight (GGML_MUL_MAT_BACK_COPY=1: A/B)
                 "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-mul-mat-back-out-prod.patch"
-        # Muon's Newton-Schulz as one op (GGML_OP_NEWTON_SCHULZ): three batched
-        # cuBLAS GEMMs per iteration, no elementwise or transpose passes
-        # (GGML_NS_BF16=1: bf16 tensor cores); opt-in (MLIPCPP_NS_FUSED=1), slower
+        # Muon's Newton-Schulz as one op over all the groups (GGML_OP_NEWTON_SCHULZ,
+        # ggml_newton_schulz_multi): bf16 storage, one grouped cuBLAS GEMM per
+        # stage (GGML_NS_F32=1: fp32/TF32; GGML_NS_LOOP=1: per group); the GPU
+        # default (MLIPCPP_NS_OPS=1: the ggml ops)
                 "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-newton-schulz.patch"
         # CUDA graph capture for one chosen static graph (the optimizer step)
         # while GGML_CUDA_DISABLE_GRAPHS keeps it off for the dynamic ones

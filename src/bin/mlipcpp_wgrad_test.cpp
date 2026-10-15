@@ -72,29 +72,43 @@ Result run(BackendProvider &bp, Variant v, int64_t in, int64_t out, int64_t R, c
   return res;
 }
 
-// ggml_newton_schulz on k stacked [ne0, ne1] matrices: result and ms per call
-std::pair<std::vector<float>, double> newton_schulz(ggml_backend_t backend, int64_t ne0, int64_t ne1, int64_t k,
-                                                    const std::vector<float> &x, int reps) {
-  ggml_context *ctx = ggml_init({ggml_tensor_overhead() * 4 + ggml_graph_overhead_custom(4, false), nullptr, true});
-  ggml_tensor *X = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne0, ne1, k);
-  ggml_tensor *Y = ggml_newton_schulz(ctx, X, 5, 3.4445f, -4.7750f, 2.0315f);
-  ggml_set_input(X), ggml_set_output(Y);
-  ggml_cgraph *gf = ggml_new_graph_custom(ctx, 4, false);
+using NsShape = std::tuple<int64_t, int64_t, int64_t>; // ne0, ne1, k
+
+// ggml_newton_schulz_multi on stacks of k [ne0, ne1] matrices (one op for
+// all of them): per stack the result, and ms per call
+std::pair<std::vector<std::vector<float>>, double> newton_schulz(ggml_backend_t backend, const std::vector<NsShape> &shapes,
+                                                                 const std::vector<std::vector<float>> &xs, int reps) {
+  const size_t n = shapes.size();
+  const size_t gs = n + 4; // graph: n leafs + the op
+  ggml_context *ctx = ggml_init({ggml_tensor_overhead() * gs + ggml_graph_overhead_custom(gs, false), nullptr, true});
+  std::vector<ggml_tensor *> X;
+  for (auto [ne0, ne1, k] : shapes) {
+    X.push_back(ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne0, ne1, k));
+    ggml_set_input(X.back());
+  }
+  ggml_tensor *Y = ggml_newton_schulz_multi(ctx, X.data(), static_cast<int>(n), 5, 3.4445f, -4.7750f, 2.0315f);
+  ggml_set_output(Y);
+  ggml_cgraph *gf = ggml_new_graph_custom(ctx, gs, false);
   ggml_build_forward_expand(gf, Y);
   ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
   ggml_gallocr_alloc_graph(ga, gf);
-  ggml_backend_tensor_set(X, x.data(), 0, ggml_nbytes(X));
+  for (size_t i = 0; i < n; i++) ggml_backend_tensor_set(X[i], xs[i].data(), 0, ggml_nbytes(X[i]));
   ggml_backend_graph_compute(backend, gf);
   ggml_backend_synchronize(backend);
   const auto t0 = std::chrono::steady_clock::now();
   for (int i = 0; i < reps; i++) ggml_backend_graph_compute(backend, gf);
   ggml_backend_synchronize(backend);
   const double ms = reps ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / reps : 0;
-  std::vector<float> y(ggml_nelements(Y));
-  ggml_backend_tensor_get(Y, y.data(), 0, ggml_nbytes(Y));
+  std::vector<std::vector<float>> ys;
+  size_t off = 0;
+  for (ggml_tensor *x : X) {
+    ys.emplace_back(ggml_nelements(x));
+    ggml_backend_tensor_get(Y, ys.back().data(), off, ggml_nbytes(x));
+    off += ggml_nbytes(x);
+  }
   ggml_gallocr_free(ga);
   ggml_free(ctx);
-  return {y, ms};
+  return {ys, ms};
 }
 
 } // namespace
@@ -140,22 +154,39 @@ int main(int argc, char **argv) {
       fmt::print("\n");
     }
 
-  // Newton-Schulz op: the backend's kernel (TF32, or bf16 with GGML_NS_BF16=1)
-  // against the CPU reference, on the Muon groups of the big model
+  // Newton-Schulz op: the backend's kernel (bf16 storage, or fp32/TF32 with
+  // GGML_NS_F32=1; grouped GEMMs, or per stack with GGML_NS_LOOP=1) against the
+  // CPU reference, per Muon group of the big model, then all groups in one op
+  // (the optimizer's call) against the per-group calls
   ggml_backend_t cpu = ggml_backend_cpu_init();
-  fmt::print("newton-schulz ({}): ms per call, max |gpu - cpu| / max |cpu|\n", std::getenv("GGML_NS_BF16") ? "bf16" : "tf32");
-  for (auto [ne0, ne1, k] : {std::tuple<int64_t, int64_t, int64_t>{256, 256, 11}, {512, 256, 12}, {256, 1024, 4},
-                             {512, 2048, 4}, {1024, 512, 4}}) {
+  fmt::print("newton-schulz ({}, {}): ms per call, max |gpu - cpu| / max |cpu|\n",
+             std::getenv("GGML_NS_F32") ? "fp32 storage" : "bf16 storage", std::getenv("GGML_NS_LOOP") ? "loop" : "grouped");
+  const std::vector<NsShape> groups = {{256, 256, 11}, {256, 512, 4}, {256, 768, 4}, {256, 1024, 4},
+                                       {512, 256, 12}, {512, 512, 1}, {512, 2048, 4}, {1024, 512, 4}};
+  std::vector<std::vector<float>> xs, ys;
+  double sum_ms = 0;
+  for (auto [ne0, ne1, k] : groups) {
     std::mt19937 rng(ne0 * ne1 + k);
     std::normal_distribution<float> U(0, 1);
-    std::vector<float> x(ne0 * ne1 * k);
-    for (auto &e : x) e = U(rng);
-    const auto [y, ms] = newton_schulz(bp->primary(), ne0, ne1, k, x, reps);
-    const auto [yc, msc] = newton_schulz(cpu, ne0, ne1, std::min<int64_t>(k, 2), x, 0); // first two matrices
+    xs.emplace_back(ne0 * ne1 * k);
+    for (auto &e : xs.back()) e = U(rng);
+    const auto [y, ms] = newton_schulz(bp->primary(), {{ne0, ne1, k}}, {xs.back()}, reps);
+    const std::vector<float> x2(xs.back().begin(), xs.back().begin() + ne0 * ne1 * std::min<int64_t>(k, 2));
+    const auto [yc, msc] = newton_schulz(cpu, {{ne0, ne1, std::min<int64_t>(k, 2)}}, {x2}, 0); // first two matrices
     double e = 0, m = 0;
-    for (size_t i = 0; i < yc.size(); i++) e = std::max(e, double(std::abs(y[i] - yc[i]))), m = std::max(m, double(std::abs(yc[i])));
+    for (size_t i = 0; i < yc[0].size(); i++)
+      e = std::max(e, double(std::abs(y[0][i] - yc[0][i]))), m = std::max(m, double(std::abs(yc[0][i])));
     fmt::print("ns {:4} x {:4} x {:2}  {:.3f} ms  {:.1e}\n", ne0, ne1, k, ms, e / m);
+    ys.push_back(y[0]);
+    sum_ms += ms;
   }
+  const auto [ya, msa] = newton_schulz(bp->primary(), groups, xs, reps);
+  double e = 0, m = 0;
+  for (size_t g = 0; g < groups.size(); g++)
+    for (size_t i = 0; i < ys[g].size(); i++)
+      e = std::max(e, double(std::abs(ya[g][i] - ys[g][i]))), m = std::max(m, double(std::abs(ys[g][i])));
+  fmt::print("ns all {} groups in one op  {:.3f} ms (sum of per-group calls {:.3f} ms)  vs per-group {:.1e}\n",
+             groups.size(), msa, sum_ms, e / m);
   ggml_backend_free(cpu);
   return 0;
 }

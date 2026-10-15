@@ -638,19 +638,15 @@ std::array<float, 4> ns_axpby_values() { return {-ns_b, (1 - ns_c) / -ns_b, -ns_
 /// g[:, :, i] = U S V^T. ggml (ne0, ne1) = PyTorch (cols, rows); the Gram
 /// matrix is taken over the shorter side. Same-shape matrices are stacked
 /// along ne2 and orthogonalised together (batched mul_mat).
-/// MLIPCPP_NS_FUSED=1: one ggml_newton_schulz op instead (strided-batched
-/// cuBLAS GEMMs, no elementwise passes): 6.5 % slower end to end on the big
-/// model (bench 145878), so off by default.
+/// (The GPU default is the fused op instead: orthogonalize_all.)
 /// `axpby` (optional): the two (lr, wd) pairs of ns_axpby_values(); then each
 /// iteration's two linear combinations run as in-place ggml_opt_step_sgd
 /// (one kernel each instead of scale, scale, add / scale, add);
 /// MLIPCPP_NS_SCALE_ADD=1: the separate ops (A/B).
 ggml_tensor *orthogonalize(ggml_context *ctx, ggml_tensor *g, int steps, ggml_tensor *axpby = nullptr) {
   const float a = ns_a, b = ns_b, c = ns_c;
-  static const bool fused = std::getenv("MLIPCPP_NS_FUSED") != nullptr;
   static const bool scale_add = std::getenv("MLIPCPP_NS_SCALE_ADD") != nullptr;
   if (scale_add) axpby = nullptr;
-  if (fused) return ggml_newton_schulz(ctx, g, steps, a, b, c);
   const bool tall = g->ne[0] < g->ne[1]; // more rows than cols: work on g^T
   ggml_tensor *x = tall ? ggml_cont(ctx, ggml_transpose(ctx, g)) : g;
   const int64_t cols = x->ne[0], rows = x->ne[1], k = x->ne[2];
@@ -670,6 +666,31 @@ ggml_tensor *orthogonalize(ggml_context *ctx, ggml_tensor *g, int steps, ggml_te
     x = ggml_add(ctx, ggml_scale(ctx, x, a), BX);
   }
   return tall ? ggml_cont(ctx, ggml_transpose(ctx, x)) : x;
+}
+/// orthogonalize() of every stack in `us`. On a GPU backend one
+/// ggml_newton_schulz_multi per GGML_MAX_SRC stacks instead (bf16 storage,
+/// all the groups' GEMMs of a stage in one grouped cuBLAS call), each result a
+/// view of its output: Muon step 3.01 -> 2.41 ms on the big model (bench
+/// 145961). MLIPCPP_NS_OPS=1, or a CPU backend (the op's CPU kernel is a
+/// reference): the ggml ops.
+std::vector<ggml_tensor *> orthogonalize_all(ggml_context *ctx, ggml_backend_t backend, const std::vector<ggml_tensor *> &us,
+                                             int steps, ggml_tensor *axpby) {
+  std::vector<ggml_tensor *> os;
+  ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+  if (std::getenv("MLIPCPP_NS_OPS") || !dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+    for (ggml_tensor *u : us) os.push_back(orthogonalize(ctx, u, steps, axpby));
+    return os;
+  }
+  for (size_t i0 = 0; i0 < us.size(); i0 += GGML_MAX_SRC) {
+    std::vector<ggml_tensor *> xs(us.begin() + i0, us.begin() + std::min(us.size(), i0 + GGML_MAX_SRC));
+    ggml_tensor *o = ggml_newton_schulz_multi(ctx, xs.data(), static_cast<int>(xs.size()), steps, ns_a, ns_b, ns_c);
+    size_t off = 0;
+    for (ggml_tensor *x : xs) {
+      os.push_back(ggml_view_3d(ctx, o, x->ne[0], x->ne[1], x->ne[2], x->nb[1], x->nb[2], off));
+      off += ggml_nbytes(x);
+    }
+  }
+  return os;
 }
 /// CUDA graph capture for a static graph computed every step (no-op off CUDA);
 /// MLIPCPP_OPT_NO_GRAPH=1: off. Returns whether capture was allowed.
@@ -827,12 +848,12 @@ Optimizer::Optimizer(std::vector<std::unique_ptr<Worker>> &workers, double clip,
   // Muon on a stack t of same-shape gradients (a view): one momentum step,
   // Nesterov (1 - mu) g + mu M divided by mu (Newton-Schulz normalises each
   // matrix first, so the common factor drops out; one in-place axpby on t,
-  // read by nothing else after the momentum step), then Newton-Schulz
-  auto muon_update = [&](ggml_context *ctx, ggml_tensor *t, ggml_tensor *M_state,
-                         const std::array<ggml_tensor *, 3> &c) {
+  // read by nothing else after the momentum step); Newton-Schulz follows for
+  // all the groups together (orthogonalize_all)
+  auto muon_momentum_step = [&](ggml_context *ctx, ggml_tensor *t, ggml_tensor *M_state,
+                                const std::array<ggml_tensor *, 3> &c) {
     ggml_tensor *M = ggml_opt_step_sgd(ctx, M_state, t, c[0]);
-    ggml_tensor *U = mu > 0 ? axpby_inplace(ctx, t, M, c[1]) : t;
-    return orthogonalize(ctx, U, ns_steps, c[2]);
+    return mu > 0 ? axpby_inplace(ctx, t, M, c[1]) : t;
   };
 
   // step graph: g = mean_w grad_w; c = min(1, clip / (|g| + 1e-6)); Adam(c g)
@@ -886,6 +907,8 @@ Optimizer::Optimizer(std::vector<std::unique_ptr<Worker>> &workers, double clip,
   // devices' updates arrive in their upd_in and are applied by apply_graph_
   if (split) apply_graph_ = ggml_new_graph_custom(gctx_, n_nodes, false);
   size_t gi = 0;
+  std::vector<ggml_tensor *> us; // device 0's Nesterov stacks, orthogonalised together after the loop
+  std::vector<std::pair<std::vector<ggml_tensor *>, ggml_tensor *>> steps; // per stack: (parameters, lr_wd)
   for (auto &[shape, idx] : old_muon ? decltype(groups){} : groups) {
     this->muon_groups.push_back(fmt::format("{}x{}x{}", shape.first, shape.second, idx.size()));
     const size_t mat = static_cast<size_t>(shape.first * shape.second), off0 = group_offset(idx);
@@ -896,13 +919,10 @@ Optimizer::Optimizer(std::vector<std::unique_ptr<Worker>> &workers, double clip,
     if (const auto [a, b] = owned[gi][0]; a < b) {
       ggml_tensor *t = ggml_view_3d(gctx_, gs, shape.first, shape.second, b - a, shape.first * sizeof(float),
                                     mat * sizeof(float), (off0 + a * mat) * sizeof(float));
-      ggml_tensor *o = muon_update(gctx_, t, m_stack[gi], {mom_pars, nest_pars, ns_pars});
-      for (size_t i = a; i < b; i++) {
-        ggml_tensor *p = params[idx[i]];
-        ggml_tensor *oi =
-            ggml_view_4d(gctx_, o, p->ne[0], p->ne[1], 1, 1, o->nb[1], o->nb[2], o->nb[3], (i - a) * o->nb[2]);
-        ggml_build_forward_expand(graph_, ggml_opt_step_sgd(gctx_, p, oi, lr_wd));
-      }
+      us.push_back(muon_momentum_step(gctx_, t, m_stack[gi], {mom_pars, nest_pars, ns_pars}));
+      std::vector<ggml_tensor *> ps;
+      for (size_t i = a; i < b; i++) ps.push_back(params[idx[i]]);
+      steps.emplace_back(ps, lr_wd);
     }
     for (size_t s = 0; s < shards_.size(); s++)
       for (size_t i = owned[gi][s + 1].first; i < owned[gi][s + 1].second; i++) {
@@ -912,6 +932,15 @@ Optimizer::Optimizer(std::vector<std::unique_ptr<Worker>> &workers, double clip,
         ggml_build_forward_expand(apply_graph_, ggml_opt_step_sgd(gctx_, p, ui, lr_wd));
       }
     gi++;
+  }
+  const std::vector<ggml_tensor *> os = orthogonalize_all(gctx_, backend, us, ns_steps, ns_pars);
+  for (size_t j = 0; j < os.size(); j++) {
+    ggml_tensor *o = os[j];
+    for (size_t i = 0; i < steps[j].first.size(); i++) {
+      ggml_tensor *p = steps[j].first[i];
+      ggml_tensor *oi = ggml_view_4d(gctx_, o, p->ne[0], p->ne[1], 1, 1, o->nb[1], o->nb[2], o->nb[3], i * o->nb[2]);
+      ggml_build_forward_expand(graph_, ggml_opt_step_sgd(gctx_, p, oi, steps[j].second));
+    }
   }
   for (auto &[shape, group] : muon_groups) {
     this->muon_groups.push_back(fmt::format("{}x{}x{}", shape.first, shape.second, group.size()));
@@ -974,6 +1003,7 @@ Optimizer::Optimizer(std::vector<std::unique_ptr<Worker>> &workers, double clip,
     gd = ggml_mul(sh.gctx, ggml_scale(sh.gctx, gd, 1.0f / W), sh.clip);
     sh.graph = ggml_new_graph_custom(sh.gctx, nd, false);
     size_t gj = 0;
+    std::vector<ggml_tensor *> ud, dst; // Nesterov stacks, their places in upd
     for (auto &[shape, idx] : groups) {
       const auto [a, b] = owned[gj][d];
       if (a < b) {
@@ -981,13 +1011,14 @@ Optimizer::Optimizer(std::vector<std::unique_ptr<Worker>> &workers, double clip,
                      off = (group_offset(idx) + a * mat - sh.lo) * sizeof(float);
         ggml_tensor *t = ggml_view_3d(sh.gctx, gd, shape.first, shape.second, b - a, shape.first * sizeof(float),
                                       mat * sizeof(float), off);
-        ggml_tensor *o = muon_update(sh.gctx, t, md[gj], cd);
-        ggml_tensor *u = ggml_view_3d(sh.gctx, sh.upd, shape.first, shape.second, b - a,
-                                      shape.first * sizeof(float), mat * sizeof(float), off);
-        ggml_build_forward_expand(sh.graph, ggml_cpy(sh.gctx, o, u));
+        ud.push_back(muon_momentum_step(sh.gctx, t, md[gj], cd));
+        dst.push_back(ggml_view_3d(sh.gctx, sh.upd, shape.first, shape.second, b - a, shape.first * sizeof(float),
+                                   mat * sizeof(float), off));
       }
       gj++;
     }
+    const std::vector<ggml_tensor *> od = orthogonalize_all(sh.gctx, bd, ud, ns_steps, cd[2]);
+    for (size_t j = 0; j < od.size(); j++) ggml_build_forward_expand(sh.graph, ggml_cpy(sh.gctx, od[j], dst[j]));
     sh.galloc = ggml_gallocr_new(bufd);
     if (!ggml_gallocr_alloc_graph(sh.galloc, sh.graph)) throw std::runtime_error("cannot allocate the optimizer graph");
     allow_cuda_graph(bd, sh.graph);
