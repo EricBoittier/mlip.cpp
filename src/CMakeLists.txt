@@ -136,6 +136,9 @@ if(MLIPCPP_BUILD_TRAINING AND UNIX AND NOT EMSCRIPTEN)
     add_executable(mlipcpp-attn-test bin/mlipcpp_attn_test.cpp)
     target_link_libraries(mlipcpp-attn-test PRIVATE mlipcpp_train)
 
+    add_executable(mlipcpp-wgrad-test bin/mlipcpp_wgrad_test.cpp)
+    target_link_libraries(mlipcpp-wgrad-test PRIVATE mlipcpp_train)
+
     add_executable(mlipcpp-train-check bin/mlipcpp_train_check.cpp)
     target_link_libraries(mlipcpp-train-check PRIVATE mlipcpp_train)
     target_link_options(mlipcpp-train-check PRIVATE -rdynamic)

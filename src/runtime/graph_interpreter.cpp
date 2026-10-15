@@ -745,7 +745,13 @@ ggml_tensor *GraphInterpreter::build_view(ggml_context *ctx,
   // Reverse shape (Python→GGML dimension order)
   std::reverse(shape.begin(), shape.end());
 
-  // If this is a chunk extraction (getitem with index), use view with offset
+  // If this is a chunk extraction (getitem with index), use view with offset.
+  // A chunk of a linear layer is built as its own linear; a view only read
+  // by binary ops (strided inputs are fine) is not copied.
+  // MLIPCPP_VIEW_CONT=1: always the view and its copy (A/B)
+  static const bool view_cont = std::getenv("MLIPCPP_VIEW_CONT") != nullptr;
+  if (index >= 0 && !view_cont)
+    if (ggml_tensor *y = build_chunk_linear(ctx, node, index, shape)) return y;
   if (index >= 0) {
     // Chunk offset: index * chunk_size * element_size
     size_t byte_offset = static_cast<size_t>(index) * shape[0] * ggml_element_size(a);
@@ -769,6 +775,11 @@ ggml_tensor *GraphInterpreter::build_view(ggml_context *ctx,
     default:
       throw std::runtime_error("VIEW: unsupported number of dimensions");
     }
+    const auto users = consumers(node.id);
+    if (!view_cont && !users.empty() && std::all_of(users.begin(), users.end(), [](const GIRNode *u) {
+          return (u->op == "ADD" || u->op == "SUB" || u->op == "MUL" || u->op == "DIV") && u->inputs.size() == 2;
+        }))
+      return view;
     // Make contiguous so subsequent reshapes work correctly
     return ggml_cont(ctx, view);
   }
@@ -1566,17 +1577,8 @@ ggml_tensor *GraphInterpreter::build_new_ones(ggml_context *ctx,
   return result;
 }
 
-ggml_tensor *GraphInterpreter::build_linear(ggml_context *ctx,
-                                            const GIRNode &node) {
-  // LINEAR: y = x @ W.T + b
-  // inputs: [input, weight] or [input, weight, bias]
-  if (node.inputs.size() < 2) {
-    throw std::runtime_error("LINEAR requires at least 2 inputs (input, weight)");
-  }
-
-  ggml_tensor *input = resolve_input(ctx, node.inputs[0]);
-  ggml_tensor *weight = resolve_input(ctx, node.inputs[1]);
-
+// y = input @ weight.T (+ bias), input [..., rows, in]
+static ggml_tensor *linear(ggml_context *ctx, ggml_tensor *input, ggml_tensor *weight, ggml_tensor *bias) {
   // Batched inputs ([..., rows, in]) are flattened to one 2-D product: ggml
   // would otherwise broadcast the weight over the batch dims, and its
   // backward then needs a batched per-row-block product followed by a
@@ -1591,16 +1593,60 @@ ggml_tensor *GraphInterpreter::build_linear(ggml_context *ctx,
   // GGML mul_mat: (weight @ input.T).T = input @ weight.T
   ggml_tensor *result = ggml_mul_mat(ctx, weight, x);
 
-  // Add bias if present
-  if (node.inputs.size() > 2) {
-    ggml_tensor *bias = resolve_input(ctx, node.inputs[2]);
-    result = ggml_add(ctx, result, bias);
-  }
+  if (bias) result = ggml_add(ctx, result, bias);
 
   if (batched) {
     result = ggml_reshape_4d(ctx, result, result->ne[0], input->ne[1], input->ne[2], input->ne[3]);
   }
   return result;
+}
+
+ggml_tensor *GraphInterpreter::build_linear(ggml_context *ctx,
+                                            const GIRNode &node) {
+  // LINEAR: y = x @ W.T + b
+  // inputs: [input, weight] or [input, weight, bias]
+  if (node.inputs.size() < 2) {
+    throw std::runtime_error("LINEAR requires at least 2 inputs (input, weight)");
+  }
+  return linear(ctx, resolve_input(ctx, node.inputs[0]), resolve_input(ctx, node.inputs[1]),
+                node.inputs.size() > 2 ? resolve_input(ctx, node.inputs[2]) : nullptr);
+}
+
+std::vector<const GIRNode *> GraphInterpreter::consumers(int id) const {
+  const std::string ref = "node:" + std::to_string(id);
+  std::vector<const GIRNode *> r;
+  for (const auto &n : graph_.nodes)
+    if (std::find(n.inputs.begin(), n.inputs.end(), ref) != n.inputs.end()) r.push_back(&n);
+  return r;
+}
+
+// getitem `index` (ggml shape `shape`) of CHUNK(LINEAR(x), dim -1) when the
+// CHUNK is the LINEAR's only consumer: the chunk's own linear, on row views
+// of weight and bias (contiguous), instead of a strided view of the full
+// output and its copy. nullptr if the pattern does not match.
+ggml_tensor *GraphInterpreter::build_chunk_linear(ggml_context *ctx, const GIRNode &node, int64_t index,
+                                                  const std::vector<int64_t> &shape) {
+  const GIRNode *chunk = find_node(node.inputs[0]);
+  if (!chunk || chunk->op != "CHUNK" || chunk->inputs.empty()) return nullptr;
+  const int64_t dim = get_param<int64_t>(*chunk, "dim", 0);
+  if (dim != -1 && dim != int64_t(node.output_shape.size()) - 1) return nullptr;
+  const GIRNode *lin = find_node(chunk->inputs[0]);
+  if (!lin || lin->op != "LINEAR" || lin->inputs.size() < 2) return nullptr;
+  const auto users = consumers(lin->id);
+  if (users.size() != 1 || users[0] != chunk) return nullptr;
+  ggml_tensor *x = resolve_input(ctx, lin->inputs[0]), *w = resolve_input(ctx, lin->inputs[1]);
+  const int64_t h = shape[0], r0 = index * h;
+  if (!ggml_is_contiguous(w) || ggml_n_dims(w) > 2 || r0 + h > w->ne[1]) return nullptr;
+  ggml_tensor *b = nullptr;
+  if (lin->inputs.size() > 2) {
+    b = resolve_input(ctx, lin->inputs[2]);
+    if (b->ne[0] != w->ne[1] || ggml_nelements(b) != b->ne[0]) return nullptr;
+    b = ggml_view_1d(ctx, b, h, r0 * b->nb[0]);
+  }
+  ggml_tensor *y = linear(ctx, x, ggml_view_2d(ctx, w, w->ne[0], h, w->nb[1], r0 * w->nb[1]), b);
+  for (size_t k = 0; k < shape.size(); k++)
+    if (y->ne[k] != shape[k]) return nullptr;
+  return y;
 }
 
 ggml_tensor *GraphInterpreter::build_slice(ggml_context *ctx,

@@ -104,6 +104,7 @@ public:
   };
   bool profile = false;
   std::map<std::string, OpStats> profile_ops;
+  std::map<std::string, OpStats> profile_copies; // CONT / CPY nodes by the view chain they copy
   std::vector<std::pair<double, std::string>> profile_nodes; // (ms, "fwd:OP name [shape]") per node
 
   /// FLOPs, ideal bytes and compute-buffer size of one batch shape's graph:

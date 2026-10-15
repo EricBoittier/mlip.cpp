@@ -210,6 +210,10 @@ else()
         # fused PET attention (GGML_OP_PET_ATTN, CPU + CUDA, with backward):
         # softmax(scale q k^T + bias) v without storing any L x L matrix
                 "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-pet-attention.patch"
+        # MUL_MAT backward for a 2-D src0 (every linear layer): both gradients
+        # as OUT_PROD GEMMs on the flattened rows, without the transposed
+        # copies of activation, gradient and weight (GGML_MUL_MAT_BACK_COPY=1: A/B)
+                "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-mul-mat-back-out-prod.patch"
         EXCLUDE_FROM_ALL YES
     )
 endif()

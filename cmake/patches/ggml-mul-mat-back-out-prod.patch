@@ -1,0 +1,36 @@
+diff --git a/src/ggml.c b/src/ggml.c
+index b5269dd..e37dcec 100644
+--- a/src/ggml.c
++++ b/src/ggml.c
+@@ -6566,6 +6566,31 @@ static void ggml_compute_backward(
+             // src0.shape   [n,m,q1,r1]
+             // src1.shape   [n,p,qq,rr]
+ 
++            // 2-D src0 (a weight): both gradients as single GEMMs with a
++            // transposed operand (OUT_PROD), on src1 / grad flattened to
++            // rows: no transposed copies of the activation, of the gradient
++            // or of the weight, and no REPEAT_BACK over broadcast dims.
++            // GGML_MUL_MAT_BACK_COPY=1 keeps the copies (A/B)
++            static int back_copy = -1;
++            if (back_copy < 0) back_copy = getenv("GGML_MUL_MAT_BACK_COPY") != NULL;
++            if (!back_copy && src0->ne[2] == 1 && src0->ne[3] == 1 && src0->type == GGML_TYPE_F32 &&
++                    src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
++                struct ggml_tensor * g = ggml_is_contiguous(grad) ? grad : ggml_cont(ctx, grad);
++                g = ggml_reshape_2d(ctx, g, g->ne[0], ggml_nrows(g)); // [m, P]
++                if (src0_needs_grads) {
++                    // ds0[n, m] = sum_p src1[n, p] grad[m, p]
++                    ggml_add_or_set(ctx, cgraph, isrc0,
++                        ggml_out_prod(ctx, ggml_reshape_2d(ctx, src1, src1->ne[0], ggml_nrows(src1)), g));
++                }
++                if (src1_needs_grads) {
++                    // ds1[n, p] = sum_m src0[n, m] grad[m, p]; for m = 1 the transposed
++                    // view has equal strides and does not read as transposed (cuBLAS
++                    // would get ldb = 1): use the identical contiguous [P, 1]
++                    struct ggml_tensor * gt = g->ne[0] == 1 ? ggml_reshape_2d(ctx, g, g->ne[1], 1) : ggml_transpose(ctx, g);
++                    ggml_add_or_set(ctx, cgraph, isrc1, ggml_reshape(ctx, ggml_out_prod(ctx, src0, gt), src1));
++                }
++                break;
++            }
+             if (src0_needs_grads) {
+                 GGML_ASSERT(grad->ne[2] == src1->ne[2]);
+                 GGML_ASSERT(grad->ne[3] == src1->ne[3]);

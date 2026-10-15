@@ -247,6 +247,15 @@ int main(int argc, char **argv) {
                  v.ms, 100 * v.ms / tot.ms, rows[k].second, v.count, v.flops / 1e9, v.flops / v.ms / 1e9,
                  v.bytes / 1e9, v.bytes / v.ms / 1e6);
     }
+    std::vector<std::pair<double, std::string>> copies;
+    for (auto &[k, v] : worker.profile_copies) copies.push_back({v.ms, k});
+    std::sort(copies.rbegin(), copies.rend());
+    fmt::print("copies by source:\n");
+    for (size_t k = 0; k < std::min<size_t>(copies.size(), 20); k++) {
+      const auto &v = worker.profile_copies[copies[k].second];
+      fmt::print("  {:>8.2f} ms {:5.1f}%  x{:<5} {:>8.2f} GB  {}\n", v.ms, 100 * v.ms / tot.ms, v.count, v.bytes / 1e9,
+                 copies[k].second);
+    }
     auto &nodes = worker.profile_nodes;
     std::sort(nodes.rbegin(), nodes.rend());
     fmt::print("slowest nodes:\n");

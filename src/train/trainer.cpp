@@ -550,6 +550,19 @@ StepStats Worker::run(const Batch &b, double energy_scale, bool backward) {
       auto [f, b] = node_cost(node);
       const double ms = 1e3 * seconds_since(tn);
       s.ms += ms, s.count++, s.flops += f, s.bytes += b;
+      if (node->op == GGML_OP_CONT || node->op == GGML_OP_CPY) {
+        // what the copy materialises: the chain of views down to the producer
+        std::string key = std::string(i < g->n_forward ? "fwd:" : "bwd:") + ggml_op_desc(node) + " <-";
+        const ggml_tensor *t = node->src[0];
+        for (int depth = 0; t && depth < 4; depth++, t = t->src[0]) {
+          key += std::string(" ") + ggml_op_desc(t);
+          if (t->op != GGML_OP_VIEW && t->op != GGML_OP_RESHAPE && t->op != GGML_OP_PERMUTE &&
+              t->op != GGML_OP_TRANSPOSE)
+            break;
+        }
+        auto &c = profile_copies[key];
+        c.ms += ms, c.count++, c.bytes += b;
+      }
       profile_nodes.push_back({ms, fmt::format("{}:{} {} [{} {} {} {}]{}", i < g->n_forward ? "fwd" : "bwd",
                                                ggml_op_desc(node), node->name, node->ne[0], node->ne[1],
                                                node->ne[2], node->ne[3],
