@@ -443,9 +443,15 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, bool
   ggml_tensor *se_f = ggml_sum(ctx, ggml_sqr(ctx, ggml_mul(ctx, d_force, force_scale)));
   g->stats = ggml_concat(ctx, ggml_concat(ctx, ggml_concat(ctx, loss, loss_e, 0), loss_f, 0), se_f, 0);
   ggml_set_output(g->stats);
+  // per structure: energy error and the atom-mean physical force squared error
+  ggml_tensor *se_f_atom = ggml_reshape_2d(
+      ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, ggml_mul(ctx, d_force, force_scale))), n, 1);
+  g->per_system = ggml_concat(ctx, d_energy, ggml_mul_mat(ctx, atom_weight, se_f_atom), 1);
+  ggml_set_output(g->per_system);
 
   g->gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, backward);
   ggml_build_forward_expand(g->gf, g->stats);
+  ggml_build_forward_expand(g->gf, g->per_system);
   g->n_forward = ggml_graph_n_nodes(g->gf);
   if (backward) {
     ggml_set_loss(loss);
@@ -615,6 +621,13 @@ StepStats Worker::run(const Batch &b, double energy_scale, bool backward) {
   st.se_force = stats[3];
   st.n_systems = b.n_real_systems;
   for (float w : b.force_mask) st.n_force_components += 3 * static_cast<int64_t>(w);
+  if (system_errors) {
+    std::vector<float> ps(2 * static_cast<size_t>(S));
+    ggml_backend_tensor_get(g->per_system, ps.data(), 0, ps.size() * sizeof(float));
+    for (int k = 0; k < b.n_real_systems; k++)
+      system_errors->push_back({b.ids[k], -1, b.n_per_system[k], static_cast<float>(ps[k] * energy_scale),
+                                ps[S + k] * b.n_per_system[k]});
+  }
   t_download = seconds_since(t0);
   return st;
 }
@@ -1216,17 +1229,25 @@ void train(const TrainOptions &o) {
   fmt::print("neighbour lists ready ({:.1f} s)\n", seconds_since(t0));
   // structures used: all, or those within --max-neighbors and --max-attention
   // (a structure alone is one micro-batch: its memory ~ n (m+1)^2)
+  // and not listed in --exclude DIR/<split>.npy
   auto kept = [&](const char *name, const MemmapSplit &s, const NeighborCache &c) {
+    std::vector<char> excluded(c.max_neighbors.size(), 0);
+    int64_t n_excluded = 0;
+    if (!o.exclude.empty()) {
+      for (int64_t i : read_npy_i64(fmt::format("{}/{}.npy", o.exclude, name)))
+        if (i >= 0 && i < static_cast<int64_t>(excluded.size()) && !excluded[i]) excluded[i] = 1, n_excluded++;
+      fmt::print("--exclude {}: {} of {} {} structures excluded\n", o.exclude, n_excluded, s.size(), name);
+    }
     std::vector<int64_t> ids;
     for (int64_t i = 0; i < static_cast<int64_t>(c.max_neighbors.size()); i++) {
       const double m1 = c.max_neighbors[i] + 1.0;
-      if ((o.max_neighbors <= 0 || c.max_neighbors[i] <= o.max_neighbors) &&
+      if (!excluded[i] && (o.max_neighbors <= 0 || c.max_neighbors[i] <= o.max_neighbors) &&
           (o.max_attention <= 0 || s.n_atoms(i) * m1 * m1 <= o.max_attention))
         ids.push_back(i);
     }
     if (o.max_neighbors > 0 || o.max_attention > 0)
       fmt::print("--max-neighbors {} --max-attention {:g}: {} of {} {} structures dropped\n", o.max_neighbors,
-                 o.max_attention, s.size() - static_cast<int64_t>(ids.size()), s.size(), name);
+                 o.max_attention, s.size() - n_excluded - static_cast<int64_t>(ids.size()), s.size(), name);
     return ids;
   };
   const std::vector<int64_t> ids_train = eval_only ? std::vector<int64_t>{} : kept("train", train_split, nl_train),
@@ -1258,6 +1279,19 @@ void train(const TrainOptions &o) {
              seconds_since(t_setup), steps_per_epoch, W, B, warmup);
   if (!optimizer.muon_split.empty()) fmt::print("muon split: {}\n", optimizer.muon_split);
 
+  // per-structure records of the workers (--dump-errors / --log-errors)
+  std::vector<std::vector<SystemError>> errors(W);
+  auto collect_errors = [&](bool on) {
+    for (int w = 0; w < W; w++) workers[w]->system_errors = on ? &errors[w] : nullptr;
+  };
+  auto drain_errors = [&](std::FILE *f, int32_t step) {
+    for (auto &e : errors) {
+      for (SystemError &r : e) r.step = step;
+      if (!e.empty() && std::fwrite(e.data(), sizeof(SystemError), e.size(), f) != e.size())
+        throw std::runtime_error("cannot write the per-structure errors");
+      e.clear();
+    }
+  };
   auto evaluate = [&](const MemmapSplit &split, const NeighborCache &cache, const std::vector<int64_t> &use) {
     std::vector<StepStats> per(W);
     const int64_t n_use = static_cast<int64_t>(use.size()), n_batches = (n_use + B - 1) / B;
@@ -1322,8 +1356,19 @@ void train(const TrainOptions &o) {
     return out;
   };
 
+  // --log-errors: each training structure's errors before the update it takes part in
+  std::unique_ptr<std::FILE, int (*)(std::FILE *)> log_file(nullptr, std::fclose);
+  if (!o.log_errors.empty() && !eval_only) {
+    log_file.reset(std::fopen(o.log_errors.c_str(), "wb"));
+    if (!log_file) throw std::runtime_error("cannot open " + o.log_errors);
+    fmt::print("--log-errors {}: per-structure training errors of the first {} epoch(s)\n", o.log_errors,
+               o.log_errors_epochs);
+  }
+
   int64_t global_step = 0;
   for (int epoch = 0; epoch < o.epochs && global_step != o.max_steps; epoch++) {
+    const bool logging = log_file && epoch < o.log_errors_epochs;
+    collect_errors(logging);
     std::vector<int64_t> perm = ids_train;
     std::shuffle(perm.begin(), perm.end(), std::mt19937_64(o.seed + epoch));
 
@@ -1362,6 +1407,7 @@ void train(const TrainOptions &o) {
         }
         optimizer.stage(w); // ship the gradients while the other workers still compute
       });
+      if (logging) drain_errors(log_file.get(), static_cast<int32_t>(global_step));
       t_gpu += seconds_since(t);
       for (int w = 0; w < W; w++) t_build += wb[w] / W, t_compute += wc[w] / W;
       for (auto &mb : batches) n_micro += mb.size();
@@ -1403,6 +1449,8 @@ void train(const TrainOptions &o) {
         std::fflush(stdout);
       }
     }
+    collect_errors(false);
+    if (logging) std::fflush(log_file.get());
     const double t_train = seconds_since(t_epoch);
     const int64_t done = std::max<int64_t>(1, ep.n_systems / B);
     auto [tre, trf] = rmse(ep);
@@ -1420,11 +1468,25 @@ void train(const TrainOptions &o) {
     std::fflush(stdout);
   }
 
-  if (eval_only) {
-    auto [ve, vf] = rmse(evaluate(val_split, nl_val, ids_val));
-    fmt::print("val: RMSE E {:.2f} meV/atom, F {:.2f} meV/A over {} structures\n", ve, vf, val_split.size());
+  log_file.reset();
+  // --dump-errors PREFIX: PREFIX.val.bin and PREFIX.test.bin (SystemError records)
+  auto dump = [&](const char *name, auto &&run) {
+    if (o.dump_errors.empty()) return run();
+    collect_errors(true);
+    auto st = run();
+    collect_errors(false);
+    const std::string path = fmt::format("{}.{}.bin", o.dump_errors, name);
+    std::unique_ptr<std::FILE, int (*)(std::FILE *)> f(std::fopen(path.c_str(), "wb"), std::fclose);
+    if (!f) throw std::runtime_error("cannot open " + path);
+    drain_errors(f.get(), -1);
+    fmt::print("wrote {}\n", path);
+    return st;
+  };
+  if (eval_only || !o.dump_errors.empty()) {
+    auto [ve, vf] = rmse(dump("val", [&] { return evaluate(val_split, nl_val, ids_val); }));
+    fmt::print("val: RMSE E {:.2f} meV/atom, F {:.2f} meV/A over {} structures\n", ve, vf, ids_val.size());
   }
-  const StepStats test = evaluate(test_split, nl_test, ids_test);
+  const StepStats test = dump("test", [&] { return evaluate(test_split, nl_test, ids_test); });
   auto [te, tf] = rmse(test);
   fmt::print("test: RMSE E {:.2f} meV/atom, F {:.2f} meV/A over {} structures\n", te, tf, test.n_systems);
   std::fflush(stdout);

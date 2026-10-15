@@ -48,7 +48,25 @@ struct TrainOptions {
   double muon_momentum = 0.95;
   double muon_lr_scale = 1.0; // Muon lr = lr * this (updates are RMS-matched to Adam)
   int muon_ns_steps = 5;
+  // per-structure errors (SystemError records, see write_errors): of val/ and
+  // test/ at the end ("" = off), and online during the first
+  // log_errors_epochs epochs of training, before each update (prequential)
+  std::string dump_errors, log_errors;
+  int log_errors_epochs = 1;
+  // drop structures: DIR/{train,val,test}.npy hold split indices ("" = none)
+  std::string exclude;
 };
+
+/// One structure's errors: energy per atom (prediction - target, eV/atom) and
+/// the summed squared force error over its atoms ((eV/A)^2). 24-byte records;
+/// numpy dtype [('id','<i8'),('step','<i4'),('n','<i4'),('de','<f4'),('fse','<f4')]
+/// (step: the training step, -1 for an evaluation).
+struct SystemError {
+  int64_t id;
+  int32_t step, n;
+  float de, fse;
+};
+static_assert(sizeof(SystemError) == 24);
 
 /// Squared errors of one batch: scaled (the loss) and physical (metrics).
 struct StepStats {
@@ -106,6 +124,8 @@ public:
     int64_t count = 0;
   };
   bool profile = false;
+  /// when set, run() appends one record per real structure (step = -1)
+  std::vector<SystemError> *system_errors = nullptr;
   std::map<std::string, OpStats> profile_ops;
   std::map<std::string, OpStats> profile_copies; // CONT / CPY nodes by the view chain they copy
   std::vector<std::pair<double, std::string>> profile_nodes; // (ms, "fwd:OP name [shape]") per node
@@ -132,6 +152,7 @@ private:
     std::vector<ggml_tensor *> inputs; // in upload order (see upload_inputs)
     // (loss, loss_e, loss_f, physical force squared error): one download
     ggml_tensor *stats = nullptr, *loss_grad = nullptr;
+    ggml_tensor *per_system = nullptr; // [S, 2]: d_energy (scaled, per atom), mean |dF|^2 per atom (physical)
     int n_forward = 0;
     std::vector<std::pair<ggml_tensor *, float>> constants;
     // cached graphs: inputs packed at the start of `persist` (one upload

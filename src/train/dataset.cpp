@@ -50,9 +50,6 @@ template <typename T> Mapped<T>::~Mapped() {
 template class Mapped<float>;
 template class Mapped<int32_t>;
 
-namespace {
-
-/// int64 payload of a little-endian .npy file (any shape, '<i8' only).
 std::vector<int64_t> read_npy_i64(const std::string &path) {
   std::ifstream f(path, std::ios::binary);
   if (!f) throw std::runtime_error("cannot open " + path);
@@ -79,8 +76,6 @@ std::vector<int64_t> read_npy_i64(const std::string &path) {
   while (f.read(reinterpret_cast<char *>(&v), sizeof v)) out.push_back(v);
   return out;
 }
-
-} // namespace
 
 MemmapSplit::MemmapSplit(const std::string &dir) : dir_(dir) {
   n_systems_ = read_npy_i64(dir + "/ns.npy").at(0);

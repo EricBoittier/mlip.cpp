@@ -27,6 +27,9 @@ private:
   size_t size_ = 0;
 };
 
+/// int64 payload of a little-endian .npy file (any shape, '<i8' only).
+std::vector<int64_t> read_npy_i64(const std::string &path);
+
 /// One split (train/ val/ test/) of metatrain's MemmapDataset:
 /// ns.npy (0-d int64), na.npy (ns+1 cumulative atom counts), x.bin (f32
 /// [N,3]), a.bin (i32 [N]), c.bin (f32 [ns,3,3], rows are lattice vectors),

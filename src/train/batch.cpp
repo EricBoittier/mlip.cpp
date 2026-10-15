@@ -123,6 +123,7 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
                  int pad_neighbors, int pad_systems) {
   Batch b;
   b.n_real_systems = static_cast<int>(ids.size());
+  b.ids.assign(ids.begin(), ids.end());
   int n_real = 0;
   for (int64_t s : ids) {
     n_real += split.n_atoms(s);

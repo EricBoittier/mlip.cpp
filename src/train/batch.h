@@ -36,6 +36,7 @@ std::array<float, 9> random_o3(std::mt19937_64 &rng);
 struct Batch {
   int n_atoms = 0, n_systems = 0, max_neighbors = 0; // padded shape (tiles)
   int n_real_systems = 0;                            // structures actually packed
+  std::vector<int64_t> ids;                          // [n_real_systems] split index of each
 
   std::vector<int32_t> species;            // [n_atoms] species index
   std::vector<int32_t> neighbor_species;   // [n_atoms, max_nb]

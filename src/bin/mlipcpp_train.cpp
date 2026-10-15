@@ -21,13 +21,18 @@ int main(int argc, char **argv) {
                "          [--mb-growth {}] [--mb-budget {}] [--max-neighbors N] [--max-attention A] [--tile-nb-ratio R] [--tile-atom-ratio {}]\n"
                "          [--graph-cache {}] [--prefetch {}] [--pack step|worker] [--optimizer adam|muon] [--muon-momentum {}]\n"
                "          [--muon-lr-scale {}] [--muon-ns-steps {}]\n"
+               "          [--dump-errors PREFIX] [--log-errors FILE] [--log-errors-epochs {}] [--exclude DIR]\n"
+               "--dump-errors writes PREFIX.{{val,test}}.bin, --log-errors the training structures' errors\n"
+               "before each update (24-byte records, see SystemError); --exclude DIR drops the split\n"
+               "indices in DIR/{{train,val,test}}.npy;\n"
                "--tile-nb-ratio > 1 pads micro-batches to a geometric grid of shapes and\n"
                "replays cached graphs (CUDA graphs);\n"
                "--gpus 0 trains on the CPU; --batch-size counts structures per GPU;\n"
                "--epochs 0 only evaluates --init on val/ and test/ (-o is ignored).\n",
                argv[0], o.epochs, o.batch_size, o.n_gpus, o.lr, o.warmup_fraction,
                o.grad_clip, o.seed, o.n_threads, o.log_every, o.mb_growth, o.mb_budget,
-               o.tile_atom_ratio, o.graph_cache, o.prefetch, o.muon_momentum, o.muon_lr_scale, o.muon_ns_steps);
+               o.tile_atom_ratio, o.graph_cache, o.prefetch, o.muon_momentum, o.muon_lr_scale, o.muon_ns_steps,
+               o.log_errors_epochs);
     std::exit(2);
   };
   for (int i = 1; i < argc; i++) {
@@ -60,6 +65,10 @@ int main(int argc, char **argv) {
     else if (a == "--muon-momentum") o.muon_momentum = std::stod(val());
     else if (a == "--muon-lr-scale") o.muon_lr_scale = std::stod(val());
     else if (a == "--muon-ns-steps") o.muon_ns_steps = std::stoi(val());
+    else if (a == "--dump-errors") o.dump_errors = val();
+    else if (a == "--log-errors") o.log_errors = val();
+    else if (a == "--log-errors-epochs") o.log_errors_epochs = std::stoi(val());
+    else if (a == "--exclude") o.exclude = val();
     else usage();
   }
   if (o.data_dir.empty() || o.init_gguf.empty() || o.output.empty()) usage();
