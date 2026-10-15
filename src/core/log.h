@@ -17,7 +17,7 @@
 #include <string_view>
 
 #ifndef __EMSCRIPTEN__
-#include <fmt/core.h>
+#include <fmt/format.h>
 #endif
 
 namespace mlipcpp {

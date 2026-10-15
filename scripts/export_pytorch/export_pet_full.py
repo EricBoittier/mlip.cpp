@@ -173,6 +173,11 @@ def _unwrap_to_pet(model):
     outer = getattr(model, 'hypers', None)
     if isinstance(outer, dict) and not hasattr(unwrapped, 'outer_hypers'):
         unwrapped.outer_hypers = dict(outer)
+    # The long-range featurizer lives on the outer metatrain model, not its
+    # PETBackend. Preserve it while unwrapping instead of silently exporting SR.
+    if getattr(model, 'long_range', False):
+        unwrapped.long_range = True
+        unwrapped.long_range_featurizer = model.long_range_featurizer
     return unwrapped
 
 
@@ -344,6 +349,17 @@ class PETFullModel(torch.nn.Module):
                  cutoff_function: str = "cosine", nc_forces: bool = False):
         super().__init__()
         self.nc_forces = nc_forces
+        self.long_range = bool(getattr(pet_model, 'long_range', False))
+        lr_hypers = getattr(pet_model, 'outer_hypers', {}).get('long_range', {})
+        if lr_hypers.get('enable', False) and not self.long_range:
+            raise ValueError("PET-LR checkpoint lost its long-range featurizer during unwrapping")
+        if self.long_range:
+            if _hyper(pet_model, 'num_neighbors_adaptive'):
+                raise NotImplementedError("PET-LR export currently requires a fixed cutoff")
+            if nc_forces:
+                raise NotImplementedError("PET-LR export currently supports conservative forces only")
+            self.lr_charges = pet_model.long_range_featurizer.charges_map
+            self.lr_projection = pet_model.long_range_featurizer.out_projection
 
         # Store dimensions for tracing
         self.n_atoms = n_atoms
@@ -465,6 +481,7 @@ class PETFullModel(torch.nn.Module):
             reverse_neighbor_index = args[2]
             cutoff_factors = args[3]
 
+        coulomb = args[-1] if self.long_range else None
         n_atoms = species.shape[0]
         max_neighbors = neighbor_species.shape[1]
 
@@ -476,21 +493,24 @@ class PETFullModel(torch.nn.Module):
             return self._forward_feedforward(
                 species, neighbor_species, edge_vectors, edge_distances,
                 padding_mask, reverse_neighbor_index, cutoff_factors,
-                input_messages, n_atoms, max_neighbors
+                input_messages, n_atoms, max_neighbors, coulomb
             )
         else:
             return self._forward_residual(
                 species, neighbor_species, edge_vectors, edge_distances,
                 padding_mask, reverse_neighbor_index, cutoff_factors,
-                input_messages, n_atoms, max_neighbors
+                input_messages, n_atoms, max_neighbors, coulomb
             )
 
     def _forward_residual(self, species, neighbor_species, edge_vectors, edge_distances,
                           padding_mask, reverse_neighbor_index, cutoff_factors,
-                          input_messages, n_atoms, max_neighbors):
+                          input_messages, n_atoms, max_neighbors, coulomb=None):
         """Residual featurization: per-layer energy accumulation (pet-mad-s style)."""
         # Initialize atomic energies accumulator
         atomic_energies = species.new_zeros(n_atoms, dtype=torch.float32)
+
+        nodes = []
+        edges = []
 
         # Process through GNN layers with per-layer energy readout
         for gnn_idx, (node_embedder, gnn_layer) in enumerate(
@@ -519,25 +539,8 @@ class PETFullModel(torch.nn.Module):
                 output_edge,
             )
 
-            # Node energy readout
-            node_feat = self.node_energy_heads[gnn_idx](output_node)
-            node_e = self.node_final_layers[gnn_idx](node_feat)
-
-            # Edge energy readout
-            edge_feat = self.edge_energy_heads[gnn_idx](output_edge)
-            edge_e = self.edge_final_layers[gnn_idx](edge_feat)
-            # Mask out padded edges and apply cutoff
-            # padding_mask: True=padded (invalid), False=valid
-            edge_e_masked = torch.where(
-                padding_mask.unsqueeze(-1),
-                torch.zeros_like(edge_e),  # Zero out padded edges
-                edge_e,                     # Keep valid edges
-            )
-            # Apply cutoff factors and sum over neighbors
-            edge_e_sum = (edge_e_masked.squeeze(-1) * cutoff_factors).sum(dim=1)
-
-            # Accumulate both node and edge contributions
-            atomic_energies = atomic_energies + node_e.squeeze(-1) + edge_e_sum
+            nodes.append(output_node)
+            edges.append(output_edge)
 
             # Message passing: prepare input for next layer (simple average)
             flat_output = output_edge.reshape(
@@ -554,11 +557,22 @@ class PETFullModel(torch.nn.Module):
             )
             input_messages = 0.5 * (input_messages + reversed_messages)
 
+        if self.long_range:
+            combined = nodes[0]
+            for node in nodes[1:]:
+                combined = combined + node
+            update = self.lr_projection(coulomb @ self.lr_charges(combined * len(nodes)**-0.5))
+            nodes = [(node + update) * 0.5**0.5 for node in nodes]
+        for i, (node, edge) in enumerate(zip(nodes, edges)):
+            atomic_energies = atomic_energies + self._readout(
+                self.node_energy_heads, self.node_final_layers,
+                self.edge_energy_heads, self.edge_final_layers, i,
+                node, edge, padding_mask, cutoff_factors).squeeze(-1)
         return atomic_energies
 
     def _forward_feedforward(self, species, neighbor_species, edge_vectors, edge_distances,
                              padding_mask, reverse_neighbor_index, cutoff_factors,
-                             input_messages, n_atoms, max_neighbors):
+                             input_messages, n_atoms, max_neighbors, coulomb=None):
         """Feedforward featurization: combination_mlps between layers, final-only energy (pet-omad-s style)."""
         # Single node embedder used for all layers
         input_node_embeddings = self.node_embedders[0](species)
@@ -621,6 +635,10 @@ class PETFullModel(torch.nn.Module):
                 update,
             )
             input_messages = input_messages + update
+
+        if self.long_range:
+            update = self.lr_projection(coulomb @ self.lr_charges(input_node_embeddings))
+            input_node_embeddings = (input_node_embeddings + update) * 0.5**0.5
 
         # Energy readout from final features only (num_readout_layers=1)
         # Node energy
@@ -855,6 +873,8 @@ def export_pet_full(
     print(f"Loading PET model: {model_name}...")
     pet = load_pet_model(model_name)
     pet.eval()
+    if getattr(pet, 'long_range', False):
+        raise NotImplementedError("Use export_pet_gguf.py for PET-LR export")
 
     params = get_model_params(pet)
     d_pet = params['d_pet']

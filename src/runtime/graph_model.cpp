@@ -378,6 +378,31 @@ bool GraphModel::load_from_gguf(const std::string &path) {
   cutoff_width_adaptive_ = loader.get_float32("pet.cutoff_width_adaptive", cutoff_width_);
   adaptive_cutoff_method_ = loader.get_string("pet.adaptive_cutoff_method", "grid");
 
+  const auto lr_solver = loader.get_string("pet.long_range.solver", "");
+  if (!lr_solver.empty() && lr_solver != "direct-ewald") {
+    ggml_free(temp_ctx);
+    throw std::runtime_error("Unsupported PET-LR solver: " + lr_solver);
+  }
+  long_range_ = !lr_solver.empty();
+  if (long_range_ && (num_neighbors_adaptive_ > 0 || nc_forces_)) {
+    ggml_free(temp_ctx);
+    throw std::runtime_error(
+        "PET-LR requires fixed cutoff and conservative forces");
+  }
+  coulomb_parameters_ = {
+      cutoff_, loader.get_float32("pet.long_range.smearing", 1.4f),
+      loader.get_float32("pet.long_range.wavelength", 1.33f)};
+
+  if (long_range_ && (!std::isfinite(coulomb_parameters_.cutoff) ||
+                      coulomb_parameters_.cutoff <= 0 ||
+                      !std::isfinite(coulomb_parameters_.smearing) ||
+                      coulomb_parameters_.smearing <= 0 ||
+                      !std::isfinite(coulomb_parameters_.wavelength) ||
+                      coulomb_parameters_.wavelength <= 0)) {
+    ggml_free(temp_ctx);
+    throw std::runtime_error("Invalid PET-LR Coulomb parameters");
+  }
+
   // Update neighbor list builder with loaded cutoff
   neighbor_builder_ = NeighborListBuilder(NeighborListOptions{cutoff_, true, false});
 
@@ -388,6 +413,10 @@ bool GraphModel::load_from_gguf(const std::string &path) {
     throw std::runtime_error("No graph.json found in GGUF file");
   }
   interp_.load_graph(graph_json);
+  if ((interp_.graph().get_input("coulomb_matrix") != nullptr) != long_range_) {
+    ggml_free(temp_ctx);
+    throw std::runtime_error("PET-LR graph input and solver metadata disagree");
+  }
 
   // Load species mapping
   auto species_map = loader.get_array_int32("pet.species_map");
@@ -544,7 +573,39 @@ ModelResult GraphModel::predict_single(
   const int32_t *atomic_numbers = system.atomic_numbers();
 
   // Build neighbor list at the global model cutoff (the search radius).
+  // Validate LR geometry/work limits before allocating ggml buffers.
+  // Build the LR matrix from the full, unfiltered neighbor list.
+  if (long_range_ && (n_atoms < 1 || n_atoms > 512))
+    throw std::runtime_error(
+        "PET-LR dense reference solver supports 1..512 atoms");
+  if (long_range_ && system.cell()) {
+    int count = 0;
+    for (bool b : system.cell()->periodic)
+      count += b;
+    const auto &c = system.cell()->matrix;
+    double determinant =
+        double(c[0][0]) *
+            (double(c[1][1]) * c[2][2] - double(c[1][2]) * c[2][1]) -
+        double(c[0][1]) *
+            (double(c[1][0]) * c[2][2] - double(c[1][2]) * c[2][0]) +
+        double(c[0][2]) *
+            (double(c[1][0]) * c[2][1] - double(c[1][1]) * c[2][0]);
+    if (!std::isfinite(determinant) || std::abs(determinant) < 1e-12)
+      throw std::runtime_error(
+          "PET-LR requires a nonsingular cell when a Cell is supplied");
+    if (count != 0 && count != 3)
+      throw std::runtime_error(
+          "PET-LR supports nonperiodic or fully periodic cells only");
+  }
+  if (long_range_) {
+    for (int i = 0; i < 3 * n_atoms; ++i)
+      if (!std::isfinite(system.positions()[i]))
+        throw std::runtime_error("PET-LR requires finite positions");
+  }
   NeighborList nlist = neighbor_builder_.build(system);
+  CoulombResult coulomb;
+  if (long_range_)
+    coulomb = coulomb_matrix(system, nlist, coulomb_parameters_);
 
   // Per-pair cutoffs: default to global cutoff. When the graph itself does
   // adaptive cutoff (adaptive_cutoff_in_graph_), C++ leaves pair_cutoffs at
@@ -648,6 +709,14 @@ ModelResult GraphModel::predict_single(
   ggml_tensor *reverse_neighbor_index_t =
       ggml_new_tensor_1d(input_ctx, GGML_TYPE_I32, total_slots);
   ggml_set_name(reverse_neighbor_index_t, "reverse_neighbor_index");
+
+  ggml_tensor *coulomb_t = nullptr;
+  if (long_range_) {
+    coulomb_t = ggml_new_tensor_2d(input_ctx, GGML_TYPE_F32, n_atoms, n_atoms);
+    ggml_set_name(coulomb_t, "coulomb_matrix");
+    if (compute_forces)
+      ggml_set_param(coulomb_t);
+  }
 
   // Mode-specific inputs
   ggml_tensor *edge_distances_t = nullptr;
@@ -791,6 +860,12 @@ ModelResult GraphModel::predict_single(
   ggml_backend_tensor_set(reverse_neighbor_index_t, rni_data.data(), 0,
                           rni_data.size() * sizeof(int32_t));
 
+  if (coulomb_t) {
+    ggml_backend_tensor_set(coulomb_t, coulomb.matrix.data(), 0,
+                            coulomb.matrix.size() * sizeof(float));
+    interp_.set_input("coulomb_matrix", coulomb_t);
+  }
+
   // Register common inputs
   interp_.set_input("species", species_t);
   interp_.set_input("neighbor_species", neighbor_species_t);
@@ -852,6 +927,11 @@ ModelResult GraphModel::predict_single(
     ggml_build_forward_expand(cgraph, total_energy);
     ggml_build_backward_expand(compute_ctx, cgraph, nullptr);
 
+    if (coulomb_t) {
+      auto *lr_grad = ggml_graph_get_grad(cgraph, coulomb_t);
+      if (lr_grad)
+        ggml_set_output(lr_grad);
+    }
     ggml_tensor *grad = ggml_graph_get_grad(cgraph, edge_vectors_t);
     if (grad) {
       ggml_set_output(grad);
@@ -1074,6 +1154,26 @@ ModelResult GraphModel::predict_single(
         }
       }
     }
+  }
+
+  if (compute_forces && coulomb_t) {
+    auto *grad = ggml_graph_get_grad(cgraph, coulomb_t);
+    if (!grad) {
+      ggml_backend_buffer_free(compute_buffer);
+      ggml_free(compute_ctx);
+      ggml_backend_buffer_free(input_buffer);
+      ggml_free(input_ctx);
+      throw std::runtime_error("Missing PET-LR Coulomb gradient");
+    }
+    std::vector<float> adjoint(size_t(n_atoms) * n_atoms);
+    ggml_backend_tensor_get(grad, adjoint.data(), 0,
+                            adjoint.size() * sizeof(float));
+    auto correction =
+        coulomb_matrix(system, nlist, coulomb_parameters_, &adjoint);
+    for (size_t i = 0; i < correction.forces.size(); ++i)
+      result.forces[i] += energy_scale_ * correction.forces[i];
+    for (size_t i = 0; i < correction.stress.size(); ++i)
+      result.stress[i] += energy_scale_ * correction.stress[i];
   }
 
   // Hook for callers that want to inspect intermediate tensors. Runs while

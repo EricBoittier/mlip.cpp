@@ -5,6 +5,7 @@
 #include <ggml-backend.h>
 #include <ggml-cpu.h>
 
+#include <cmath>
 #include <cstring>
 #include <sstream>
 #include <vector>
@@ -857,5 +858,56 @@ TEST_CASE("Activation capture callback", "[runtime][activations]") {
 
   ggml_backend_buffer_free(buf);
   ggml_backend_free(cpu_backend);
+  ggml_free(ctx);
+}
+
+TEST_CASE("PET excluded attention keys have zero weight and gradient",
+          "[runtime][pet-lr]") {
+  GraphInterpreter interp;
+  interp.load_graph(R"({
+    "version":"1.0.0", "model_type":"test",
+    "inputs":[{"name":"x","dtype":"f32","shape":[4]}],
+    "outputs":[{"name":"y","node_ref":"node:2"}],
+    "nodes":[
+      {"id":0,"op":"LE","name":"excluded","inputs":["input:x"],"output_shape":[4],"output_dtype":"f32","params":{"scalar":0.0}},
+      {"id":1,"op":"MASKED_FILL","name":"masked","inputs":["input:x","node:0"],"output_shape":[4],"output_dtype":"f32","params":{"fill":"-inf"}},
+      {"id":2,"op":"SOFT_MAX","name":"softmax","inputs":["node:1"],"output_shape":[4],"output_dtype":"f32"}
+    ]
+  })");
+  auto *ctx = ggml_init({16 * 1024 * 1024, nullptr, true});
+  auto *x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4);
+  ggml_set_param(x);
+  interp.set_input("x", x);
+  auto *out = interp.build(ctx);
+  auto *loss = ggml_sum(ctx, ggml_sqr(ctx, out));
+  ggml_set_loss(loss);
+  auto *graph = ggml_new_graph_custom(ctx, 2048, true);
+  ggml_build_forward_expand(graph, loss);
+  ggml_build_backward_expand(ctx, graph, nullptr);
+  auto *gradient = ggml_graph_get_grad(graph, x);
+  REQUIRE(gradient != nullptr);
+  auto cpu = ggml_backend_cpu_init();
+  auto buffer = ggml_backend_alloc_ctx_tensors(ctx, cpu);
+  REQUIRE(buffer != nullptr);
+  float input[] = {-1, 0, 2, 3};
+  ggml_backend_tensor_set(x, input, 0, sizeof(input));
+  interp.init_constants();
+  ggml_graph_reset(graph);
+  REQUIRE(ggml_backend_graph_compute(cpu, graph) == GGML_STATUS_SUCCESS);
+  float values[4], grads[4];
+  ggml_backend_tensor_get(out, values, 0, sizeof(values));
+  ggml_backend_tensor_get(gradient, grads, 0, sizeof(grads));
+  REQUIRE(values[0] == 0);
+  REQUIRE(values[1] == 0); // <= must include equality
+  REQUIRE(grads[0] == 0);
+  REQUIRE(grads[1] == 0);
+  REQUIRE(std::abs(values[2] - 0.26894142f) < 1e-6f);
+  REQUIRE(std::abs(values[3] - 0.73105858f) < 1e-6f);
+  const float sum_squares = values[2] * values[2] + values[3] * values[3];
+  for (int i = 2; i < 4; ++i)
+    REQUIRE(std::abs(grads[i] - 2 * values[i] * (values[i] - sum_squares)) <
+            1e-6f);
+  ggml_backend_buffer_free(buffer);
+  ggml_backend_free(cpu);
   ggml_free(ctx);
 }

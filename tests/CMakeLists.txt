@@ -203,3 +203,8 @@ target_compile_definitions(test_backend_selection
 )
 
 catch_discover_tests(test_backend_selection)
+
+add_executable(test_coulomb test_coulomb.cpp)
+target_link_libraries(test_coulomb PRIVATE mlipcpp ggml Catch2::Catch2WithMain nlohmann_json::nlohmann_json)
+target_include_directories(test_coulomb PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+catch_discover_tests(test_coulomb)

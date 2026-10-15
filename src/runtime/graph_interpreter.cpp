@@ -6,14 +6,37 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <iostream>
 #include <iomanip>
+#include <iostream>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace mlipcpp::runtime {
 
 namespace {
+
+// Fused attention kernels do not differentiate their bias. A cutoff-derived
+// bias must stay on the ordinary ADD/softmax path when forces are requested.
+bool depends_on_parameter(const ggml_tensor *root) {
+  std::vector<const ggml_tensor *> pending{root};
+  std::unordered_set<const ggml_tensor *> seen;
+  while (!pending.empty()) {
+    const auto *t = pending.back();
+    pending.pop_back();
+    if (!t || !seen.insert(t).second || t->type == GGML_TYPE_I32)
+      continue;
+    if (t->flags & GGML_TENSOR_FLAG_PARAM)
+      return true;
+    if (t->op == GGML_OP_UNARY && (ggml_get_unary_op(t) == GGML_UNARY_OP_STEP ||
+                                   ggml_get_unary_op(t) == GGML_UNARY_OP_SGN))
+      continue;
+    for (auto *src : t->src)
+      if (src)
+        pending.push_back(src);
+  }
+  return false;
+}
 
 // Parse a reference string like "node:5", "input:name", "weight:name", "const:value"
 struct RefParsed {
@@ -387,6 +410,39 @@ ggml_tensor *GraphInterpreter::build_node(ggml_context *ctx,
     return build_index(ctx, node);
   } else if (node.op == "INDEX_PUT") {
     return build_index_put(ctx, node);
+  } else if (node.op == "LE" || node.op == "GE") {
+    if (node.inputs.empty())
+      throw std::runtime_error("Comparison requires an input");
+    auto *a = resolve_input(ctx, node.inputs[0]);
+    ggml_tensor *b;
+    if (node.inputs.size() > 1) {
+      b = resolve_input(ctx, node.inputs[1]);
+    } else {
+      b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+      ggml_set_input(b);
+      pending_constants_.push_back(
+          {b, float(get_param<double>(node, "scalar", 0.0))});
+    }
+    auto *difference = ggml_sub(ctx, a, b);
+    if (node.op == "GE")
+      difference = ggml_neg(ctx, difference);
+    // STEP(x) is 1 iff x > 0, with zero derivative. Include equality.
+    return ggml_scale_bias(ctx, ggml_step(ctx, difference), -1.0f, 1.0f);
+  } else if (node.op == "MASKED_FILL") {
+    if (node.inputs.size() != 2)
+      throw std::runtime_error("MASKED_FILL requires source and mask");
+    auto *source = resolve_input(ctx, node.inputs[0]);
+    auto *mask = resolve_input(ctx, node.inputs[1]);
+    auto *keep = ggml_scale_bias(ctx, mask, -1.0f, 1.0f);
+    auto *kept = ggml_mul(ctx, source, keep);
+    if (get_param<std::string>(node, "fill", "") == "-inf") {
+      // Avoid 0*(-inf), which would turn every unmasked element into NaN.
+      // PET's source is log(clamp(cutoff)), hence finite. The comparison mask
+      // is nondifferentiable, so log(0) has no backward path.
+      return ggml_add(ctx, kept, ggml_log(ctx, keep));
+    }
+    const float value = get_param<double>(node, "value", 0.0);
+    return ggml_add(ctx, kept, ggml_scale(ctx, mask, value));
   } else if (node.op == "WHERE") {
     return build_where(ctx, node);
   } else if (node.op == "COS") {
@@ -624,6 +680,8 @@ ggml_tensor *GraphInterpreter::build_fused_attention(ggml_context *ctx, const GI
   ggml_tensor *q = resolve_input(ctx, qk->inputs[0]); // [d, L, H, N]
   ggml_tensor *xt = resolve_input(ctx, "node:" + std::to_string(x->id));
   ggml_tensor *bias = resolve_input(ctx, add->inputs[1]);
+  if (depends_on_parameter(bias))
+    return nullptr;
   const int64_t d = q->ne[0], L = q->ne[1], H = q->ne[2], N = q->ne[3];
   if ((d != 8 && d != 16 && d != 32 && d != 64) || xt->ne[0] != H * d || xt->ne[1] != 3 ||
       xt->ne[2] != L || xt->ne[3] != N || bias->ne[0] != L || bias->ne[1] != L || bias->ne[2] != 1 ||
@@ -1218,9 +1276,11 @@ ggml_tensor *GraphInterpreter::build_softmax(ggml_context *ctx,
   };
   if (fuse && !mask && a->op == GGML_OP_ADD && a->src[0]->op == GGML_OP_SCALE && param(a->src[0], 1) == 0.0f) {
     ggml_tensor *x = a->src[0]->src[0], *bias = a->src[1];
-    if (x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && bias->type == GGML_TYPE_F32 &&
-        ggml_is_contiguous(bias) && bias->ne[0] == x->ne[0] && bias->ne[1] == x->ne[1] &&
-        x->ne[2] % bias->ne[2] == 0 && x->ne[3] % bias->ne[3] == 0)
+    if (!depends_on_parameter(bias) && x->type == GGML_TYPE_F32 &&
+        ggml_is_contiguous(x) && bias->type == GGML_TYPE_F32 &&
+        ggml_is_contiguous(bias) && bias->ne[0] == x->ne[0] &&
+        bias->ne[1] == x->ne[1] && x->ne[2] % bias->ne[2] == 0 &&
+        x->ne[3] % bias->ne[3] == 0)
       return ggml_soft_max_ext(ctx, x, bias, scale * param(a->src[0], 0), 0.0f);
   }
   return ggml_soft_max_ext(ctx, a, mask, scale, 0.0f);

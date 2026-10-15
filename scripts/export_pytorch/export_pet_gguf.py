@@ -293,6 +293,13 @@ def example_export_args(n_atoms: int, max_neighbors: int, cutoff: float, forces:
     return example_inputs, input_names, dynamic_shapes
 
 
+def add_coulomb_input(inputs, names, shapes, n_atoms):
+    """Append the geometry kernel; both axes share the atom dimension."""
+    atom_dim = shapes[0][0]
+    return (inputs + (torch.eye(n_atoms),), names + ["coulomb_matrix"],
+            shapes[:3] + (shapes[3] + ({0: atom_dim, 1: atom_dim},),))
+
+
 def metatrain_baselines(model):
     """Fitted composition (Z -> eV), energy scale and per-species
     non-conservative force scales of a metatrain >= 2026.5 PET (outer model,
@@ -343,6 +350,10 @@ def main():
         "--max-neighbors", type=int, default=11,
         help="Example max-neighbors count used for tracing",
     )
+    parser.add_argument(
+        "--long-range-solver", choices=["direct-ewald"], default=None,
+        help="Required for PET-LR: explicitly select the dense reference solver (periodic results differ from upstream P3M)",
+    )
     args = parser.parse_args()
 
     n_atoms = args.n_atoms
@@ -371,9 +382,17 @@ def main():
         cutoff_function=cutoff_function, nc_forces=args.nc_forces,
     )
     wrapper.eval()
+    if wrapper.long_range and args.long_range_solver is None:
+        parser.error("PET-LR requires --long-range-solver direct-ewald; this is a small-system reference solver, not P3M")
+    if not wrapper.long_range and args.long_range_solver is not None:
+        parser.error("--long-range-solver requires a checkpoint trained with long_range.enable=true")
 
     example_inputs, input_names, dynamic_shapes = example_export_args(
         n_atoms, max_neighbors, cutoff, forces=not args.no_forces)
+
+    if wrapper.long_range:
+        example_inputs, input_names, dynamic_shapes = add_coulomb_input(
+            example_inputs, input_names, dynamic_shapes, n_atoms)
 
     # Export via torch.export
     print("\nExporting graph via torch.export...")
@@ -440,6 +459,11 @@ def main():
     writer.add_string("pet.cutoff_function", cutoff_function)
     writer.add_int32("pet.forces_mode", 1 if not args.no_forces else 0)
     writer.add_int32("pet.nc_forces", 1 if args.nc_forces else 0)
+    if wrapper.long_range:
+        calculator = pet.long_range_featurizer.ewald_calculator
+        writer.add_string("pet.long_range.solver", "direct-ewald")
+        writer.add_float32("pet.long_range.smearing", float(calculator.potential.smearing))
+        writer.add_float32("pet.long_range.wavelength", float(calculator.lr_wavelength))
     if nc_force_scales:
         writer.add_array_int32("pet.nc_force_scale_keys", list(nc_force_scales))
         writer.add_array_float32("pet.nc_force_scale_values", list(nc_force_scales.values()))

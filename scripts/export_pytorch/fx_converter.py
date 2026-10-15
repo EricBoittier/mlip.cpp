@@ -6,6 +6,7 @@ Supports two export modes:
 """
 
 import json
+import math
 import operator
 import re
 from collections import defaultdict, deque
@@ -1315,6 +1316,15 @@ def convert_exported_to_gir(
                             input_refs.append(ref)
                     elif isinstance(node.args[2], (int, float)):
                         params["y_scalar"] = float(node.args[2])
+
+            elif ggml_op == "MASKED_FILL":
+                value = float(node.args[2])
+                if value == -math.inf:
+                    params["fill"] = "-inf"
+                elif math.isfinite(value):
+                    params["value"] = value
+                else:
+                    raise NotImplementedError("MASKED_FILL supports finite values and -inf")
 
             elif ggml_op in ("GE", "LE"):
                 # Comparison op: tensor >= scalar / tensor <= scalar
