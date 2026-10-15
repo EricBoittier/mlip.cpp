@@ -81,6 +81,9 @@ public:
   void zero_grads();
   std::vector<float> get_grads() const; // flat, in parameter order
   ggml_tensor *grad_flat() const { return acc_flat_; }
+  /// offset (in floats) of parameter k's gradient in grad_flat: Muon
+  /// matrices of one shape are adjacent, so not parameter order
+  size_t grad_offset(size_t k) const { return grad_off_[k]; }
 
   void set_params(const std::vector<float> &flat);
   /// The whole weight buffer as one byte tensor (for one-copy broadcasts).
@@ -158,6 +161,7 @@ private:
   ggml_context *acc_ctx_ = nullptr;
   ggml_backend_buffer_t acc_buf_ = nullptr;
   ggml_tensor *acc_flat_ = nullptr;
+  std::vector<size_t> grad_off_; // per parameter, in grad_flat
   std::map<ggml_tensor *, ggml_tensor *> acc_; // parameter -> its view
 };
 
@@ -182,6 +186,10 @@ public:
   /// before clipping). Updated weights go to the other workers as one copy
   /// of the weight buffer when the layouts match.
   double step(double lr);
+  /// Profiling only (steps the parameters): mean wall time of `reps` whole
+  /// steps, then the step graph node by node (synchronised), by op.
+  double profile(int reps, std::map<std::string, Worker::OpStats> &ops);
+  std::vector<std::string> muon_groups; // "ne0 x ne1 x count" per orthogonalised group
 
 private:
   std::vector<std::unique_ptr<Worker>> &workers_;
@@ -194,7 +202,12 @@ private:
   std::vector<char> staged_;   // per worker: gradients already on device 0
   bool blob_broadcast_ = false; // weight buffers laid out identically
   double muon_lr_scale_ = 1.0;
+  ggml_tensor *muon_pars_ = nullptr; // per Muon group (lr, wd)
+  std::vector<float> muon_rms_;      // per Muon group, the update RMS factor
   int64_t t_ = 0;
+
+public:
+  bool graph_captured_ = false; // the step graph runs as a CUDA graph
 
 public:
   size_t n_muon_tensors = 0;

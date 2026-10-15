@@ -1,0 +1,56 @@
+diff --git a/src/ggml-cuda/common.cuh b/src/ggml-cuda/common.cuh
+index c0f1a7d..2f85795 100644
+--- a/src/ggml-cuda/common.cuh
++++ b/src/ggml-cuda/common.cuh
+@@ -1174,6 +1174,7 @@ struct ggml_cuda_graph {
+     std::vector<cudaGraphNode_t> nodes;
+     bool disable_due_to_gpu_arch = false;
+     bool warmup_complete = false;
++    bool allowed = false; // ggml_backend_cuda_graph_allow: captured even with GGML_CUDA_DISABLE_GRAPHS
+     struct node_properties {
+         ggml_tensor node;
+         void * node_src_data_ptrs[GGML_MAX_SRC];
+@@ -1182,7 +1183,7 @@ struct ggml_cuda_graph {
+ 
+     bool is_enabled() const {
+         static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
+-        return !(disable_due_to_gpu_arch || disable_cuda_graphs_due_to_env);
++        return !(disable_due_to_gpu_arch || (disable_cuda_graphs_due_to_env && !allowed));
+     }
+ #endif
+ };
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index 543b967..46ff61b 100644
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -5144,6 +5144,20 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t
+     GGML_UNUSED(reg);
+ }
+ 
++// a static graph that is computed again and again (an optimizer step): CUDA
++// graph capture for the cgraph whose first node is `first_node`, even when
++// GGML_CUDA_DISABLE_GRAPHS turns capture off for every other graph (looked
++// up with ggml_backend_reg_get_proc_address, no ggml-cuda.h dependency)
++static void ggml_backend_cuda_graph_allow(ggml_backend_t backend, const void * first_node) {
++#ifdef USE_CUDA_GRAPH
++    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
++    cuda_ctx->cuda_graph(first_node)->allowed = true;
++#else
++    GGML_UNUSED(backend);
++    GGML_UNUSED(first_node);
++#endif
++}
++
+ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+     GGML_UNUSED(reg);
+     if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {
+@@ -5158,6 +5172,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+     if (strcmp(name, "ggml_backend_get_features") == 0) {
+         return (void *)ggml_backend_cuda_get_features;
+     }
++    if (strcmp(name, "ggml_backend_cuda_graph_allow") == 0) {
++        return (void *)ggml_backend_cuda_graph_allow;
++    }
+     return nullptr;
+ }
+ 

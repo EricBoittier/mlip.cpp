@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <fmt/core.h>
 #include <fmt/format.h>
+#include <fmt/ranges.h>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -264,6 +265,28 @@ int main(int argc, char **argv) {
     for (const Batch &mb : mbs) // the profiled shapes
       fmt::print("  micro-batch {} atoms x {} neighbours, {} systems\n", mb.n_atoms, mb.max_neighbors, mb.n_systems);
     worker.profile = false;
+
+    // the optimizer step (Adam, then Muon with 5 NS steps) on one more worker
+    // of the same model: wall time per step, then node by node by op
+    for (bool muon : {false, true}) {
+      std::vector<std::unique_ptr<Worker>> one;
+      one.push_back(std::make_unique<Worker>(init, gpus > 0 ? 0 : -1));
+      Optimizer opt(one, 1.0, muon, 0.95, 10.0, 5);
+      std::map<std::string, Worker::OpStats> ops;
+      const double ms = opt.profile(20, ops);
+      double total = 0;
+      int64_t nodes = 0;
+      std::vector<std::pair<double, std::string>> r;
+      for (auto &[op, v] : ops) r.push_back({v.ms, op}), total += v.ms, nodes += v.count;
+      std::sort(r.rbegin(), r.rend());
+      fmt::print("optimizer step ({}): {:.2f} ms per step; {} nodes, {:.2f} ms node by node{}\n", muon ? "muon" : "adam", ms,
+                 nodes, total, muon ? fmt::format("; groups {}", fmt::join(opt.muon_groups, " ")) : std::string());
+      for (size_t k = 0; k < std::min<size_t>(r.size(), 12); k++) {
+        const auto &v = ops[r[k].second];
+        fmt::print("  {:>8.2f} ms  {:<16} x{:<5} {:>8.2f} GFLOP {:>8.3f} GB\n", v.ms, r[k].second, v.count, v.flops / 1e9,
+                   v.bytes / 1e9);
+      }
+    }
   }
 
   std::filesystem::create_directories(out);

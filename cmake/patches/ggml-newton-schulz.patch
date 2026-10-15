@@ -1,0 +1,321 @@
+diff --git a/include/ggml.h b/include/ggml.h
+index 24a3470..18944e5 100644
+--- a/include/ggml.h
++++ b/include/ggml.h
+@@ -579,6 +579,7 @@ extern "C" {
+ 
+         GGML_OP_PET_ATTN,
+         GGML_OP_PET_ATTN_BACK,
++        GGML_OP_NEWTON_SCHULZ,
+ 
+         GGML_OP_COUNT,
+     };
+@@ -1781,6 +1782,18 @@ extern "C" {
+             int                   n_head,
+             float                 scale);
+ 
++    // Muon's quintic Newton-Schulz iteration on each matrix x[:, :, i]
++    // (F32, contiguous, ne[3] == 1): x / (|x|_F + 1e-7), then `steps` times
++    //   X = a X + (b A + c A^2) X,  A = X X^T over the shorter side
++    // result: same shape, approximately U V^T of each x = U S V^T (no backward)
++    GGML_API struct ggml_tensor * ggml_newton_schulz(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * x,
++            int                   steps,
++            float                 a,
++            float                 b,
++            float                 c);
++
+     // rotary position embedding
+     // if (mode & 1) - skip n_past elements (NOT SUPPORTED)
+     // if (mode & GGML_ROPE_TYPE_NEOX) - GPT-NeoX style
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index 6b07f8b..a490e2d 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -1882,6 +1882,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_pet_attn_back(params, tensor);
+             } break;
++        case GGML_OP_NEWTON_SCHULZ:
++            {
++                ggml_compute_forward_newton_schulz(params, tensor);
++            } break;
+         case GGML_OP_ROPE:
+             {
+                 ggml_compute_forward_rope(params, tensor);
+@@ -2323,6 +2327,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+         case GGML_OP_SOFT_MAX_BACK:
+         case GGML_OP_PET_ATTN:
+         case GGML_OP_PET_ATTN_BACK:
++        case GGML_OP_NEWTON_SCHULZ:
+         case GGML_OP_ROPE:
+         case GGML_OP_ROPE_BACK:
+         case GGML_OP_ADD_REL_POS:
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+index abcd370..cbb292a 100644
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -11305,3 +11305,50 @@ void ggml_compute_forward_pet_attn_back(const ggml_compute_params * params, ggml
+         }
+     }
+ }
++
++// ggml_compute_forward_newton_schulz: reference implementation (thread 0),
++// same algebra as the CUDA kernel (column-major M = X^T, Gram over the
++// shorter side, B = c G^2 + b G + a I folded into one product)
++
++void ggml_compute_forward_newton_schulz(const ggml_compute_params * params, ggml_tensor * dst) {
++    if (params->ith != 0) return;
++    const ggml_tensor * src = dst->src[0];
++    const int     steps = ggml_get_op_params_i32(dst, 0);
++    const float   a = ggml_get_op_params_f32(dst, 1), b = ggml_get_op_params_f32(dst, 2), c = ggml_get_op_params_f32(dst, 3);
++    const int64_t ne0 = src->ne[0], ne1 = src->ne[1], k = src->ne[2];
++    const bool    wide = ne1 <= ne0;
++    const int64_t n = wide ? ne1 : ne0;
++    std::vector<float> G(n * n), B(n * n), Y(ne0 * ne1);
++    for (int64_t m = 0; m < k; m++) {
++        const float * s = (const float *) src->data + m * ne0 * ne1;
++        float * X = (float *) dst->data + m * ne0 * ne1;
++        double ss = 0;
++        for (int64_t i = 0; i < ne0 * ne1; i++) ss += (double) s[i] * s[i];
++        const float inv = 1.0f / ((float) sqrt(ss) + 1e-7f);
++        for (int64_t i = 0; i < ne0 * ne1; i++) X[i] = s[i] * inv;
++        auto x = [&](int64_t r, int64_t col) -> float & { return X[col * ne0 + r]; }; // M(r, col), r < ne0, col < ne1
++        for (int it = 0; it < steps; it++) {
++            for (int64_t i = 0; i < n; i++)
++                for (int64_t j = 0; j < n; j++) {
++                    double acc = 0;
++                    if (wide) for (int64_t r = 0; r < ne0; r++) acc += (double) x(r, i) * x(r, j); // (M^T M)(i, j)
++                    else      for (int64_t q = 0; q < ne1; q++) acc += (double) x(i, q) * x(j, q); // (M M^T)(i, j)
++                    G[j * n + i] = (float) acc;
++                }
++            for (int64_t i = 0; i < n; i++)
++                for (int64_t j = 0; j < n; j++) {
++                    double acc = 0;
++                    for (int64_t q = 0; q < n; q++) acc += (double) G[q * n + i] * G[j * n + q];
++                    B[j * n + i] = (float) (c * acc + b * G[j * n + i] + (i == j ? a : 0.0f));
++                }
++            for (int64_t r = 0; r < ne0; r++)
++                for (int64_t col = 0; col < ne1; col++) {
++                    double acc = 0;
++                    if (wide) for (int64_t q = 0; q < n; q++) acc += (double) x(r, q) * B[col * n + q]; // (M B)(r, col)
++                    else      for (int64_t q = 0; q < n; q++) acc += (double) B[q * n + r] * x(q, col); // (B M)(r, col)
++                    Y[col * ne0 + r] = (float) acc;
++                }
++            std::copy(Y.begin(), Y.end(), X);
++        }
++    }
++}
+diff --git a/src/ggml-cpu/ops.h b/src/ggml-cpu/ops.h
+index ca15fb0..a6caf47 100644
+--- a/src/ggml-cpu/ops.h
++++ b/src/ggml-cpu/ops.h
+@@ -62,6 +62,7 @@ void ggml_compute_forward_soft_max(const struct ggml_compute_params * params, st
+ void ggml_compute_forward_soft_max_ext_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_pet_attn(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_pet_attn_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_newton_schulz(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_rope(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_rope_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_clamp(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index c9e8c57..543b967 100644
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -35,6 +35,7 @@
+ #include "ggml-cuda/out-prod.cuh"
+ #include "ggml-cuda/pad.cuh"
+ #include "ggml-cuda/pet-attn.cuh"
++#include "ggml-cuda/newton-schulz.cuh"
+ #include "ggml-cuda/pool2d.cuh"
+ #include "ggml-cuda/quantize.cuh"
+ #include "ggml-cuda/rope.cuh"
+@@ -2731,6 +2732,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+         case GGML_OP_PET_ATTN_BACK:
+             ggml_cuda_op_pet_attn_back(ctx, dst);
+             break;
++        case GGML_OP_NEWTON_SCHULZ:
++            ggml_cuda_op_newton_schulz(ctx, dst);
++            break;
+         case GGML_OP_ROPE:
+             ggml_cuda_op_rope(ctx, dst);
+             break;
+@@ -4911,6 +4915,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+         case GGML_OP_PET_ATTN:
+         case GGML_OP_PET_ATTN_BACK:
+             return ggml_cuda_pet_attn_supported(op);
++        case GGML_OP_NEWTON_SCHULZ:
++            return ggml_cuda_newton_schulz_supported(op);
+         case GGML_OP_ROLL:
+             if(op->src[0]->type == GGML_TYPE_F32) {
+                 return true;
+diff --git a/src/ggml-cuda/newton-schulz.cu b/src/ggml-cuda/newton-schulz.cu
+new file mode 100644
+index 0000000..da6334c
+--- /dev/null
++++ b/src/ggml-cuda/newton-schulz.cu
+@@ -0,0 +1,92 @@
++#include "newton-schulz.cuh"
++
++#include <cstdlib>
++
++// dst = src / (|src|_F + 1e-7), one block per matrix
++static __global__ void k_ns_normalize(const float * src, float * dst, const int64_t n) {
++    const float * s = src + blockIdx.x * n;
++    float       * d = dst + blockIdx.x * n;
++    float acc = 0.0f;
++    for (int64_t i = threadIdx.x; i < n; i += blockDim.x) acc += s[i] * s[i];
++    __shared__ float part[32];
++    acc = warp_reduce_sum(acc);
++    if (threadIdx.x % WARP_SIZE == 0) part[threadIdx.x / WARP_SIZE] = acc;
++    __syncthreads();
++    if (threadIdx.x < WARP_SIZE) {
++        acc = threadIdx.x < blockDim.x / WARP_SIZE ? part[threadIdx.x] : 0.0f;
++        acc = warp_reduce_sum(acc);
++        if (threadIdx.x == 0) part[0] = acc;
++    }
++    __syncthreads();
++    const float inv = 1.0f / (sqrtf(part[0]) + 1e-7f);
++    for (int64_t i = threadIdx.x; i < n; i += blockDim.x) d[i] = s[i] * inv;
++}
++
++// B[:, :, i] += a I (n x n matrices)
++static __global__ void k_ns_add_diag(float * B, const int n, const int k, const float a) {
++    const int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x;
++    if (i >= (int64_t) n * k) return;
++    const int64_t m = i / n, j = i % n;
++    B[m * n * n + j * n + j] += a;
++}
++
++bool ggml_cuda_newton_schulz_supported(const ggml_tensor * op) {
++    const ggml_tensor * x = op->src[0];
++    return x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && x->ne[3] == 1;
++}
++
++// Quintic Newton-Schulz on each x[:, :, i] (ggml ne0 x ne1 = PyTorch rows ne1,
++// cols ne0; column-major M = X^T with leading dimension ne0). Gram over the
++// shorter side, and the update folded into one GEMM:
++//   wide (ne1 <= ne0): G = M^T M, B = c G^2 + b G + a I, M' = M B
++//   tall (ne1 >  ne0): G = M M^T, B = c G^2 + b G + a I, M' = B M
++// GEMMs are batched over the k matrices; TF32 by default, bf16 tensor cores
++// with GGML_NS_BF16=1, full FP32 with GGML_CUDA_NO_TF32=1.
++void ggml_cuda_op_newton_schulz(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * src = dst->src[0];
++    const int     steps = ggml_get_op_params_i32(dst, 0);
++    const float   a = ggml_get_op_params_f32(dst, 1), b = ggml_get_op_params_f32(dst, 2), c = ggml_get_op_params_f32(dst, 3);
++    const int64_t ne0 = src->ne[0], ne1 = src->ne[1], k = src->ne[2];
++    const bool    wide = ne1 <= ne0;
++    const int64_t n = wide ? ne1 : ne0; // Gram size
++
++    cudaStream_t   stream = ctx.stream();
++    cublasHandle_t handle = ctx.cublas_handle();
++    CUBLAS_CHECK(cublasSetStream(handle, stream));
++
++    static const cublasComputeType_t compute =
++        getenv("GGML_NS_BF16") ? CUBLAS_COMPUTE_32F_FAST_16BF :
++        getenv("GGML_CUDA_NO_TF32") ? CUBLAS_COMPUTE_32F : CUBLAS_COMPUTE_32F_FAST_TF32;
++
++    ggml_cuda_pool_alloc<float> G(ctx.pool(), n * n * k), B(ctx.pool(), n * n * k), Y(ctx.pool(), ne0 * ne1 * k);
++    float * X   = (float *) dst->data;
++    float * Xn  = Y.get();
++    k_ns_normalize<<<k, 256, 0, stream>>>((const float *) src->data, X, ne0 * ne1);
++
++    const float one = 1.0f, zero = 0.0f;
++    const long long sX = ne0 * ne1, sG = n * n;
++    for (int it = 0; it < steps; it++) {
++        if (wide) {
++            CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, n, n, ne0, &one,
++                X, CUDA_R_32F, ne0, sX, X, CUDA_R_32F, ne0, sX, &zero, G.get(), CUDA_R_32F, n, sG, k, compute, CUBLAS_GEMM_DEFAULT));
++        } else {
++            CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, CUBLAS_OP_N, CUBLAS_OP_T, n, n, ne1, &one,
++                X, CUDA_R_32F, ne0, sX, X, CUDA_R_32F, ne0, sX, &zero, G.get(), CUDA_R_32F, n, sG, k, compute, CUBLAS_GEMM_DEFAULT));
++        }
++        CUDA_CHECK(cudaMemcpyAsync(B.get(), G.get(), n * n * k * sizeof(float), cudaMemcpyDeviceToDevice, stream));
++        CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, &c,
++            G.get(), CUDA_R_32F, n, sG, G.get(), CUDA_R_32F, n, sG, &b, B.get(), CUDA_R_32F, n, sG, k, compute, CUBLAS_GEMM_DEFAULT));
++        k_ns_add_diag<<<(n * k + 255) / 256, 256, 0, stream>>>(B.get(), n, k, a);
++        if (wide) {
++            CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, ne0, ne1, ne1, &one,
++                X, CUDA_R_32F, ne0, sX, B.get(), CUDA_R_32F, n, sG, &zero, Xn, CUDA_R_32F, ne0, sX, k, compute, CUBLAS_GEMM_DEFAULT));
++        } else {
++            CUBLAS_CHECK(cublasGemmStridedBatchedEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, ne0, ne1, ne0, &one,
++                B.get(), CUDA_R_32F, n, sG, X, CUDA_R_32F, ne0, sX, &zero, Xn, CUDA_R_32F, ne0, sX, k, compute, CUBLAS_GEMM_DEFAULT));
++        }
++        std::swap(X, Xn);
++    }
++    if (X != (float *) dst->data) {
++        CUDA_CHECK(cudaMemcpyAsync(dst->data, X, ne0 * ne1 * k * sizeof(float), cudaMemcpyDeviceToDevice, stream));
++    }
++}
+diff --git a/src/ggml-cuda/newton-schulz.cuh b/src/ggml-cuda/newton-schulz.cuh
+new file mode 100644
+index 0000000..731b71d
+--- /dev/null
++++ b/src/ggml-cuda/newton-schulz.cuh
+@@ -0,0 +1,5 @@
++#include "common.cuh"
++
++// Muon's Newton-Schulz orthogonalisation (GGML_OP_NEWTON_SCHULZ): see ggml_newton_schulz
++bool ggml_cuda_newton_schulz_supported(const ggml_tensor * op);
++void ggml_cuda_op_newton_schulz(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+diff --git a/src/ggml.c b/src/ggml.c
+index e37dcec..3475497 100644
+--- a/src/ggml.c
++++ b/src/ggml.c
+@@ -1066,9 +1066,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+ 
+     "PET_ATTN",
+     "PET_ATTN_BACK",
++    "NEWTON_SCHULZ",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
++static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1179,9 +1180,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+ 
+     "pet_attn(qkv,bias)",
+     "pet_attn_back(qkv,bias,o,do)",
++    "newton_schulz(x)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
++static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -4119,6 +4121,31 @@ struct ggml_tensor * ggml_pet_attn_back(
+     return dqkv;
+ }
+ 
++// ggml_newton_schulz
++
++struct ggml_tensor * ggml_newton_schulz(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * x,
++        int                   steps,
++        float                 a,
++        float                 b,
++        float                 c) {
++    GGML_ASSERT(x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && x->ne[3] == 1 && steps >= 0);
++
++    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, x->ne);
++
++    int32_t params[4] = { steps, 0, 0, 0 };
++    memcpy(params + 1, &a, sizeof(float));
++    memcpy(params + 2, &b, sizeof(float));
++    memcpy(params + 3, &c, sizeof(float));
++    ggml_set_op_params(result, params, sizeof(params));
++
++    result->op     = GGML_OP_NEWTON_SCHULZ;
++    result->src[0] = x;
++
++    return result;
++}
++
+ // ggml_soft_max_ext_back
+ 
+ static struct ggml_tensor * ggml_soft_max_ext_back_impl(
