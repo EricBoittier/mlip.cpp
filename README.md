@@ -111,41 +111,48 @@ PET checkpoints trained with `long_range.enable: true` can be exported with:
 
 ```bash
 python scripts/export_pytorch/export_pet_gguf.py \
-  --model pet-lr.ckpt --long-range-solver direct-ewald -o pet-lr.gguf
+  --model pet-lr.ckpt --long-range-solver p3m -o pet-lr.gguf
 ./build/bin/graph_inference pet-lr.gguf structure.xyz --forces --stress
 ```
 
-The exporter preserves the learned charge channels and long-range projection,
-including the normalization before each PET node readout. The C++ runtime computes
-an excluded Coulomb matrix and its analytic position/strain derivatives; ggml
-propagates charge gradients through the PET backbone. No torch-pme dependency is
-needed at inference time. Exporting requires the checkpoint's Python dependencies.
+The P3M path applies the excluded Coulomb potential directly to the learned charge
+channels, without allocating an N-by-N matrix or imposing the reference solver's
+512-atom limit. It uses a portable CPU FFT, fifth-order charge assignment, and
+torch-pme's potential influence function, self term, and neutralizing background.
+Both residual and feedforward PET support energies, conservative forces, and
+periodic stress, including gradients through the learned charges and mesh weights.
+No torch-pme dependency is needed at inference time.
 
-This is a **small-system reference implementation**, with a dense N-by-N matrix:
+For fully periodic systems, electrostatics costs `O(C * (N + M log M))` at fixed
+neighbor density, with `C` charge channels and `M` mesh points; working storage is
+`O(N*C + M)`. Mesh dimensions follow torch-pme's power-of-two rule using the
+checkpoint's `kspace_resolution`. Triclinic cells are supported. This initial CPU
+implementation processes channels sequentially and recomputes the PET graph to
+propagate charge gradients. It guards allocations at 8 million mesh points and
+1024 points per axis. These are mesh resource limits, not atom-count limits.
 
-- Nonperiodic systems use all pairs with the same cosine exclusion as torch-pme.
-- Fully periodic systems use direct Ewald, including self and neutralizing-background
-  corrections. This matches metatrain's Ewald training path, **not its P3M inference
-  approximation**; compare predictions before using an existing checkpoint.
-- Both residual and feedforward PET support energies, conservative forces, and
-  periodic stress. Use fixed cutoffs; adaptive cutoffs, partial periodicity,
-  non-conservative force heads, and C++ training are not supported for PET-LR.
-- The reference solver limits systems to 512 atoms and periodic work to
-  `N*N*number_of_k_vectors <= 100,000,000`. It builds geometry on the CPU and
-  is not intended as a scalable mesh solver. The GGUF exporter requires an explicit
-  solver flag so a periodic solver change is never silently selected.
+Nonperiodic systems use direct excluded Coulomb interactions with linear storage
+but quadratic work. Fixed cutoffs and `interpolation_nodes: 5` are required;
+adaptive cutoffs, partial periodicity, non-conservative force heads, and C++
+training are not supported for PET-LR. Exporting requires the checkpoint's Python
+dependencies. The existing `--long-range-solver direct-ewald` option remains a
+small-system reference (maximum 512 atoms and `N*N*number_of_k_vectors <= 100,000,000`).
+Its periodic results follow Ewald rather than P3M. Re-export an existing checkpoint
+with `--long-range-solver p3m` to select the mesh path explicitly.
 
-Validation against metatrain and torch-pme (including both PET featurizers,
-isolated atoms, distant pairs, triclinic cells, and periodic images):
+Validation against metatrain and torch-pme includes both PET featurizers, isolated
+atoms, distant pairs, triclinic cells, periodic images, and a 729-atom periodic cell:
 
 ```bash
-python tests/generate_pet_lr_reference.py /tmp/pet-lr-reference
-MLIPCPP_PET_LR_REFERENCE=/tmp/pet-lr-reference/reference.json \
+python tests/generate_pet_lr_reference.py /tmp/pet-p3m-reference --solver p3m
+MLIPCPP_PET_LR_REFERENCE=/tmp/pet-p3m-reference/reference.json \
   ./build/tests/test_coulomb
 ```
 
-Build with `-DMLIPCPP_BUILD_TESTS=ON`. The same test executable also checks analytic
-Coulomb force and stress derivatives against finite differences without Python.
+Build with `-DMLIPCPP_BUILD_TESTS=ON`. Without Python, the test executable still
+checks analytic charge, force, and stress derivatives against finite differences
+and exercises the mesh solver above 512 atoms. Use `--solver direct-ewald` to
+regenerate the dense reference fixtures.
 
 ## API
 

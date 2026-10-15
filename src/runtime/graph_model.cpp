@@ -1,5 +1,6 @@
 #include "graph_model.h"
 #include "core/gguf_loader.h"
+#include "core/p3m.h"
 
 #include <nlohmann/json.hpp>
 
@@ -379,11 +380,16 @@ bool GraphModel::load_from_gguf(const std::string &path) {
   adaptive_cutoff_method_ = loader.get_string("pet.adaptive_cutoff_method", "grid");
 
   const auto lr_solver = loader.get_string("pet.long_range.solver", "");
-  if (!lr_solver.empty() && lr_solver != "direct-ewald") {
+  if (!lr_solver.empty() && lr_solver != "direct-ewald" && lr_solver != "p3m") {
     ggml_free(temp_ctx);
     throw std::runtime_error("Unsupported PET-LR solver: " + lr_solver);
   }
   long_range_ = !lr_solver.empty();
+  p3m_ = lr_solver == "p3m";
+  if (p3m_ && loader.get_int32("pet.long_range.interpolation_nodes", 5) != 5) {
+    ggml_free(temp_ctx);
+    throw std::runtime_error("P3M currently requires interpolation_nodes=5");
+  }
   if (long_range_ && (num_neighbors_adaptive_ > 0 || nc_forces_)) {
     ggml_free(temp_ctx);
     throw std::runtime_error(
@@ -573,9 +579,10 @@ ModelResult GraphModel::predict_single(
   const int32_t *atomic_numbers = system.atomic_numbers();
 
   // Build neighbor list at the global model cutoff (the search radius).
-  // Validate LR geometry/work limits before allocating ggml buffers.
-  // Build the LR matrix from the full, unfiltered neighbor list.
-  if (long_range_ && (n_atoms < 1 || n_atoms > 512))
+  // Validate LR geometry before building the full, unfiltered neighbor list.
+  if (long_range_ && n_atoms < 1)
+    throw std::runtime_error("PET-LR requires at least one atom");
+  if (long_range_ && !p3m_ && n_atoms > 512)
     throw std::runtime_error(
         "PET-LR dense reference solver supports 1..512 atoms");
   if (long_range_ && system.cell()) {
@@ -604,7 +611,7 @@ ModelResult GraphModel::predict_single(
   }
   NeighborList nlist = neighbor_builder_.build(system);
   CoulombResult coulomb;
-  if (long_range_)
+  if (long_range_ && !p3m_)
     coulomb = coulomb_matrix(system, nlist, coulomb_parameters_);
 
   // Per-pair cutoffs: default to global cutoff. When the graph itself does
@@ -686,6 +693,8 @@ ModelResult GraphModel::predict_single(
 
   // --- Create input context ---
   ggml_context *input_ctx = ggml_init({INPUT_CTX_SIZE, nullptr, true});
+  std::unique_ptr<ggml_context, decltype(&ggml_free)> input_owner(input_ctx,
+                                                                  ggml_free);
   if (!input_ctx) {
     throw std::runtime_error("Failed to create input context");
   }
@@ -711,7 +720,7 @@ ModelResult GraphModel::predict_single(
   ggml_set_name(reverse_neighbor_index_t, "reverse_neighbor_index");
 
   ggml_tensor *coulomb_t = nullptr;
-  if (long_range_) {
+  if (long_range_ && !p3m_) {
     coulomb_t = ggml_new_tensor_2d(input_ctx, GGML_TYPE_F32, n_atoms, n_atoms);
     ggml_set_name(coulomb_t, "coulomb_matrix");
     if (compute_forces)
@@ -750,8 +759,9 @@ ModelResult GraphModel::predict_single(
   // Allocate input buffer
   ggml_backend_buffer_t input_buffer =
       ggml_backend_alloc_ctx_tensors(input_ctx, compute_backend_);
+  std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)>
+      input_buffer_owner(input_buffer, ggml_backend_buffer_free);
   if (!input_buffer) {
-    ggml_free(input_ctx);
     throw std::runtime_error("Failed to allocate input buffer");
   }
 
@@ -760,8 +770,6 @@ ModelResult GraphModel::predict_single(
   for (int i = 0; i < n_atoms; i++) {
     auto it = species_to_index_.find(atomic_numbers[i]);
     if (it == species_to_index_.end()) {
-      ggml_backend_buffer_free(input_buffer);
-      ggml_free(input_ctx);
       throw std::runtime_error(
           "Atomic number " + std::to_string(atomic_numbers[i]) +
           " not in species map");
@@ -802,8 +810,6 @@ ModelResult GraphModel::predict_single(
 
     auto it = species_to_index_.find(atomic_numbers[j]);
     if (it == species_to_index_.end()) {
-      ggml_backend_buffer_free(input_buffer);
-      ggml_free(input_ctx);
       throw std::runtime_error(
           "Atomic number " + std::to_string(atomic_numbers[j]) +
           " not in species map");
@@ -889,17 +895,43 @@ ModelResult GraphModel::predict_single(
 
   // --- Build and compute ---
   ggml_context *compute_ctx = ggml_init({COMPUTE_CTX_SIZE, nullptr, true});
+  std::unique_ptr<ggml_context, decltype(&ggml_free)> compute_owner(compute_ctx,
+                                                                    ggml_free);
   if (!compute_ctx) {
-    ggml_backend_buffer_free(input_buffer);
-    ggml_free(input_ctx);
     throw std::runtime_error("Failed to create compute context");
   }
 
-  ggml_tensor *output = interp_.build(compute_ctx);
+  ggml_tensor *lr_charges = nullptr, *lr_potentials = nullptr,
+              *lr_charge_adjoint = nullptr;
+  interp_.coulomb_application = {};
+  if (p3m_) {
+    interp_.coulomb_application = [&](ggml_context *ctx, ggml_tensor *charges) {
+      if (lr_charges)
+        throw std::runtime_error(
+            "Multiple PET-LR applications are unsupported");
+      lr_charges = ggml_cont(ctx, charges);
+      ggml_set_output(lr_charges);
+      lr_potentials = ggml_dup_tensor(ctx, lr_charges);
+      ggml_set_input(lr_potentials);
+      if (compute_forces) {
+        ggml_set_param(lr_potentials);
+        lr_charge_adjoint = ggml_dup_tensor(ctx, lr_charges);
+        ggml_set_input(lr_charge_adjoint);
+      }
+      return lr_potentials;
+    };
+  }
+  ggml_tensor *output = nullptr;
+  try {
+    output = interp_.build(compute_ctx);
+  } catch (...) {
+    interp_.coulomb_application = {};
+    throw;
+  }
+  interp_.coulomb_application = {};
+  if (p3m_ && !lr_charges)
+    throw std::runtime_error("Missing PET-LR charge application");
   if (!output) {
-    ggml_free(compute_ctx);
-    ggml_backend_buffer_free(input_buffer);
-    ggml_free(input_ctx);
     throw std::runtime_error("Failed to build computation graph");
   }
   // nc-force models output [n_atoms, 4] = (energy | force): split the columns
@@ -918,6 +950,13 @@ ModelResult GraphModel::predict_single(
   if (compute_forces) {
     // Build forward + backward graph
     ggml_tensor *total_energy = ggml_sum(compute_ctx, output);
+    // Seed the backbone with the native solver's charge adjoint in a second
+    // backward evaluation. Potentials are independent inputs to the readout.
+    if (lr_charge_adjoint)
+      total_energy =
+          ggml_add(compute_ctx, total_energy,
+                   ggml_sum(compute_ctx, ggml_mul(compute_ctx, lr_charges,
+                                                  lr_charge_adjoint)));
     ggml_set_loss(total_energy);
     ggml_set_output(total_energy);
 
@@ -927,6 +966,12 @@ ModelResult GraphModel::predict_single(
     ggml_build_forward_expand(cgraph, total_energy);
     ggml_build_backward_expand(compute_ctx, cgraph, nullptr);
 
+    if (lr_potentials) {
+      auto *grad = ggml_graph_get_grad(cgraph, lr_potentials);
+      if (!grad)
+        throw std::runtime_error("Missing P3M potential gradient");
+      ggml_set_output(grad);
+    }
     if (coulomb_t) {
       auto *lr_grad = ggml_graph_get_grad(cgraph, coulomb_t);
       if (lr_grad)
@@ -944,28 +989,60 @@ ModelResult GraphModel::predict_single(
     if (nc_output) ggml_build_forward_expand(cgraph, nc_output);
   }
 
+  ggml_cgraph *charge_graph = nullptr;
+  if (lr_charges) {
+    charge_graph = ggml_new_graph_custom(compute_ctx, 32768, false);
+    ggml_build_forward_expand(charge_graph, lr_charges);
+  }
   ggml_backend_buffer_t compute_buffer =
       ggml_backend_alloc_ctx_tensors(compute_ctx, compute_backend_);
+  std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)>
+      compute_buffer_owner(compute_buffer, ggml_backend_buffer_free);
   if (!compute_buffer) {
-    ggml_free(compute_ctx);
-    ggml_backend_buffer_free(input_buffer);
-    ggml_free(input_ctx);
     throw std::runtime_error("Failed to allocate compute buffer");
   }
 
   interp_.init_constants();
 
+  P3MResult mesh_result;
+  std::vector<float> charge_values;
+  if (charge_graph) {
+    if (ggml_backend_graph_compute(compute_backend_, charge_graph) !=
+        GGML_STATUS_SUCCESS)
+      throw std::runtime_error("PET-LR charge graph failed");
+    charge_values.resize(ggml_nelements(lr_charges));
+    ggml_backend_tensor_get(lr_charges, charge_values.data(), 0,
+                            ggml_nbytes(lr_charges));
+    mesh_result = p3m(system, nlist, coulomb_parameters_, lr_charges->ne[0],
+                      charge_values);
+    ggml_backend_tensor_set(lr_potentials, mesh_result.potentials.data(), 0,
+                            ggml_nbytes(lr_potentials));
+    if (lr_charge_adjoint)
+      ggml_backend_tensor_memset(lr_charge_adjoint, 0, 0,
+                                 ggml_nbytes(lr_charge_adjoint));
+  }
   if (compute_forces) {
     ggml_graph_reset(cgraph);
   }
 
   ggml_status status = ggml_backend_graph_compute(compute_backend_, cgraph);
   if (status != GGML_STATUS_SUCCESS) {
-    ggml_backend_buffer_free(compute_buffer);
-    ggml_free(compute_ctx);
-    ggml_backend_buffer_free(input_buffer);
-    ggml_free(input_ctx);
     throw std::runtime_error("Graph computation failed");
+  }
+
+  if (lr_potentials && compute_forces) {
+    std::vector<float> adjoint(charge_values.size());
+    ggml_backend_tensor_get(ggml_graph_get_grad(cgraph, lr_potentials),
+                            adjoint.data(), 0, adjoint.size() * sizeof(float));
+    mesh_result = p3m(system, nlist, coulomb_parameters_, lr_charges->ne[0],
+                      charge_values, &adjoint);
+    ggml_backend_tensor_set(lr_charge_adjoint,
+                            mesh_result.charge_gradient.data(), 0,
+                            ggml_nbytes(lr_charge_adjoint));
+    ggml_graph_reset(cgraph);
+    if (ggml_backend_graph_compute(compute_backend_, cgraph) !=
+        GGML_STATUS_SUCCESS)
+      throw std::runtime_error("PET-LR charge backward graph failed");
   }
 
   // --- Extract results ---
@@ -1156,13 +1233,15 @@ ModelResult GraphModel::predict_single(
     }
   }
 
+  if (compute_forces && lr_potentials) {
+    for (size_t i = 0; i < mesh_result.forces.size(); ++i)
+      result.forces[i] += energy_scale_ * mesh_result.forces[i];
+    for (size_t i = 0; i < mesh_result.stress.size(); ++i)
+      result.stress[i] += energy_scale_ * mesh_result.stress[i];
+  }
   if (compute_forces && coulomb_t) {
     auto *grad = ggml_graph_get_grad(cgraph, coulomb_t);
     if (!grad) {
-      ggml_backend_buffer_free(compute_buffer);
-      ggml_free(compute_ctx);
-      ggml_backend_buffer_free(input_buffer);
-      ggml_free(input_ctx);
       throw std::runtime_error("Missing PET-LR Coulomb gradient");
     }
     std::vector<float> adjoint(size_t(n_atoms) * n_atoms);
@@ -1182,12 +1261,6 @@ ModelResult GraphModel::predict_single(
   if (post_compute_hook) {
     post_compute_hook();
   }
-
-  // Cleanup
-  ggml_backend_buffer_free(compute_buffer);
-  ggml_free(compute_ctx);
-  ggml_backend_buffer_free(input_buffer);
-  ggml_free(input_ctx);
 
   return result;
 }

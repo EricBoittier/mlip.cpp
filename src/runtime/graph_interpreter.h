@@ -37,6 +37,10 @@ public:
   // This uses the provided context for allocations
   ggml_tensor *build(ggml_context *ctx);
 
+  // Optional native replacement for the PET-LR matrix application.
+  std::function<ggml_tensor *(ggml_context *, ggml_tensor *)>
+      coulomb_application;
+
   // Get the output tensor after build
   ggml_tensor *get_output() const { return output_; }
 

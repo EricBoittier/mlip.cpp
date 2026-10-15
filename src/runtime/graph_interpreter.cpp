@@ -609,6 +609,8 @@ ggml_tensor *GraphInterpreter::build_matmul(ggml_context *ctx,
   if (node.inputs.size() < 2) {
     throw std::runtime_error("MATMUL requires 2 inputs");
   }
+  if (coulomb_application && node.inputs[0] == "input:coulomb_matrix")
+    return coulomb_application(ctx, resolve_input(ctx, node.inputs[1]));
   ggml_tensor *a = resolve_input(ctx, node.inputs[0]);
   ggml_tensor *b = resolve_input(ctx, node.inputs[1]);
 

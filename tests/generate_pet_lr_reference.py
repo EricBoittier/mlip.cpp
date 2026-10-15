@@ -3,8 +3,8 @@
 python tests/generate_pet_lr_reference.py /tmp/pet-lr-reference
 MLIPCPP_PET_LR_REFERENCE=/tmp/pet-lr-reference/reference.json build/tests/test_coulomb
 
-Uses upstream direct Ewald in training mode as the periodic reference; it does
-not claim equivalence to P3M evaluation. No downloaded pretrained weights needed.
+Selects upstream Ewald or P3M through the training-path solver setting, avoiding
+unfitted composition baselines. No downloaded pretrained weights needed.
 """
 
 import argparse
@@ -26,6 +26,9 @@ from metatrain.utils.neighbor_lists import get_system_with_neighbor_lists
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", type=Path)
+    parser.add_argument(
+        "--solver", choices=["direct-ewald", "p3m"], default="direct-ewald"
+    )
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     torch.set_num_threads(1)
@@ -63,7 +66,10 @@ def main():
             activation="SiLU",
         )
         hypers["long_range"].update(
-            enable=enabled, use_ewald=True, smearing=1.4, kspace_resolution=1.33
+            enable=enabled,
+            use_ewald=args.solver == "direct-ewald",
+            smearing=1.4,
+            kspace_resolution=1.33,
         )
         model = PET(hypers, info)
         label = kind if enabled else f"{kind}-sr"
@@ -78,11 +84,11 @@ def main():
                 str(ckpt),
                 "-o",
                 str(gguf),
-                *(["--long-range-solver", "direct-ewald"] if enabled else []),
+                *(["--long-range-solver", args.solver] if enabled else []),
             ],
             check=True,
         )
-        # Training mode selects upstream Ewald and excludes unfitted baselines.
+        # Training mode excludes unfitted baselines; use_ewald selects the solver.
         model.train()
         for name, points, cell in [
             ("molecule", [[0.3, 0.5, 0.2], [1.5, 0.8, 0.4], [5.1, 1.7, 2.1]], None),
@@ -98,7 +104,22 @@ def main():
                 [[0.3, 0.5, 0.2], [1.5, 0.8, 0.4]],
                 [[3.3, 0, 0], [0.6, 3.1, 0], [0.2, 0.7, 3.7]],
             ),
-        ]:
+        ] + (
+            [
+                (
+                    "periodic-729",
+                    [
+                        [2.1 * x + 0.13, 2.1 * y + 0.23, 2.1 * z + 0.31]
+                        for x in range(9)
+                        for y in range(9)
+                        for z in range(9)
+                    ],
+                    [[18.9, 0, 0], [0, 18.9, 0], [0, 0, 18.9]],
+                )
+            ]
+            if args.solver == "p3m"
+            else []
+        ):
             r = torch.tensor(points, requires_grad=True)
             c = torch.tensor(cell if cell else [[0.0] * 3] * 3)
             strain = torch.eye(3, requires_grad=True)
@@ -132,21 +153,29 @@ def main():
                 nl = system.get_neighbor_list(model.requested_neighbor_lists()[0])
                 indices = nl.samples.values[:, :2]
                 distances = nl.values.reshape(-1, 3).norm(dim=1)
-                calc = lr.ewald_calculator
+                calc = (
+                    lr.p3m_calculator if args.solver == "p3m" else lr.ewald_calculator
+                )
             else:
                 indices = torch.combinations(torch.arange(len(points)), 2)
                 distances = (r[indices[:, 1]] - r[indices[:, 0]]).norm(dim=1)
                 calc = lr.direct_calculator
-            matrix = calc(torch.eye(len(points)), c, r, indices, distances)
+            matrix = (
+                calc(torch.eye(len(points)), c, r, indices, distances)
+                if len(points) <= 512
+                else None
+            )
             case = {
                 "name": f"{label}-{name}",
+                "solver": args.solver,
                 "gguf": str(gguf.resolve()),
                 "positions": r.detach().flatten().tolist(),
                 "numbers": types.tolist(),
                 "energy": energy.item(),
                 "forces": (-grad).flatten().tolist(),
-                "matrix": matrix.detach().flatten().tolist(),
             }
+            if matrix is not None:
+                case["matrix"] = matrix.detach().flatten().tolist()
             if cell:
                 stress = (ds + ds.T) * 0.5 / torch.det(c).abs()
                 case.update(
@@ -162,7 +191,7 @@ def main():
             "--model",
             str(args.output / "feedforward.pt"),
             "--long-range-solver",
-            "direct-ewald",
+            args.solver,
             "--no-forces",
             "-o",
             str(energy_gguf),

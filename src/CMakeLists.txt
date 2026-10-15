@@ -5,6 +5,7 @@
 # Core components
 set(MLIPCPP_CORE_SOURCES
     core/coulomb.cpp
+    core/p3m.cpp
     core/system.cpp
     core/neighbor_list.cpp
     core/gguf_loader.cpp

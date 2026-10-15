@@ -351,8 +351,8 @@ def main():
         help="Example max-neighbors count used for tracing",
     )
     parser.add_argument(
-        "--long-range-solver", choices=["direct-ewald"], default=None,
-        help="Required for PET-LR: explicitly select the dense reference solver (periodic results differ from upstream P3M)",
+        "--long-range-solver", choices=["direct-ewald", "p3m"], default=None,
+        help="Required for PET-LR: p3m for scalable periodic inference, direct-ewald for reference",
     )
     args = parser.parse_args()
 
@@ -383,7 +383,7 @@ def main():
     )
     wrapper.eval()
     if wrapper.long_range and args.long_range_solver is None:
-        parser.error("PET-LR requires --long-range-solver direct-ewald; this is a small-system reference solver, not P3M")
+        parser.error("PET-LR requires --long-range-solver p3m (scalable) or direct-ewald (reference)")
     if not wrapper.long_range and args.long_range_solver is not None:
         parser.error("--long-range-solver requires a checkpoint trained with long_range.enable=true")
 
@@ -461,9 +461,14 @@ def main():
     writer.add_int32("pet.nc_forces", 1 if args.nc_forces else 0)
     if wrapper.long_range:
         calculator = pet.long_range_featurizer.ewald_calculator
-        writer.add_string("pet.long_range.solver", "direct-ewald")
+        writer.add_string("pet.long_range.solver", args.long_range_solver)
+        if args.long_range_solver == "p3m":
+            calculator = pet.long_range_featurizer.p3m_calculator
+            if calculator.mesh_interpolator.interpolation_nodes != 5:
+                raise ValueError("Native P3M currently requires interpolation_nodes=5")
+            writer.add_int32("pet.long_range.interpolation_nodes", 5)
         writer.add_float32("pet.long_range.smearing", float(calculator.potential.smearing))
-        writer.add_float32("pet.long_range.wavelength", float(calculator.lr_wavelength))
+        writer.add_float32("pet.long_range.wavelength", float(calculator.mesh_spacing if args.long_range_solver == "p3m" else calculator.lr_wavelength))
     if nc_force_scales:
         writer.add_array_int32("pet.nc_force_scale_keys", list(nc_force_scales))
         writer.add_array_float32("pet.nc_force_scale_values", list(nc_force_scales.values()))

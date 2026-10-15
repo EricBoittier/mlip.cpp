@@ -134,6 +134,7 @@ private:
   bool forces_mode_ = false;
   bool nc_forces_ = false;
   bool long_range_ = false;
+  bool p3m_ = false;
   CoulombParameters coulomb_parameters_;
   int device_ = 0;
   std::string gguf_path_;
