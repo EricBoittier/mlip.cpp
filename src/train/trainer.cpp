@@ -187,7 +187,16 @@ ggml_tensor *find_weight(runtime::GraphModel &m, const std::string &name) {
 }
 } // namespace
 
-std::string cache_path(const std::string &cache_dir, const MemmapSplit &split, float cutoff) {
+AdaptiveCutoff adaptive_cutoff(const runtime::GraphModel &model) {
+  AdaptiveCutoff a{model.num_neighbors_adaptive(), model.cutoff_width_adaptive()};
+  if (a.enabled() && model.adaptive_cutoff_method() != "solver")
+    throw std::runtime_error("adaptive cutoff: training implements the \"solver\" method, the model uses \"" +
+                             model.adaptive_cutoff_method() + "\" (re-export it with a current exporter)");
+  return a;
+}
+
+std::string cache_path(const std::string &cache_dir, const MemmapSplit &split, float cutoff,
+                       const AdaptiveCutoff &adaptive) {
   if (cache_dir.empty()) return {};
   // keyed by content, not path: the data is staged to a per-job $TMPDIR
   uint64_t h = 1469598103934665603ULL; // FNV-1a
@@ -196,6 +205,7 @@ std::string cache_path(const std::string &cache_dir, const MemmapSplit &split, f
   };
   const int64_t ns = split.size(), N = split.total_atoms();
   mix(&ns, sizeof ns), mix(&N, sizeof N), mix(&cutoff, sizeof cutoff);
+  if (adaptive.enabled()) mix(&adaptive.n_target, sizeof(double)), mix(&adaptive.width, sizeof(double));
   mix(split.numbers(0), N * sizeof(int32_t));
   mix(split.positions(0), N * 3 * sizeof(float));
   mix(split.cell(0), ns * 9 * sizeof(float));
@@ -308,6 +318,45 @@ std::pair<float, float> loss_norms(const Batch &b) {
   return {e_norm, f_norm};
 }
 } // namespace
+
+// (FLOPs, ideal bytes) of one node; views cost nothing
+static std::pair<double, double> node_cost(const ggml_tensor *t) {
+  switch (t->op) {
+  case GGML_OP_NONE: case GGML_OP_VIEW: case GGML_OP_RESHAPE: case GGML_OP_PERMUTE: case GGML_OP_TRANSPOSE:
+    return {0, 0};
+  case GGML_OP_CPY: return {0, 2.0 * ggml_nbytes(t->src[0])};
+  default: break;
+  }
+  double bytes = ggml_nbytes(t);
+  for (const ggml_tensor *s : t->src)
+    if (s) bytes += ggml_nbytes(s);
+  const double e = ggml_nelements(t);
+  switch (t->op) {
+  case GGML_OP_MUL_MAT: return {2.0 * t->src[0]->ne[0] * e, bytes};
+  case GGML_OP_OUT_PROD: return {2.0 * t->src[0]->ne[1] * e, bytes};
+  case GGML_OP_CONT: case GGML_OP_DUP: case GGML_OP_GET_ROWS: case GGML_OP_CONCAT: return {0, bytes};
+  case GGML_OP_SOFT_MAX: case GGML_OP_SOFT_MAX_BACK: return {5.0 * e, bytes};
+  case GGML_OP_PET_ATTN: case GGML_OP_PET_ATTN_BACK: { // per (sequence, head, query, key), executed
+    const ggml_tensor *x = t->src[0];
+    const double H = t->op_params[0], d = x->ne[0] / H, L = x->ne[2]; // op_params[0]: n_head
+    return {(t->op == GGML_OP_PET_ATTN ? 4 * d + 5 : 10 * d + 10) * x->ne[3] * H * L * L, bytes};
+  }
+  default: return {e, bytes};
+  }
+}
+
+Worker::GraphCost Worker::graph_cost(int n, int m, int S, bool backward) {
+  auto g = build_graph(n, m, S, backward, false);
+  GraphCost c;
+  for (int i = 0; i < ggml_graph_n_nodes(g->gf); i++) {
+    auto [f, b] = node_cost(ggml_graph_node(g->gf, i));
+    c.flops += f, c.bytes += b;
+  }
+  ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model_.backend()));
+  ggml_gallocr_reserve_n_size(ga, g->gf, nullptr, nullptr, &c.buffer);
+  ggml_gallocr_free(ga);
+  return c;
+}
 
 std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, bool backward, bool cached) {
   auto g = std::make_unique<StepGraph>();
@@ -496,8 +545,15 @@ StepStats Worker::run(const Batch &b, double energy_scale, bool backward) {
       if (ggml_backend_graph_compute(model_.backend(), &one) != GGML_STATUS_SUCCESS)
         throw std::runtime_error("graph compute failed");
       ggml_backend_synchronize(model_.backend());
-      auto &[ms, count] = profile_ms[std::string(i < g->n_forward ? "fwd:" : "bwd:") + ggml_op_desc(ggml_graph_node(gf, i))];
-      ms += 1e3 * seconds_since(tn), count++;
+      const ggml_tensor *node = ggml_graph_node(gf, i);
+      auto &s = profile_ops[std::string(i < g->n_forward ? "fwd:" : "bwd:") + ggml_op_desc(node)];
+      auto [f, b] = node_cost(node);
+      const double ms = 1e3 * seconds_since(tn);
+      s.ms += ms, s.count++, s.flops += f, s.bytes += b;
+      profile_nodes.push_back({ms, fmt::format("{}:{} {} [{} {} {} {}]{}", i < g->n_forward ? "fwd" : "bwd",
+                                               ggml_op_desc(node), node->name, node->ne[0], node->ne[1],
+                                               node->ne[2], node->ne[3],
+                                               ggml_is_contiguous(node) ? "" : " non-contiguous")});
     }
   } else if (ggml_backend_graph_compute(model_.backend(), gf) != GGML_STATUS_SUCCESS) {
     throw std::runtime_error("graph compute failed");
@@ -723,16 +779,37 @@ void train(const TrainOptions &o) {
              scaling.energy_scale, seconds_since(t0));
 
   t0 = clock_type::now();
+  const AdaptiveCutoff adaptive = adaptive_cutoff(w0.model());
+  if (adaptive.enabled())
+    fmt::print("adaptive cutoff: {} neighbours (solver, taper {} A) within {} A\n", adaptive.n_target, adaptive.width, cutoff);
   auto nl = [&](const MemmapSplit &s) {
-    return NeighborCache::load_or_build(s, cutoff, cache_path(o.cache_dir, s, cutoff), o.n_threads);
+    return NeighborCache::load_or_build(s, cutoff, cache_path(o.cache_dir, s, cutoff, adaptive), o.n_threads,
+                                        adaptive);
   };
   const NeighborCache nl_train = eval_only ? NeighborCache{} : nl(train_split),
                       nl_val = nl(val_split), nl_test = nl(test_split);
   fmt::print("neighbour lists ready ({:.1f} s)\n", seconds_since(t0));
+  // structures used: all, or those within --max-neighbors and --max-attention
+  // (a structure alone is one micro-batch: its memory ~ n (m+1)^2)
+  auto kept = [&](const char *name, const MemmapSplit &s, const NeighborCache &c) {
+    std::vector<int64_t> ids;
+    for (int64_t i = 0; i < static_cast<int64_t>(c.max_neighbors.size()); i++) {
+      const double m1 = c.max_neighbors[i] + 1.0;
+      if ((o.max_neighbors <= 0 || c.max_neighbors[i] <= o.max_neighbors) &&
+          (o.max_attention <= 0 || s.n_atoms(i) * m1 * m1 <= o.max_attention))
+        ids.push_back(i);
+    }
+    if (o.max_neighbors > 0 || o.max_attention > 0)
+      fmt::print("--max-neighbors {} --max-attention {:g}: {} of {} {} structures dropped\n", o.max_neighbors,
+                 o.max_attention, s.size() - static_cast<int64_t>(ids.size()), s.size(), name);
+    return ids;
+  };
+  const std::vector<int64_t> ids_train = eval_only ? std::vector<int64_t>{} : kept("train", train_split, nl_train),
+                             ids_val = kept("val", val_split, nl_val), ids_test = kept("test", test_split, nl_test);
 
   const int W = static_cast<int>(workers.size()), B = o.batch_size;
   const Tiling tiling{o.tile_nb_ratio, o.tile_atom_ratio, B};
-  const int64_t steps_per_epoch = train_split.size() / (int64_t(B) * W); // drop_last
+  const int64_t steps_per_epoch = static_cast<int64_t>(ids_train.size()) / (int64_t(B) * W); // drop_last
   const int64_t total_steps = o.epochs * steps_per_epoch;
   const int64_t warmup = static_cast<int64_t>(o.warmup_fraction * total_steps);
 
@@ -755,13 +832,12 @@ void train(const TrainOptions &o) {
   fmt::print("setup: {:.1f} s; {} steps/epoch of {} x {} structures, warmup {} steps\n",
              seconds_since(t_setup), steps_per_epoch, W, B, warmup);
 
-  auto evaluate = [&](const MemmapSplit &split, const NeighborCache &cache) {
+  auto evaluate = [&](const MemmapSplit &split, const NeighborCache &cache, const std::vector<int64_t> &use) {
     std::vector<StepStats> per(W);
-    const int64_t n_batches = (split.size() + B - 1) / B;
+    const int64_t n_use = static_cast<int64_t>(use.size()), n_batches = (n_use + B - 1) / B;
     for_workers(workers, [&](size_t w) {
       for (int64_t k = w; k < n_batches; k += W) {
-        std::vector<int64_t> ids;
-        for (int64_t s = k * B; s < std::min<int64_t>(split.size(), (k + 1) * B); s++) ids.push_back(s);
+        std::vector<int64_t> ids(use.begin() + k * B, use.begin() + std::min<int64_t>(n_use, (k + 1) * B));
         for (const Batch &b : make_microbatches(split, cache, ids, {}, species, scaling, cutoff,
                                                     o.mb_budget, o.mb_growth, tiling))
           per[w] += workers[w]->run(b, scaling.energy_scale, false);
@@ -777,14 +853,12 @@ void train(const TrainOptions &o) {
   };
 
   // step packing: the cost model is refitted to measured micro-batch times
-  // after every step and shared with the packing threads; worker 0 is
-  // preloaded with the optimizer time
+  // after every step and shared with the packing threads
   const bool step_pack = o.pack == "step";
   if (!step_pack && o.pack != "worker") throw std::runtime_error("--pack must be step or worker");
   const Tiling step_tiling{o.tile_nb_ratio, o.tile_atom_ratio, W * B};
   std::mutex plan_mu;
   CostModel plan_cost;
-  double plan_preload_ms = 0;
   CostFit cost_fit;
 
   // batches of a step: structures perm[step*W*B, +W*B); worker w's rotation
@@ -799,13 +873,12 @@ void train(const TrainOptions &o) {
         for (int k = 0; k < B; k++) rot[w * B + k] = random_o3(rng);
       }
       CostModel cost;
-      double preload;
       {
         std::lock_guard<std::mutex> lock(plan_mu);
-        cost = plan_cost, preload = plan_preload_ms;
+        cost = plan_cost;
       }
       return make_step_batches(train_split, nl_train, ids, rot, species, scaling, cutoff, W, cost,
-                               preload, o.mb_budget, step_tiling);
+                               o.mb_budget, step_tiling);
     }
     std::vector<std::future<std::vector<Batch>>> fs;
     for (int w = 0; w < W; w++) {
@@ -825,8 +898,7 @@ void train(const TrainOptions &o) {
 
   int64_t global_step = 0;
   for (int epoch = 0; epoch < o.epochs && global_step != o.max_steps; epoch++) {
-    std::vector<int64_t> perm(train_split.size());
-    std::iota(perm.begin(), perm.end(), 0);
+    std::vector<int64_t> perm = ids_train;
     std::shuffle(perm.begin(), perm.end(), std::mt19937_64(o.seed + epoch));
 
     auto t_epoch = clock_type::now();
@@ -873,8 +945,7 @@ void train(const TrainOptions &o) {
       const double lr = o.lr * lr_factor(global_step, total_steps, warmup);
       const double norm = optimizer.step(lr);
       if (!std::isfinite(norm)) throw std::runtime_error(fmt::format("non-finite gradient at step {}", global_step));
-      const double dt_sync = seconds_since(t);
-      t_sync += dt_sync;
+      t_sync += seconds_since(t);
       if (step_pack) {
         for (auto &sw : samples)
           for (auto [n, m, ms] : sw) cost_fit.add(n, m, ms);
@@ -882,7 +953,6 @@ void train(const TrainOptions &o) {
         const bool ok = cost_fit.fit(fitted);
         std::lock_guard<std::mutex> lock(plan_mu);
         if (ok) plan_cost = fitted;
-        plan_preload_ms = 0.9 * plan_preload_ms + 0.1 * 1e3 * dt_sync;
       }
 
       StepStats step_total;
@@ -901,8 +971,8 @@ void train(const TrainOptions &o) {
                    w0.cache_misses, w0.cache_flushes);
         if (step_pack) {
           std::lock_guard<std::mutex> lock(plan_mu);
-          fmt::print("  packing cost model: {:.2f} ms + {:.3g} n(m+1)^2 + {:.3g} n(m+1); optimizer preload {:.1f} ms\n",
-                     plan_cost.c[0], plan_cost.c[1], plan_cost.c[2], plan_preload_ms);
+          fmt::print("  packing cost model: {:.2f} ms + {:.3g} n(m+1)^2 + {:.3g} n(m+1)\n",
+                     plan_cost.c[0], plan_cost.c[1], plan_cost.c[2]);
         }
         std::fflush(stdout);
       }
@@ -912,7 +982,7 @@ void train(const TrainOptions &o) {
     auto [tre, trf] = rmse(ep);
 
     auto t = clock_type::now();
-    const StepStats val = evaluate(val_split, nl_val);
+    const StepStats val = evaluate(val_split, nl_val, ids_val);
     auto [ve, vf] = rmse(val);
     fmt::print("epoch {} done: train {:.1f} s ({:.1f} struct/s, mean loss {:.4g}), RMSE E {:.2f} meV/atom, "
                "F {:.2f} meV/A | val ({:.1f} s) RMSE E {:.2f} meV/atom, F {:.2f} meV/A\n",
@@ -925,10 +995,10 @@ void train(const TrainOptions &o) {
   }
 
   if (eval_only) {
-    auto [ve, vf] = rmse(evaluate(val_split, nl_val));
+    auto [ve, vf] = rmse(evaluate(val_split, nl_val, ids_val));
     fmt::print("val: RMSE E {:.2f} meV/atom, F {:.2f} meV/A over {} structures\n", ve, vf, val_split.size());
   }
-  const StepStats test = evaluate(test_split, nl_test);
+  const StepStats test = evaluate(test_split, nl_test, ids_test);
   auto [te, tf] = rmse(test);
   fmt::print("test: RMSE E {:.2f} meV/atom, F {:.2f} meV/A over {} structures\n", te, tf, test.n_systems);
   std::fflush(stdout);

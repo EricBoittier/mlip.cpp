@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
+#include <numbers>
 #include <numeric>
 #include <stdexcept>
 #include <sys/mman.h>
@@ -134,16 +135,95 @@ AtomicSystem MemmapSplit::system(int64_t s) const {
 
 namespace {
 
-constexpr uint64_t CACHE_MAGIC = 0x314c4e5050494c4dULL; // "MLIPPNL1"
+constexpr uint64_t CACHE_MAGIC = 0x314c4e5050494c4dULL;          // "MLIPPNL1"
+constexpr uint64_t CACHE_MAGIC_ADAPTIVE = 0x324c4e5050494c4dULL; // "MLIPPNL2": + n_target, width, pair_cutoff
 
 struct LocalEdges {
   std::vector<int32_t> center, neighbor, slot, reverse;
   std::vector<std::array<float, 3>> vector;
+  std::vector<float> pair_cutoff;
   int32_t max_neighbors = 0;
 };
 
+// metatrain pet/modules/adaptive_cutoff.py, get_adaptive_cutoffs_solver, in
+// double: 10 Newton-bisection steps on the smoothed count, then the IFT step
+// (one more Newton step with the clamped bump), clamped to [cutoff/16, cutoff].
+// Edges sorted by centre: atom i's are [start[i], start[i+1]).
+std::vector<double> adaptive_radii(const std::vector<int32_t> &start, const std::vector<double> &dist,
+                                   double cutoff, const AdaptiveCutoff &a) {
+  const int n = static_cast<int>(start.size()) - 1;
+  const double N = a.n_target, w = a.width, inv = 1.0 / cutoff;
+  std::vector<double> radii(n);
+  for (int i = 0; i < n; i++) {
+    // (n_total, dn/dr) at r; `loop`: the solver's exact 0/1 outside the taper,
+    // else cutoff_func_bump (clamped) everywhere, as in the IFT residual
+    auto count = [&](double r, bool loop) {
+      double cnt = 0, dcnt = 0;
+      for (int k = start[i]; k < start[i + 1]; k++) {
+        const double sc = (dist[k] - (r - w)) / w, s = std::numbers::pi * std::clamp(sc, 1e-6, 1.0 - 1e-6);
+        const double sn = std::sin(s), th = std::tanh(std::cos(s) / sn);
+        if (!loop) cnt += 0.5 * (1.0 + th);
+        else if (sc > 0.0 && sc < 1.0) cnt += 0.5 * (1.0 + th), dcnt += 0.5 * std::numbers::pi / w * (1.0 - th * th) / (sn * sn);
+        else if (sc <= 0.0) cnt += 1.0;
+      }
+      const double x = r * inv;
+      return std::pair{cnt + N * x * x * x, dcnt + 3.0 * N * x * x * inv};
+    };
+    double lo = 0.0, hi = cutoff, r = 0.5 * cutoff;
+    for (int it = 0; it < 10; it++) {
+      const auto [cnt, dcnt] = count(r, true);
+      const double f = cnt - N;
+      if (f <= 0) lo = r;
+      else hi = r;
+      const double rn = r - f / std::max(dcnt, 1e-6);
+      r = rn >= lo && rn <= hi ? rn : 0.5 * (lo + hi);
+    }
+    const double dn_root = count(r, true).second, residual = count(r, false).first - N;
+    radii[i] = std::clamp(r - residual / std::max(dn_root, 1e-6), cutoff / 16.0, cutoff);
+  }
+  return radii;
+}
+
+// keep the edges within their pair cutoff (one decision per edge pair, so
+// the lists stay symmetric), then renumber slot / reverse
+void apply_adaptive(LocalEdges &e, int n, double cutoff, const AdaptiveCutoff &a) {
+  const int E = static_cast<int>(e.center.size());
+  std::vector<int32_t> start(n + 1, 0);
+  for (int k = 0; k < E; k++) start[e.center[k] + 1]++;
+  for (int i = 0; i < n; i++) start[i + 1] += start[i];
+  std::vector<double> dist(E);
+  for (int k = 0; k < E; k++) {
+    const auto &v = e.vector[k];
+    dist[k] = std::sqrt(double(v[0]) * v[0] + double(v[1]) * v[1] + double(v[2]) * v[2]) + 1e-15;
+  }
+  const std::vector<double> radii = adaptive_radii(start, dist, cutoff, a);
+  std::vector<char> keep(E);
+  std::vector<double> pc(E);
+  for (int k = 0; k < E; k++) pc[k] = 0.5 * (radii[e.center[k]] + radii[e.neighbor[k]]);
+  for (int k = 0; k < E; k++) {
+    const int r = e.reverse[k], first = r >= 0 ? std::min(k, r) : k;
+    keep[k] = dist[first] <= pc[first];
+  }
+  std::vector<int32_t> new_index(E, -1), count(n, 0);
+  LocalEdges out;
+  for (int k = 0; k < E; k++) {
+    if (!keep[k]) continue;
+    new_index[k] = static_cast<int32_t>(out.center.size());
+    out.center.push_back(e.center[k]);
+    out.neighbor.push_back(e.neighbor[k]);
+    out.vector.push_back(e.vector[k]);
+    out.slot.push_back(count[e.center[k]]++);
+    out.pair_cutoff.push_back(static_cast<float>(pc[k]));
+  }
+  out.reverse.resize(out.center.size());
+  for (int k = 0; k < E; k++)
+    if (keep[k]) out.reverse[new_index[k]] = e.reverse[k] >= 0 ? new_index[e.reverse[k]] : -1;
+  out.max_neighbors = n ? *std::max_element(count.begin(), count.end()) : 0;
+  e = std::move(out);
+}
+
 LocalEdges build_one(const MemmapSplit &split, int64_t s,
-                     const NeighborListBuilder &builder) {
+                     const NeighborListBuilder &builder, const AdaptiveCutoff &adaptive, double cutoff) {
   NeighborList nl = builder.build(split.system(s));
   const int E = nl.num_pairs(), n = split.n_atoms(s);
   std::vector<int> order(E);
@@ -180,6 +260,7 @@ LocalEdges build_one(const MemmapSplit &split, int64_t s,
       }
     }
   }
+  if (adaptive.enabled()) apply_adaptive(out, n, cutoff, adaptive);
   return out;
 }
 
@@ -195,11 +276,13 @@ template <typename V> void read_vec(std::ifstream &f, std::vector<V> &v, size_t 
 
 NeighborCache NeighborCache::load_or_build(const MemmapSplit &split, float cutoff,
                                            const std::string &cache_path,
-                                           int n_threads) {
+                                           int n_threads, const AdaptiveCutoff &adaptive) {
   const int64_t ns = split.size();
   const int64_t n_atoms_total = split.total_atoms();
   NeighborCache nc;
   nc.cutoff = cutoff;
+  nc.adaptive = adaptive;
+  const uint64_t magic_expected = adaptive.enabled() ? CACHE_MAGIC_ADAPTIVE : CACHE_MAGIC;
 
   if (!cache_path.empty() && std::filesystem::exists(cache_path)) {
     std::ifstream f(cache_path, std::ios::binary);
@@ -211,8 +294,10 @@ NeighborCache NeighborCache::load_or_build(const MemmapSplit &split, float cutof
     f.read(reinterpret_cast<char *>(&c_atoms), 8);
     f.read(reinterpret_cast<char *>(&c_cut), 4);
     f.read(reinterpret_cast<char *>(&c_edges), 8);
-    if (f && magic == CACHE_MAGIC && c_ns == ns && c_atoms == n_atoms_total &&
-        c_cut == cutoff) {
+    double c_adaptive[2] = {0, 0};
+    if (magic == CACHE_MAGIC_ADAPTIVE) f.read(reinterpret_cast<char *>(c_adaptive), sizeof c_adaptive);
+    if (f && magic == magic_expected && c_ns == ns && c_atoms == n_atoms_total && c_cut == cutoff &&
+        (!adaptive.enabled() || (c_adaptive[0] == adaptive.n_target && c_adaptive[1] == adaptive.width))) {
       read_vec(f, nc.edge_offset, ns + 1);
       read_vec(f, nc.max_neighbors, ns);
       read_vec(f, nc.center, c_edges);
@@ -220,6 +305,7 @@ NeighborCache NeighborCache::load_or_build(const MemmapSplit &split, float cutof
       read_vec(f, nc.slot, c_edges);
       read_vec(f, nc.reverse, c_edges);
       read_vec(f, nc.vector, c_edges);
+      if (adaptive.enabled()) read_vec(f, nc.pair_cutoff, c_edges);
       if (f) {
         log::info("neighbour lists: loaded {} edges from {}", c_edges, cache_path);
         return nc;
@@ -240,18 +326,23 @@ NeighborCache NeighborCache::load_or_build(const MemmapSplit &split, float cutof
   };
   // two passes, so that peak memory is the final arrays (one allocation)
   // plus per-thread scratch: 2^24 structures hold ~4e9 edges (~120 GB).
-  // Pass 1: edge counts (neighbour search only); pass 2: build every
-  // structure straight into its slice of the final arrays.
+  // Pass 1: edge counts (neighbour search only; with an adaptive cutoff the
+  // full build); pass 2: build every structure straight into its slice of
+  // the final arrays.
   std::vector<int64_t> count(ns);
-  parallel([&](int64_t s) { count[s] = builder.build(split.system(s)).num_pairs(); });
+  parallel([&](int64_t s) {
+    count[s] = adaptive.enabled() ? static_cast<int64_t>(build_one(split, s, builder, adaptive, cutoff).center.size())
+                                  : builder.build(split.system(s)).num_pairs();
+  });
   nc.edge_offset.assign(ns + 1, 0);
   for (int64_t s = 0; s < ns; s++) nc.edge_offset[s + 1] = nc.edge_offset[s] + count[s];
   const int64_t E = nc.edge_offset.back();
   nc.max_neighbors.resize(ns);
   nc.center.resize(E), nc.neighbor.resize(E), nc.slot.resize(E);
   nc.reverse.resize(E), nc.vector.resize(E);
+  if (adaptive.enabled()) nc.pair_cutoff.resize(E);
   parallel([&](int64_t s) {
-    LocalEdges p = build_one(split, s, builder);
+    LocalEdges p = build_one(split, s, builder, adaptive, cutoff);
     if (static_cast<int64_t>(p.center.size()) != count[s])
       throw std::runtime_error("neighbour lists: edge count changed between passes");
     const int64_t o = nc.edge_offset[s];
@@ -260,6 +351,7 @@ NeighborCache NeighborCache::load_or_build(const MemmapSplit &split, float cutof
     std::copy(p.slot.begin(), p.slot.end(), nc.slot.begin() + o);
     std::copy(p.reverse.begin(), p.reverse.end(), nc.reverse.begin() + o);
     std::copy(p.vector.begin(), p.vector.end(), nc.vector.begin() + o);
+    std::copy(p.pair_cutoff.begin(), p.pair_cutoff.end(), nc.pair_cutoff.begin() + o);
     nc.max_neighbors[s] = p.max_neighbors;
   });
   log::info("neighbour lists: built {} edges for {} structures", E, ns);
@@ -269,12 +361,15 @@ NeighborCache NeighborCache::load_or_build(const MemmapSplit &split, float cutof
     const std::string tmp = cache_path + ".tmp." + std::to_string(::getpid());
     {
       std::ofstream f(tmp, std::ios::binary);
-      const uint64_t magic = CACHE_MAGIC;
-      f.write(reinterpret_cast<const char *>(&magic), 8);
+      f.write(reinterpret_cast<const char *>(&magic_expected), 8);
       f.write(reinterpret_cast<const char *>(&ns), 8);
       f.write(reinterpret_cast<const char *>(&n_atoms_total), 8);
       f.write(reinterpret_cast<const char *>(&cutoff), 4);
       f.write(reinterpret_cast<const char *>(&E), 8);
+      if (adaptive.enabled()) {
+        const double a[2] = {adaptive.n_target, adaptive.width};
+        f.write(reinterpret_cast<const char *>(a), sizeof a);
+      }
       write_vec(f, nc.edge_offset);
       write_vec(f, nc.max_neighbors);
       write_vec(f, nc.center);
@@ -282,6 +377,7 @@ NeighborCache NeighborCache::load_or_build(const MemmapSplit &split, float cutof
       write_vec(f, nc.slot);
       write_vec(f, nc.reverse);
       write_vec(f, nc.vector);
+      if (adaptive.enabled()) write_vec(f, nc.pair_cutoff);
       f.close();
       if (!f) {
         // e.g. quota or disk full: never leave a large partial file behind

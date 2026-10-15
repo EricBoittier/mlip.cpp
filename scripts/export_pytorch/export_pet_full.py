@@ -167,7 +167,16 @@ def _unwrap_to_pet(model):
     attribute names first, then fall back to scanning nn.Module children."""
     if hasattr(model, 'gnn_layers'):
         return model
+    unwrapped = _unwrap_to_pet_inner(model)
+    # hypers that only the wrapper keeps (metatrain's PETBackend gets e.g.
+    # cutoff_width_adaptive as a forward argument): get_model_params falls back to them
+    outer = getattr(model, 'hypers', None)
+    if isinstance(outer, dict) and not hasattr(unwrapped, 'outer_hypers'):
+        unwrapped.outer_hypers = dict(outer)
+    return unwrapped
 
+
+def _unwrap_to_pet_inner(model):
     candidates = ('model', 'module', 'pet', 'base_model', 'inner_model',
                   'last_layer_features_model', 'backbone')
     for attr in candidates:
@@ -199,6 +208,12 @@ def _unwrap_to_pet(model):
     )
 
 
+def _hyper(pet_model, key):
+    """A hyper from the module, else from the hypers of the wrapper it was unwrapped from."""
+    value = getattr(pet_model, key, None)
+    return value if value is not None else getattr(pet_model, 'outer_hypers', {}).get(key)
+
+
 def get_model_params(pet_model):
     """Extract model parameters from a PET model (handles both old and new formats).
 
@@ -213,6 +228,9 @@ def get_model_params(pet_model):
             'cutoff_width': getattr(pet_model, 'cutoff_width', 0.2),
             'cutoff_function': getattr(pet_model, 'cutoff_function', 'Cosine').lower(),
             'num_neighbors_adaptive': getattr(pet_model, 'num_neighbors_adaptive', None),
+            # metatrain >= v14: the adaptive solver's taper and method
+            'cutoff_width_adaptive': _hyper(pet_model, 'cutoff_width_adaptive'),
+            'adaptive_cutoff_method': _hyper(pet_model, 'adaptive_cutoff_method'),
         }
 
     # Legacy pet-mad format

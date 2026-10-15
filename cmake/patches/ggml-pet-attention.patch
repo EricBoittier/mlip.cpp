@@ -1,0 +1,920 @@
+diff --git a/include/ggml.h b/include/ggml.h
+index 11d3e8a..4b80ffc 100644
+--- a/include/ggml.h
++++ b/include/ggml.h
+@@ -577,6 +577,9 @@ extern "C" {
+ 
+         GGML_OP_GLU,
+ 
++        GGML_OP_PET_ATTN,
++        GGML_OP_PET_ATTN_BACK,
++
+         GGML_OP_COUNT,
+     };
+ 
+@@ -1753,6 +1756,30 @@ extern "C" {
+             float                 scale,
+             float                 max_bias);
+ 
++    // fused multi-head attention with an additive bias shared by the heads
++    // (PET): qkv [D, 3, L, N] (q, k, v of N sequences of length L, D = n_head * d),
++    // bias [L, L, 1, N]; per sequence and head,
++    //   o = softmax(scale * q k^T + bias) v
++    // result [D + n_head, L, N]: per row the D outputs, then the n_head
++    // log-sum-exps (used by the backward pass)
++    GGML_API struct ggml_tensor * ggml_pet_attn(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * qkv,
++            struct ggml_tensor  * bias,
++            int                   n_head,
++            float                 scale);
++
++    // gradient of ggml_pet_attn w.r.t. qkv ([D, 3, L, N]), given its result
++    // and the gradient of that result (the log-sum-exp part is ignored)
++    GGML_API struct ggml_tensor * ggml_pet_attn_back(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * qkv,
++            struct ggml_tensor  * bias,
++            struct ggml_tensor  * result,
++            struct ggml_tensor  * grad,
++            int                   n_head,
++            float                 scale);
++
+     // rotary position embedding
+     // if (mode & 1) - skip n_past elements (NOT SUPPORTED)
+     // if (mode & GGML_ROPE_TYPE_NEOX) - GPT-NeoX style
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index 2b3eb5b..6b07f8b 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -1874,6 +1874,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_soft_max_ext_back(params, tensor);
+             } break;
++        case GGML_OP_PET_ATTN:
++            {
++                ggml_compute_forward_pet_attn(params, tensor);
++            } break;
++        case GGML_OP_PET_ATTN_BACK:
++            {
++                ggml_compute_forward_pet_attn_back(params, tensor);
++            } break;
+         case GGML_OP_ROPE:
+             {
+                 ggml_compute_forward_rope(params, tensor);
+@@ -2313,6 +2321,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+         case GGML_OP_DIAG_MASK_ZERO:
+         case GGML_OP_DIAG_MASK_INF:
+         case GGML_OP_SOFT_MAX_BACK:
++        case GGML_OP_PET_ATTN:
++        case GGML_OP_PET_ATTN_BACK:
+         case GGML_OP_ROPE:
+         case GGML_OP_ROPE_BACK:
+         case GGML_OP_ADD_REL_POS:
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+index 2d2c3f1..cc9109f 100644
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -11,6 +11,7 @@
+ #include <algorithm>
+ #include <cfloat>
+ #include <cmath>
++#include <vector>
+ 
+ // ggml_compute_forward_dup
+ 
+@@ -11209,3 +11210,86 @@ void ggml_compute_forward_opt_step_sgd(const ggml_compute_params * params, ggml_
+             }
+     }
+ }
++
++// ggml_compute_forward_pet_attn (reference: one thread per sequence)
++
++void ggml_compute_forward_pet_attn(const ggml_compute_params * params, ggml_tensor * dst) {
++    const ggml_tensor * qkv  = dst->src[0];
++    const ggml_tensor * bias = dst->src[1];
++    const int   H     = ggml_get_op_params_i32(dst, 0);
++    const float scale = ggml_get_op_params_f32(dst, 1);
++    const int64_t D = qkv->ne[0], d = D / H, L = qkv->ne[2], N = qkv->ne[3];
++
++    std::vector<float> p(L);
++    for (int64_t n = params->ith; n < N; n += params->nth) {
++        auto row = [&](int64_t i, int s) { return (const float *) ((const char *) qkv->data + n*qkv->nb[3] + i*qkv->nb[2] + s*qkv->nb[1]); };
++        for (int64_t i = 0; i < L; i++) {
++            const float * b = (const float *) ((const char *) bias->data + n*bias->nb[3] + i*bias->nb[1]);
++            float * out = (float *) ((char *) dst->data + n*dst->nb[2] + i*dst->nb[1]);
++            for (int h = 0; h < H; h++) {
++                const float * q = row(i, 0) + h*d;
++                float mx = -INFINITY;
++                for (int64_t j = 0; j < L; j++) {
++                    const float * k = row(j, 1) + h*d;
++                    float s = 0.0f;
++                    for (int64_t c = 0; c < d; c++) s += q[c]*k[c];
++                    p[j] = scale*s + b[j];
++                    mx = std::max(mx, p[j]);
++                }
++                double sum = 0.0;
++                for (int64_t j = 0; j < L; j++) p[j] = expf(p[j] - mx), sum += p[j];
++                float * o = out + h*d;
++                for (int64_t c = 0; c < d; c++) o[c] = 0.0f;
++                for (int64_t j = 0; j < L; j++) {
++                    const float * v = row(j, 2) + h*d;
++                    const float w = p[j] / (float) sum;
++                    for (int64_t c = 0; c < d; c++) o[c] += w*v[c];
++                }
++                out[D + h] = mx + (float) log(sum);
++            }
++        }
++    }
++}
++
++// ggml_compute_forward_pet_attn_back: dq, dk, dv into the q, k, v slots of dst
++
++void ggml_compute_forward_pet_attn_back(const ggml_compute_params * params, ggml_tensor * dst) {
++    const ggml_tensor * qkv  = dst->src[0];
++    const ggml_tensor * bias = dst->src[1];
++    const ggml_tensor * res  = dst->src[2];
++    const ggml_tensor * grad = dst->src[3];
++    const int   H     = ggml_get_op_params_i32(dst, 0);
++    const float scale = ggml_get_op_params_f32(dst, 1);
++    const int64_t D = qkv->ne[0], d = D / H, L = qkv->ne[2], N = qkv->ne[3];
++
++    for (int64_t n = params->ith; n < N; n += params->nth) {
++        auto in  = [&](int64_t i, int s) { return (const float *) ((const char *) qkv->data + n*qkv->nb[3] + i*qkv->nb[2] + s*qkv->nb[1]); };
++        auto out = [&](int64_t i, int s) { return (float *) ((char *) dst->data + n*dst->nb[3] + i*dst->nb[2] + s*dst->nb[1]); };
++        auto r   = [&](const ggml_tensor * t, int64_t i) { return (const float *) ((const char *) t->data + n*t->nb[2] + i*t->nb[1]); };
++        for (int64_t i = 0; i < L; i++)
++            for (int s = 0; s < 3; s++) memset(out(i, s), 0, D*sizeof(float));
++        for (int h = 0; h < H; h++) {
++            for (int64_t i = 0; i < L; i++) {
++                const float * q  = in(i, 0) + h*d;
++                const float * o  = r(res, i) + h*d;
++                const float * dO = r(grad, i) + h*d;
++                const float lse  = r(res, i)[D + h];
++                const float * b  = (const float *) ((const char *) bias->data + n*bias->nb[3] + i*bias->nb[1]);
++                float Di = 0.0f;
++                for (int64_t c = 0; c < d; c++) Di += dO[c]*o[c];
++                float * dq = out(i, 0) + h*d;
++                for (int64_t j = 0; j < L; j++) {
++                    const float * k = in(j, 1) + h*d;
++                    const float * v = in(j, 2) + h*d;
++                    float s = 0.0f, dp = 0.0f;
++                    for (int64_t c = 0; c < d; c++) s += q[c]*k[c], dp += dO[c]*v[c];
++                    const float p  = expf(scale*s + b[j] - lse);
++                    const float ds = p*(dp - Di)*scale;
++                    float * dk = out(j, 1) + h*d;
++                    float * dv = out(j, 2) + h*d;
++                    for (int64_t c = 0; c < d; c++) dq[c] += ds*k[c], dk[c] += ds*q[c], dv[c] += p*dO[c];
++                }
++            }
++        }
++    }
++}
+diff --git a/src/ggml-cpu/ops.h b/src/ggml-cpu/ops.h
+index 3fa1443..ca15fb0 100644
+--- a/src/ggml-cpu/ops.h
++++ b/src/ggml-cpu/ops.h
+@@ -60,6 +60,8 @@ void ggml_compute_forward_diag_mask_inf(const struct ggml_compute_params * param
+ void ggml_compute_forward_diag_mask_zero(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_soft_max(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_soft_max_ext_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_pet_attn(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_pet_attn_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_rope(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_rope_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_clamp(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+diff --git a/src/ggml-cuda/common.cuh b/src/ggml-cuda/common.cuh
+index 65d7a6e..c0f1a7d 100644
+--- a/src/ggml-cuda/common.cuh
++++ b/src/ggml-cuda/common.cuh
+@@ -25,6 +25,7 @@
+ #include <cassert>
+ #include <cfloat>
+ #include <cstdio>
++#include <cstdlib>
+ #include <string>
+ #include <unordered_map>
+ #include <vector>
+@@ -1408,7 +1409,9 @@ struct ggml_backend_cuda_context {
+         if (cublas_handles[device] == nullptr) {
+             ggml_cuda_set_device(device);
+             CUBLAS_CHECK(cublasCreate(&cublas_handles[device]));
+-            CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device], CUBLAS_TF32_TENSOR_OP_MATH));
++            // GGML_CUDA_NO_TF32=1: full-precision FP32 GEMMs (A/B against TF32 tensor cores)
++            static const bool no_tf32 = getenv("GGML_CUDA_NO_TF32") != nullptr;
++            CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device], no_tf32 ? CUBLAS_DEFAULT_MATH : CUBLAS_TF32_TENSOR_OP_MATH));
+         }
+         return cublas_handles[device];
+     }
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index 648124c..c9e8c57 100644
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -34,6 +34,7 @@
+ #include "ggml-cuda/opt-step-sgd.cuh"
+ #include "ggml-cuda/out-prod.cuh"
+ #include "ggml-cuda/pad.cuh"
++#include "ggml-cuda/pet-attn.cuh"
+ #include "ggml-cuda/pool2d.cuh"
+ #include "ggml-cuda/quantize.cuh"
+ #include "ggml-cuda/rope.cuh"
+@@ -2724,6 +2725,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+         case GGML_OP_SOFT_MAX_BACK:
+             ggml_cuda_op_soft_max_back(ctx, dst);
+             break;
++        case GGML_OP_PET_ATTN:
++            ggml_cuda_op_pet_attn(ctx, dst);
++            break;
++        case GGML_OP_PET_ATTN_BACK:
++            ggml_cuda_op_pet_attn_back(ctx, dst);
++            break;
+         case GGML_OP_ROPE:
+             ggml_cuda_op_rope(ctx, dst);
+             break;
+@@ -4901,6 +4908,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+             memcpy(&max_bias, (const float *) op->op_params + 1, sizeof(float));
+             return max_bias == 0.0f;
+         }
++        case GGML_OP_PET_ATTN:
++        case GGML_OP_PET_ATTN_BACK:
++            return ggml_cuda_pet_attn_supported(op);
+         case GGML_OP_ROLL:
+             if(op->src[0]->type == GGML_TYPE_F32) {
+                 return true;
+diff --git a/src/ggml-cuda/pet-attn.cu b/src/ggml-cuda/pet-attn.cu
+new file mode 100644
+index 0000000..baa8819
+--- /dev/null
++++ b/src/ggml-cuda/pet-attn.cu
+@@ -0,0 +1,553 @@
++#include "pet-attn.cuh"
++
++// One thread per (query or key, head); a block holds T positions x H heads
++// and streams the other side in tiles of T rows through shared memory. Rows
++// of all heads are kept head-padded to d+1 floats, so the H threads of one
++// position read distinct banks. Probabilities are recomputed from the stored
++// log-sum-exp in the backward kernels: no L x L matrix is ever stored.
++//
++// qkv [D, 3, L, N] and the result rows [D + H] are contiguous; bias is
++// [L, L, 1, N], bias[n][query][key].
++
++static constexpr int MAX_SMEM = 48*1024;
++
++template <int d>
++static __global__ void pet_attn_fwd(
++        const float * __restrict__ qkv, const float * __restrict__ bias, float * __restrict__ dst,
++        const int H, const int L, const int T, const float scale) {
++    extern __shared__ float sm[];
++    const int D = H*d, P = d + 1;
++    float * Ks = sm;            // [T][H][P]
++    float * Vs = Ks + T*H*P;    // [T][H][P]
++    float * Bs = Vs + T*H*P;    // [T][T]
++
++    const int64_t n = blockIdx.x;
++    const int q0 = blockIdx.y*T, t = threadIdx.x, h = t % H, qi = t / H, i = q0 + qi;
++    const bool active = i < L;
++    const float * base = qkv + n*L*3*D;
++
++    float q[d], acc[d], m = -INFINITY, l = 0.0f;
++#pragma unroll
++    for (int c = 0; c < d; c++) q[c] = active ? scale*base[(int64_t) i*3*D + h*d + c] : 0.0f, acc[c] = 0.0f;
++
++    for (int k0 = 0; k0 < L; k0 += T) {
++        const int nk = min(T, L - k0);
++        for (int e = t; e < nk*D; e += blockDim.x) {
++            const int kk = e / D, c = e % D, o = (kk*H + c / d)*P + c % d;
++            Ks[o] = base[(int64_t) (k0 + kk)*3*D +   D + c];
++            Vs[o] = base[(int64_t) (k0 + kk)*3*D + 2*D + c];
++        }
++        for (int e = t; e < T*nk; e += blockDim.x) {
++            const int a = e / nk, kk = e % nk;
++            Bs[a*T + kk] = q0 + a < L ? bias[(n*L + q0 + a)*L + k0 + kk] : 0.0f;
++        }
++        __syncthreads();
++        if (active) {
++            for (int kk = 0; kk < nk; kk++) {
++                const float * kr = Ks + (kk*H + h)*P;
++                float s = Bs[qi*T + kk];
++#pragma unroll
++                for (int c = 0; c < d; c++) s += q[c]*kr[c];
++                if (s > m) {
++                    const float corr = expf(m - s);
++                    l *= corr;
++#pragma unroll
++                    for (int c = 0; c < d; c++) acc[c] *= corr;
++                    m = s;
++                }
++                const float p = expf(s - m);
++                l += p;
++                const float * vr = Vs + (kk*H + h)*P;
++#pragma unroll
++                for (int c = 0; c < d; c++) acc[c] += p*vr[c];
++            }
++        }
++        __syncthreads();
++    }
++    if (active) {
++        float * o = dst + (n*L + i)*(D + H);
++#pragma unroll
++        for (int c = 0; c < d; c++) o[h*d + c] = acc[c]/l;
++        o[D + h] = m + logf(l);
++    }
++}
++
++// dq = scale * sum_k p (dp - Di) k, one thread per (query, head)
++template <int d>
++static __global__ void pet_attn_bwd_dq(
++        const float * __restrict__ qkv, const float * __restrict__ bias, const float * __restrict__ res,
++        const float * __restrict__ grad, float * __restrict__ dst,
++        const int H, const int L, const int T, const float scale) {
++    extern __shared__ float sm[];
++    const int D = H*d, P = d + 1;
++    float * Ks = sm;
++    float * Vs = Ks + T*H*P;
++    float * Bs = Vs + T*H*P;
++
++    const int64_t n = blockIdx.x;
++    const int q0 = blockIdx.y*T, t = threadIdx.x, h = t % H, qi = t / H, i = q0 + qi;
++    const bool active = i < L;
++    const float * base = qkv + n*L*3*D;
++    const int64_t row = n*L + (active ? i : 0);
++
++    float q[d], dO[d], dq[d], Di = 0.0f;
++#pragma unroll
++    for (int c = 0; c < d; c++) {
++        q[c]  = active ? base[(int64_t) i*3*D + h*d + c] : 0.0f;
++        dO[c] = active ? grad[row*(D + H) + h*d + c] : 0.0f;
++        Di   += dO[c]*(active ? res[row*(D + H) + h*d + c] : 0.0f);
++        dq[c] = 0.0f;
++    }
++    const float lse = active ? res[row*(D + H) + D + h] : 0.0f;
++
++    for (int k0 = 0; k0 < L; k0 += T) {
++        const int nk = min(T, L - k0);
++        for (int e = t; e < nk*D; e += blockDim.x) {
++            const int kk = e / D, c = e % D, o = (kk*H + c / d)*P + c % d;
++            Ks[o] = base[(int64_t) (k0 + kk)*3*D +   D + c];
++            Vs[o] = base[(int64_t) (k0 + kk)*3*D + 2*D + c];
++        }
++        for (int e = t; e < T*nk; e += blockDim.x) {
++            const int a = e / nk, kk = e % nk;
++            Bs[a*T + kk] = q0 + a < L ? bias[(n*L + q0 + a)*L + k0 + kk] : 0.0f;
++        }
++        __syncthreads();
++        if (active) {
++            for (int kk = 0; kk < nk; kk++) {
++                const float * kr = Ks + (kk*H + h)*P;
++                const float * vr = Vs + (kk*H + h)*P;
++                float s = 0.0f, dp = 0.0f;
++#pragma unroll
++                for (int c = 0; c < d; c++) s += q[c]*kr[c], dp += dO[c]*vr[c];
++                const float p  = expf(scale*s + Bs[qi*T + kk] - lse);
++                const float ds = p*(dp - Di);
++#pragma unroll
++                for (int c = 0; c < d; c++) dq[c] += ds*kr[c];
++            }
++        }
++        __syncthreads();
++    }
++    if (active) {
++#pragma unroll
++        for (int c = 0; c < d; c++) dst[row*3*D + h*d + c] = scale*dq[c];
++    }
++}
++
++// dk = scale * sum_q p (dp - Di) q, dv = sum_q p dO, one thread per (key, head)
++template <int d>
++static __global__ void pet_attn_bwd_dkv(
++        const float * __restrict__ qkv, const float * __restrict__ bias, const float * __restrict__ res,
++        const float * __restrict__ grad, float * __restrict__ dst,
++        const int H, const int L, const int T, const float scale) {
++    extern __shared__ float sm[];
++    const int D = H*d, P = d + 1;
++    float * Qs  = sm;             // [T][H][P]
++    float * dOs = Qs + T*H*P;     // [T][H][P]
++    float * Bs  = dOs + T*H*P;    // [T queries][T keys]
++    float * Ls  = Bs + T*T;       // [T][H] log-sum-exp
++    float * Ds  = Ls + T*H;       // [T][H] dO . O
++
++    const int64_t n = blockIdx.x;
++    const int k0 = blockIdx.y*T, t = threadIdx.x, h = t % H, kj = t / H, j = k0 + kj;
++    const bool active = j < L;
++    const int nk = min(T, L - k0);
++    const float * base = qkv + n*L*3*D;
++
++    float k[d], v[d], dk[d], dv[d];
++#pragma unroll
++    for (int c = 0; c < d; c++) {
++        k[c] = active ? base[(int64_t) j*3*D +   D + h*d + c] : 0.0f;
++        v[c] = active ? base[(int64_t) j*3*D + 2*D + h*d + c] : 0.0f;
++        dk[c] = dv[c] = 0.0f;
++    }
++
++    for (int q0 = 0; q0 < L; q0 += T) {
++        const int nq = min(T, L - q0);
++        for (int e = t; e < nq*D; e += blockDim.x) {
++            const int qq = e / D, c = e % D, o = (qq*H + c / d)*P + c % d;
++            const int64_t row = n*L + q0 + qq;
++            Qs[o]  = base[(int64_t) (q0 + qq)*3*D + c];
++            dOs[o] = grad[row*(D + H) + c];
++        }
++        for (int e = t; e < nq*nk; e += blockDim.x) {
++            const int qq = e / nk, kk = e % nk;
++            Bs[qq*T + kk] = bias[(n*L + q0 + qq)*L + k0 + kk];
++        }
++        for (int e = t; e < nq*H; e += blockDim.x) Ls[e] = res[(n*L + q0 + e / H)*(D + H) + D + e % H];
++        __syncthreads();
++        for (int e = t; e < nq*H; e += blockDim.x) {
++            const int qq = e / H, hh = e % H;
++            const float * o = res + (n*L + q0 + qq)*(D + H) + hh*d;
++            float s = 0.0f;
++            for (int c = 0; c < d; c++) s += dOs[(qq*H + hh)*P + c]*o[c];
++            Ds[e] = s;
++        }
++        __syncthreads();
++        if (active) {
++            for (int qq = 0; qq < nq; qq++) {
++                const float * qr = Qs  + (qq*H + h)*P;
++                const float * gr = dOs + (qq*H + h)*P;
++                float s = 0.0f, dp = 0.0f;
++#pragma unroll
++                for (int c = 0; c < d; c++) s += qr[c]*k[c], dp += gr[c]*v[c];
++                const float p  = expf(scale*s + Bs[qq*T + kj] - Ls[qq*H + h]);
++                const float ds = p*(dp - Ds[qq*H + h]);
++#pragma unroll
++                for (int c = 0; c < d; c++) dv[c] += p*gr[c], dk[c] += ds*qr[c];
++            }
++        }
++        __syncthreads();
++    }
++    if (active) {
++        float * o = dst + (n*L + j)*3*D;
++#pragma unroll
++        for (int c = 0; c < d; c++) o[D + h*d + c] = scale*dk[c], o[2*D + h*d + c] = dv[c];
++    }
++}
++
++
++// ---- v2: register-blocked ----
++// Each thread owns R rows (queries; keys in the dk/dv kernel) of one head, so
++// a row streamed through shared memory is loaded once and used R times
++// (v1: once). Shared rows are padded to d+4 floats: 128-bit loads, and the
++// heads of a quarter-warp hit disjoint banks. A block holds G row groups x H
++// heads (TP = G*R rows, fitted to L: short adaptive-cutoff sequences do not
++// leave threads idle) and streams the other side in tiles of TS rows. A
++// thread's rows are strided by G, so that a tile's rows are spread evenly.
++
++template <int d>
++static __device__ __forceinline__ void load_row(const float * __restrict__ s, float (&r)[d]) {
++#pragma unroll
++    for (int c = 0; c < d; c += 4) {
++        const float4 v = *reinterpret_cast<const float4 *>(s + c);
++        r[c] = v.x, r[c + 1] = v.y, r[c + 2] = v.z, r[c + 3] = v.w;
++    }
++}
++
++// nr rows of D floats (row stride `stride`) into shared [nr][H][P]
++static __device__ __forceinline__ void stage_rows(float * __restrict__ dst, const float * __restrict__ src,
++        const int64_t stride, const int nr, const int D, const int d, const int P, const int t, const int nt) {
++    const int H = D / d;
++    if ((stride & 3) == 0 && (reinterpret_cast<uintptr_t>(src) & 15) == 0) {
++        const int D4 = D / 4;
++        for (int e = t; e < nr*D4; e += nt) {
++            const int r = e / D4, c = (e % D4)*4;
++            *reinterpret_cast<float4 *>(dst + (r*H + c / d)*P + c % d) = *reinterpret_cast<const float4 *>(src + r*stride + c);
++        }
++    } else {
++        for (int e = t; e < nr*D; e += nt) {
++            const int r = e / D, c = e % D;
++            dst[(r*H + c / d)*P + c % d] = src[r*stride + c];
++        }
++    }
++}
++
++template <int d, int R>
++static __global__ void pet_attn_fwd_v2(
++        const float * __restrict__ qkv, const float * __restrict__ bias, float * __restrict__ dst,
++        const int H, const int L, const int TP, const int TS, const float scale) {
++    extern __shared__ float4 sm4[];
++    float * sm = reinterpret_cast<float *>(sm4);
++    const int D = H*d, P = d + 4, G = TP / R;
++    float * Ks = sm;            // [TS][H][P]
++    float * Vs = Ks + TS*H*P;   // [TS][H][P]
++    float * Bs = Vs + TS*H*P;   // [TP][TS]
++
++    const int64_t n = blockIdx.x;
++    const int q0 = blockIdx.y*TP, t = threadIdx.x, h = t % H, g = t / H;
++    const float * base = qkv + n*L*3*D;
++
++    float q[R][d], acc[R][d], m[R], l[R];
++#pragma unroll
++    for (int r = 0; r < R; r++) {
++        const int i = q0 + g + r*G;
++        m[r] = -INFINITY, l[r] = 0.0f;
++#pragma unroll
++        for (int c = 0; c < d; c++) q[r][c] = i < L ? scale*base[(int64_t) i*3*D + h*d + c] : 0.0f, acc[r][c] = 0.0f;
++    }
++
++    for (int k0 = 0; k0 < L; k0 += TS) {
++        const int nk = min(TS, L - k0);
++        stage_rows(Ks, base + (int64_t) k0*3*D +   D, 3*D, nk, D, d, P, t, blockDim.x);
++        stage_rows(Vs, base + (int64_t) k0*3*D + 2*D, 3*D, nk, D, d, P, t, blockDim.x);
++        for (int e = t; e < TP*nk; e += blockDim.x) {
++            const int a = e / nk, kk = e % nk;
++            Bs[a*TS + kk] = q0 + a < L ? bias[(n*L + q0 + a)*L + k0 + kk] : 0.0f;
++        }
++        __syncthreads();
++        for (int kk = 0; kk < nk; kk++) {
++            float kr[d], vr[d];
++            load_row<d>(Ks + (kk*H + h)*P, kr);
++            load_row<d>(Vs + (kk*H + h)*P, vr);
++#pragma unroll
++            for (int r = 0; r < R; r++) {
++                float s = Bs[(g + r*G)*TS + kk];
++#pragma unroll
++                for (int c = 0; c < d; c++) s += q[r][c]*kr[c];
++                if (s > m[r]) {
++                    const float corr = __expf(m[r] - s);
++                    l[r] *= corr;
++#pragma unroll
++                    for (int c = 0; c < d; c++) acc[r][c] *= corr;
++                    m[r] = s;
++                }
++                const float p = __expf(s - m[r]);
++                l[r] += p;
++#pragma unroll
++                for (int c = 0; c < d; c++) acc[r][c] += p*vr[c];
++            }
++        }
++        __syncthreads();
++    }
++#pragma unroll
++    for (int r = 0; r < R; r++) {
++        const int i = q0 + g + r*G;
++        if (i >= L) continue;
++        float * o = dst + (n*L + i)*(D + H);
++#pragma unroll
++        for (int c = 0; c < d; c++) o[h*d + c] = acc[r][c]/l[r];
++        o[D + h] = m[r] + logf(l[r]);
++    }
++}
++
++template <int d, int R>
++static __global__ void pet_attn_bwd_dq_v2(
++        const float * __restrict__ qkv, const float * __restrict__ bias, const float * __restrict__ res,
++        const float * __restrict__ grad, float * __restrict__ dst,
++        const int H, const int L, const int TP, const int TS, const float scale) {
++    extern __shared__ float4 sm4[];
++    float * sm = reinterpret_cast<float *>(sm4);
++    const int D = H*d, P = d + 4, G = TP / R;
++    float * Ks = sm;
++    float * Vs = Ks + TS*H*P;
++    float * Bs = Vs + TS*H*P;   // [TP][TS]
++
++    const int64_t n = blockIdx.x;
++    const int q0 = blockIdx.y*TP, t = threadIdx.x, h = t % H, g = t / H;
++    const float * base = qkv + n*L*3*D;
++
++    float q[R][d], dO[R][d], dq[R][d], Di[R], lse[R];
++#pragma unroll
++    for (int r = 0; r < R; r++) {
++        const int i = q0 + g + r*G;
++        const bool ok = i < L;
++        const int64_t row = n*L + (ok ? i : 0);
++        Di[r] = 0.0f;
++#pragma unroll
++        for (int c = 0; c < d; c++) {
++            q[r][c]  = ok ? base[(int64_t) i*3*D + h*d + c] : 0.0f;
++            dO[r][c] = ok ? grad[row*(D + H) + h*d + c] : 0.0f;
++            Di[r]   += dO[r][c]*(ok ? res[row*(D + H) + h*d + c] : 0.0f);
++            dq[r][c] = 0.0f;
++        }
++        lse[r] = ok ? res[row*(D + H) + D + h] : 0.0f;
++    }
++
++    for (int k0 = 0; k0 < L; k0 += TS) {
++        const int nk = min(TS, L - k0);
++        stage_rows(Ks, base + (int64_t) k0*3*D +   D, 3*D, nk, D, d, P, t, blockDim.x);
++        stage_rows(Vs, base + (int64_t) k0*3*D + 2*D, 3*D, nk, D, d, P, t, blockDim.x);
++        for (int e = t; e < TP*nk; e += blockDim.x) {
++            const int a = e / nk, kk = e % nk;
++            Bs[a*TS + kk] = q0 + a < L ? bias[(n*L + q0 + a)*L + k0 + kk] : 0.0f;
++        }
++        __syncthreads();
++        for (int kk = 0; kk < nk; kk++) {
++            float kr[d], vr[d];
++            load_row<d>(Ks + (kk*H + h)*P, kr);
++            load_row<d>(Vs + (kk*H + h)*P, vr);
++#pragma unroll
++            for (int r = 0; r < R; r++) {
++                float s = 0.0f, dp = 0.0f;
++#pragma unroll
++                for (int c = 0; c < d; c++) s += q[r][c]*kr[c], dp += dO[r][c]*vr[c];
++                const float p  = __expf(scale*s + Bs[(g + r*G)*TS + kk] - lse[r]);
++                const float ds = p*(dp - Di[r]);
++#pragma unroll
++                for (int c = 0; c < d; c++) dq[r][c] += ds*kr[c];
++            }
++        }
++        __syncthreads();
++    }
++#pragma unroll
++    for (int r = 0; r < R; r++) {
++        const int i = q0 + g + r*G;
++        if (i >= L) continue;
++#pragma unroll
++        for (int c = 0; c < d; c++) dst[(n*L + i)*3*D + h*d + c] = scale*dq[r][c];
++    }
++}
++
++template <int d, int R>
++static __global__ void pet_attn_bwd_dkv_v2(
++        const float * __restrict__ qkv, const float * __restrict__ bias, const float * __restrict__ res,
++        const float * __restrict__ grad, float * __restrict__ dst,
++        const int H, const int L, const int TP, const int TS, const float scale) {
++    extern __shared__ float4 sm4[];
++    float * sm = reinterpret_cast<float *>(sm4);
++    const int D = H*d, P = d + 4, G = TP / R;
++    float * Qs  = sm;             // [TS][H][P]
++    float * dOs = Qs + TS*H*P;    // [TS][H][P]
++    float * Bs  = dOs + TS*H*P;   // [TS queries][TP keys]
++    float * Ls  = Bs + TS*TP;     // [TS][H]
++    float * Ds  = Ls + TS*H;      // [TS][H]
++
++    const int64_t n = blockIdx.x;
++    const int k0 = blockIdx.y*TP, t = threadIdx.x, h = t % H, g = t / H;
++    const float * base = qkv + n*L*3*D;
++
++    float k[R][d], v[R][d], dk[R][d], dv[R][d];
++#pragma unroll
++    for (int r = 0; r < R; r++) {
++        const int j = k0 + g + r*G;
++#pragma unroll
++        for (int c = 0; c < d; c++) {
++            k[r][c] = j < L ? base[(int64_t) j*3*D +   D + h*d + c] : 0.0f;
++            v[r][c] = j < L ? base[(int64_t) j*3*D + 2*D + h*d + c] : 0.0f;
++            dk[r][c] = dv[r][c] = 0.0f;
++        }
++    }
++
++    for (int q0 = 0; q0 < L; q0 += TS) {
++        const int nq = min(TS, L - q0);
++        stage_rows(Qs,  base + (int64_t) q0*3*D, 3*D, nq, D, d, P, t, blockDim.x);
++        stage_rows(dOs, grad + (n*L + q0)*(D + H), D + H, nq, D, d, P, t, blockDim.x);
++        for (int e = t; e < nq*TP; e += blockDim.x) {
++            const int qq = e / TP, a = e % TP;
++            Bs[qq*TP + a] = k0 + a < L ? bias[(n*L + q0 + qq)*L + k0 + a] : 0.0f;
++        }
++        for (int e = t; e < nq*H; e += blockDim.x) Ls[e] = res[(n*L + q0 + e / H)*(D + H) + D + e % H];
++        __syncthreads();
++        for (int e = t; e < nq*H; e += blockDim.x) {
++            const int qq = e / H, hh = e % H;
++            const float * o = res + (n*L + q0 + qq)*(D + H) + hh*d;
++            float s = 0.0f;
++            for (int c = 0; c < d; c++) s += dOs[(qq*H + hh)*P + c]*o[c];
++            Ds[e] = s;
++        }
++        __syncthreads();
++        for (int qq = 0; qq < nq; qq++) {
++            float qr[d], gr[d];
++            load_row<d>(Qs  + (qq*H + h)*P, qr);
++            load_row<d>(dOs + (qq*H + h)*P, gr);
++            const float lq = Ls[qq*H + h], dq = Ds[qq*H + h];
++#pragma unroll
++            for (int r = 0; r < R; r++) {
++                float s = 0.0f, dp = 0.0f;
++#pragma unroll
++                for (int c = 0; c < d; c++) s += qr[c]*k[r][c], dp += gr[c]*v[r][c];
++                const float p  = __expf(scale*s + Bs[qq*TP + g + r*G] - lq);
++                const float ds = p*(dp - dq);
++#pragma unroll
++                for (int c = 0; c < d; c++) dv[r][c] += p*gr[c], dk[r][c] += ds*qr[c];
++            }
++        }
++        __syncthreads();
++    }
++#pragma unroll
++    for (int r = 0; r < R; r++) {
++        const int j = k0 + g + r*G;
++        if (j >= L) continue;
++        float * o = dst + (n*L + j)*3*D;
++#pragma unroll
++        for (int c = 0; c < d; c++) o[D + h*d + c] = scale*dk[r][c], o[2*D + h*d + c] = dv[r][c];
++    }
++}
++
++// v2 launch shape: G row groups (<= 256 threads, no more rows than L), then
++// the largest streamed tile TS <= 32 that fits (and is not much above L)
++struct pet_attn_shape { int TP, TS; size_t smem; };
++
++static pet_attn_shape pet_attn_v2_shape(int H, int d, int R, int L, bool dkv) {
++    const int G = std::max(1, std::min(256 / H, (L + R - 1) / R)), TP = G*R;
++    auto smem = [&](int TS) {
++        return (2*(size_t) TS*H*(d + 4) + (size_t) TP*TS + (dkv ? 2*(size_t) TS*H : 0))*sizeof(float);
++    };
++    int TS = 32;
++    while (TS > 1 && (TS / 2 >= L || smem(TS) > MAX_SMEM)) TS /= 2;
++    return {TP, TS, smem(TS)};
++}
++
++template <int d>
++static void pet_attn_launch_v2(ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool back) {
++    constexpr int RF = 64 / d > 1 ? 64 / d : 1; // forward: q, acc in registers
++    constexpr int RB = 32 / d > 1 ? 32 / d : 1; // backward: three row arrays
++    const ggml_tensor * qkv = dst->src[0];
++    const int   H     = ggml_get_op_params_i32(dst, 0);
++    const float scale = ggml_get_op_params_f32(dst, 1);
++    const int   L     = (int) qkv->ne[2];
++    const int64_t N   = qkv->ne[3];
++    if (N == 0 || L == 0) return;
++    cudaStream_t stream = ctx.stream();
++    const float * q = (const float *) qkv->data, * b = (const float *) dst->src[1]->data;
++    if (!back) {
++        const pet_attn_shape s = pet_attn_v2_shape(H, d, RF, L, false);
++        const dim3 grid((unsigned) N, (L + s.TP - 1) / s.TP), block(s.TP / RF * H);
++        pet_attn_fwd_v2<d, RF><<<grid, block, s.smem, stream>>>(q, b, (float *) dst->data, H, L, s.TP, s.TS, scale);
++    } else {
++        const float * res = (const float *) dst->src[2]->data, * grad = (const float *) dst->src[3]->data;
++        const pet_attn_shape sq = pet_attn_v2_shape(H, d, RB, L, false), sk = pet_attn_v2_shape(H, d, RB, L, true);
++        pet_attn_bwd_dq_v2<d, RB><<<dim3((unsigned) N, (L + sq.TP - 1) / sq.TP), sq.TP / RB * H, sq.smem, stream>>>(
++            q, b, res, grad, (float *) dst->data, H, L, sq.TP, sq.TS, scale);
++        pet_attn_bwd_dkv_v2<d, RB><<<dim3((unsigned) N, (L + sk.TP - 1) / sk.TP), sk.TP / RB * H, sk.smem, stream>>>(
++            q, b, res, grad, (float *) dst->data, H, L, sk.TP, sk.TS, scale);
++    }
++    CUDA_CHECK(cudaGetLastError());
++}
++
++// positions per block: 256 threads, shrunk until the tiles fit
++static int pet_attn_tile(int H, int d, bool back) {
++    int T = std::max(1, 256 / H);
++    auto smem = [&](int T) { return (2*T*H*(d + 1) + T*T + (back ? 2*T*H : 0))*(int) sizeof(float); };
++    while (T > 1 && smem(T) > MAX_SMEM) T /= 2;
++    return T;
++}
++
++bool ggml_cuda_pet_attn_supported(const ggml_tensor * op) {
++    const int H = ggml_get_op_params_i32(op, 0);
++    const int64_t d = op->src[0]->ne[0] / H;
++    for (int i = 0; i < GGML_MAX_SRC && op->src[i]; i++)
++        if (op->src[i]->type != GGML_TYPE_F32 || !ggml_is_contiguous(op->src[i])) return false;
++    return (d == 8 || d == 16 || d == 32 || d == 64) && H <= 256 && op->src[0]->ne[2] <= (1 << 28);
++}
++
++template <int d>
++static void pet_attn_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool back) {
++    const ggml_tensor * qkv = dst->src[0];
++    const int   H     = ggml_get_op_params_i32(dst, 0);
++    const float scale = ggml_get_op_params_f32(dst, 1);
++    const int   L     = (int) qkv->ne[2];
++    const int64_t N   = qkv->ne[3];
++    if (N == 0 || L == 0) return;
++    const int T = pet_attn_tile(H, d, back);
++    const dim3 grid((unsigned) N, (L + T - 1) / T), block(T*H);
++    cudaStream_t stream = ctx.stream();
++    const float * q = (const float *) qkv->data, * b = (const float *) dst->src[1]->data;
++    if (!back) {
++        const size_t smem = (2*T*H*(d + 1) + T*T)*sizeof(float);
++        pet_attn_fwd<d><<<grid, block, smem, stream>>>(q, b, (float *) dst->data, H, L, T, scale);
++    } else {
++        const float * res = (const float *) dst->src[2]->data, * grad = (const float *) dst->src[3]->data;
++        const size_t smem_q = (2*T*H*(d + 1) + T*T)*sizeof(float);
++        const size_t smem_k = smem_q + 2*T*H*sizeof(float);
++        pet_attn_bwd_dq<d><<<grid, block, smem_q, stream>>>(q, b, res, grad, (float *) dst->data, H, L, T, scale);
++        pet_attn_bwd_dkv<d><<<grid, block, smem_k, stream>>>(q, b, res, grad, (float *) dst->data, H, L, T, scale);
++    }
++    CUDA_CHECK(cudaGetLastError());
++}
++
++// GGML_PET_ATTN_V1=1: the one-row-per-thread kernels (A/B)
++static void pet_attn_dispatch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool back) {
++    static const bool v1 = getenv("GGML_PET_ATTN_V1") != nullptr;
++    const int H = ggml_get_op_params_i32(dst, 0);
++    switch (dst->src[0]->ne[0] / H) {
++        case  8: v1 ? pet_attn_launch< 8>(ctx, dst, back) : pet_attn_launch_v2< 8>(ctx, dst, back); break;
++        case 16: v1 ? pet_attn_launch<16>(ctx, dst, back) : pet_attn_launch_v2<16>(ctx, dst, back); break;
++        case 32: v1 ? pet_attn_launch<32>(ctx, dst, back) : pet_attn_launch_v2<32>(ctx, dst, back); break;
++        case 64: v1 ? pet_attn_launch<64>(ctx, dst, back) : pet_attn_launch_v2<64>(ctx, dst, back); break;
++        default: GGML_ABORT("pet_attn: unsupported head size");
++    }
++}
++
++void ggml_cuda_op_pet_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) { pet_attn_dispatch(ctx, dst, false); }
++void ggml_cuda_op_pet_attn_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) { pet_attn_dispatch(ctx, dst, true); }
+diff --git a/src/ggml-cuda/pet-attn.cuh b/src/ggml-cuda/pet-attn.cuh
+new file mode 100644
+index 0000000..fe9f1f1
+--- /dev/null
++++ b/src/ggml-cuda/pet-attn.cuh
+@@ -0,0 +1,6 @@
++#include "common.cuh"
++
++// fused PET attention (GGML_OP_PET_ATTN / GGML_OP_PET_ATTN_BACK): see ggml_pet_attn
++bool ggml_cuda_pet_attn_supported(const ggml_tensor * op);
++void ggml_cuda_op_pet_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++void ggml_cuda_op_pet_attn_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+diff --git a/src/ggml.c b/src/ggml.c
+index 67a31b8..d3b13ec 100644
+--- a/src/ggml.c
++++ b/src/ggml.c
+@@ -1063,9 +1063,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "OPT_STEP_SGD",
+ 
+     "GLU",
++
++    "PET_ATTN",
++    "PET_ATTN_BACK",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
++static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1173,9 +1176,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "sgd(x)",
+ 
+     "glu(x)",
++
++    "pet_attn(qkv,bias)",
++    "pet_attn_back(qkv,bias,o,do)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
++static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -4061,6 +4067,58 @@ void ggml_soft_max_add_sinks(
+     a->src[2] = sinks;
+ }
+ 
++// ggml_pet_attn
++
++struct ggml_tensor * ggml_pet_attn(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * qkv,
++        struct ggml_tensor  * bias,
++        int                   n_head,
++        float                 scale) {
++    GGML_ASSERT(qkv->type == GGML_TYPE_F32 && bias->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(qkv) && ggml_is_contiguous(bias));
++    GGML_ASSERT(qkv->ne[1] == 3 && n_head > 0 && qkv->ne[0] % n_head == 0);
++    GGML_ASSERT(bias->ne[0] == qkv->ne[2] && bias->ne[1] == qkv->ne[2] && bias->ne[2] == 1 && bias->ne[3] == qkv->ne[3]);
++
++    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, qkv->ne[0] + n_head, qkv->ne[2], qkv->ne[3]);
++
++    int32_t params[2] = { n_head, 0 };
++    memcpy(params + 1, &scale, sizeof(float));
++    ggml_set_op_params(result, params, sizeof(params));
++
++    result->op     = GGML_OP_PET_ATTN;
++    result->src[0] = qkv;
++    result->src[1] = bias;
++
++    return result;
++}
++
++struct ggml_tensor * ggml_pet_attn_back(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * qkv,
++        struct ggml_tensor  * bias,
++        struct ggml_tensor  * result,
++        struct ggml_tensor  * grad,
++        int                   n_head,
++        float                 scale) {
++    GGML_ASSERT(ggml_are_same_shape(result, grad) && grad->type == GGML_TYPE_F32);
++    GGML_ASSERT(result->ne[0] == qkv->ne[0] + n_head);
++
++    struct ggml_tensor * dqkv = ggml_dup_tensor(ctx, qkv);
++
++    int32_t params[2] = { n_head, 0 };
++    memcpy(params + 1, &scale, sizeof(float));
++    ggml_set_op_params(dqkv, params, sizeof(params));
++
++    dqkv->op     = GGML_OP_PET_ATTN_BACK;
++    dqkv->src[0] = qkv;
++    dqkv->src[1] = bias;
++    dqkv->src[2] = result;
++    dqkv->src[3] = grad;
++
++    return dqkv;
++}
++
+ // ggml_soft_max_ext_back
+ 
+ static struct ggml_tensor * ggml_soft_max_ext_back_impl(
+@@ -6715,6 +6773,14 @@ static void ggml_compute_backward(
+             }
+             GGML_ASSERT((!src1 || !src1_needs_grads) && "backward pass for softmax mask not implemented");
+         } break;
++        case GGML_OP_PET_ATTN: {
++            if (src0_needs_grads) {
++                const int32_t n_head = ggml_get_op_params_i32(tensor, 0);
++                const float   scale  = ggml_get_op_params_f32(tensor, 1);
++                ggml_add_or_set(ctx, cgraph, isrc0, ggml_pet_attn_back(ctx, src0, src1, tensor, grad, n_head, scale));
++            }
++            GGML_ASSERT(!src1_needs_grads && "backward pass for the attention bias not implemented");
++        } break;
+         case GGML_OP_ROPE: {
+             if (src0_needs_grads) {
+                 //const int n_past = ((int32_t *) tensor->op_params)[0];

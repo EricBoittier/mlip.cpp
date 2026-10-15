@@ -375,6 +375,8 @@ bool GraphModel::load_from_gguf(const std::string &path) {
                      .get<std::vector<std::string>>();
   gguf_path_ = path;
   num_neighbors_adaptive_ = loader.get_float32("pet.num_neighbors_adaptive", 0.0f);
+  cutoff_width_adaptive_ = loader.get_float32("pet.cutoff_width_adaptive", cutoff_width_);
+  adaptive_cutoff_method_ = loader.get_string("pet.adaptive_cutoff_method", "grid");
 
   // Update neighbor list builder with loaded cutoff
   neighbor_builder_ = NeighborListBuilder(NeighborListOptions{cutoff_, true, false});

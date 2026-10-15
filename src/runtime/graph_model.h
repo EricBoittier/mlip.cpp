@@ -96,6 +96,12 @@ public:
   const std::map<int, float> &nc_force_scales() const { return nc_force_scales_; }
   float energy_scale() const { return energy_scale_; }
   float cutoff_width() const { return cutoff_width_; }
+  /// PET adaptive cutoff: target neighbour count (0 = fixed cutoff), the
+  /// solver's taper width and the method ("solver" or "grid"; GGUFs written
+  /// before these keys existed: the cutoff width and "grid")
+  float num_neighbors_adaptive() const { return num_neighbors_adaptive_; }
+  float cutoff_width_adaptive() const { return cutoff_width_adaptive_; }
+  const std::string &adaptive_cutoff_method() const { return adaptive_cutoff_method_; }
   bool forces_mode() const { return forces_mode_; }
   /// Graph output is [n_atoms, 4] = (energy | non-conservative force).
   bool nc_forces() const { return nc_forces_; }
@@ -130,6 +136,8 @@ private:
   std::vector<std::string> weight_names_;
   std::vector<std::string> param_names_;
   float num_neighbors_adaptive_ = 0.0f;
+  float cutoff_width_adaptive_ = 0.0f;
+  std::string adaptive_cutoff_method_ = "grid";
 
   BackendPreference backend_preference_ = BackendPreference::Auto;
 

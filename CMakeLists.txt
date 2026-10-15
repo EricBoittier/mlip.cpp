@@ -207,6 +207,9 @@ else()
         # CUDA REPEAT_BACK (every bias / broadcast gradient): split the
         # reduction across the grid instead of one serial thread per output
                 "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-repeat-back-split.patch"
+        # fused PET attention (GGML_OP_PET_ATTN, CPU + CUDA, with backward):
+        # softmax(scale q k^T + bias) v without storing any L x L matrix
+                "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-pet-attention.patch"
         EXCLUDE_FROM_ALL YES
     )
 endif()

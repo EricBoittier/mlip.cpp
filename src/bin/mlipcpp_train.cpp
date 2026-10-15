@@ -18,7 +18,7 @@ int main(int argc, char **argv) {
                "usage: {} --data DIR --init INIT.gguf -o OUT.gguf [--epochs {}] [--batch-size {}]\n"
                "          [--gpus {}] [--lr {}] [--warmup-fraction {}] [--grad-clip {}] [--seed {}]\n"
                "          [--threads {}] [--cache-dir DIR] [--max-steps N] [--log-every {}]\n"
-               "          [--mb-growth {}] [--mb-budget {}] [--tile-nb-ratio R] [--tile-atom-ratio {}]\n"
+               "          [--mb-growth {}] [--mb-budget {}] [--max-neighbors N] [--max-attention A] [--tile-nb-ratio R] [--tile-atom-ratio {}]\n"
                "          [--graph-cache {}] [--prefetch {}] [--pack step|worker] [--optimizer adam|muon] [--muon-momentum {}]\n"
                "          [--muon-lr-scale {}] [--muon-ns-steps {}]\n"
                "--tile-nb-ratio > 1 pads micro-batches to a geometric grid of shapes and\n"
@@ -49,6 +49,8 @@ int main(int argc, char **argv) {
     else if (a == "--log-every") o.log_every = std::stoi(val());
     else if (a == "--mb-growth") o.mb_growth = std::stod(val());
     else if (a == "--mb-budget") o.mb_budget = std::stod(val());
+    else if (a == "--max-neighbors") o.max_neighbors = std::stoi(val());
+    else if (a == "--max-attention") o.max_attention = std::stod(val());
     else if (a == "--tile-nb-ratio") o.tile_nb_ratio = std::stod(val());
     else if (a == "--tile-atom-ratio") o.tile_atom_ratio = std::stod(val());
     else if (a == "--pack") o.pack = val();

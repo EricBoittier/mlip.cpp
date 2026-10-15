@@ -27,8 +27,8 @@ int main(int argc, char **argv) {
   mlipcpp::train::install_crash_backtrace();
   std::string data, init, out, cache_dir;
   int n = 64, gpus = 1;
-  bool node_grads_on = false, mb_failed = false, profile = false;
-  double tile_ratio = 1.25;
+  bool node_grads_on = false, mb_failed = false, profile = false, sweep = false;
+  double tile_ratio = 1.25, tol = 1e-3;
   for (int i = 1; i + 1 < argc; i += 2) {
     const std::string a = argv[i], v = argv[i + 1];
     if (a == "--data") data = v;
@@ -39,21 +39,24 @@ int main(int argc, char **argv) {
     else if (a == "--gpus") gpus = std::stoi(v);
     else if (a == "--node-grads") node_grads_on = v == "1";
     else if (a == "--profile") profile = v == "1";
+    else if (a == "--sweep") sweep = v == "1";
     else if (a == "--tile-nb-ratio") tile_ratio = std::stod(v);
+    else if (a == "--tol") tol = std::stod(v); // max relative gradient difference
   }
   // the node-by-node profile computes one-node graph views; ggml's CUDA graph
   // cache (keyed by the first node's address) could replay a stale capture
   // into a later graph's view -> no CUDA graphs when profiling (read once)
   if (profile) setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 1);
   if (data.empty() || init.empty() || out.empty()) {
-    fmt::print(stderr, "usage: {} --data DIR --init INIT.gguf --out DIR [--n 64] [--gpus 1] [--cache-dir DIR] [--node-grads 0|1]\n", argv[0]);
+    fmt::print(stderr, "usage: {} --data DIR --init INIT.gguf --out DIR [--n 64] [--gpus 1] [--cache-dir DIR] [--node-grads 0|1] [--tol 1e-3] [--profile 0|1] [--sweep 0|1]\n", argv[0]);
     return 2;
   }
   MemmapSplit split(data + "/train");
   Worker worker(init, gpus > 0 ? 0 : -1);
   const TargetScaling sc = TargetScaling::fit(split);
+  const AdaptiveCutoff adaptive = adaptive_cutoff(worker.model());
   NeighborCache nl = NeighborCache::load_or_build(
-      split, worker.model().cutoff(), cache_path(cache_dir, split, worker.model().cutoff()), 8);
+      split, worker.model().cutoff(), cache_path(cache_dir, split, worker.model().cutoff(), adaptive), 8, adaptive);
   std::vector<int64_t> ids(n);
   std::iota(ids.begin(), ids.end(), 0);
   Batch b = make_batch(split, nl, ids, {}, worker.model().species_to_index(), sc, worker.model().cutoff());
@@ -115,7 +118,7 @@ int main(int argc, char **argv) {
     }
     fmt::print("micro-batches: {} (growth 2), loss {:.8g} vs {:.8g}, worst relative gradient "
                "difference {:.2e}\n", mbs.size(), loss, st.loss, worst);
-    if (!(worst < 1e-3)) mb_failed = true;
+    if (!(worst < tol)) mb_failed = true;
   }
 
   // step packing for 2 workers (cost-model cuts, longest-first dealing): all
@@ -123,7 +126,7 @@ int main(int argc, char **argv) {
   // the full-batch gradient, and the metrics add up exactly
   if (!node_grads_on) {
     auto per = make_step_batches(split, nl, ids, {}, worker.model().species_to_index(), sc,
-                                 worker.model().cutoff(), 2, CostModel{}, 5.0, 5e7);
+                                 worker.model().cutoff(), 2, CostModel{}, 5e7);
     double loss = 0;
     StepStats sum_st;
     std::string plan;
@@ -150,7 +153,7 @@ int main(int argc, char **argv) {
                "difference {:.2e}; se E {:.6g} vs {:.6g}, se F {:.6g} vs {:.6g}\n", plan, loss / 2,
                st.loss, worst, sum_st.se_energy_per_atom, st.se_energy_per_atom, sum_st.se_force,
                st.se_force);
-    if (!(worst < 1e-3) || !close(loss / 2, st.loss) || !close(sum_st.se_force, st.se_force) ||
+    if (!(worst < tol) || !close(loss / 2, st.loss) || !close(sum_st.se_force, st.se_force) ||
         !close(sum_st.se_energy_per_atom, st.se_energy_per_atom) || sum_st.n_systems != st.n_systems ||
         sum_st.n_force_components != st.n_force_components)
       mb_failed = true;
@@ -194,12 +197,25 @@ int main(int argc, char **argv) {
                    sum_st.se_energy_per_atom, st.se_energy_per_atom, sum_st.se_force, st.se_force,
                    sum_st.n_systems, sum_st.n_force_components, 1e3 * wall);
         auto close = [](double a, double b) { return std::abs(a - b) <= 1e-4 * std::abs(b); };
-        if (!(worst < 1e-3) || !close(loss, st.loss) || !close(sum_st.se_force, st.se_force) ||
+        if (!(worst < tol) || !close(loss, st.loss) || !close(sum_st.se_force, st.se_force) ||
             !close(sum_st.se_energy_per_atom, st.se_energy_per_atom) ||
             sum_st.n_systems != st.n_systems || sum_st.n_force_components != st.n_force_components)
           mb_failed = true;
       }
     }
+  }
+
+  if (sweep) {
+    // FLOPs, ideal traffic and compute buffer of one training micro-batch, by
+    // shape (graphs are only built and measured)
+    fmt::print("sweep: n_atoms max_neighbors n_systems GFLOP GB_ideal buffer_GB\n");
+    for (int n : {32, 128, 512, 2048})
+      for (int m : {8, 16, 32, 64, 128, 256, 512, 1024, 2048}) {
+        if (int64_t(n) * m > 1000000) continue; // the interpreter's sanity limit on n_edges
+        const int S = std::max(1, n / 8);
+        const auto c = worker.graph_cost(n, m, S);
+        fmt::print("sweep {} {} {} {:.4f} {:.4f} {:.4f}\n", n, m, S, c.flops / 1e9, c.bytes / 1e9, c.buffer / 1e9);
+      }
   }
 
   if (profile) {
@@ -218,13 +234,26 @@ int main(int argc, char **argv) {
     worker.profile = true;
     for (const Batch &mb : mbs) worker.run(mb, sc.energy_scale, true);
     std::vector<std::pair<double, std::string>> rows;
-    double total = 0;
-    for (auto &[op, v] : worker.profile_ms) rows.push_back({v.first, op}), total += v.first;
+    Worker::OpStats tot;
+    for (auto &[op, v] : worker.profile_ops)
+      rows.push_back({v.ms, op}), tot.ms += v.ms, tot.flops += v.flops, tot.bytes += v.bytes;
     std::sort(rows.rbegin(), rows.rend());
-    fmt::print("profile (node by node, synchronised; total {:.1f} ms):\n", total);
-    for (size_t k = 0; k < std::min<size_t>(rows.size(), 30); k++)
-      fmt::print("  {:>8.2f} ms {:5.1f}%  {:<24} x{}\n", rows[k].first, 100 * rows[k].first / total,
-                 rows[k].second, worker.profile_ms[rows[k].second].second);
+    fmt::print("profile (node by node, synchronised; total {:.1f} ms, {:.1f} GFLOP, {:.1f} GB ideal traffic: "
+               "{:.2f} TFLOP/s, {:.0f} GB/s):\n", tot.ms, tot.flops / 1e9, tot.bytes / 1e9,
+               tot.flops / tot.ms / 1e9, tot.bytes / tot.ms / 1e6);
+    for (size_t k = 0; k < std::min<size_t>(rows.size(), 30); k++) {
+      const auto &v = worker.profile_ops[rows[k].second];
+      fmt::print("  {:>8.2f} ms {:5.1f}%  {:<24} x{:<5} {:>9.2f} GFLOP {:>7.2f} TFLOP/s {:>8.2f} GB {:>6.0f} GB/s\n",
+                 v.ms, 100 * v.ms / tot.ms, rows[k].second, v.count, v.flops / 1e9, v.flops / v.ms / 1e9,
+                 v.bytes / 1e9, v.bytes / v.ms / 1e6);
+    }
+    auto &nodes = worker.profile_nodes;
+    std::sort(nodes.rbegin(), nodes.rend());
+    fmt::print("slowest nodes:\n");
+    for (size_t k = 0; k < std::min<size_t>(nodes.size(), 25); k++)
+      fmt::print("  {:>8.2f} ms {:5.1f}%  {}\n", nodes[k].first, 100 * nodes[k].first / tot.ms, nodes[k].second);
+    for (const Batch &mb : mbs) // the profiled shapes
+      fmt::print("  micro-batch {} atoms x {} neighbours, {} systems\n", mb.n_atoms, mb.max_neighbors, mb.n_systems);
     worker.profile = false;
   }
 

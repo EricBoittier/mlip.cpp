@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -312,6 +313,7 @@ ggml_tensor *GraphInterpreter::build_node(ggml_context *ctx,
   } else if (node.op == "MUL_MAT") {
     return build_mul_mat(ctx, node);
   } else if (node.op == "MATMUL") {
+    if (ggml_tensor *fused = build_fused_attention(ctx, node)) return fused;
     return build_matmul(ctx, node);
   } else if (node.op == "RESHAPE") {
     return build_reshape(ctx, node);
@@ -568,6 +570,72 @@ ggml_tensor *GraphInterpreter::build_matmul(ggml_context *ctx,
   // Result: ne[0] = transpose(b)->ne[1] = b->ne[0] = n, ne[1] = a->ne[1] = m
   ggml_tensor *bt = ggml_cont(ctx, ggml_transpose(ctx, b));
   return ggml_mul_mat(ctx, bt, a);
+}
+
+const GIRNode *GraphInterpreter::find_node(const std::string &ref) const {
+  auto p = parse_ref(ref);
+  if (p.type != "node") return nullptr;
+  const int id = std::stoi(p.value);
+  for (const auto &n : graph_.nodes)
+    if (n.id == id) return &n;
+  return nullptr;
+}
+
+// Multi-head attention with an additive bias, as exported from PET:
+//   MATMUL(SOFT_MAX(ADD(DIV(MATMUL(q, TRANSPOSE(k)), c), bias)), v)
+// with q, k, v = PERMUTE(RESHAPE(SELECT(x, dim 2, 0 | 1 | 2)), [0, 2, 1, 3]) of
+// one x [N, L, 3, D] -> one ggml_pet_attn (no L x L tensor is stored, forward
+// or backward). nullptr if the pattern does not match;
+// MLIPCPP_NO_FUSED_ATTN=1 keeps the separate ops.
+ggml_tensor *GraphInterpreter::build_fused_attention(ggml_context *ctx, const GIRNode &node) {
+  static const bool off = std::getenv("MLIPCPP_NO_FUSED_ATTN") != nullptr;
+  if (off || node.inputs.size() != 2) return nullptr;
+  auto in = [&](const GIRNode *n, size_t i) -> const GIRNode * {
+    return n && i < n->inputs.size() ? find_node(n->inputs[i]) : nullptr;
+  };
+  auto is = [](const GIRNode *n, const char *op) { return n && n->op == op; };
+  const GIRNode *sm = in(&node, 0), *add = in(sm, 0), *div = in(add, 0), *qk = in(div, 0);
+  if (!is(sm, "SOFT_MAX") || !is(add, "ADD") || add->inputs.size() != 2 || !is(div, "DIV") ||
+      div->inputs.size() != 1 || !has_param(*div, "scalar") || !is(qk, "MATMUL"))
+    return nullptr;
+  const int64_t dim = get_param<int64_t>(*sm, "dim", -1);
+  if (dim != -1 && dim != 3) return nullptr;
+  const GIRNode *kt = in(qk, 1);
+  if (!is(kt, "TRANSPOSE")) return nullptr;
+  const auto tdims = get_int_array_param(*kt, "dims");
+  if (tdims != std::vector<int64_t>{-2, -1} && tdims != std::vector<int64_t>{2, 3}) return nullptr;
+
+  // q, k, v: slots 0, 1, 2 of the same x, split into heads
+  const GIRNode *heads[3] = {in(qk, 0), in(kt, 0), in(&node, 1)}, *x = nullptr;
+  for (int s = 0; s < 3; s++) {
+    const GIRNode *r = in(heads[s], 0), *sel = in(r, 0);
+    if (!is(heads[s], "PERMUTE") || get_int_array_param(*heads[s], "axes") != std::vector<int64_t>{0, 2, 1, 3} ||
+        !is(r, "RESHAPE") || !is(sel, "SELECT") || get_param<int64_t>(*sel, "dim", -1) != 2 ||
+        get_param<int64_t>(*sel, "index", -1) != s)
+      return nullptr;
+    const GIRNode *xs = in(sel, 0);
+    if (!xs || (x && xs != x)) return nullptr;
+    x = xs;
+  }
+
+  ggml_tensor *q = resolve_input(ctx, qk->inputs[0]); // [d, L, H, N]
+  ggml_tensor *xt = resolve_input(ctx, "node:" + std::to_string(x->id));
+  ggml_tensor *bias = resolve_input(ctx, add->inputs[1]);
+  const int64_t d = q->ne[0], L = q->ne[1], H = q->ne[2], N = q->ne[3];
+  if ((d != 8 && d != 16 && d != 32 && d != 64) || xt->ne[0] != H * d || xt->ne[1] != 3 ||
+      xt->ne[2] != L || xt->ne[3] != N || bias->ne[0] != L || bias->ne[1] != L || bias->ne[2] != 1 ||
+      bias->ne[3] != N || xt->type != GGML_TYPE_F32 || bias->type != GGML_TYPE_F32)
+    return nullptr;
+  if (!ggml_is_contiguous(xt)) xt = ggml_cont(ctx, xt);
+  if (!ggml_is_contiguous(bias)) bias = ggml_cont(ctx, bias);
+
+  const float scale = static_cast<float>(get_param<double>(*sm, "scale", 1.0) / get_param<double>(*div, "scalar", 1.0));
+  ggml_tensor *r = ggml_pet_attn(ctx, xt, bias, static_cast<int>(H), scale); // [D + H, L, N]
+  // the MATMUL's [N, H, L, d] = ggml [d, L, H, N]: the outputs viewed as
+  // [d, H, L, N] (increasing strides: the view's backward, a CUDA ACC, decodes
+  // indices assuming that), then permuted
+  ggml_tensor *o = ggml_view_4d(ctx, r, d, H, L, N, d * sizeof(float), r->nb[1], r->nb[2], 0);
+  return ggml_permute(ctx, o, 0, 2, 1, 3);
 }
 
 // ===================== Shape Operations =====================
@@ -1123,6 +1191,23 @@ ggml_tensor *GraphInterpreter::build_softmax(ggml_context *ctx,
   }
 
   float scale = static_cast<float>(get_param<double>(node, "scale", 1.0));
+
+  // attention: softmax(x * s + bias), with the bias broadcast over heads, as
+  // one fused op (two fewer full passes over n x heads x (m+1)^2, forward and
+  // backward); MLIPCPP_NO_SOFTMAX_FUSION=1 keeps the separate ops
+  static const bool fuse = !std::getenv("MLIPCPP_NO_SOFTMAX_FUSION");
+  auto param = [](const ggml_tensor *t, int i) {
+    float v;
+    std::memcpy(&v, reinterpret_cast<const float *>(t->op_params) + i, sizeof v);
+    return v;
+  };
+  if (fuse && !mask && a->op == GGML_OP_ADD && a->src[0]->op == GGML_OP_SCALE && param(a->src[0], 1) == 0.0f) {
+    ggml_tensor *x = a->src[0]->src[0], *bias = a->src[1];
+    if (x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && bias->type == GGML_TYPE_F32 &&
+        ggml_is_contiguous(bias) && bias->ne[0] == x->ne[0] && bias->ne[1] == x->ne[1] &&
+        x->ne[2] % bias->ne[2] == 0 && x->ne[3] % bias->ne[3] == 0)
+      return ggml_soft_max_ext(ctx, x, bias, scale * param(a->src[0], 0), 0.0f);
+  }
   return ggml_soft_max_ext(ctx, a, mask, scale, 0.0f);
 }
 

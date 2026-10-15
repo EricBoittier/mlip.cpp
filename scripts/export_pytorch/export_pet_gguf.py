@@ -445,6 +445,10 @@ def main():
         writer.add_array_float32("pet.nc_force_scale_values", list(nc_force_scales.values()))
     writer.add_float32("pet.num_neighbors_adaptive",
                        float(num_neighbors_adaptive) if num_neighbors_adaptive is not None else 0.0)
+    if params.get('cutoff_width_adaptive') is not None:
+        writer.add_float32("pet.cutoff_width_adaptive", float(params['cutoff_width_adaptive']))
+    if params.get('adaptive_cutoff_method') is not None:
+        writer.add_string("pet.adaptive_cutoff_method", str(params['adaptive_cutoff_method']).lower())
 
     # Species mapping: pairs of [Z, index, Z, index, ...]
     species_map = []

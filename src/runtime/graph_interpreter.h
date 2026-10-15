@@ -137,6 +137,8 @@ private:
   ggml_tensor *build_div(ggml_context *ctx, const GIRNode &node);
   ggml_tensor *build_mul_mat(ggml_context *ctx, const GIRNode &node);
   ggml_tensor *build_matmul(ggml_context *ctx, const GIRNode &node);
+  ggml_tensor *build_fused_attention(ggml_context *ctx, const GIRNode &node);
+  const GIRNode *find_node(const std::string &ref) const;
   ggml_tensor *build_reshape(ggml_context *ctx, const GIRNode &node);
   ggml_tensor *build_view(ggml_context *ctx, const GIRNode &node);
   ggml_tensor *build_select(ggml_context *ctx, const GIRNode &node);

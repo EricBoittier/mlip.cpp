@@ -33,6 +33,8 @@ struct TrainOptions {
   // micro-batching (see make_microbatches): exact full-batch gradients
   double mb_growth = 4.0;  // max ratio of padded neighbour counts in one micro-batch
   double mb_budget = 5e7;  // max n_atoms * (max_nb+1)^2 per micro-batch
+  int max_neighbors = 0;   // drop structures with an atom above this many neighbours (0 = keep all)
+  double max_attention = 0; // drop structures with n_atoms * (max_nb+1)^2 above this (0 = keep all)
   // "step": all workers' structures packed together by a fitted cost model
   // (make_step_batches; loss = full-step mean); "worker": each worker packs
   // its own batch (make_microbatches; DDP mean of per-worker means)
@@ -93,10 +95,24 @@ public:
   /// (before allocation) and after compute.
   std::function<void(ggml_cgraph *)> after_build, after_compute;
 
-  /// Profiling: compute node by node (synchronised) and accumulate wall
-  /// time per op into `profile_ms` ("fwd:OP" / "bwd:OP"). Slow; diagnostics only.
+  /// Profiling: compute node by node (synchronised) and accumulate, per op
+  /// ("fwd:OP" / "bwd:OP"), wall time, FLOPs and ideal bytes (every operand
+  /// read and the result written once). Slow; diagnostics only.
+  struct OpStats {
+    double ms = 0, flops = 0, bytes = 0;
+    int64_t count = 0;
+  };
   bool profile = false;
-  std::map<std::string, std::pair<double, int64_t>> profile_ms;
+  std::map<std::string, OpStats> profile_ops;
+  std::vector<std::pair<double, std::string>> profile_nodes; // (ms, "fwd:OP name [shape]") per node
+
+  /// FLOPs, ideal bytes and compute-buffer size of one batch shape's graph:
+  /// built and measured, never allocated or computed.
+  struct GraphCost {
+    double flops = 0, bytes = 0;
+    size_t buffer = 0;
+  };
+  GraphCost graph_cost(int n, int m, int S, bool backward = true);
 
   /// Per-phase wall time of the last run(), in seconds.
   double t_build = 0, t_alloc = 0, t_upload = 0, t_compute = 0, t_download = 0;
@@ -184,7 +200,10 @@ public:
 };
 
 /// Neighbour-list cache file of `split` under `cache_dir` ("" if no dir).
-std::string cache_path(const std::string &cache_dir, const MemmapSplit &split, float cutoff);
+std::string cache_path(const std::string &cache_dir, const MemmapSplit &split, float cutoff,
+                       const AdaptiveCutoff &adaptive = {});
+/// The model's adaptive-cutoff settings (training implements the "solver" method only).
+AdaptiveCutoff adaptive_cutoff(const runtime::GraphModel &model);
 
 void train(const TrainOptions &opts);
 

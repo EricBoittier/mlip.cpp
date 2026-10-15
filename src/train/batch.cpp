@@ -189,6 +189,7 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
       b.neighbor_species[flat] = index_of(Z[nl.neighbor[e]]);
       rotate(nl.vector[e].data(), &b.edge_vectors[3 * flat]);
       b.padding_mask[flat] = 0.0f;
+      if (!nl.pair_cutoff.empty()) b.cutoff_values[flat] = nl.pair_cutoff[e];
       const int32_t r = nl.reverse[e];
       b.reverse_neighbor_index[flat] =
           r >= 0 ? (offset + nl.center[e0 + r]) * m + nl.slot[e0 + r] : flat;
@@ -254,7 +255,7 @@ std::vector<std::vector<Batch>> make_step_batches(const MemmapSplit &split, cons
                                                   const std::map<int, int> &species_to_index,
                                                   const TargetScaling &scaling, float cutoff,
                                                   int n_workers, const CostModel &cost,
-                                                  double preload_ms, double budget,
+                                                  double budget,
                                                   const Tiling &tiling) {
   const size_t K = ids.size();
   const int W = std::max(1, n_workers);
@@ -296,25 +297,35 @@ std::vector<std::vector<Batch>> make_step_batches(const MemmapSplit &split, cons
     for (size_t j = K; j > 0; j = cut[j]) g.emplace_back(cut[j], j);
     return g;
   };
+  // longest first onto the least loaded worker; returns the makespan
+  auto deal = [&](const Groups &groups, std::vector<int> &owner) {
+    std::vector<std::pair<double, size_t>> by_cost;
+    for (size_t g = 0; g < groups.size(); g++) by_cost.emplace_back(group_cost(groups[g].first, groups[g].second), g);
+    std::sort(by_cost.rbegin(), by_cost.rend());
+    std::vector<double> load(W, 0.0);
+    owner.assign(groups.size(), 0);
+    for (auto [c, g] : by_cost) {
+      const int w = static_cast<int>(std::min_element(load.begin(), load.end()) - load.begin());
+      owner[g] = w, load[w] += c;
+    }
+    return *std::max_element(load.begin(), load.end());
+  };
+
+  // the cap on a micro-batch's cost trades balance (small caps) against the
+  // fixed cost of each extra micro-batch: keep the plan that ends first
   Groups groups = plan(std::numeric_limits<double>::infinity());
   if (groups.empty()) groups = {{0, K}};
-  if (W > 1) { // no micro-batch longer than one worker's share of the step
-    double total = preload_ms;
+  std::vector<int> owner;
+  double best = deal(groups, owner);
+  if (W > 1) {
+    double total = 0;
     for (auto [i, j] : groups) total += group_cost(i, j);
-    Groups capped = plan(1.05 * total / W);
-    if (!capped.empty()) groups = std::move(capped);
-  }
-
-  // longest first onto the least loaded worker
-  std::vector<std::pair<double, size_t>> by_cost;
-  for (size_t g = 0; g < groups.size(); g++) by_cost.emplace_back(group_cost(groups[g].first, groups[g].second), g);
-  std::sort(by_cost.rbegin(), by_cost.rend());
-  std::vector<double> load(W, 0.0);
-  load[0] = preload_ms;
-  std::vector<int> owner(groups.size());
-  for (auto [c, g] : by_cost) {
-    const int w = static_cast<int>(std::min_element(load.begin(), load.end()) - load.begin());
-    owner[g] = w, load[w] += c;
+    for (double f : {1.0, 1.05, 1.15, 1.3, 1.5, 1.75}) {
+      Groups g = plan(f * total / W);
+      std::vector<int> own;
+      double span;
+      if (!g.empty() && (span = deal(g, own)) < best) best = span, groups = std::move(g), owner = std::move(own);
+    }
   }
 
   std::vector<std::future<Batch>> built;

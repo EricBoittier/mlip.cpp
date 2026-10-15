@@ -111,9 +111,10 @@ struct CostModel {
 /// All structures `ids` of a step (n_workers x batch) packed together:
 /// sorted by neighbour count and cut into contiguous micro-batches that
 /// minimise the modelled total cost (dynamic programming; none above
-/// `budget` = n (m+1)^2 nor above one worker's share), then dealt to the
-/// workers longest first, worker 0 starting at `preload_ms` (it also runs
-/// the optimizer). Loss normalisation is the mean over the whole step:
+/// `budget` = n (m+1)^2), then dealt to the workers longest first. The cost
+/// cap per micro-batch is the one (of a few) whose deal ends first. No
+/// worker is preloaded with the optimizer: it runs after all of them, so a
+/// preload only made the others straggle. Loss normalisation is the mean over the whole step:
 /// summing every worker's gradient and dividing by n_workers gives the
 /// full-batch gradient. A worker may get no micro-batch.
 std::vector<std::vector<Batch>> make_step_batches(const MemmapSplit &split, const NeighborCache &nl,
@@ -122,7 +123,7 @@ std::vector<std::vector<Batch>> make_step_batches(const MemmapSplit &split, cons
                                                   const std::map<int, int> &species_to_index,
                                                   const TargetScaling &scaling, float cutoff,
                                                   int n_workers, const CostModel &cost,
-                                                  double preload_ms = 0, double budget = 5e7,
+                                                  double budget = 5e7,
                                                   const Tiling &tiling = {});
 
 } // namespace mlipcpp::train
