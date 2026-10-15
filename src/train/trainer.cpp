@@ -671,6 +671,18 @@ ggml_tensor *orthogonalize(ggml_context *ctx, ggml_tensor *g, int steps, ggml_te
   }
   return tall ? ggml_cont(ctx, ggml_transpose(ctx, x)) : x;
 }
+/// CUDA graph capture for a static graph computed every step (no-op off CUDA);
+/// MLIPCPP_OPT_NO_GRAPH=1: off. Returns whether capture was allowed.
+bool allow_cuda_graph(ggml_backend_t backend, ggml_cgraph *graph) {
+  if (std::getenv("MLIPCPP_OPT_NO_GRAPH") || ggml_graph_n_nodes(graph) == 0) return false;
+  ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+  if (!dev) return false;
+  using allow_fn = void (*)(ggml_backend_t, const void *);
+  auto allow = reinterpret_cast<allow_fn>(
+      ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_graph_allow"));
+  if (allow) allow(backend, ggml_graph_node(graph, 0));
+  return allow != nullptr;
+}
 } // namespace
 
 Optimizer::Optimizer(std::vector<std::unique_ptr<Worker>> &workers, double clip, bool muon,
@@ -690,23 +702,86 @@ Optimizer::Optimizer(std::vector<std::unique_ptr<Worker>> &workers, double clip,
     for (size_t k = 0; k < params.size(); k++)
       if (is_muon_param(params[k])) groups[{params[k]->ne[0], params[k]->ne[1]}].push_back(k);
 
+  // the Muon matrices' owners: in grad_flat order (group by group), device 0
+  // up to a share MLIPCPP_MUON_SPLIT (default 1/W) of the Newton-Schulz
+  // FLOPs, the rest evenly; owned[group][device] = its matrices [a, b)
+  const bool one_device = std::getenv("MLIPCPP_MUON_ONE_DEVICE") != nullptr;
+  const char *share_env = std::getenv("MLIPCPP_MUON_SPLIT");
+  const double share0 = share_env ? std::atof(share_env) : 1.0 / W;
+  std::vector<std::vector<std::pair<size_t, size_t>>> owned;
+  std::vector<double> dev_flops(W, 0.0);
+  auto assign = [&](bool split) {
+    std::vector<double> f; // per matrix
+    for (auto &[shape, idx] : groups) {
+      const double m = std::min(shape.first, shape.second), n = std::max(shape.first, shape.second);
+      f.insert(f.end(), idx.size(), ns_steps * (4 * m * m * n + 2 * m * m * m));
+    }
+    const double total = std::accumulate(f.begin(), f.end(), 0.0);
+    auto owner = [&](double x) {
+      if (!split || x < share0 * total) return 0;
+      return std::min(W - 1, 1 + static_cast<int>((x - share0 * total) / ((1 - share0) * total) * (W - 1)));
+    };
+    owned.clear(), std::fill(dev_flops.begin(), dev_flops.end(), 0.0);
+    double F = 0;
+    size_t j = 0;
+    for (auto &[shape, idx] : groups) {
+      auto &o = owned.emplace_back(W, std::make_pair(size_t(0), size_t(0)));
+      for (size_t i = 0; i < idx.size(); i++, j++) {
+        const int d = owner(F + f[j] / 2);
+        F += f[j], dev_flops[d] += f[j];
+        o[d] = o[d].first == o[d].second ? std::make_pair(i, i + 1) : std::make_pair(o[d].first, i + 1);
+      }
+    }
+    return std::all_of(dev_flops.begin(), dev_flops.end(), [](double x) { return x > 0; });
+  };
+  const bool split = muon && !old_muon && W > 1 && !one_device && !groups.empty() && assign(true);
+  if (!split) assign(false);
+  if (split) {
+    for (int d = 0; d < W; d++)
+      muon_split += fmt::format("{}device {} {:.1f} GFLOP", d ? ", " : "", d, dev_flops[d] / 1e9);
+  }
+  auto group_offset = [&](const std::vector<size_t> &idx) { return w0.grad_offset(idx[0]); };
+
   // persistent state on device 0: Adam moments, staging for the other
-  // workers' gradients, per Muon group the stacked momentum,
-  // hyper-parameters and constants
-  ctx_ = ggml_init({ggml_tensor_overhead() * (2 * params.size() + W + 2 * groups.size() + 12), nullptr, true});
+  // workers' gradients, per Muon group the stacked momentum (of device 0's
+  // matrices), hyper-parameters and constants; with the split, the clip
+  // factor, the clipped mean gradient and the other devices' updates
+  ctx_ = ggml_init({ggml_tensor_overhead() * (2 * params.size() + 2 * W + 2 * groups.size() + 16), nullptr, true});
   std::vector<ggml_tensor *> m, v;
   for (ggml_tensor *p : params) {
     const bool stacked = muon && is_muon_param(p) && !old_muon; // momentum in m_stack instead
     m.push_back(stacked ? nullptr : ggml_dup_tensor(ctx_, p));
     v.push_back(stacked || (muon && is_muon_param(p)) ? nullptr : ggml_dup_tensor(ctx_, p));
   }
-  std::vector<ggml_tensor *> m_stack; // [ne0, ne1, group size]
-  for (auto &[shape, idx] : groups) {
-    m_stack.push_back(ggml_new_tensor_3d(ctx_, GGML_TYPE_F32, shape.first, shape.second, idx.size()));
-    ggml_set_param(m_stack.back()); // stepped in place by ggml_opt_step_sgd
-  }
+  auto new_m_stack = [&](ggml_context *ctx, int d) { // [ne0, ne1, owned count] per group (nullptr: none)
+    std::vector<ggml_tensor *> ms;
+    size_t gi = 0;
+    for (auto &[shape, idx] : groups) {
+      const auto [a, b] = owned[gi++][d];
+      ms.push_back(a == b ? nullptr : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, shape.first, shape.second, b - a));
+      if (ms.back()) ggml_set_param(ms.back()); // stepped in place by ggml_opt_step_sgd
+    }
+    return ms;
+  };
+  std::vector<ggml_tensor *> m_stack = new_m_stack(ctx_, 0);
   for (int w = 1; w < W; w++) staging_.push_back(ggml_dup_tensor(ctx_, w0.grad_flat()));
   staged_.assign(W, 0);
+  shards_.resize(split ? W - 1 : 0);
+  for (size_t s = 0; s < shards_.size(); s++) {
+    Shard &sh = shards_[s];
+    sh.lo = SIZE_MAX;
+    size_t gi = 0;
+    for (auto &[shape, idx] : groups) {
+      const auto [a, b] = owned[gi++][s + 1];
+      const size_t mat = static_cast<size_t>(shape.first * shape.second);
+      if (a < b) sh.lo = std::min(sh.lo, group_offset(idx) + a * mat), sh.hi = group_offset(idx) + b * mat;
+    }
+    sh.upd_in = ggml_new_tensor_1d(ctx_, GGML_TYPE_F32, sh.hi - sh.lo);
+  }
+  if (split) {
+    clip_ = ggml_new_tensor_1d(ctx_, GGML_TYPE_F32, 1);
+    gbuf_ = ggml_dup_tensor(ctx_, w0.grad_flat());
+  }
   // one-copy weight broadcast: every parameter at the same offset of a
   // same-size weight buffer on every worker (same GGUF, same allocator)
   blob_broadcast_ = true;
@@ -717,6 +792,7 @@ Optimizer::Optimizer(std::vector<std::unique_ptr<Worker>> &workers, double clip,
       if (static_cast<char *>(params[k]->data) - static_cast<char *>(w0.weights_blob()->data) !=
           static_cast<char *>(ww.params()[k]->data) - static_cast<char *>(ww.weights_blob()->data))
         blob_broadcast_ = false;
+    if (split && ww.grad_offset(0) != w0.grad_offset(0)) throw std::runtime_error("workers' gradient layouts differ");
   }
   pars_ = ggml_new_tensor_1d(ctx_, GGML_TYPE_F32, 7);
   ggml_tensor *one = ggml_new_tensor_1d(ctx_, GGML_TYPE_F32, 1);
@@ -724,9 +800,20 @@ Optimizer::Optimizer(std::vector<std::unique_ptr<Worker>> &workers, double clip,
   muon_lr_ = ggml_new_tensor_1d(ctx_, GGML_TYPE_F32, 1);
   // ggml_opt_step_sgd computes x (1 - lr wd) - lr g: with lr = -(1 - mu), wd = -1
   // that is the momentum mu x + (1 - mu) g
-  ggml_tensor *mom_pars = ggml_new_tensor_1d(ctx_, GGML_TYPE_F32, 2);
-  ggml_tensor *nest_pars = ggml_new_tensor_1d(ctx_, GGML_TYPE_F32, 2); // Nesterov axpby
-  ggml_tensor *ns_pars = ggml_new_tensor_1d(ctx_, GGML_TYPE_F32, 4);   // Newton-Schulz axpbys
+  const float mu = static_cast<float>(muon_momentum);
+  const float mom_vals[2] = {-(1 - mu), -1.0f};
+  const float nest_vals[2] = {-1.0f, mu > 0 ? (1 - mu) / mu - 1 : 0.0f}; // Nesterov axpby
+  const std::array<float, 4> ns_vals = ns_axpby_values();                // Newton-Schulz axpbys
+  auto muon_constants = [&](ggml_context *ctx) {
+    return std::array<ggml_tensor *, 3>{ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2), ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2),
+                                        ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4)};
+  };
+  auto set_muon_constants = [&](const std::array<ggml_tensor *, 3> &c) {
+    ggml_backend_tensor_set(c[0], mom_vals, 0, sizeof mom_vals);
+    ggml_backend_tensor_set(c[1], nest_vals, 0, sizeof nest_vals);
+    ggml_backend_tensor_set(c[2], ns_vals.data(), 0, sizeof ns_vals);
+  };
+  const auto [mom_pars, nest_pars, ns_pars] = muon_constants(ctx_);
   // per group (lr * muon_lr_scale * rms, wd = 0) for the SGD update, set by step()
   muon_pars_ = ggml_new_tensor_1d(ctx_, GGML_TYPE_F32, 2 * std::max<int64_t>(1, groups.size()));
   buf_ = ggml_backend_alloc_ctx_tensors_from_buft(ctx_, buft);
@@ -735,17 +822,24 @@ Optimizer::Optimizer(std::vector<std::unique_ptr<Worker>> &workers, double clip,
   const float c1 = 1.0f, ce = 1e-6f;
   ggml_backend_tensor_set(one, &c1, 0, sizeof c1);
   ggml_backend_tensor_set(eps, &ce, 0, sizeof ce);
-  const float mu = static_cast<float>(muon_momentum), mp[2] = {-(1 - mu), -1.0f};
-  ggml_backend_tensor_set(mom_pars, mp, 0, sizeof mp);
-  const float np[2] = {-1.0f, mu > 0 ? (1 - mu) / mu - 1 : 0.0f};
-  ggml_backend_tensor_set(nest_pars, np, 0, sizeof np);
-  const std::array<float, 4> nsp = ns_axpby_values();
-  ggml_backend_tensor_set(ns_pars, nsp.data(), 0, sizeof nsp);
+  set_muon_constants({mom_pars, nest_pars, ns_pars});
+
+  // Muon on a stack t of same-shape gradients (a view): one momentum step,
+  // Nesterov (1 - mu) g + mu M divided by mu (Newton-Schulz normalises each
+  // matrix first, so the common factor drops out; one in-place axpby on t,
+  // read by nothing else after the momentum step), then Newton-Schulz
+  auto muon_update = [&](ggml_context *ctx, ggml_tensor *t, ggml_tensor *M_state,
+                         const std::array<ggml_tensor *, 3> &c) {
+    ggml_tensor *M = ggml_opt_step_sgd(ctx, M_state, t, c[0]);
+    ggml_tensor *U = mu > 0 ? axpby_inplace(ctx, t, M, c[1]) : t;
+    return orthogonalize(ctx, U, ns_steps, c[2]);
+  };
 
   // step graph: g = mean_w grad_w; c = min(1, clip / (|g| + 1e-6)); Adam(c g)
+  // (with the split, g c is the norm graph's output gbuf_: the other devices
+  // need c before device 0's step)
   const size_t n_nodes = (16 + 12 * ns_steps) * params.size() + 64;
-  gctx_ = ggml_init({ggml_tensor_overhead() * n_nodes + ggml_graph_overhead_custom(n_nodes, false),
-                     nullptr, true});
+  gctx_ = ggml_init({ggml_tensor_overhead() * n_nodes + 3 * ggml_graph_overhead_custom(n_nodes, false), nullptr, true});
   ggml_tensor *g = w0.grad_flat();
   for (ggml_tensor *st : staging_) g = ggml_add(gctx_, g, st);
   if (W > 1) g = ggml_scale(gctx_, g, 1.0f / W);
@@ -753,10 +847,19 @@ Optimizer::Optimizer(std::vector<std::unique_ptr<Worker>> &workers, double clip,
   ggml_tensor *c = ggml_clamp(gctx_, ggml_scale(gctx_, ggml_div(gctx_, one, ggml_add(gctx_, norm_, eps)),
                                                 static_cast<float>(clip)),
                               0.0f, 1.0f);
-  ggml_tensor *gs = ggml_mul(gctx_, g, c);
-  graph_ = ggml_new_graph_custom(gctx_, n_nodes, false);
   ggml_set_output(norm_);
-  ggml_build_forward_expand(graph_, norm_);
+  ggml_tensor *gs = nullptr;
+  graph_ = ggml_new_graph_custom(gctx_, n_nodes, false);
+  if (split) {
+    norm_graph_ = ggml_new_graph_custom(gctx_, n_nodes, false);
+    ggml_build_forward_expand(norm_graph_, norm_);
+    ggml_build_forward_expand(norm_graph_, ggml_cpy(gctx_, c, clip_));
+    ggml_build_forward_expand(norm_graph_, ggml_cpy(gctx_, ggml_mul(gctx_, g, c), gbuf_));
+    gs = gbuf_;
+  } else {
+    gs = ggml_mul(gctx_, g, c);
+    ggml_build_forward_expand(graph_, norm_);
+  }
   // Muon: (param, Nesterov momentum) per matrix shape, orthogonalised per group
   std::map<std::pair<int64_t, int64_t>, std::vector<std::pair<ggml_tensor *, ggml_tensor *>>> muon_groups;
   for (size_t k = 0; k < params.size(); k++) {
@@ -778,30 +881,36 @@ Optimizer::Optimizer(std::vector<std::unique_ptr<Worker>> &workers, double clip,
     }
   }
   // per group: the gradients are one contiguous block of gs (the worker's
-  // grouped layout), so the stack is a view; one momentum step, Nesterov,
-  // Newton-Schulz, then per matrix one in-place SGD step at
-  // lr * muon_lr_scale * 0.2 sqrt(max dim)
+  // grouped layout), so device 0's stack is a view; Muon, then per matrix one
+  // in-place SGD step at lr * muon_lr_scale * 0.2 sqrt(max dim). The other
+  // devices' updates arrive in their upd_in and are applied by apply_graph_
+  if (split) apply_graph_ = ggml_new_graph_custom(gctx_, n_nodes, false);
   size_t gi = 0;
   for (auto &[shape, idx] : old_muon ? decltype(groups){} : groups) {
     this->muon_groups.push_back(fmt::format("{}x{}x{}", shape.first, shape.second, idx.size()));
-    const size_t mat = static_cast<size_t>(shape.first * shape.second), off0 = w0.grad_offset(idx[0]);
+    const size_t mat = static_cast<size_t>(shape.first * shape.second), off0 = group_offset(idx);
     for (size_t i = 0; i < idx.size(); i++)
       if (w0.grad_offset(idx[i]) != off0 + i * mat) throw std::runtime_error("Muon group not contiguous in grad_flat");
-    ggml_tensor *t = ggml_view_3d(gctx_, gs, shape.first, shape.second, idx.size(), shape.first * sizeof(float),
-                                  mat * sizeof(float), off0 * sizeof(float));
-    ggml_tensor *M = ggml_opt_step_sgd(gctx_, m_stack[gi], t, mom_pars);
-    // Nesterov (1 - mu) g + mu M, divided by mu: Newton-Schulz normalises
-    // each matrix first, so the common factor drops out. One in-place axpby
-    // on this group's slice of gs (read by nothing else after the momentum step)
-    ggml_tensor *U = mu > 0 ? axpby_inplace(gctx_, t, M, nest_pars) : t;
-    ggml_tensor *o = orthogonalize(gctx_, U, ns_steps, ns_pars);
     muon_rms_.push_back(0.2f * std::sqrt(static_cast<float>(std::max(shape.first, shape.second))));
     ggml_tensor *lr_wd = ggml_view_1d(gctx_, muon_pars_, 2, 2 * gi * sizeof(float));
-    for (size_t i = 0; i < idx.size(); i++) {
-      ggml_tensor *p = params[idx[i]];
-      ggml_tensor *oi = ggml_view_4d(gctx_, o, p->ne[0], p->ne[1], 1, 1, o->nb[1], o->nb[2], o->nb[3], i * o->nb[2]);
-      ggml_build_forward_expand(graph_, ggml_opt_step_sgd(gctx_, p, oi, lr_wd));
+    if (const auto [a, b] = owned[gi][0]; a < b) {
+      ggml_tensor *t = ggml_view_3d(gctx_, gs, shape.first, shape.second, b - a, shape.first * sizeof(float),
+                                    mat * sizeof(float), (off0 + a * mat) * sizeof(float));
+      ggml_tensor *o = muon_update(gctx_, t, m_stack[gi], {mom_pars, nest_pars, ns_pars});
+      for (size_t i = a; i < b; i++) {
+        ggml_tensor *p = params[idx[i]];
+        ggml_tensor *oi =
+            ggml_view_4d(gctx_, o, p->ne[0], p->ne[1], 1, 1, o->nb[1], o->nb[2], o->nb[3], (i - a) * o->nb[2]);
+        ggml_build_forward_expand(graph_, ggml_opt_step_sgd(gctx_, p, oi, lr_wd));
+      }
     }
+    for (size_t s = 0; s < shards_.size(); s++)
+      for (size_t i = owned[gi][s + 1].first; i < owned[gi][s + 1].second; i++) {
+        ggml_tensor *p = params[idx[i]];
+        ggml_tensor *ui = ggml_view_2d(gctx_, shards_[s].upd_in, p->ne[0], p->ne[1], p->nb[1],
+                                       (off0 + i * mat - shards_[s].lo) * sizeof(float));
+        ggml_build_forward_expand(apply_graph_, ggml_opt_step_sgd(gctx_, p, ui, lr_wd));
+      }
     gi++;
   }
   for (auto &[shape, group] : muon_groups) {
@@ -820,19 +929,80 @@ Optimizer::Optimizer(std::vector<std::unique_ptr<Worker>> &workers, double clip,
   }
   galloc_ = ggml_gallocr_new(buft);
   if (!ggml_gallocr_alloc_graph(galloc_, graph_)) throw std::runtime_error("cannot allocate the optimizer graph");
-  // the step graph is the same every step: CUDA graph capture for it alone
-  // (every other graph runs uncaptured: dynamic shapes); MLIPCPP_OPT_NO_GRAPH=1: off
-  if (!std::getenv("MLIPCPP_OPT_NO_GRAPH"))
-    if (ggml_backend_dev_t dev = ggml_backend_get_device(backend)) {
-      using allow_fn = void (*)(ggml_backend_t, const void *);
-      if (auto allow = reinterpret_cast<allow_fn>(
-              ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_graph_allow")))
-        allow(backend, ggml_graph_node(graph_, 0)), graph_captured_ = true;
+  // the step graphs are the same every step: CUDA graph capture for them
+  // alone (every other graph runs uncaptured: dynamic shapes)
+  graph_captured_ = allow_cuda_graph(backend, graph_);
+  for (auto [gr, ga] : {std::make_pair(norm_graph_, &norm_galloc_), std::make_pair(apply_graph_, &apply_galloc_)})
+    if (gr) {
+      *ga = ggml_gallocr_new(buft);
+      if (!ggml_gallocr_alloc_graph(*ga, gr)) throw std::runtime_error("cannot allocate the optimizer graph");
+      allow_cuda_graph(backend, gr);
     }
+
+  // the other devices: per shard, persistent state on device d (staging for
+  // the other workers' gradients over [lo, hi), clip factor, momentum,
+  // constants, the update) and its graph: mean, clip, Muon, update -> upd
+  for (size_t s = 0; s < shards_.size(); s++) {
+    Shard &sh = shards_[s];
+    const int d = static_cast<int>(s) + 1;
+    Worker &wd = *workers_[d];
+    ggml_backend_t bd = wd.model().backend();
+    ggml_backend_buffer_type_t bufd = ggml_backend_get_default_buffer_type(bd);
+    const int64_t n = static_cast<int64_t>(sh.hi - sh.lo);
+    sh.ctx = ggml_init({ggml_tensor_overhead() * (W + groups.size() + 8), nullptr, true});
+    sh.vctx = ggml_init({ggml_tensor_overhead() * W, nullptr, true});
+    for (int w = 0; w < W; w++)
+      if (w != d) {
+        sh.staging.push_back(ggml_new_tensor_1d(sh.ctx, GGML_TYPE_F32, n));
+        sh.src.push_back(ggml_view_1d(sh.vctx, workers_[w]->grad_flat(), n, sh.lo * sizeof(float)));
+        if (ggml_backend_view_init(sh.src.back()) != GGML_STATUS_SUCCESS)
+          throw std::runtime_error("cannot view the gradient accumulator");
+      }
+    sh.clip = ggml_new_tensor_1d(sh.ctx, GGML_TYPE_F32, 1);
+    sh.upd = ggml_new_tensor_1d(sh.ctx, GGML_TYPE_F32, n);
+    std::vector<ggml_tensor *> md = new_m_stack(sh.ctx, d);
+    const auto cd = muon_constants(sh.ctx);
+    sh.buf = ggml_backend_alloc_ctx_tensors_from_buft(sh.ctx, bufd);
+    if (!sh.buf) throw std::runtime_error("cannot allocate the optimizer state");
+    ggml_backend_buffer_clear(sh.buf, 0);
+    set_muon_constants(cd);
+
+    const size_t nd = (32 + 16 * ns_steps) * groups.size() + 64;
+    sh.gctx = ggml_init({ggml_tensor_overhead() * nd + ggml_graph_overhead_custom(nd, false), nullptr, true});
+    ggml_tensor *gd = ggml_view_1d(sh.gctx, wd.grad_flat(), n, sh.lo * sizeof(float));
+    for (ggml_tensor *st : sh.staging) gd = ggml_add(sh.gctx, gd, st);
+    gd = ggml_mul(sh.gctx, ggml_scale(sh.gctx, gd, 1.0f / W), sh.clip);
+    sh.graph = ggml_new_graph_custom(sh.gctx, nd, false);
+    size_t gj = 0;
+    for (auto &[shape, idx] : groups) {
+      const auto [a, b] = owned[gj][d];
+      if (a < b) {
+        const size_t mat = static_cast<size_t>(shape.first * shape.second),
+                     off = (group_offset(idx) + a * mat - sh.lo) * sizeof(float);
+        ggml_tensor *t = ggml_view_3d(sh.gctx, gd, shape.first, shape.second, b - a, shape.first * sizeof(float),
+                                      mat * sizeof(float), off);
+        ggml_tensor *o = muon_update(sh.gctx, t, md[gj], cd);
+        ggml_tensor *u = ggml_view_3d(sh.gctx, sh.upd, shape.first, shape.second, b - a,
+                                      shape.first * sizeof(float), mat * sizeof(float), off);
+        ggml_build_forward_expand(sh.graph, ggml_cpy(sh.gctx, o, u));
+      }
+      gj++;
+    }
+    sh.galloc = ggml_gallocr_new(bufd);
+    if (!ggml_gallocr_alloc_graph(sh.galloc, sh.graph)) throw std::runtime_error("cannot allocate the optimizer graph");
+    allow_cuda_graph(bd, sh.graph);
+  }
 }
 
 Optimizer::~Optimizer() {
-  if (galloc_) ggml_gallocr_free(galloc_);
+  for (Shard &sh : shards_) {
+    if (sh.galloc) ggml_gallocr_free(sh.galloc);
+    if (sh.buf) ggml_backend_buffer_free(sh.buf);
+    for (ggml_context *c : {sh.gctx, sh.vctx, sh.ctx})
+      if (c) ggml_free(c);
+  }
+  for (ggml_gallocr_t ga : {galloc_, norm_galloc_, apply_galloc_})
+    if (ga) ggml_gallocr_free(ga);
   if (buf_) ggml_backend_buffer_free(buf_);
   if (gctx_) ggml_free(gctx_);
   if (ctx_) ggml_free(ctx_);
@@ -853,9 +1023,29 @@ double Optimizer::step(double lr) {
     for (size_t i = 0; i < muon_rms_.size(); i++) mp[2 * i] = mlr * muon_rms_[i];
     ggml_backend_tensor_set(muon_pars_, mp.data(), 0, mp.size() * sizeof(float));
   }
-  for (size_t w = 1; w < workers_.size(); w++) stage(w);
-  if (ggml_backend_graph_compute(w0.model().backend(), graph_) != GGML_STATUS_SUCCESS)
-    throw std::runtime_error("optimizer step failed");
+  for (size_t w = 0; w < workers_.size(); w++) stage(w);
+  ggml_backend_t b0 = w0.model().backend();
+  if (shards_.empty()) {
+    if (ggml_backend_graph_compute(b0, graph_) != GGML_STATUS_SUCCESS) throw std::runtime_error("optimizer step failed");
+  } else {
+    // all queued on the device streams, the copies ordered by events: norm
+    // and clip on device 0; the clip factor to the other devices, their
+    // Muon; device 0's step; their updates back, applied on device 0
+    auto run = [](ggml_backend_t b, ggml_cgraph *gr) {
+      if (ggml_backend_graph_compute_async(b, gr) != GGML_STATUS_SUCCESS) throw std::runtime_error("optimizer step failed");
+    };
+    run(b0, norm_graph_);
+    for (size_t s = 0; s < shards_.size(); s++) {
+      ggml_backend_t bd = workers_[s + 1]->model().backend();
+      ggml_backend_tensor_copy_async(b0, bd, clip_, shards_[s].clip);
+      run(bd, shards_[s].graph);
+    }
+    run(b0, graph_);
+    for (size_t s = 0; s < shards_.size(); s++)
+      ggml_backend_tensor_copy_async(workers_[s + 1]->model().backend(), b0, shards_[s].upd, shards_[s].upd_in);
+    run(b0, apply_graph_);
+    for (auto &w : workers_) ggml_backend_synchronize(w->model().backend());
+  }
   float norm = 0;
   ggml_backend_tensor_get(norm_, &norm, 0, sizeof norm);
   for (size_t w = 1; w < workers_.size(); w++) {
@@ -894,8 +1084,13 @@ double Optimizer::profile(int reps, std::map<std::string, Worker::OpStats> &ops)
 }
 
 void Optimizer::stage(size_t w) {
-  if (w == 0 || staged_[w]) return;
-  ggml_backend_tensor_copy(workers_[w]->grad_flat(), staging_[w - 1]); // peer copy
+  if (staged_[w]) return;
+  if (w > 0) ggml_backend_tensor_copy(workers_[w]->grad_flat(), staging_[w - 1]); // peer copy
+  for (size_t d = 1; d <= shards_.size(); d++)
+    if (d != w) {
+      const size_t k = w < d ? w : w - 1; // w's slot among d's other workers
+      ggml_backend_tensor_copy(shards_[d - 1].src[k], shards_[d - 1].staging[k]);
+    }
   staged_[w] = 1;
 }
 
@@ -989,6 +1184,7 @@ void train(const TrainOptions &o) {
                               : std::string("dynamic shapes"));
   fmt::print("setup: {:.1f} s; {} steps/epoch of {} x {} structures, warmup {} steps\n",
              seconds_since(t_setup), steps_per_epoch, W, B, warmup);
+  if (!optimizer.muon_split.empty()) fmt::print("muon split: {}\n", optimizer.muon_split);
 
   auto evaluate = [&](const MemmapSplit &split, const NeighborCache &cache, const std::vector<int64_t> &use) {
     std::vector<StepStats> per(W);

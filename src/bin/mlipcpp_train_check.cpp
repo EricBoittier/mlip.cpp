@@ -20,6 +20,7 @@
 #include <set>
 #include <fstream>
 #include <numeric>
+#include <random>
 #include <string>
 
 using namespace mlipcpp::train;
@@ -286,6 +287,53 @@ int main(int argc, char **argv) {
         fmt::print("  {:>8.2f} ms  {:<16} x{:<5} {:>8.2f} GFLOP {:>8.3f} GB\n", v.ms, r[k].second, v.count, v.flops / 1e9,
                    v.bytes / 1e9);
       }
+    }
+  }
+
+  // the Muon step split over two GPUs == the step on device 0
+  // (MLIPCPP_MUON_ONE_DEVICE): the same random gradients through both for a
+  // few steps, then the parameters compared; then each one's wall time per step
+  if (gpus >= 2) {
+    const char *env = std::getenv("MLIPCPP_MUON_ONE_DEVICE");
+    const std::string saved = env ? env : "";
+    auto run = [&](bool split) {
+      if (split) unsetenv("MLIPCPP_MUON_ONE_DEVICE");
+      else setenv("MLIPCPP_MUON_ONE_DEVICE", "1", 1);
+      std::vector<std::unique_ptr<Worker>> ws;
+      for (int d = 0; d < 2; d++) ws.push_back(std::make_unique<Worker>(init, d));
+      Optimizer opt(ws, 1.0, true, 0.95, 10.0, 5);
+      std::mt19937 rng(7);
+      std::normal_distribution<float> normal(0.0f, 1.0f);
+      std::vector<float> g(ggml_nelements(ws[0]->grad_flat()));
+      std::vector<double> norms;
+      for (int s = 0; s < 3; s++) {
+        for (auto &w : ws) {
+          for (float &x : g) x = normal(rng);
+          ggml_backend_tensor_set(w->grad_flat(), g.data(), 0, g.size() * sizeof(float));
+        }
+        norms.push_back(opt.step(1e-3));
+      }
+      const auto t0 = std::chrono::steady_clock::now();
+      for (int r = 0; r < 50; r++) opt.step(1e-6);
+      const double ms = 1e3 * std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / 50;
+      return std::make_tuple(ws[0]->get_params(), ws[1]->get_params(), norms, ms, opt.muon_split);
+    };
+    const auto [a0, a1, an, ams, as] = run(false);
+    const auto [b0, b1, bn, bms, bs] = run(true);
+    if (saved.empty()) unsetenv("MLIPCPP_MUON_ONE_DEVICE");
+    else setenv("MLIPCPP_MUON_ONE_DEVICE", saved.c_str(), 1);
+    auto rel = [](const std::vector<float> &x, const std::vector<float> &y) {
+      double d = 0, s = 0;
+      for (size_t i = 0; i < x.size(); i++) d = std::max(d, double(std::abs(x[i] - y[i]))), s = std::max(s, double(std::abs(x[i])));
+      return d / s;
+    };
+    const double diff = std::max(rel(a0, b0), rel(b0, b1));
+    fmt::print("muon split ({}): max relative parameter difference to one device {:.2e} (workers {:.2e}), "
+               "norms {} vs {}; {:.2f} ms per step vs {:.2f} on one device\n",
+               bs, rel(a0, b0), rel(b0, b1), fmt::join(bn, " "), fmt::join(an, " "), bms, ams);
+    if (!(diff < 1e-5)) {
+      fmt::print("!! the Muon split changes the step\n");
+      return 1;
     }
   }
 

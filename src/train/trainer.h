@@ -178,8 +178,9 @@ public:
   Optimizer(std::vector<std::unique_ptr<Worker>> &workers, double clip, bool muon = false,
             double muon_momentum = 0.95, double muon_lr_scale = 1.0, int ns_steps = 5);
   ~Optimizer();
-  /// Copy worker w's (w > 0) gradients to device 0 now, from w's thread as
-  /// soon as it is done, so the copy overlaps the other workers' compute.
+  /// Copy worker w's (w > 0) gradients to device 0 now (and, with the Muon
+  /// split, w's gradients over each other device's range there), from w's
+  /// thread as soon as it is done, so the copy overlaps the other workers' compute.
   void stage(size_t w);
   /// One step at learning rate `lr` (gradients not staged yet are copied
   /// first); returns the global gradient norm (of the averaged gradient,
@@ -190,6 +191,7 @@ public:
   /// steps, then the step graph node by node (synchronised), by op.
   double profile(int reps, std::map<std::string, Worker::OpStats> &ops);
   std::vector<std::string> muon_groups; // "ne0 x ne1 x count" per orthogonalised group
+  std::string muon_split;               // Newton-Schulz FLOPs per device ("" if not split)
 
 private:
   std::vector<std::unique_ptr<Worker>> &workers_;
@@ -205,6 +207,26 @@ private:
   ggml_tensor *muon_pars_ = nullptr; // per Muon group (lr, wd)
   std::vector<float> muon_rms_;      // per Muon group, the update RMS factor
   int64_t t_ = 0;
+  // Muon split over the devices: device d > 0 owns the Muon matrices in the
+  // grad_flat range [lo, hi) (contiguous, balanced by Newton-Schulz FLOPs):
+  // it receives the other workers' gradients over that range, takes the
+  // momentum / Newton-Schulz steps there and sends the orthogonalised update
+  // back to device 0, which applies it. Device 0 keeps Adam, the global norm
+  // and its own range. MLIPCPP_MUON_ONE_DEVICE=1: everything on device 0.
+  struct Shard {
+    size_t lo = 0, hi = 0;
+    ggml_context *ctx = nullptr, *gctx = nullptr, *vctx = nullptr;
+    ggml_backend_buffer_t buf = nullptr;
+    ggml_gallocr_t galloc = nullptr;
+    ggml_cgraph *graph = nullptr;
+    std::vector<ggml_tensor *> staging, src; // per other worker: its gradients here / its grad_flat over [lo, hi)
+    ggml_tensor *clip = nullptr, *upd = nullptr; // on device d
+    ggml_tensor *upd_in = nullptr;               // on device 0
+  };
+  std::vector<Shard> shards_; // devices 1..W-1
+  ggml_cgraph *norm_graph_ = nullptr, *apply_graph_ = nullptr;
+  ggml_gallocr_t norm_galloc_ = nullptr, apply_galloc_ = nullptr;
+  ggml_tensor *clip_ = nullptr, *gbuf_ = nullptr; // device 0: clip factor, clipped mean gradient
 
 public:
   bool graph_captured_ = false; // the step graph runs as a CUDA graph
