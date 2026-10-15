@@ -3,11 +3,12 @@
 #include "../core/ggml_utils.h"
 #include "graph_ir.h"
 
-#include <ggml.h>
 #include <functional>
+#include <ggml-backend.h>
+#include <ggml.h>
 #include <map>
-#include <set>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -22,6 +23,9 @@ public:
   // Load a graph from JSON
   void load_graph(const std::string &json_str);
   void load_graph_file(const std::string &path);
+
+  // Restrict optional fused operations to the selected execution backend.
+  void set_backend(ggml_backend_t backend) { backend_ = backend; }
 
   // Set a runtime dimension value (e.g., "n_atoms" -> 3, "max_neighbors" -> 20)
   // Must be called before build() for graphs with symbolic dimensions
@@ -101,6 +105,7 @@ public:
 private:
   // The IR graph
   GIRGraph graph_;
+  ggml_backend_t backend_ = nullptr;
 
   // Runtime dimension values (for symbolic dimensions like "n_atoms")
   std::map<std::string, int64_t> dimensions_;

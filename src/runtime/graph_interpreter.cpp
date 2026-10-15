@@ -695,6 +695,8 @@ ggml_tensor *GraphInterpreter::build_fused_attention(ggml_context *ctx, const GI
 
   const float scale = static_cast<float>(get_param<double>(*sm, "scale", 1.0) / get_param<double>(*div, "scalar", 1.0));
   ggml_tensor *r = ggml_pet_attn(ctx, xt, bias, static_cast<int>(H), scale); // [D + H, L, N]
+  if (backend_ && !ggml_backend_supports_op(backend_, r))
+    return nullptr;
   // the MATMUL's [N, H, L, d] = ggml [d, L, H, N]: the outputs viewed as
   // [d, H, L, N] (increasing strides: the view's backward, a CUDA ACC, decodes
   // indices assuming that), then permuted

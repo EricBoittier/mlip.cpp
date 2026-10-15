@@ -1101,15 +1101,6 @@ Optimizer::~Optimizer() {
 
 double Optimizer::step(double lr) {
   Worker &w0 = *workers_[0];
-  const bool diag = std::getenv("MLIPCPP_METAL_DIAG");
-  std::vector<float> before;
-  if (diag) {
-    before = w0.get_params();
-    auto grad = w0.get_grads();
-    size_t bad = 0; double norm = 0;
-    for (float v : grad) { bad += !std::isfinite(v); norm += double(v)*v; }
-    fmt::print(stderr, "DIAG before step {}: {} bad gradients, norm {}\n", t_, bad, std::sqrt(norm));
-  }
   ++t_;
   const double b1 = 0.9, b2 = 0.999;
   const float pars[7] = {static_cast<float>(lr), static_cast<float>(b1), static_cast<float>(b2), 1e-8f, 0.0f,
@@ -1155,11 +1146,6 @@ double Optimizer::step(double lr) {
       for (size_t k = 0; k < w0.params().size(); k++)
         ggml_backend_tensor_copy(w0.params()[k], workers_[w]->params()[k]);
     }
-  }
-  if (diag) {
-    auto after = w0.get_params(); size_t bad = 0; double change = 0;
-    for (size_t k=0;k<after.size();++k) { bad += !std::isfinite(after[k]); change=std::max(change,std::abs(double(after[k])-before[k])); }
-    fmt::print(stderr, "DIAG after step {}: {} bad parameters, max change {}, GPU norm {}\n", t_-1, bad, change, norm);
   }
   for (auto &w : workers_) w->zero_grads();
   std::fill(staged_.begin(), staged_.end(), 0);

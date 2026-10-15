@@ -1,0 +1,14 @@
+diff --git a/src/ggml-metal/ggml-metal.metal b/src/ggml-metal/ggml-metal.metal
+index 767eb881..12e5740d 100644
+--- a/src/ggml-metal/ggml-metal.metal
++++ b/src/ggml-metal/ggml-metal.metal
+@@ -10794,7 +10794,8 @@ kernel void kernel_soft_max_back_f32(
+     }
+     threadgroup_barrier(mem_flags::mem_threadgroup);
+ 
+-    partial = shmem[tiisg];
++    const ushort nsg = (ntg.x + 31) / 32;
++    partial = tiisg < nsg ? shmem[tiisg] : 0.0f;
+     partial = simd_sum(partial);
+     const float dot = partial;
+ 

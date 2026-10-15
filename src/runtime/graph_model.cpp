@@ -526,6 +526,7 @@ bool GraphModel::load_from_gguf(const std::string &path) {
 
   // Use primary backend (may be GPU) for compute; owned by BackendProvider.
   compute_backend_ = backend_provider_->primary();
+  interp_.set_backend(compute_backend_);
   if (!compute_backend_) {
     throw std::runtime_error("Failed to get compute backend");
   }

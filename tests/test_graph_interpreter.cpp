@@ -911,3 +911,54 @@ TEST_CASE("PET excluded attention keys have zero weight and gradient",
   ggml_backend_free(cpu);
   ggml_free(ctx);
 }
+
+TEST_CASE("Metal softmax backward bounds its simdgroup reduction",
+          "[runtime][metal]") {
+  auto *device = ggml_backend_dev_by_name("MTL0");
+  if (!device)
+    SKIP("Metal device unavailable");
+  auto *backend = ggml_backend_dev_init(device, nullptr);
+  REQUIRE(backend);
+  for (int width : {25, 53, 129, 511}) {
+    constexpr int rows = 97;
+    auto *ctx = ggml_init({1024 * 1024, nullptr, true});
+    auto *dy = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, rows);
+    auto *y = ggml_dup_tensor(ctx, dy);
+    auto *dx = ggml_soft_max_ext_back(ctx, dy, y, 0.37f, 0.0f);
+    auto *graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, dx);
+    auto *buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    REQUIRE(buffer);
+    std::vector<float> values(width * rows), gradients(width * rows),
+        actual(width * rows);
+    for (int r = 0; r < rows; ++r) {
+      double sum = 0;
+      for (int c = 0; c < width; ++c) {
+        int i = r * width + c;
+        values[i] = std::exp(std::sin(i * .13));
+        sum += values[i];
+        gradients[i] = std::cos(i * .23) * 3;
+      }
+      for (int c = 0; c < width; ++c)
+        values[r * width + c] /= sum;
+    }
+    ggml_backend_tensor_set(y, values.data(), 0, ggml_nbytes(y));
+    ggml_backend_tensor_set(dy, gradients.data(), 0, ggml_nbytes(dy));
+    REQUIRE(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_tensor_get(dx, actual.data(), 0, ggml_nbytes(dx));
+    for (int r = 0; r < rows; ++r) {
+      double dot = 0;
+      for (int c = 0; c < width; ++c)
+        dot += double(values[r * width + c]) * gradients[r * width + c];
+      for (int c = 0; c < width; ++c) {
+        int i = r * width + c;
+        double expected = .37 * (gradients[i] - dot) * values[i];
+        REQUIRE(std::isfinite(actual[i]));
+        REQUIRE(std::abs(actual[i] - expected) < 2e-7);
+      }
+    }
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+  }
+  ggml_backend_free(backend);
+}
