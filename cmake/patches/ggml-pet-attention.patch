@@ -1,5 +1,5 @@
 diff --git a/include/ggml.h b/include/ggml.h
-index 11d3e8a..4b80ffc 100644
+index 11d3e8a..24a3470 100644
 --- a/include/ggml.h
 +++ b/include/ggml.h
 @@ -577,6 +577,9 @@ extern "C" {
@@ -12,7 +12,7 @@ index 11d3e8a..4b80ffc 100644
          GGML_OP_COUNT,
      };
  
-@@ -1753,6 +1756,30 @@ extern "C" {
+@@ -1753,6 +1756,31 @@ extern "C" {
              float                 scale,
              float                 max_bias);
  
@@ -21,7 +21,8 @@ index 11d3e8a..4b80ffc 100644
 +    // bias [L, L, 1, N]; per sequence and head,
 +    //   o = softmax(scale * q k^T + bias) v
 +    // result [D + n_head, L, N]: per row the D outputs, then the n_head
-+    // log-sum-exps (used by the backward pass)
++    // log-sum-exps (used by the backward pass); qkv may be F16 (storage only,
++    // arithmetic in F32), the result and the gradient are F32
 +    GGML_API struct ggml_tensor * ggml_pet_attn(
 +            struct ggml_context * ctx,
 +            struct ggml_tensor  * qkv,
@@ -72,7 +73,7 @@ index 2b3eb5b..6b07f8b 100644
          case GGML_OP_ROPE_BACK:
          case GGML_OP_ADD_REL_POS:
 diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
-index 2d2c3f1..cc9109f 100644
+index 2d2c3f1..abcd370 100644
 --- a/src/ggml-cpu/ops.cpp
 +++ b/src/ggml-cpu/ops.cpp
 @@ -11,6 +11,7 @@
@@ -83,12 +84,21 @@ index 2d2c3f1..cc9109f 100644
  
  // ggml_compute_forward_dup
  
-@@ -11209,3 +11210,86 @@ void ggml_compute_forward_opt_step_sgd(const ggml_compute_params * params, ggml_
+@@ -11209,3 +11210,98 @@ void ggml_compute_forward_opt_step_sgd(const ggml_compute_params * params, ggml_
              }
      }
  }
 +
 +// ggml_compute_forward_pet_attn (reference: one thread per sequence)
++
++// sequence n of a contiguous qkv [D, 3, L, N] as F32 (F16 converted into buf)
++static const float * pet_attn_qkv_f32(const ggml_tensor * qkv, int64_t n, std::vector<float> & buf) {
++    const int64_t m = qkv->ne[0]*qkv->ne[1]*qkv->ne[2];
++    if (qkv->type == GGML_TYPE_F32) return (const float *) ((const char *) qkv->data + n*qkv->nb[3]);
++    buf.resize(m);
++    ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) ((const char *) qkv->data + n*qkv->nb[3]), buf.data(), m);
++    return buf.data();
++}
 +
 +void ggml_compute_forward_pet_attn(const ggml_compute_params * params, ggml_tensor * dst) {
 +    const ggml_tensor * qkv  = dst->src[0];
@@ -97,9 +107,10 @@ index 2d2c3f1..cc9109f 100644
 +    const float scale = ggml_get_op_params_f32(dst, 1);
 +    const int64_t D = qkv->ne[0], d = D / H, L = qkv->ne[2], N = qkv->ne[3];
 +
-+    std::vector<float> p(L);
++    std::vector<float> p(L), x32;
 +    for (int64_t n = params->ith; n < N; n += params->nth) {
-+        auto row = [&](int64_t i, int s) { return (const float *) ((const char *) qkv->data + n*qkv->nb[3] + i*qkv->nb[2] + s*qkv->nb[1]); };
++        const float * x = pet_attn_qkv_f32(qkv, n, x32);
++        auto row = [&](int64_t i, int s) { return x + (i*3 + s)*D; };
 +        for (int64_t i = 0; i < L; i++) {
 +            const float * b = (const float *) ((const char *) bias->data + n*bias->nb[3] + i*bias->nb[1]);
 +            float * out = (float *) ((char *) dst->data + n*dst->nb[2] + i*dst->nb[1]);
@@ -139,8 +150,10 @@ index 2d2c3f1..cc9109f 100644
 +    const float scale = ggml_get_op_params_f32(dst, 1);
 +    const int64_t D = qkv->ne[0], d = D / H, L = qkv->ne[2], N = qkv->ne[3];
 +
++    std::vector<float> x32;
 +    for (int64_t n = params->ith; n < N; n += params->nth) {
-+        auto in  = [&](int64_t i, int s) { return (const float *) ((const char *) qkv->data + n*qkv->nb[3] + i*qkv->nb[2] + s*qkv->nb[1]); };
++        const float * x = pet_attn_qkv_f32(qkv, n, x32);
++        auto in  = [&](int64_t i, int s) { return x + (i*3 + s)*D; };
 +        auto out = [&](int64_t i, int s) { return (float *) ((char *) dst->data + n*dst->nb[3] + i*dst->nb[2] + s*dst->nb[1]); };
 +        auto r   = [&](const ggml_tensor * t, int64_t i) { return (const float *) ((const char *) t->data + n*t->nb[2] + i*t->nb[1]); };
 +        for (int64_t i = 0; i < L; i++)
@@ -243,11 +256,13 @@ index 648124c..c9e8c57 100644
                  return true;
 diff --git a/src/ggml-cuda/pet-attn.cu b/src/ggml-cuda/pet-attn.cu
 new file mode 100644
-index 0000000..baa8819
+index 0000000..9172391
 --- /dev/null
 +++ b/src/ggml-cuda/pet-attn.cu
-@@ -0,0 +1,553 @@
+@@ -0,0 +1,1128 @@
 +#include "pet-attn.cuh"
++
++#include <type_traits>
 +
 +// One thread per (query or key, head); a block holds T positions x H heads
 +// and streams the other side in tiles of T rows through shared memory. Rows
@@ -273,7 +288,7 @@ index 0000000..baa8819
 +    const int64_t n = blockIdx.x;
 +    const int q0 = blockIdx.y*T, t = threadIdx.x, h = t % H, qi = t / H, i = q0 + qi;
 +    const bool active = i < L;
-+    const float * base = qkv + n*L*3*D;
++    const auto * base = qkv + n*L*3*D;
 +
 +    float q[d], acc[d], m = -INFINITY, l = 0.0f;
 +#pragma unroll
@@ -336,7 +351,7 @@ index 0000000..baa8819
 +    const int64_t n = blockIdx.x;
 +    const int q0 = blockIdx.y*T, t = threadIdx.x, h = t % H, qi = t / H, i = q0 + qi;
 +    const bool active = i < L;
-+    const float * base = qkv + n*L*3*D;
++    const auto * base = qkv + n*L*3*D;
 +    const int64_t row = n*L + (active ? i : 0);
 +
 +    float q[d], dO[d], dq[d], Di = 0.0f;
@@ -400,7 +415,7 @@ index 0000000..baa8819
 +    const int k0 = blockIdx.y*T, t = threadIdx.x, h = t % H, kj = t / H, j = k0 + kj;
 +    const bool active = j < L;
 +    const int nk = min(T, L - k0);
-+    const float * base = qkv + n*L*3*D;
++    const auto * base = qkv + n*L*3*D;
 +
 +    float k[d], v[d], dk[d], dv[d];
 +#pragma unroll
@@ -464,6 +479,15 @@ index 0000000..baa8819
 +// leave threads idle) and streams the other side in tiles of TS rows. A
 +// thread's rows are strided by G, so that a tile's rows are spread evenly.
 +
++// qkv may be F16 (storage only): loads return F32
++static __device__ __forceinline__ float ld_f(const float * p) { return *p; }
++static __device__ __forceinline__ float ld_f(const half  * p) { return __half2float(*p); }
++static __device__ __forceinline__ float4 ld_f4(const float * p) { return *reinterpret_cast<const float4 *>(p); }
++static __device__ __forceinline__ float4 ld_f4(const half * p) {
++    const float2 a = __half22float2(reinterpret_cast<const half2 *>(p)[0]), b = __half22float2(reinterpret_cast<const half2 *>(p)[1]);
++    return make_float4(a.x, a.y, b.x, b.y);
++}
++
 +template <int d>
 +static __device__ __forceinline__ void load_row(const float * __restrict__ s, float (&r)[d]) {
 +#pragma unroll
@@ -473,27 +497,28 @@ index 0000000..baa8819
 +    }
 +}
 +
-+// nr rows of D floats (row stride `stride`) into shared [nr][H][P]
-+static __device__ __forceinline__ void stage_rows(float * __restrict__ dst, const float * __restrict__ src,
++// nr rows of D values (row stride `stride`) into shared F32 [nr][H][P]
++template <typename T>
++static __device__ __forceinline__ void stage_rows(float * __restrict__ dst, const T * __restrict__ src,
 +        const int64_t stride, const int nr, const int D, const int d, const int P, const int t, const int nt) {
 +    const int H = D / d;
-+    if ((stride & 3) == 0 && (reinterpret_cast<uintptr_t>(src) & 15) == 0) {
++    if ((stride & 3) == 0 && (reinterpret_cast<uintptr_t>(src) % (4*sizeof(T))) == 0) {
 +        const int D4 = D / 4;
 +        for (int e = t; e < nr*D4; e += nt) {
 +            const int r = e / D4, c = (e % D4)*4;
-+            *reinterpret_cast<float4 *>(dst + (r*H + c / d)*P + c % d) = *reinterpret_cast<const float4 *>(src + r*stride + c);
++            *reinterpret_cast<float4 *>(dst + (r*H + c / d)*P + c % d) = ld_f4(src + r*stride + c);
 +        }
 +    } else {
 +        for (int e = t; e < nr*D; e += nt) {
 +            const int r = e / D, c = e % D;
-+            dst[(r*H + c / d)*P + c % d] = src[r*stride + c];
++            dst[(r*H + c / d)*P + c % d] = ld_f(src + r*stride + c);
 +        }
 +    }
 +}
 +
-+template <int d, int R>
++template <int d, int R, typename T>
 +static __global__ void pet_attn_fwd_v2(
-+        const float * __restrict__ qkv, const float * __restrict__ bias, float * __restrict__ dst,
++        const T * __restrict__ qkv, const float * __restrict__ bias, float * __restrict__ dst,
 +        const int H, const int L, const int TP, const int TS, const float scale) {
 +    extern __shared__ float4 sm4[];
 +    float * sm = reinterpret_cast<float *>(sm4);
@@ -504,7 +529,7 @@ index 0000000..baa8819
 +
 +    const int64_t n = blockIdx.x;
 +    const int q0 = blockIdx.y*TP, t = threadIdx.x, h = t % H, g = t / H;
-+    const float * base = qkv + n*L*3*D;
++    const auto * base = qkv + n*L*3*D;
 +
 +    float q[R][d], acc[R][d], m[R], l[R];
 +#pragma unroll
@@ -512,7 +537,7 @@ index 0000000..baa8819
 +        const int i = q0 + g + r*G;
 +        m[r] = -INFINITY, l[r] = 0.0f;
 +#pragma unroll
-+        for (int c = 0; c < d; c++) q[r][c] = i < L ? scale*base[(int64_t) i*3*D + h*d + c] : 0.0f, acc[r][c] = 0.0f;
++        for (int c = 0; c < d; c++) q[r][c] = i < L ? scale*ld_f(base + (int64_t) i*3*D + h*d + c) : 0.0f, acc[r][c] = 0.0f;
 +    }
 +
 +    for (int k0 = 0; k0 < L; k0 += TS) {
@@ -559,9 +584,9 @@ index 0000000..baa8819
 +    }
 +}
 +
-+template <int d, int R>
++template <int d, int R, typename T>
 +static __global__ void pet_attn_bwd_dq_v2(
-+        const float * __restrict__ qkv, const float * __restrict__ bias, const float * __restrict__ res,
++        const T * __restrict__ qkv, const float * __restrict__ bias, const float * __restrict__ res,
 +        const float * __restrict__ grad, float * __restrict__ dst,
 +        const int H, const int L, const int TP, const int TS, const float scale) {
 +    extern __shared__ float4 sm4[];
@@ -573,7 +598,7 @@ index 0000000..baa8819
 +
 +    const int64_t n = blockIdx.x;
 +    const int q0 = blockIdx.y*TP, t = threadIdx.x, h = t % H, g = t / H;
-+    const float * base = qkv + n*L*3*D;
++    const auto * base = qkv + n*L*3*D;
 +
 +    float q[R][d], dO[R][d], dq[R][d], Di[R], lse[R];
 +#pragma unroll
@@ -584,7 +609,7 @@ index 0000000..baa8819
 +        Di[r] = 0.0f;
 +#pragma unroll
 +        for (int c = 0; c < d; c++) {
-+            q[r][c]  = ok ? base[(int64_t) i*3*D + h*d + c] : 0.0f;
++            q[r][c]  = ok ? ld_f(base + (int64_t) i*3*D + h*d + c) : 0.0f;
 +            dO[r][c] = ok ? grad[row*(D + H) + h*d + c] : 0.0f;
 +            Di[r]   += dO[r][c]*(ok ? res[row*(D + H) + h*d + c] : 0.0f);
 +            dq[r][c] = 0.0f;
@@ -627,9 +652,9 @@ index 0000000..baa8819
 +    }
 +}
 +
-+template <int d, int R>
++template <int d, int R, typename T>
 +static __global__ void pet_attn_bwd_dkv_v2(
-+        const float * __restrict__ qkv, const float * __restrict__ bias, const float * __restrict__ res,
++        const T * __restrict__ qkv, const float * __restrict__ bias, const float * __restrict__ res,
 +        const float * __restrict__ grad, float * __restrict__ dst,
 +        const int H, const int L, const int TP, const int TS, const float scale) {
 +    extern __shared__ float4 sm4[];
@@ -643,7 +668,7 @@ index 0000000..baa8819
 +
 +    const int64_t n = blockIdx.x;
 +    const int k0 = blockIdx.y*TP, t = threadIdx.x, h = t % H, g = t / H;
-+    const float * base = qkv + n*L*3*D;
++    const auto * base = qkv + n*L*3*D;
 +
 +    float k[R][d], v[R][d], dk[R][d], dv[R][d];
 +#pragma unroll
@@ -651,8 +676,8 @@ index 0000000..baa8819
 +        const int j = k0 + g + r*G;
 +#pragma unroll
 +        for (int c = 0; c < d; c++) {
-+            k[r][c] = j < L ? base[(int64_t) j*3*D +   D + h*d + c] : 0.0f;
-+            v[r][c] = j < L ? base[(int64_t) j*3*D + 2*D + h*d + c] : 0.0f;
++            k[r][c] = j < L ? ld_f(base + (int64_t) j*3*D +   D + h*d + c) : 0.0f;
++            v[r][c] = j < L ? ld_f(base + (int64_t) j*3*D + 2*D + h*d + c) : 0.0f;
 +            dk[r][c] = dv[r][c] = 0.0f;
 +        }
 +    }
@@ -717,7 +742,7 @@ index 0000000..baa8819
 +    return {TP, TS, smem(TS)};
 +}
 +
-+template <int d>
++template <int d, typename T>
 +static void pet_attn_launch_v2(ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool back) {
 +    constexpr int RF = 64 / d > 1 ? 64 / d : 1; // forward: q, acc in registers
 +    constexpr int RB = 32 / d > 1 ? 32 / d : 1; // backward: three row arrays
@@ -728,17 +753,18 @@ index 0000000..baa8819
 +    const int64_t N   = qkv->ne[3];
 +    if (N == 0 || L == 0) return;
 +    cudaStream_t stream = ctx.stream();
-+    const float * q = (const float *) qkv->data, * b = (const float *) dst->src[1]->data;
++    const T * q = (const T *) qkv->data;
++    const float * b = (const float *) dst->src[1]->data;
 +    if (!back) {
 +        const pet_attn_shape s = pet_attn_v2_shape(H, d, RF, L, false);
 +        const dim3 grid((unsigned) N, (L + s.TP - 1) / s.TP), block(s.TP / RF * H);
-+        pet_attn_fwd_v2<d, RF><<<grid, block, s.smem, stream>>>(q, b, (float *) dst->data, H, L, s.TP, s.TS, scale);
++        pet_attn_fwd_v2<d, RF, T><<<grid, block, s.smem, stream>>>(q, b, (float *) dst->data, H, L, s.TP, s.TS, scale);
 +    } else {
 +        const float * res = (const float *) dst->src[2]->data, * grad = (const float *) dst->src[3]->data;
 +        const pet_attn_shape sq = pet_attn_v2_shape(H, d, RB, L, false), sk = pet_attn_v2_shape(H, d, RB, L, true);
-+        pet_attn_bwd_dq_v2<d, RB><<<dim3((unsigned) N, (L + sq.TP - 1) / sq.TP), sq.TP / RB * H, sq.smem, stream>>>(
++        pet_attn_bwd_dq_v2<d, RB, T><<<dim3((unsigned) N, (L + sq.TP - 1) / sq.TP), sq.TP / RB * H, sq.smem, stream>>>(
 +            q, b, res, grad, (float *) dst->data, H, L, sq.TP, sq.TS, scale);
-+        pet_attn_bwd_dkv_v2<d, RB><<<dim3((unsigned) N, (L + sk.TP - 1) / sk.TP), sk.TP / RB * H, sk.smem, stream>>>(
++        pet_attn_bwd_dkv_v2<d, RB, T><<<dim3((unsigned) N, (L + sk.TP - 1) / sk.TP), sk.TP / RB * H, sk.smem, stream>>>(
 +            q, b, res, grad, (float *) dst->data, H, L, sk.TP, sk.TS, scale);
 +    }
 +    CUDA_CHECK(cudaGetLastError());
@@ -756,7 +782,8 @@ index 0000000..baa8819
 +    const int H = ggml_get_op_params_i32(op, 0);
 +    const int64_t d = op->src[0]->ne[0] / H;
 +    for (int i = 0; i < GGML_MAX_SRC && op->src[i]; i++)
-+        if (op->src[i]->type != GGML_TYPE_F32 || !ggml_is_contiguous(op->src[i])) return false;
++        if ((op->src[i]->type != GGML_TYPE_F32 && !(i == 0 && op->src[i]->type == GGML_TYPE_F16)) ||
++            !ggml_is_contiguous(op->src[i])) return false;
 +    return (d == 8 || d == 16 || d == 32 || d == 64) && H <= 256 && op->src[0]->ne[2] <= (1 << 28);
 +}
 +
@@ -785,17 +812,578 @@ index 0000000..baa8819
 +    CUDA_CHECK(cudaGetLastError());
 +}
 +
-+// GGML_PET_ATTN_V1=1: the one-row-per-thread kernels (A/B)
-+static void pet_attn_dispatch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool back) {
-+    static const bool v1 = getenv("GGML_PET_ATTN_V1") != nullptr;
-+    const int H = ggml_get_op_params_i32(dst, 0);
-+    switch (dst->src[0]->ne[0] / H) {
-+        case  8: v1 ? pet_attn_launch< 8>(ctx, dst, back) : pet_attn_launch_v2< 8>(ctx, dst, back); break;
-+        case 16: v1 ? pet_attn_launch<16>(ctx, dst, back) : pet_attn_launch_v2<16>(ctx, dst, back); break;
-+        case 32: v1 ? pet_attn_launch<32>(ctx, dst, back) : pet_attn_launch_v2<32>(ctx, dst, back); break;
-+        case 64: v1 ? pet_attn_launch<64>(ctx, dst, back) : pet_attn_launch_v2<64>(ctx, dst, back); break;
++// ---- v3: bf16 tensor cores (GGML_PET_ATTN_BF16=1) ----
++// FlashAttention-2 on mma.sync m16n8k16: one warp per head and 16*MT rows
++// (queries; keys in the dk/dv kernel), a block holds HB heads of the same
++// rows and streams the other side in tiles of TS = 32 rows, converted to bf16
++// in shared memory ([head][row][d + 8]: 16-byte rows for ldmatrix, no bank
++// conflicts). Products are bf16 with fp32 accumulation; scores, softmax,
++// log-sum-exp, dp - Di and every accumulator stay fp32. The warp's own rows
++// are loaded once from global memory straight into fragments. Fragment
++// layouts (PTX ISA, m16n8k16): g = lane / 4, tq = lane % 4; A a0 (g, 2tq..+1),
++// a1 (g+8, 2tq), a2 (g, 2tq+8), a3 (g+8, 2tq+8); B b0 (k 2tq..+1, n g),
++// b1 (k 2tq+8); C c0 c1 (g, 2tq..+1), c2 c3 (g+8, 2tq..+1). Two neighbouring
++// C tiles of 8 columns are one A fragment of 16 columns (P, dS are reused
++// without going through shared memory).
++
++static constexpr int BF_TS = 32;
++
++static __device__ __forceinline__ uint32_t bf_pack(const float a, const float b) {
++    const __nv_bfloat162 v = __floats2bfloat162_rn(a, b);
++    return *reinterpret_cast<const uint32_t *>(&v);
++}
++
++static __device__ __forceinline__ void bf_mma(float (&c)[4], const uint32_t (&a)[4], const uint32_t b0, const uint32_t b1) {
++#ifdef AMPERE_MMA_AVAILABLE
++    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
++        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
++        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
++#else
++    GGML_UNUSED(c); GGML_UNUSED(a); GGML_UNUSED(b0); GGML_UNUSED(b1);
++    NO_DEVICE_CODE;
++#endif
++}
++
++// B fragments of two neighbouring 8-column tiles from 16 x 16 of a row-major
++// [row][SD] array: trans = 0 when the array is [n][k] (K for q k^T), 1 when
++// it is [k][n] (V for p v). r = {b0, b1} of tile 0, {b0, b1} of tile 1.
++template <bool trans>
++static __device__ __forceinline__ void bf_ldsm_b2(uint32_t (&r)[4], const __nv_bfloat16 * base, const int SD, const int lane) {
++#ifdef AMPERE_MMA_AVAILABLE
++    const int mi = lane >> 3, rr = lane & 7;
++    // non-trans: matrices (n 0-7, k 0-7) (n 0-7, k 8-15) (n 8-15, k 0-7) (n 8-15, k 8-15)
++    // trans:     (k 0-7, n 0-7) (k 8-15, n 0-7) (k 0-7, n 8-15) (k 8-15, n 8-15)
++    const __nv_bfloat16 * p = trans ? base + ((mi & 1)*8 + rr)*SD + (mi >> 1)*8
++                                    : base + ((mi >> 1)*8 + rr)*SD + (mi & 1)*8;
++    const uint32_t a = (uint32_t) __cvta_generic_to_shared(p);
++    if (trans) {
++        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];"
++            : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
++    } else {
++        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
++            : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
++    }
++#else
++    GGML_UNUSED(r); GGML_UNUSED(base); GGML_UNUSED(SD); GGML_UNUSED(lane);
++    NO_DEVICE_CODE;
++#endif
++}
++
++// TS rows (nr valid, the rest zero) of the HB*d columns of heads [h0, h0+HB)
++// into bf16 shared [HB][TS][d + 8]
++template <int d, typename T>
++static __device__ __forceinline__ void bf_stage(__nv_bfloat16 * __restrict__ dst, const T * __restrict__ src,
++        const int64_t stride, const int nr, const int HB, const int t, const int nt) {
++    constexpr int SD = d + 8;
++    const int C4 = HB*d / 4;
++    const bool vec = (stride & 3) == 0 && (reinterpret_cast<uintptr_t>(src) % (4*sizeof(T))) == 0;
++    for (int e = t; e < BF_TS*C4; e += nt) {
++        const int r = e / C4, c = (e % C4)*4;
++        float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++        if (r < nr) {
++            const T * s = src + r*stride + c;
++            v = vec ? ld_f4(s) : make_float4(ld_f(s), ld_f(s + 1), ld_f(s + 2), ld_f(s + 3));
++        }
++        __nv_bfloat162 * o = reinterpret_cast<__nv_bfloat162 *>(dst + ((c / d)*BF_TS + r)*SD + c % d);
++        o[0] = __floats2bfloat162_rn(v.x, v.y);
++        o[1] = __floats2bfloat162_rn(v.z, v.w);
++    }
++}
++
++// A fragments of rows r0 + 16 mt + {g, g+8}, columns [0, d) of src (row
++// stride `stride`, rows >= L are zero); optionally sum_c a*w (fp32) per row
++template <int d, int MT, typename T>
++static __device__ __forceinline__ void bf_load_a(uint32_t (&a)[MT][d/16][4], const T * __restrict__ src, const int64_t stride,
++        const int r0, const int L, const int lane) {
++    const int g = lane >> 2, tq = lane & 3;
++#pragma unroll
++    for (int mt = 0; mt < MT; mt++) {
++#pragma unroll
++        for (int ks = 0; ks < d/16; ks++) {
++#pragma unroll
++            for (int f = 0; f < 4; f++) {
++                const int r = r0 + mt*16 + g + (f & 1)*8, c = ks*16 + 2*tq + (f >> 1)*8;
++                const float x = r < L ? ld_f(src + r*stride + c)     : 0.0f;
++                const float y = r < L ? ld_f(src + r*stride + c + 1) : 0.0f;
++                a[mt][ks][f] = bf_pack(x, y);
++            }
++        }
++    }
++}
++
++template <int d, int MT, typename T>
++static __global__ void __launch_bounds__(256) pet_attn_fwd_bf16(
++        const T * __restrict__ qkv, const float * __restrict__ bias, float * __restrict__ dst,
++        const int H, const int HB, const int L, const float scale) {
++    constexpr int SD = d + 8, KS = d/16, ND = d/8, NS = BF_TS/8, TQ = 16*MT;
++    extern __shared__ float4 sm4[];
++    __nv_bfloat16 * Ks = reinterpret_cast<__nv_bfloat16 *>(sm4); // [HB][TS][SD]
++    __nv_bfloat16 * Vs = Ks + HB*BF_TS*SD;
++    float         * Bs = reinterpret_cast<float *>(Vs + HB*BF_TS*SD); // [TQ][TS]
++
++    const int D = H*d, t = threadIdx.x, w = t >> 5, lane = t & 31, g = lane >> 2, tq = lane & 3;
++    const int64_t n = blockIdx.x;
++    const int q0 = blockIdx.y*TQ, h0 = blockIdx.z*HB, h = h0 + w;
++    const auto * base = qkv + n*L*3*D;
++
++    uint32_t qa[MT][KS][4];
++    bf_load_a<d, MT>(qa, base + h*d, 3*D, q0, L, lane);
++
++    float o[MT][ND][4], m[MT][2], l[MT][2];
++#pragma unroll
++    for (int mt = 0; mt < MT; mt++) {
++        m[mt][0] = m[mt][1] = -INFINITY, l[mt][0] = l[mt][1] = 0.0f;
++#pragma unroll
++        for (int dn = 0; dn < ND; dn++) o[mt][dn][0] = o[mt][dn][1] = o[mt][dn][2] = o[mt][dn][3] = 0.0f;
++    }
++
++    for (int k0 = 0; k0 < L; k0 += BF_TS) {
++        const int nk = min(BF_TS, L - k0);
++        bf_stage<d>(Ks, base + (int64_t) k0*3*D +   D + h0*d, 3*D, nk, HB, t, blockDim.x);
++        bf_stage<d>(Vs, base + (int64_t) k0*3*D + 2*D + h0*d, 3*D, nk, HB, t, blockDim.x);
++        for (int e = t; e < TQ*BF_TS; e += blockDim.x) {
++            const int a = e / BF_TS, kk = e % BF_TS;
++            Bs[e] = q0 + a < L && kk < nk ? bias[(n*L + q0 + a)*L + k0 + kk] : 0.0f;
++        }
++        __syncthreads();
++        const __nv_bfloat16 * Kh = Ks + w*BF_TS*SD, * Vh = Vs + w*BF_TS*SD;
++        uint32_t kb[NS][KS][2], vb[BF_TS/16][ND][2];
++#pragma unroll
++        for (int nt = 0; nt < NS; nt += 2)
++#pragma unroll
++            for (int ks = 0; ks < KS; ks++) {
++                uint32_t r[4];
++                bf_ldsm_b2<false>(r, Kh + nt*8*SD + ks*16, SD, lane);
++                kb[nt][ks][0] = r[0], kb[nt][ks][1] = r[1], kb[nt + 1][ks][0] = r[2], kb[nt + 1][ks][1] = r[3];
++            }
++#pragma unroll
++        for (int j = 0; j < BF_TS/16; j++)
++#pragma unroll
++            for (int dn = 0; dn < ND; dn += 2) {
++                uint32_t r[4];
++                bf_ldsm_b2<true>(r, Vh + j*16*SD + dn*8, SD, lane);
++                vb[j][dn][0] = r[0], vb[j][dn][1] = r[1], vb[j][dn + 1][0] = r[2], vb[j][dn + 1][1] = r[3];
++            }
++#pragma unroll
++        for (int mt = 0; mt < MT; mt++) {
++            float s[NS][4];
++#pragma unroll
++            for (int nt = 0; nt < NS; nt++) {
++                s[nt][0] = s[nt][1] = s[nt][2] = s[nt][3] = 0.0f;
++#pragma unroll
++                for (int ks = 0; ks < KS; ks++) bf_mma(s[nt], qa[mt][ks], kb[nt][ks][0], kb[nt][ks][1]);
++            }
++            float mx[2] = {-INFINITY, -INFINITY};
++#pragma unroll
++            for (int nt = 0; nt < NS; nt++)
++#pragma unroll
++                for (int f = 0; f < 4; f++) {
++                    const int a = mt*16 + g + (f >> 1)*8, kk = nt*8 + 2*tq + (f & 1);
++                    const float x = kk < nk ? scale*s[nt][f] + Bs[a*BF_TS + kk] : -INFINITY;
++                    s[nt][f] = x;
++                    mx[f >> 1] = fmaxf(mx[f >> 1], x);
++                }
++            float corr[2], sum[2] = {0.0f, 0.0f};
++#pragma unroll
++            for (int u = 0; u < 2; u++) {
++                mx[u] = fmaxf(mx[u], __shfl_xor_sync(0xffffffff, mx[u], 1));
++                mx[u] = fmaxf(mx[u], __shfl_xor_sync(0xffffffff, mx[u], 2));
++                const float mn = fmaxf(m[mt][u], mx[u]);
++                corr[u] = __expf(m[mt][u] - mn);
++                m[mt][u] = mn;
++            }
++#pragma unroll
++            for (int nt = 0; nt < NS; nt++)
++#pragma unroll
++                for (int f = 0; f < 4; f++) {
++                    s[nt][f] = __expf(s[nt][f] - m[mt][f >> 1]);
++                    sum[f >> 1] += s[nt][f];
++                }
++#pragma unroll
++            for (int u = 0; u < 2; u++) l[mt][u] = l[mt][u]*corr[u] + sum[u];
++#pragma unroll
++            for (int dn = 0; dn < ND; dn++)
++                o[mt][dn][0] *= corr[0], o[mt][dn][1] *= corr[0], o[mt][dn][2] *= corr[1], o[mt][dn][3] *= corr[1];
++#pragma unroll
++            for (int j = 0; j < BF_TS/16; j++) {
++                const uint32_t pa[4] = {
++                    bf_pack(s[2*j][0], s[2*j][1]), bf_pack(s[2*j][2], s[2*j][3]),
++                    bf_pack(s[2*j + 1][0], s[2*j + 1][1]), bf_pack(s[2*j + 1][2], s[2*j + 1][3])};
++#pragma unroll
++                for (int dn = 0; dn < ND; dn++) bf_mma(o[mt][dn], pa, vb[j][dn][0], vb[j][dn][1]);
++            }
++        }
++        __syncthreads();
++    }
++#pragma unroll
++    for (int mt = 0; mt < MT; mt++)
++#pragma unroll
++        for (int u = 0; u < 2; u++) {
++            float lu = l[mt][u];
++            lu += __shfl_xor_sync(0xffffffff, lu, 1);
++            lu += __shfl_xor_sync(0xffffffff, lu, 2);
++            const int i = q0 + mt*16 + g + u*8;
++            if (i >= L) continue;
++            float * out = dst + (n*L + i)*(D + H);
++#pragma unroll
++            for (int dn = 0; dn < ND; dn++) {
++                out[h*d + dn*8 + 2*tq]     = o[mt][dn][2*u]/lu;
++                out[h*d + dn*8 + 2*tq + 1] = o[mt][dn][2*u + 1]/lu;
++            }
++            if (tq == 0) out[D + h] = m[mt][u] + logf(lu);
++        }
++}
++
++// dq = scale * sum_k p (dp - Di) k, dp = dO v^T; per warp: one head, 16*MT queries
++template <int d, int MT, typename T>
++static __global__ void __launch_bounds__(256) pet_attn_bwd_dq_bf16(
++        const T * __restrict__ qkv, const float * __restrict__ bias, const float * __restrict__ res,
++        const float * __restrict__ grad, float * __restrict__ dst,
++        const int H, const int HB, const int L, const float scale) {
++    constexpr int SD = d + 8, KS = d/16, ND = d/8, NS = BF_TS/8, TQ = 16*MT;
++    extern __shared__ float4 sm4[];
++    __nv_bfloat16 * Ks = reinterpret_cast<__nv_bfloat16 *>(sm4);
++    __nv_bfloat16 * Vs = Ks + HB*BF_TS*SD;
++    float         * Bs = reinterpret_cast<float *>(Vs + HB*BF_TS*SD); // [TQ][TS]
++
++    const int D = H*d, t = threadIdx.x, w = t >> 5, lane = t & 31, g = lane >> 2, tq = lane & 3;
++    const int64_t n = blockIdx.x;
++    const int q0 = blockIdx.y*TQ, h0 = blockIdx.z*HB, h = h0 + w;
++    const auto * base = qkv + n*L*3*D;
++    const float * rres = res + n*L*(D + H), * rgrad = grad + n*L*(D + H);
++
++    uint32_t qa[MT][KS][4], ga[MT][KS][4];
++    bf_load_a<d, MT>(qa, base  + h*d, 3*D,   q0, L, lane);
++    bf_load_a<d, MT>(ga, rgrad + h*d, D + H, q0, L, lane);
++    float lse[MT][2], Di[MT][2], dq[MT][ND][4];
++#pragma unroll
++    for (int mt = 0; mt < MT; mt++) {
++#pragma unroll
++        for (int u = 0; u < 2; u++) {
++            const int i = q0 + mt*16 + g + u*8;
++            float s = 0.0f;
++            if (i < L)
++#pragma unroll
++                for (int c = 2*tq; c < d; c += 8) {
++                    s += rgrad[i*(D + H) + h*d + c]*rres[i*(D + H) + h*d + c]
++                       + rgrad[i*(D + H) + h*d + c + 1]*rres[i*(D + H) + h*d + c + 1];
++                }
++            s += __shfl_xor_sync(0xffffffff, s, 1);
++            s += __shfl_xor_sync(0xffffffff, s, 2);
++            Di[mt][u]  = s;
++            lse[mt][u] = i < L ? rres[i*(D + H) + D + h] : 0.0f;
++        }
++#pragma unroll
++        for (int dn = 0; dn < ND; dn++) dq[mt][dn][0] = dq[mt][dn][1] = dq[mt][dn][2] = dq[mt][dn][3] = 0.0f;
++    }
++
++    for (int k0 = 0; k0 < L; k0 += BF_TS) {
++        const int nk = min(BF_TS, L - k0);
++        bf_stage<d>(Ks, base + (int64_t) k0*3*D +   D + h0*d, 3*D, nk, HB, t, blockDim.x);
++        bf_stage<d>(Vs, base + (int64_t) k0*3*D + 2*D + h0*d, 3*D, nk, HB, t, blockDim.x);
++        for (int e = t; e < TQ*BF_TS; e += blockDim.x) {
++            const int a = e / BF_TS, kk = e % BF_TS;
++            Bs[e] = q0 + a < L && kk < nk ? bias[(n*L + q0 + a)*L + k0 + kk] : 0.0f;
++        }
++        __syncthreads();
++        const __nv_bfloat16 * Kh = Ks + w*BF_TS*SD, * Vh = Vs + w*BF_TS*SD;
++        uint32_t kb[NS][KS][2], vb[NS][KS][2], kt[BF_TS/16][ND][2];
++#pragma unroll
++        for (int nt = 0; nt < NS; nt += 2)
++#pragma unroll
++            for (int ks = 0; ks < KS; ks++) {
++                uint32_t r[4];
++                bf_ldsm_b2<false>(r, Kh + nt*8*SD + ks*16, SD, lane);
++                kb[nt][ks][0] = r[0], kb[nt][ks][1] = r[1], kb[nt + 1][ks][0] = r[2], kb[nt + 1][ks][1] = r[3];
++                bf_ldsm_b2<false>(r, Vh + nt*8*SD + ks*16, SD, lane);
++                vb[nt][ks][0] = r[0], vb[nt][ks][1] = r[1], vb[nt + 1][ks][0] = r[2], vb[nt + 1][ks][1] = r[3];
++            }
++#pragma unroll
++        for (int j = 0; j < BF_TS/16; j++)
++#pragma unroll
++            for (int dn = 0; dn < ND; dn += 2) {
++                uint32_t r[4];
++                bf_ldsm_b2<true>(r, Kh + j*16*SD + dn*8, SD, lane);
++                kt[j][dn][0] = r[0], kt[j][dn][1] = r[1], kt[j][dn + 1][0] = r[2], kt[j][dn + 1][1] = r[3];
++            }
++#pragma unroll
++        for (int mt = 0; mt < MT; mt++) {
++            float s[NS][4], dp[NS][4];
++#pragma unroll
++            for (int nt = 0; nt < NS; nt++) {
++#pragma unroll
++                for (int f = 0; f < 4; f++) s[nt][f] = dp[nt][f] = 0.0f;
++#pragma unroll
++                for (int ks = 0; ks < KS; ks++) {
++                    bf_mma(s[nt],  qa[mt][ks], kb[nt][ks][0], kb[nt][ks][1]);
++                    bf_mma(dp[nt], ga[mt][ks], vb[nt][ks][0], vb[nt][ks][1]);
++                }
++#pragma unroll
++                for (int f = 0; f < 4; f++) {
++                    const int a = mt*16 + g + (f >> 1)*8, kk = nt*8 + 2*tq + (f & 1);
++                    const float p = kk < nk ? __expf(scale*s[nt][f] + Bs[a*BF_TS + kk] - lse[mt][f >> 1]) : 0.0f;
++                    s[nt][f] = p*(dp[nt][f] - Di[mt][f >> 1]);
++                }
++            }
++#pragma unroll
++            for (int j = 0; j < BF_TS/16; j++) {
++                const uint32_t da[4] = {
++                    bf_pack(s[2*j][0], s[2*j][1]), bf_pack(s[2*j][2], s[2*j][3]),
++                    bf_pack(s[2*j + 1][0], s[2*j + 1][1]), bf_pack(s[2*j + 1][2], s[2*j + 1][3])};
++#pragma unroll
++                for (int dn = 0; dn < ND; dn++) bf_mma(dq[mt][dn], da, kt[j][dn][0], kt[j][dn][1]);
++            }
++        }
++        __syncthreads();
++    }
++#pragma unroll
++    for (int mt = 0; mt < MT; mt++)
++#pragma unroll
++        for (int u = 0; u < 2; u++) {
++            const int i = q0 + mt*16 + g + u*8;
++            if (i >= L) continue;
++            float * out = dst + (n*L + i)*3*D + h*d;
++#pragma unroll
++            for (int dn = 0; dn < ND; dn++) {
++                out[dn*8 + 2*tq]     = scale*dq[mt][dn][2*u];
++                out[dn*8 + 2*tq + 1] = scale*dq[mt][dn][2*u + 1];
++            }
++        }
++}
++
++// dk = scale * sum_q p (dp - Di) q, dv = sum_q p dO; per warp: one head, 16*MT
++// keys (the transposed products: rows are keys, columns streamed queries)
++template <int d, int MT, typename T>
++static __global__ void __launch_bounds__(256) pet_attn_bwd_dkv_bf16(
++        const T * __restrict__ qkv, const float * __restrict__ bias, const float * __restrict__ res,
++        const float * __restrict__ grad, float * __restrict__ dst,
++        const int H, const int HB, const int L, const float scale) {
++    constexpr int SD = d + 8, KS = d/16, ND = d/8, NS = BF_TS/8, TK = 16*MT;
++    extern __shared__ float4 sm4[];
++    __nv_bfloat16 * Qs  = reinterpret_cast<__nv_bfloat16 *>(sm4);
++    __nv_bfloat16 * dOs = Qs + HB*BF_TS*SD;
++    float         * Bs  = reinterpret_cast<float *>(dOs + HB*BF_TS*SD); // [TS queries][TK keys]
++    float         * Ls  = Bs + BF_TS*TK;                                // [HB][TS]
++    float         * Ds  = Ls + HB*BF_TS;                                // [HB][TS]
++
++    const int D = H*d, t = threadIdx.x, w = t >> 5, lane = t & 31, g = lane >> 2, tq = lane & 3;
++    const int64_t n = blockIdx.x;
++    const int k0 = blockIdx.y*TK, h0 = blockIdx.z*HB, h = h0 + w;
++    const auto * base = qkv + n*L*3*D;
++    const float * rres = res + n*L*(D + H), * rgrad = grad + n*L*(D + H);
++
++    uint32_t ka[MT][KS][4], va[MT][KS][4];
++    bf_load_a<d, MT>(ka, base +   D + h*d, 3*D, k0, L, lane);
++    bf_load_a<d, MT>(va, base + 2*D + h*d, 3*D, k0, L, lane);
++    float dk[MT][ND][4], dv[MT][ND][4];
++#pragma unroll
++    for (int mt = 0; mt < MT; mt++)
++#pragma unroll
++        for (int dn = 0; dn < ND; dn++)
++#pragma unroll
++            for (int f = 0; f < 4; f++) dk[mt][dn][f] = dv[mt][dn][f] = 0.0f;
++
++    for (int q0 = 0; q0 < L; q0 += BF_TS) {
++        const int nq = min(BF_TS, L - q0);
++        bf_stage<d>(Qs,  base  + (int64_t) q0*3*D + h0*d, 3*D,   nq, HB, t, blockDim.x);
++        bf_stage<d>(dOs, rgrad + (int64_t) q0*(D + H) + h0*d, D + H, nq, HB, t, blockDim.x);
++        for (int e = t; e < BF_TS*TK; e += blockDim.x) {
++            const int qq = e / TK, a = e % TK;
++            Bs[e] = qq < nq && k0 + a < L ? bias[(n*L + q0 + qq)*L + k0 + a] : 0.0f;
++        }
++        for (int e = t; e < HB*BF_TS; e += blockDim.x) {
++            const int hb = e / BF_TS, qq = e % BF_TS;
++            float lq = 0.0f, s = 0.0f;
++            if (qq < nq) {
++                const float * gr = rgrad + (int64_t) (q0 + qq)*(D + H) + (h0 + hb)*d;
++                const float * orow = rres + (int64_t) (q0 + qq)*(D + H);
++                for (int c = 0; c < d; c++) s += gr[c]*orow[(h0 + hb)*d + c];
++                lq = orow[D + h0 + hb];
++            }
++            Ls[e] = lq, Ds[e] = s;
++        }
++        __syncthreads();
++        const __nv_bfloat16 * Qh = Qs + w*BF_TS*SD, * Gh = dOs + w*BF_TS*SD;
++        const float * Lh = Ls + w*BF_TS, * Dh = Ds + w*BF_TS;
++        uint32_t qb[NS][KS][2], gb[NS][KS][2], qt[BF_TS/16][ND][2], gt[BF_TS/16][ND][2];
++#pragma unroll
++        for (int nt = 0; nt < NS; nt += 2)
++#pragma unroll
++            for (int ks = 0; ks < KS; ks++) {
++                uint32_t r[4];
++                bf_ldsm_b2<false>(r, Qh + nt*8*SD + ks*16, SD, lane);
++                qb[nt][ks][0] = r[0], qb[nt][ks][1] = r[1], qb[nt + 1][ks][0] = r[2], qb[nt + 1][ks][1] = r[3];
++                bf_ldsm_b2<false>(r, Gh + nt*8*SD + ks*16, SD, lane);
++                gb[nt][ks][0] = r[0], gb[nt][ks][1] = r[1], gb[nt + 1][ks][0] = r[2], gb[nt + 1][ks][1] = r[3];
++            }
++#pragma unroll
++        for (int j = 0; j < BF_TS/16; j++)
++#pragma unroll
++            for (int dn = 0; dn < ND; dn += 2) {
++                uint32_t r[4];
++                bf_ldsm_b2<true>(r, Qh + j*16*SD + dn*8, SD, lane);
++                qt[j][dn][0] = r[0], qt[j][dn][1] = r[1], qt[j][dn + 1][0] = r[2], qt[j][dn + 1][1] = r[3];
++                bf_ldsm_b2<true>(r, Gh + j*16*SD + dn*8, SD, lane);
++                gt[j][dn][0] = r[0], gt[j][dn][1] = r[1], gt[j][dn + 1][0] = r[2], gt[j][dn + 1][1] = r[3];
++            }
++#pragma unroll
++        for (int mt = 0; mt < MT; mt++) {
++            float p[NS][4], ds[NS][4];
++#pragma unroll
++            for (int nt = 0; nt < NS; nt++) {
++#pragma unroll
++                for (int f = 0; f < 4; f++) p[nt][f] = ds[nt][f] = 0.0f;
++#pragma unroll
++                for (int ks = 0; ks < KS; ks++) {
++                    bf_mma(p[nt],  ka[mt][ks], qb[nt][ks][0], qb[nt][ks][1]);
++                    bf_mma(ds[nt], va[mt][ks], gb[nt][ks][0], gb[nt][ks][1]);
++                }
++#pragma unroll
++                for (int f = 0; f < 4; f++) {
++                    const int a = mt*16 + g + (f >> 1)*8, qq = nt*8 + 2*tq + (f & 1);
++                    const float pv = qq < nq ? __expf(scale*p[nt][f] + Bs[qq*TK + a] - Lh[qq]) : 0.0f;
++                    p[nt][f]  = pv;
++                    ds[nt][f] = pv*(ds[nt][f] - Dh[qq]);
++                }
++            }
++#pragma unroll
++            for (int j = 0; j < BF_TS/16; j++) {
++                const uint32_t pa[4] = {
++                    bf_pack(p[2*j][0], p[2*j][1]), bf_pack(p[2*j][2], p[2*j][3]),
++                    bf_pack(p[2*j + 1][0], p[2*j + 1][1]), bf_pack(p[2*j + 1][2], p[2*j + 1][3])};
++                const uint32_t da[4] = {
++                    bf_pack(ds[2*j][0], ds[2*j][1]), bf_pack(ds[2*j][2], ds[2*j][3]),
++                    bf_pack(ds[2*j + 1][0], ds[2*j + 1][1]), bf_pack(ds[2*j + 1][2], ds[2*j + 1][3])};
++#pragma unroll
++                for (int dn = 0; dn < ND; dn++) {
++                    bf_mma(dv[mt][dn], pa, gt[j][dn][0], gt[j][dn][1]);
++                    bf_mma(dk[mt][dn], da, qt[j][dn][0], qt[j][dn][1]);
++                }
++            }
++        }
++        __syncthreads();
++    }
++#pragma unroll
++    for (int mt = 0; mt < MT; mt++)
++#pragma unroll
++        for (int u = 0; u < 2; u++) {
++            const int j = k0 + mt*16 + g + u*8;
++            if (j >= L) continue;
++            float * out = dst + (n*L + j)*3*D + h*d;
++#pragma unroll
++            for (int dn = 0; dn < ND; dn++) {
++                out[D + dn*8 + 2*tq]       = scale*dk[mt][dn][2*u];
++                out[D + dn*8 + 2*tq + 1]   = scale*dk[mt][dn][2*u + 1];
++                out[2*D + dn*8 + 2*tq]     = dv[mt][dn][2*u];
++                out[2*D + dn*8 + 2*tq + 1] = dv[mt][dn][2*u + 1];
++            }
++        }
++}
++
++// heads per block: the largest divisor of H <= 8 whose tiles fit
++static int pet_attn_bf16_heads(int H, int d, int MT, bool dkv) {
++    for (int HB = std::min(H, 8); HB >= 1; HB--) {
++        if (H % HB) continue;
++        const size_t smem = 2*(size_t) HB*BF_TS*(d + 8)*2 + (size_t) 16*MT*BF_TS*4 + (dkv ? 2*(size_t) HB*BF_TS*4 : 0);
++        if (smem <= MAX_SMEM) return HB;
++    }
++    return 0;
++}
++
++static size_t pet_attn_bf16_smem(int HB, int d, int MT, bool dkv) {
++    return 2*(size_t) HB*BF_TS*(d + 8)*2 + (size_t) 16*MT*BF_TS*4 + (dkv ? 2*(size_t) HB*BF_TS*4 : 0);
++}
++
++// rows per warp: the most (<= MTmax) that still give two waves of blocks and
++// do not exceed L
++static int pet_attn_bf16_mt(int MTmax, int64_t N, int L, int H, int HB, int nsm) {
++    int MT = MTmax;
++    while (MT > 1 && (16*MT/2 >= L || N*((L + 16*MT - 1)/(16*MT))*(H/HB) < 2*nsm)) MT /= 2;
++    return MT;
++}
++
++template <int d, int MT, typename T>
++static void pet_attn_launch_bf16_mt(ggml_backend_cuda_context & ctx, ggml_tensor * dst, int which) {
++    const ggml_tensor * qkv = dst->src[0];
++    const int   H     = ggml_get_op_params_i32(dst, 0);
++    const float scale = ggml_get_op_params_f32(dst, 1);
++    const int   L     = (int) qkv->ne[2];
++    const int64_t N   = qkv->ne[3];
++    const int   HB    = pet_attn_bf16_heads(H, d, MT, which == 2);
++    const size_t smem = pet_attn_bf16_smem(HB, d, MT, which == 2);
++    const dim3 grid((unsigned) N, (L + 16*MT - 1)/(16*MT), H/HB), block(32*HB);
++    cudaStream_t stream = ctx.stream();
++    const T * q = (const T *) qkv->data;
++    const float * b = (const float *) dst->src[1]->data;
++    if (which == 0) {
++        pet_attn_fwd_bf16<d, MT, T><<<grid, block, smem, stream>>>(q, b, (float *) dst->data, H, HB, L, scale);
++    } else {
++        const float * res = (const float *) dst->src[2]->data, * grad = (const float *) dst->src[3]->data;
++        if (which == 1) pet_attn_bwd_dq_bf16 <d, MT, T><<<grid, block, smem, stream>>>(q, b, res, grad, (float *) dst->data, H, HB, L, scale);
++        else            pet_attn_bwd_dkv_bf16<d, MT, T><<<grid, block, smem, stream>>>(q, b, res, grad, (float *) dst->data, H, HB, L, scale);
++    }
++}
++
++template <int d, typename T>
++static void pet_attn_launch_bf16(ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool back) {
++    const ggml_tensor * qkv = dst->src[0];
++    const int H = ggml_get_op_params_i32(dst, 0), L = (int) qkv->ne[2];
++    const int64_t N = qkv->ne[3];
++    if (N == 0 || L == 0) return;
++    const int nsm = ggml_cuda_info().devices[ctx.device].nsm;
++    // m-tiles per warp: forward up to 64/d, backward 32/d (twice the live
++    // fragments), so the accumulators stay in registers
++    for (int which = back ? 1 : 0; which <= (back ? 2 : 0); which++) {
++        const int MTmax = std::max(1, (which == 0 ? 64 : 32) / d);
++        const int MT = pet_attn_bf16_mt(MTmax, N, L, H, pet_attn_bf16_heads(H, d, MTmax, which == 2), nsm);
++        switch (MT) {
++            case 4:  pet_attn_launch_bf16_mt<d, 4, T>(ctx, dst, which); break;
++            case 2:  pet_attn_launch_bf16_mt<d, 2, T>(ctx, dst, which); break;
++            default: pet_attn_launch_bf16_mt<d, 1, T>(ctx, dst, which); break;
++        }
++    }
++    CUDA_CHECK(cudaGetLastError());
++}
++
++static bool pet_attn_use_bf16(const ggml_backend_cuda_context & ctx, int d) {
++    const char * e = getenv("GGML_PET_ATTN_BF16");
++    return e && atoi(e) != 0 && d % 16 == 0 && ampere_mma_available(ggml_cuda_info().devices[ctx.device].cc);
++}
++
++// GGML_PET_ATTN_V1=1: the one-row-per-thread kernels (A/B; F32 qkv only, F16
++// falls back to v2); GGML_PET_ATTN_BF16=1: the bf16 tensor-core kernels (d a
++// multiple of 16, Ampere or newer)
++template <typename T>
++static void pet_attn_dispatch_t(ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool back) {
++    const bool v1 = getenv("GGML_PET_ATTN_V1") != nullptr; // read per call, like BF16 (A/B in one process)
++    const int H = ggml_get_op_params_i32(dst, 0), d = (int) (dst->src[0]->ne[0] / H);
++    if (pet_attn_use_bf16(ctx, d) && !(v1 && std::is_same<T, float>::value)) {
++        switch (d) {
++            case 16: pet_attn_launch_bf16<16, T>(ctx, dst, back); return;
++            case 32: pet_attn_launch_bf16<32, T>(ctx, dst, back); return;
++            case 64: pet_attn_launch_bf16<64, T>(ctx, dst, back); return;
++        }
++    }
++    if (v1 && std::is_same<T, float>::value) {
++        switch (d) {
++            case  8: pet_attn_launch< 8>(ctx, dst, back); return;
++            case 16: pet_attn_launch<16>(ctx, dst, back); return;
++            case 32: pet_attn_launch<32>(ctx, dst, back); return;
++            case 64: pet_attn_launch<64>(ctx, dst, back); return;
++        }
++    }
++    switch (d) {
++        case  8: pet_attn_launch_v2< 8, T>(ctx, dst, back); break;
++        case 16: pet_attn_launch_v2<16, T>(ctx, dst, back); break;
++        case 32: pet_attn_launch_v2<32, T>(ctx, dst, back); break;
++        case 64: pet_attn_launch_v2<64, T>(ctx, dst, back); break;
 +        default: GGML_ABORT("pet_attn: unsupported head size");
 +    }
++}
++
++static void pet_attn_dispatch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool back) {
++    if (dst->src[0]->type == GGML_TYPE_F16) pet_attn_dispatch_t<half>(ctx, dst, back);
++    else                                    pet_attn_dispatch_t<float>(ctx, dst, back);
 +}
 +
 +void ggml_cuda_op_pet_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) { pet_attn_dispatch(ctx, dst, false); }
@@ -813,7 +1401,7 @@ index 0000000..fe9f1f1
 +void ggml_cuda_op_pet_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 +void ggml_cuda_op_pet_attn_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/src/ggml.c b/src/ggml.c
-index 67a31b8..d3b13ec 100644
+index 67a31b8..b5269dd 100644
 --- a/src/ggml.c
 +++ b/src/ggml.c
 @@ -1063,9 +1063,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
@@ -856,7 +1444,7 @@ index 67a31b8..d3b13ec 100644
 +        struct ggml_tensor  * bias,
 +        int                   n_head,
 +        float                 scale) {
-+    GGML_ASSERT(qkv->type == GGML_TYPE_F32 && bias->type == GGML_TYPE_F32);
++    GGML_ASSERT((qkv->type == GGML_TYPE_F32 || qkv->type == GGML_TYPE_F16) && bias->type == GGML_TYPE_F32);
 +    GGML_ASSERT(ggml_is_contiguous(qkv) && ggml_is_contiguous(bias));
 +    GGML_ASSERT(qkv->ne[1] == 3 && n_head > 0 && qkv->ne[0] % n_head == 0);
 +    GGML_ASSERT(bias->ne[0] == qkv->ne[2] && bias->ne[1] == qkv->ne[2] && bias->ne[2] == 1 && bias->ne[3] == qkv->ne[3]);
@@ -885,7 +1473,7 @@ index 67a31b8..d3b13ec 100644
 +    GGML_ASSERT(ggml_are_same_shape(result, grad) && grad->type == GGML_TYPE_F32);
 +    GGML_ASSERT(result->ne[0] == qkv->ne[0] + n_head);
 +
-+    struct ggml_tensor * dqkv = ggml_dup_tensor(ctx, qkv);
++    struct ggml_tensor * dqkv = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, qkv->ne); // F32 also for F16 qkv
 +
 +    int32_t params[2] = { n_head, 0 };
 +    memcpy(params + 1, &scale, sizeof(float));

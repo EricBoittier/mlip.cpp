@@ -586,9 +586,12 @@ const GIRNode *GraphInterpreter::find_node(const std::string &ref) const {
 // with q, k, v = PERMUTE(RESHAPE(SELECT(x, dim 2, 0 | 1 | 2)), [0, 2, 1, 3]) of
 // one x [N, L, 3, D] -> one ggml_pet_attn (no L x L tensor is stored, forward
 // or backward). nullptr if the pattern does not match;
-// MLIPCPP_NO_FUSED_ATTN=1 keeps the separate ops.
+// MLIPCPP_NO_FUSED_ATTN=1 keeps the separate ops. MLIPCPP_ATTN_F16=1: the op
+// reads an F16 copy of x (the F32 x dies at the cast; the copy is what the
+// backward pass keeps), gradients stay F32.
 ggml_tensor *GraphInterpreter::build_fused_attention(ggml_context *ctx, const GIRNode &node) {
   static const bool off = std::getenv("MLIPCPP_NO_FUSED_ATTN") != nullptr;
+  static const bool f16 = [] { const char *e = std::getenv("MLIPCPP_ATTN_F16"); return e && std::atoi(e) != 0; }();
   if (off || node.inputs.size() != 2) return nullptr;
   auto in = [&](const GIRNode *n, size_t i) -> const GIRNode * {
     return n && i < n->inputs.size() ? find_node(n->inputs[i]) : nullptr;
@@ -628,6 +631,7 @@ ggml_tensor *GraphInterpreter::build_fused_attention(ggml_context *ctx, const GI
     return nullptr;
   if (!ggml_is_contiguous(xt)) xt = ggml_cont(ctx, xt);
   if (!ggml_is_contiguous(bias)) bias = ggml_cont(ctx, bias);
+  if (f16) xt = ggml_cast(ctx, xt, GGML_TYPE_F16);
 
   const float scale = static_cast<float>(get_param<double>(*sm, "scale", 1.0) / get_param<double>(*div, "scalar", 1.0));
   ggml_tensor *r = ggml_pet_attn(ctx, xt, bias, static_cast<int>(H), scale); // [D + H, L, N]
