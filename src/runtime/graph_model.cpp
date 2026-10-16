@@ -9,6 +9,9 @@
 #include <ggml.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <sstream>
@@ -21,6 +24,26 @@ using json = nlohmann::json;
 namespace mlipcpp::runtime {
 
 namespace {
+
+// Optional wall-clock breakdown, including backend synchronization in compute.
+struct GraphProfile {
+  bool enabled = std::getenv("MLIPCPP_PROFILE_GRAPH") != nullptr;
+  std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now(), previous = start;
+  std::vector<std::pair<const char *, double>> stages;
+  void mark(const char *name) {
+    if (!enabled) return;
+    const auto now = std::chrono::steady_clock::now();
+    stages.emplace_back(name, std::chrono::duration<double, std::milli>(now - previous).count());
+    previous = now;
+  }
+  ~GraphProfile() {
+    if (!enabled) return;
+    mark("cleanup");
+    std::fprintf(stderr, "GRAPH_PROFILE");
+    for (auto [name, ms] : stages) std::fprintf(stderr, " %s=%.3f", name, ms);
+    std::fprintf(stderr, " total=%.3f ms\n", std::chrono::duration<double, std::milli>(previous - start).count());
+  }
+};
 
 // Bump cutoff function
 float cutoff_func_bump(float distance, float cutoff, float width) {
@@ -567,9 +590,31 @@ ModelResult GraphModel::predict_with_capture(
                            : nullptr);
 }
 
+ModelResult GraphModel::predict_with_parameter_gradients(
+    const AtomicSystem &system, std::vector<float> &gradients) {
+  if (param_names_.empty())
+    throw std::runtime_error("Model has no train.param_names metadata");
+  struct RestoreFlags {
+    std::vector<std::pair<ggml_tensor *, int>> entries;
+    ~RestoreFlags() {
+      for (auto [tensor, flags] : entries) tensor->flags = flags;
+    }
+  } restore;
+  const auto all = weights();
+  for (const auto &name : param_names_) {
+    auto it = std::find_if(all.begin(), all.end(), [&](const auto &w) { return w.first == name; });
+    if (it == all.end()) throw std::runtime_error("Missing trainable tensor: " + name);
+    restore.entries.emplace_back(it->second, it->second->flags);
+    ggml_set_param(it->second);
+  }
+  return predict_single(system, true, nullptr, &gradients);
+}
+
 ModelResult GraphModel::predict_single(
     const AtomicSystem &system, bool compute_forces,
-    const std::function<void()> &post_compute_hook) {
+    const std::function<void()> &post_compute_hook,
+    std::vector<float> *parameter_gradients) {
+  GraphProfile profile;
   if (compute_forces && !forces_mode_) {
     throw std::runtime_error(
         "GraphModel: forces requested but model was exported with "
@@ -894,6 +939,7 @@ ModelResult GraphModel::predict_single(
     interp_.set_input("cutoff_values", cutoff_values_t);
   }
 
+  profile.mark("inputs");
   // --- Build and compute ---
   ggml_context *compute_ctx = ggml_init({COMPUTE_CTX_SIZE, nullptr, true});
   std::unique_ptr<ggml_context, decltype(&ggml_free)> compute_owner(compute_ctx,
@@ -1004,6 +1050,7 @@ ModelResult GraphModel::predict_single(
   }
 
   interp_.init_constants();
+  profile.mark("build_allocate");
 
   P3MResult mesh_result;
   std::vector<float> charge_values;
@@ -1011,6 +1058,7 @@ ModelResult GraphModel::predict_single(
     if (ggml_backend_graph_compute(compute_backend_, charge_graph) !=
         GGML_STATUS_SUCCESS)
       throw std::runtime_error("PET-LR charge graph failed");
+    profile.mark("charge_forward");
     charge_values.resize(ggml_nelements(lr_charges));
     ggml_backend_tensor_get(lr_charges, charge_values.data(), 0,
                             ggml_nbytes(lr_charges));
@@ -1022,6 +1070,7 @@ ModelResult GraphModel::predict_single(
       ggml_backend_tensor_memset(lr_charge_adjoint, 0, 0,
                                  ggml_nbytes(lr_charge_adjoint));
   }
+  profile.mark("p3m_forward");
   if (compute_forces) {
     ggml_graph_reset(cgraph);
   }
@@ -1031,6 +1080,7 @@ ModelResult GraphModel::predict_single(
     throw std::runtime_error("Graph computation failed");
   }
 
+  profile.mark("forward_backward");
   if (lr_potentials && compute_forces) {
     std::vector<float> adjoint(charge_values.size());
     ggml_backend_tensor_get(ggml_graph_get_grad(cgraph, lr_potentials),
@@ -1040,10 +1090,30 @@ ModelResult GraphModel::predict_single(
     ggml_backend_tensor_set(lr_charge_adjoint,
                             mesh_result.charge_gradient.data(), 0,
                             ggml_nbytes(lr_charge_adjoint));
+    profile.mark("p3m_backward");
     ggml_graph_reset(cgraph);
     if (ggml_backend_graph_compute(compute_backend_, cgraph) !=
         GGML_STATUS_SUCCESS)
       throw std::runtime_error("PET-LR charge backward graph failed");
+  }
+
+  profile.mark("charge_backward");
+  if (parameter_gradients) {
+    parameter_gradients->clear();
+    const auto all = weights();
+    for (const auto &name : param_names_) {
+      auto it = std::find_if(all.begin(), all.end(), [&](const auto &w) { return w.first == name; });
+      auto *parameter = it->second;
+      auto *gradient = ggml_graph_get_grad(cgraph, parameter);
+      const size_t offset = parameter_gradients->size();
+      parameter_gradients->resize(offset + ggml_nelements(parameter), 0.0f);
+      if (gradient) {
+        ggml_backend_tensor_get(gradient, parameter_gradients->data() + offset, 0,
+                                ggml_nbytes(gradient));
+        for (size_t i = offset; i < parameter_gradients->size(); ++i)
+          (*parameter_gradients)[i] *= energy_scale_;
+      }
+    }
   }
 
   // --- Extract results ---
@@ -1256,6 +1326,7 @@ ModelResult GraphModel::predict_single(
       result.stress[i] += energy_scale_ * correction.stress[i];
   }
 
+  profile.mark("readback");
   // Hook for callers that want to inspect intermediate tensors. Runs while
   // the compute buffer (and therefore every node_outputs_ tensor) is still
   // alive on the active backend.

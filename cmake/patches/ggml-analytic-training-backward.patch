@@ -1,0 +1,47 @@
+--- a/src/ggml.c
++++ b/src/ggml.c
+@@ -6837,6 +6837,44 @@
+             if (src0_needs_grads) {
+                 const int n_past = ((const int32_t *) tensor->op_params)[0];
+                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_diag_mask_zero_impl(ctx, grad, n_past, false));
++            }
++        } break;
++        case GGML_OP_SILU_BACK: {
++            // d/da [u silu'(a)] = u sigmoid(a)(1-sigmoid(a))
++            //                       [2+a(1-2 sigmoid(a))].
++            if (src1_needs_grads) {
++                struct ggml_tensor * sig = ggml_sigmoid(ctx, src1);
++                struct ggml_tensor * curvature = ggml_mul(ctx,
++                    ggml_mul(ctx, sig, ggml_scale_bias(ctx, sig, -1.0f, 1.0f)),
++                    ggml_scale_bias(ctx, ggml_mul(ctx, src1,
++                        ggml_scale_bias(ctx, sig, -2.0f, 1.0f)), 1.0f, 2.0f));
++                ggml_add_or_set(ctx, cgraph, isrc1,
++                    ggml_mul(ctx, ggml_mul(ctx, grad, src0), curvature));
++            }
++            if (src0_needs_grads) {
++                ggml_add_or_set(ctx, cgraph, isrc0, ggml_silu_back(ctx, grad, src1));
++            }
++        } break;
++        case GGML_OP_SOFT_MAX_BACK: {
++            float scale, max_bias;
++            memcpy(&scale, tensor->op_params, sizeof(float));
++            memcpy(&max_bias, tensor->op_params + 1, sizeof(float));
++            GGML_ASSERT(max_bias == 0.0f);
++            // y is the softmax output; u is the incoming directional seed.
++            // z = scale*y*(u - sum(y*u)). Differentiate u and y separately.
++            if (src0_needs_grads) {
++                ggml_add_or_set(ctx, cgraph, isrc0,
++                    ggml_soft_max_ext_back(ctx, grad, src1, scale, 0.0f));
++            }
++            if (src1_needs_grads) {
++                struct ggml_tensor * dot_yu = ggml_repeat(ctx,
++                    ggml_sum_rows(ctx, ggml_mul(ctx, src1, src0)), src0);
++                struct ggml_tensor * dot_gy = ggml_repeat(ctx,
++                    ggml_sum_rows(ctx, ggml_mul(ctx, grad, src1)), src0);
++                struct ggml_tensor * dy = ggml_sub(ctx,
++                    ggml_mul(ctx, grad, ggml_sub(ctx, src0, dot_yu)),
++                    ggml_mul(ctx, src0, dot_gy));
++                ggml_add_or_set(ctx, cgraph, isrc1, ggml_scale(ctx, dy, scale));
+             }
+         } break;
+         case GGML_OP_SOFT_MAX: {

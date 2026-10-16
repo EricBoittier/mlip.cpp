@@ -89,6 +89,11 @@ public:
 
   /// Weight tensors by GGUF name, in GGUF order (all F32, on the backend).
   std::vector<std::pair<std::string, ggml_tensor *>> weights() const;
+  /// Conservative forces and d(total physical energy)/d(parameter), flattened
+  /// in param_names() order. Includes the P3M charge adjoint. Intended for
+  /// experimental native training; parameter flags are restored on return.
+  ModelResult predict_with_parameter_gradients(const AtomicSystem &system,
+                                              std::vector<float> &gradients);
   /// The backend buffer holding every weight tensor (one allocation).
   ggml_backend_buffer_t weight_buffer() const { return weight_buffer_; }
 
@@ -105,6 +110,8 @@ public:
   const std::string &adaptive_cutoff_method() const { return adaptive_cutoff_method_; }
   bool forces_mode() const { return forces_mode_; }
   /// Graph output is [n_atoms, 4] = (energy | non-conservative force).
+  bool uses_p3m() const { return p3m_; }
+  const CoulombParameters &coulomb_parameters() const { return coulomb_parameters_; }
   bool long_range() const { return long_range_; }
   bool nc_forces() const { return nc_forces_; }
   const std::string &gguf_path() const { return gguf_path_; }
@@ -170,7 +177,8 @@ private:
   // intermediate tensor data is live on the backend buffer.
   ModelResult predict_single(
       const AtomicSystem &system, bool compute_forces,
-      const std::function<void()> &post_compute_hook = nullptr);
+      const std::function<void()> &post_compute_hook = nullptr,
+      std::vector<float> *parameter_gradients = nullptr);
 };
 
 } // namespace mlipcpp::runtime

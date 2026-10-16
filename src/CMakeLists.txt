@@ -61,6 +61,15 @@ endforeach()
 add_library(mlipcpp ${MLIPCPP_SOURCES})
 add_library(mlipcpp::mlipcpp ALIAS mlipcpp)
 
+if(APPLE)
+    option(MLIPCPP_ACCELERATE_FFT "Use Accelerate for P3M FFTs on Apple platforms" ON)
+    if(MLIPCPP_ACCELERATE_FFT)
+        find_library(MLIPCPP_ACCELERATE_FRAMEWORK Accelerate REQUIRED)
+        target_link_libraries(mlipcpp PRIVATE ${MLIPCPP_ACCELERATE_FRAMEWORK})
+        target_compile_definitions(mlipcpp PRIVATE MLIPCPP_ACCELERATE_FFT)
+    endif()
+endif()
+
 target_include_directories(mlipcpp
     PUBLIC
         $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
@@ -119,6 +128,7 @@ endif()
 if(MLIPCPP_BUILD_TRAINING AND UNIX AND NOT EMSCRIPTEN)
     find_package(Threads REQUIRED)
     add_library(mlipcpp_train STATIC
+        train/conservative.cpp
         train/dataset.cpp
         train/batch.cpp
         train/trainer.cpp
@@ -129,6 +139,8 @@ if(MLIPCPP_BUILD_TRAINING AND UNIX AND NOT EMSCRIPTEN)
     target_compile_options(mlipcpp_train PRIVATE -Wall -Wextra)
 
     add_executable(mlipcpp-train bin/mlipcpp_train.cpp)
+    add_executable(mlipcpp-train-lr bin/mlipcpp_train_lr.cpp)
+    target_link_libraries(mlipcpp-train-lr PRIVATE mlipcpp_train)
     target_link_libraries(mlipcpp-train PRIVATE mlipcpp_train)
     target_link_options(mlipcpp-train PRIVATE -rdynamic) # names in crash backtraces
 

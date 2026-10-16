@@ -1,0 +1,42 @@
+--- a/src/ggml-metal/ggml-metal.metal
++++ b/src/ggml-metal/ggml-metal.metal
+@@ -9275,7 +9275,7 @@
+         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+ 
+     threadgroup S0 * sa = (threadgroup S0 *)(shmem);
+-    threadgroup S1 * sb = (threadgroup S1 *)(shmem + 4096);
++    threadgroup S1 * sb = (threadgroup S1 *)(shmem + sizeof(S0)*64*32);
+ 
+ #ifdef GGML_METAL_HAS_TENSOR
+     threadgroup float * sc = (threadgroup float *)(shmem);
+@@ -10018,6 +10018,7 @@
+ typedef decltype(kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, float4x4, 1, dequantize_f32, float, float4x4, float, float2x4>) mul_mm_t;
+ 
+ template [[host_name("kernel_mul_mm_f32_f32")]]     kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   float4x4,      1,     dequantize_f32,     float,  float4x4,  float, float2x4>;
++template [[host_name("kernel_mul_mm_f32_f32_precise")]] kernel mul_mm_t kernel_mul_mm<float, float4x4, simdgroup_float8x8, float, float2x4, simdgroup_float8x8, float4x4, 1, dequantize_f32, float, float4x4, float, float2x4>;
+ template [[host_name("kernel_mul_mm_f16_f32")]]     kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   half4x4,       1,     dequantize_f16,     half,   half4x4,   float, float2x4>;
+ #if defined(GGML_METAL_HAS_BF16)
+ template [[host_name("kernel_mul_mm_bf16_f32")]]    kernel mul_mm_t kernel_mul_mm<bfloat, bfloat4x4, simdgroup_bfloat8x8, bfloat, bfloat2x4, simdgroup_bfloat8x8, bfloat4x4,     1,     dequantize_bf16,    bfloat, bfloat4x4, float, float2x4>;
+--- a/src/ggml-metal/ggml-metal-device.cpp
++++ b/src/ggml-metal/ggml-metal-device.cpp
+@@ -717,7 +717,10 @@
+     const bool bc_inp = op->src[0]->ne[0] % 32 != 0;
+     const bool bc_out = op->ne[0] % 64 != 0 || op->ne[1] % 32 != 0;
+ 
+-    snprintf(base, 256, "kernel_mul_mm_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
++    int32_t precision;
++    memcpy(&precision, op->op_params, sizeof(precision));
++    const bool precise = tsrc0 == GGML_TYPE_F32 && tsrc1 == GGML_TYPE_F32 && precision == GGML_PREC_F32;
++    snprintf(base, 256, "kernel_mul_mm_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), precise ? "_precise" : "");
+     snprintf(name, 256, "%s_bci=%d_bco=%d", base, bc_inp, bc_out);
+ 
+     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+@@ -733,7 +736,7 @@
+     }
+ 
+     // when the output size is not multiple of 64x32, we need extra smem to prevent out-of-bounds writes
+-    res.smem = bc_out ? 8192 : 4096 + 2048;
++    res.smem = precise ? 12288 : (bc_out ? 8192 : 4096 + 2048);
+ 
+     return res;
+ }

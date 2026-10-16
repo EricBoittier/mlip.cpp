@@ -206,6 +206,10 @@ else()
                 "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cpu-norm-softmax-back-inplace.patch"
         # Metal SOFT_MAX_BACK: only read initialized simdgroup partial sums.
                 "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-metal-softmax-back-reduction.patch"
+        # Parallel Metal reductions for weight, bias, and species gradients.
+                "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-metal-training-reductions.patch"
+            "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-analytic-training-backward.patch"
+            "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-metal-precise-matmul.patch"
         # CUDA REPEAT_BACK (every bias / broadcast gradient): split the
         # reduction across the grid instead of one serial thread per output
                 "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-repeat-back-split.patch"

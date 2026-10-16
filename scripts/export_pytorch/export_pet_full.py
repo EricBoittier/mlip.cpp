@@ -149,6 +149,9 @@ def load_pet_model(model_name: str):
 
 def load_local_model(path):
     """A metatrain checkpoint (.ckpt / exported .pt) or a `make_init.py` dump."""
+    # Register the custom classes used by metatrain checkpoint metadata before
+    # torch.load unpickles them.
+    import metatomic.torch  # noqa: F401
     obj = torch.load(path, map_location="cpu", weights_only=False)
     if isinstance(obj, dict) and isinstance(obj.get("model"), torch.nn.Module):
         return obj["model"]

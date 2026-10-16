@@ -3,6 +3,7 @@
 #include "runtime/graph_model.h"
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
@@ -302,4 +303,113 @@ TEST_CASE("P3M reproduces torch-pme 0.5 potential influence convention",
   }
   for (size_t i = 0; i < force.size(); ++i)
     REQUIRE_THAT(out.forces[i], WithinAbs(force[i], 1e-8));
+}
+
+TEST_CASE("PET-LR parameter gradients include the charge adjoint", "[pet-lr][training]") {
+  const char *path = std::getenv("MLIPCPP_PET_LR_REFERENCE");
+  if (!path) SKIP("Set MLIPCPP_PET_LR_REFERENCE to generated fixtures");
+  std::ifstream file(path);
+  nlohmann::json cases;
+  file >> cases;
+  int checked_models = 0;
+  for (const auto &test : cases) {
+    const auto name = test.at("name").get<std::string>();
+    if (name != "feedforward-triclinic" && name != "residual-triclinic") continue;
+    std::vector<float> cpu_gradient;
+    for (auto backend : {BackendPreference::CPU, BackendPreference::Metal}) {
+      INFO(name);
+      INFO(static_cast<int>(backend));
+      runtime::GraphModel model;
+      model.set_backend_preference(backend);
+      bool loaded = false;
+      try {
+        loaded = model.load_from_gguf(test.at("gguf"));
+      } catch (const BackendUnavailableError &) {
+        continue;
+      }
+      REQUIRE(loaded);
+      auto pos = test.at("positions").get<std::vector<float>>();
+      auto z = test.at("numbers").get<std::vector<int32_t>>();
+      auto c = test.at("cell").get<std::vector<std::vector<float>>>();
+      float cell[3][3];
+      for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j) cell[i][j] = c[i][j];
+      AtomicSystem system(z.size(), pos.data(), z.data());
+      system.set_cell(Cell(cell));
+      auto before = model.predict(system, true);
+      std::vector<float> gradient;
+      auto prediction = model.predict_with_parameter_gradients(system, gradient);
+      if (backend == BackendPreference::CPU) cpu_gradient = gradient;
+      else {
+        REQUIRE(gradient.size() == cpu_gradient.size());
+        for (size_t i = 0; i < gradient.size(); ++i)
+          REQUIRE_THAT(gradient[i], WithinAbs(cpu_gradient[i], 2e-6 + std::abs(cpu_gradient[i]) * 1e-4));
+      }
+      REQUIRE_THAT(prediction.energy, WithinAbs(before.energy, 1e-6));
+      for (size_t i = 0; i < before.forces.size(); ++i)
+        REQUIRE_THAT(prediction.forces[i], WithinAbs(before.forces[i], 1e-6));
+      const auto weights = model.weights();
+      size_t offset = 0;
+      int checked = 0;
+      for (const auto &parameter_name : model.param_names()) {
+        auto it = std::find_if(weights.begin(), weights.end(), [&](auto &w) { return w.first == parameter_name; });
+        REQUIRE(it != weights.end());
+        auto *tensor = it->second;
+        REQUIRE((tensor->flags & GGML_TENSOR_FLAG_PARAM) == 0);
+        const size_t count = ggml_nelements(tensor);
+        REQUIRE(offset + count <= gradient.size());
+        if (parameter_name.find("lr_charges") != std::string::npos ||
+            parameter_name.find("lr_projection") != std::string::npos) {
+          INFO(parameter_name);
+          size_t index = 0;
+          for (size_t i = 1; i < count; ++i)
+            if (std::abs(gradient[offset + i]) > std::abs(gradient[offset + index])) index = i;
+          float original;
+          ggml_backend_tensor_get(tensor, &original, index * sizeof(float), sizeof(float));
+          const float h = 0.002f;
+          float value = original + h;
+          ggml_backend_tensor_set(tensor, &value, index * sizeof(float), sizeof(float));
+          double plus = model.predict(system).energy;
+          value = original - h;
+          ggml_backend_tensor_set(tensor, &value, index * sizeof(float), sizeof(float));
+          double minus = model.predict(system).energy;
+          ggml_backend_tensor_set(tensor, &original, index * sizeof(float), sizeof(float));
+          const double analytic = gradient[offset + index];
+          REQUIRE_THAT(analytic, WithinAbs((plus - minus) / (2 * h), 2e-4 + std::abs(analytic) * 0.01));
+          ++checked;
+        }
+        offset += count;
+      }
+      REQUIRE(checked >= 2);
+      REQUIRE(offset == gradient.size());
+      ++checked_models;
+    }
+  }
+  REQUIRE(checked_models >= 2);
+}
+
+TEST_CASE("P3M directional operator is analytic and self-adjoint", "[p3m][training]") {
+  for(bool periodic:{false,true}) {
+    auto s=make_system(periodic);
+    auto nl=NeighborListBuilder({4.5f,true,false}).build(s);
+    std::vector<float> q{.7f,-.3f,.2f,.4f,-.5f,.9f}, a{-.2f,.6f,.8f,-.7f,.3f,.1f};
+    std::vector<double> d{.12,-.04,.08,-.1,.3,.04,.07,-.06,.09};
+    auto r=p3m(s,nl,{},2,q,&a,&d);
+    auto transpose=p3m(s,nl,{},2,a,nullptr,&d);
+    auto plus=s,minus=s;
+    const double h=.002;
+    for(size_t i=0;i<d.size();++i) { plus.positions_mut()[i]+=h*d[i]; minus.positions_mut()[i]-=h*d[i]; }
+    auto p=p3m(plus,NeighborListBuilder({4.5f,true,false}).build(plus),{},2,q);
+    auto m=p3m(minus,NeighborListBuilder({4.5f,true,false}).build(minus),{},2,q);
+    double lhs=0,rhs=0,vjp=0;
+    for(size_t i=0;i<q.size();++i) {
+      REQUIRE_THAT(r.potential_tangent[i],WithinAbs((p.potentials[i]-m.potentials[i])/(2*h),1e-5));
+      lhs+=a[i]*r.potential_tangent[i]; rhs+=q[i]*transpose.potential_tangent[i];
+    }
+    for(size_t i=0;i<d.size();++i) vjp-=d[i]*r.forces[i];
+    REQUIRE_THAT(lhs,WithinAbs(rhs,1e-8));
+    REQUIRE_THAT(lhs,WithinAbs(vjp,1e-8));
+    std::vector<double> invalid;
+    REQUIRE_THROWS(p3m(s,nl,{},2,q,nullptr,&invalid));
+  }
 }

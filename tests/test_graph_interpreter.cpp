@@ -962,3 +962,98 @@ TEST_CASE("Metal softmax backward bounds its simdgroup reduction",
   }
   ggml_backend_free(backend);
 }
+
+TEST_CASE("Metal training reductions cover long and batched sums", "[runtime][metal]") {
+  auto *device = ggml_backend_dev_by_name("MTL0");
+  if (!device) SKIP("Metal device unavailable");
+  auto *backend = ggml_backend_dev_init(device, nullptr);
+  REQUIRE(backend);
+  for (int k : {127, 128, 1025, 10003}) {
+    INFO(k);
+    auto *ctx = ggml_init({2 * 1024 * 1024, nullptr, true});
+    auto *a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 7, k);
+    auto *b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 5, k, 2, 2);
+    auto *product = ggml_out_prod(ctx, a, b);
+    auto *rows = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 7, k);
+    auto *indices = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, k);
+    auto *table = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 7, 3);
+    auto *gather_back = ggml_get_rows_back(ctx, rows, indices, table);
+    auto *source = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 6, 36, 4, 6);
+    auto *target = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 3, 3, 2, 2);
+    auto *repeated = ggml_repeat_back(ctx, source, target);
+    auto *graph = ggml_new_graph(ctx);
+    for (auto *t : {product, gather_back, repeated}) ggml_build_forward_expand(graph, t);
+    auto *buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    REQUIRE(buffer);
+    std::vector<float> av(7*k), bv(5*k*4), rv(6*36*4*6), actual(7*5*4);
+    std::vector<int32_t> iv(k);
+    for (size_t i = 0; i < av.size(); ++i) av[i] = std::sin(i * .37);
+    for (size_t i = 0; i < bv.size(); ++i) bv[i] = std::cos(i * .13);
+    for (size_t i = 0; i < rv.size(); ++i) rv[i] = std::sin(i * .23);
+    for (int i = 0; i < k; ++i) iv[i] = i % 2; // unused destination row must stay zero
+    ggml_backend_tensor_set(a, av.data(), 0, ggml_nbytes(a));
+    ggml_backend_tensor_set(b, bv.data(), 0, ggml_nbytes(b));
+    ggml_backend_tensor_set(rows, av.data(), 0, ggml_nbytes(rows));
+    ggml_backend_tensor_set(indices, iv.data(), 0, ggml_nbytes(indices));
+    ggml_backend_tensor_set(source, rv.data(), 0, ggml_nbytes(source));
+    REQUIRE(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_tensor_get(product, actual.data(), 0, ggml_nbytes(product));
+    for (int batch = 0; batch < 4; ++batch)
+      for (int j = 0; j < 5; ++j)
+        for (int i = 0; i < 7; ++i) {
+          double expected = 0;
+          for (int r = 0; r < k; ++r) expected += double(av[i+7*r]) * bv[j+5*(r+k*batch)];
+          REQUIRE(std::abs(actual[i+7*(j+5*batch)] - expected) < 1e-4 + 1e-5*std::abs(expected));
+        }
+    actual.resize(21);
+    ggml_backend_tensor_get(gather_back, actual.data(), 0, ggml_nbytes(gather_back));
+    for (int row = 0; row < 3; ++row)
+      for (int col = 0; col < 7; ++col) {
+        double expected = 0;
+        for (int r = 0; r < k; ++r) if (iv[r] == row) expected += av[col+7*r];
+        REQUIRE(std::abs(actual[col+7*row] - expected) < 1e-4 + 1e-5*std::abs(expected));
+      }
+    std::vector<double> expected(3*3*2*2);
+    for (int l = 0; l < 6; ++l)
+      for (int z = 0; z < 4; ++z)
+        for (int y = 0; y < 36; ++y)
+          for (int x = 0; x < 6; ++x)
+            expected[x%3+3*(y%3+3*(z%2+2*(l%2)))] += rv[x+6*(y+36*(z+4*l))];
+    actual.resize(expected.size());
+    ggml_backend_tensor_get(repeated, actual.data(), 0, ggml_nbytes(repeated));
+    for (size_t i = 0; i < expected.size(); ++i)
+      REQUIRE(std::abs(actual[i]-expected[i]) < 1e-4);
+    ggml_backend_buffer_free(buffer);
+    ggml_free(ctx);
+  }
+  ggml_backend_free(backend);
+}
+
+TEST_CASE("Metal F32 precision preserves matrix operands", "[runtime][metal]") {
+  auto *device=ggml_backend_dev_by_name("MTL0");
+  if(!device) SKIP("Metal device unavailable");
+  auto *backend=ggml_backend_dev_init(device,nullptr);
+  REQUIRE(backend);
+  for(int k:{64,65,128}) for(int m:{64,67}) {
+    INFO(k); INFO(m);
+    constexpr int n=32;
+    auto *ctx=ggml_init({2*1024*1024,nullptr,true});
+    auto *a=ggml_new_tensor_2d(ctx,GGML_TYPE_F32,k,m);
+    auto *b=ggml_new_tensor_3d(ctx,GGML_TYPE_F32,k,n,2);
+    auto *c=ggml_mul_mat(ctx,a,b); ggml_mul_mat_set_prec(c,GGML_PREC_F32);
+    auto *graph=ggml_new_graph(ctx);ggml_build_forward_expand(graph,c);
+    auto *buffer=ggml_backend_alloc_ctx_tensors(ctx,backend);REQUIRE(buffer);
+    std::vector<float> av(k*m),bv(k*n*2),cv(m*n*2);
+    for(size_t i=0;i<av.size();++i) av[i]=std::sin(i*.071)+.00013;
+    for(size_t i=0;i<bv.size();++i) bv[i]=std::cos(i*.137)-.00017;
+    ggml_backend_tensor_set(a,av.data(),0,ggml_nbytes(a));ggml_backend_tensor_set(b,bv.data(),0,ggml_nbytes(b));
+    REQUIRE(ggml_backend_graph_compute(backend,graph)==GGML_STATUS_SUCCESS);
+    ggml_backend_tensor_get(c,cv.data(),0,ggml_nbytes(c));
+    for(int j=0;j<n*2;++j) for(int i=0;i<m;++i) {
+      double expected=0;for(int l=0;l<k;++l) expected+=double(av[l+k*i])*bv[l+k*j];
+      REQUIRE(std::abs(cv[i+m*j]-expected)<1e-5+2e-6*std::abs(expected));
+    }
+    ggml_backend_buffer_free(buffer);ggml_free(ctx);
+  }
+  ggml_backend_free(backend);
+}

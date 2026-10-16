@@ -3,8 +3,13 @@
 #include <array>
 #include <cmath>
 #include <complex>
+#include <future>
 #include <numbers>
 #include <stdexcept>
+#ifdef MLIPCPP_ACCELERATE_FFT
+#include <Accelerate/Accelerate.h>
+#include <map>
+#endif
 
 namespace mlipcpp {
 namespace {
@@ -13,6 +18,7 @@ using Complex = std::complex<double>;
 using Vec = std::array<double, 3>;
 constexpr int va[] = {0, 1, 2, 1, 0, 0}, vb[] = {0, 1, 2, 2, 2, 1};
 // Both transforms are unnormalised, as in torch-pme's backward/forward FFTs.
+#ifndef MLIPCPP_ACCELERATE_FFT
 void fft(std::vector<Complex> &v, bool inverse) {
   const size_t n = v.size();
   for (size_t i = 1, j = 0; i < n; ++i) {
@@ -35,7 +41,51 @@ void fft(std::vector<Complex> &v, bool inverse) {
     }
   }
 }
+#endif
 void fft3(std::vector<Complex> &v, const std::array<int, 3> &ns, bool inverse) {
+#ifdef MLIPCPP_ACCELERATE_FFT
+  struct Plans {
+    std::map<int, FFTSetupD> plans;
+    ~Plans() {
+      for (auto [_, plan] : plans)
+        vDSP_destroy_fftsetupD(plan);
+    }
+    FFTSetupD get(int logn) {
+      auto &plan = plans[logn];
+      if (!plan)
+        plan = vDSP_create_fftsetupD(logn, kFFTRadix2);
+      if (!plan)
+        throw std::runtime_error("Could not allocate Accelerate FFT plan");
+      return plan;
+    }
+  };
+  thread_local Plans plans;
+  size_t stride = 1;
+  for (int axis = 2; axis >= 0; --axis) {
+    const size_t n = ns[axis], block = n * stride;
+    int logn = 0;
+    for (size_t k = n; k > 1; k >>= 1)
+      ++logn;
+    if (n > 1) {
+      auto plan = plans.get(logn);
+      std::vector<double> real(n), imag(n);
+      DSPDoubleSplitComplex split{real.data(), imag.data()};
+      for (size_t base = 0; base < v.size(); base += block)
+        for (size_t offset = 0; offset < stride; ++offset) {
+          for (size_t i = 0; i < n; ++i) {
+            auto x = v[base + offset + i * stride];
+            real[i] = x.real();
+            imag[i] = x.imag();
+          }
+          vDSP_fft_zipD(plan, &split, 1, logn,
+                        inverse ? FFT_INVERSE : FFT_FORWARD);
+          for (size_t i = 0; i < n; ++i)
+            v[base + offset + i * stride] = {real[i], imag[i]};
+        }
+    }
+    stride = block;
+  }
+#else
   size_t stride = 1;
   for (int axis = 2; axis >= 0; --axis) {
     size_t n = ns[axis], block = n * stride;
@@ -50,6 +100,7 @@ void fft3(std::vector<Complex> &v, const std::array<int, 3> &ns, bool inverse) {
       }
     stride = block;
   }
+#endif
 }
 // Centered cardinal B-spline, order five, and its analytic derivative.
 std::array<double, 2> spline(double x) {
@@ -70,10 +121,17 @@ struct Assignment {
 
 P3MResult p3m(const AtomicSystem &s, const NeighborList &nl,
               const CoulombParameters &p, int channels,
-              const std::vector<float> &q, const std::vector<float> *g) {
+              const std::vector<float> &q, const std::vector<float> *g,
+              const std::vector<double> *direction, int threads) {
   const size_t n = s.num_atoms(), nc = size_t(channels);
   if (!n || channels <= 0 || q.size() != n * nc || (g && g->size() != q.size()))
     throw std::runtime_error("Invalid P3M charge/adjoint shape");
+  if (direction && direction->size() != 3 * n)
+    throw std::runtime_error("Invalid P3M position direction shape");
+  if (direction)
+    for (auto v : *direction)
+      if (!std::isfinite(v))
+        throw std::runtime_error("P3M requires finite direction");
   if (!(p.cutoff > 0 && p.smearing > 0 && p.wavelength > 0) ||
       !std::isfinite(p.cutoff + p.smearing + p.wavelength))
     throw std::runtime_error("Invalid P3M parameters");
@@ -125,6 +183,7 @@ P3MResult p3m(const AtomicSystem &s, const NeighborList &nl,
   }
   P3MResult out;
   std::vector<double> pot(q.size(), 0), dq(g ? q.size() : 0, 0);
+  std::vector<double> tangent(direction ? q.size() : 0, 0);
   if (g) {
     out.forces.assign(3 * n, 0);
     if (periodic)
@@ -149,9 +208,16 @@ P3MResult p3m(const AtomicSystem &s, const NeighborList &nl,
       v = .5 * (1 - f) / d;
       dv = -.5 * (df / d + (1 - f) / (d * d));
     }
+    double dv_direction = 0;
+    if (direction)
+      for (int a = 0; a < 3; ++a)
+        dv_direction +=
+            dv * r[a] / d * ((*direction)[3 * j + a] - (*direction)[3 * i + a]);
     double adj = 0;
     for (size_t ch = 0; ch < nc; ++ch) {
       pot[i * nc + ch] += v * q[j * nc + ch];
+      if (direction)
+        tangent[i * nc + ch] += dv_direction * q[j * nc + ch];
       if (g) {
         dq[j * nc + ch] += v * (*g)[i * nc + ch];
         adj += (*g)[i * nc + ch] * q[j * nc + ch];
@@ -275,32 +341,58 @@ P3MResult p3m(const AtomicSystem &s, const NeighborList &nl,
               dk[idx][t] = v * deriv;
             }
         }
-    for (size_t ch = 0; ch < nc; ++ch) {
+    std::vector<Vec> velocity(n);
+    if (direction)
+      for (size_t i = 0; i < n; ++i)
+        for (int a = 0; a < 3; ++a)
+          for (int b = 0; b < 3; ++b)
+            velocity[i][b] += (*direction)[3 * i + a] * ns[b] * inv[a][b];
+    auto weight_tangent = [&](size_t i, const Vec &dw) {
+      return dw[0] * velocity[i][0] + dw[1] * velocity[i][1] +
+             dw[2] * velocity[i][2];
+    };
+    std::vector<std::vector<double>> channel_forces(g ? nc : 0),
+        channel_stress(g ? nc : 0);
+    if (g)
+      for (size_t ch = 0; ch < nc; ++ch) {
+        channel_forces[ch].resize(3 * n);
+        channel_stress[ch].resize(6);
+      }
+    auto channel = [&](size_t ch) {
+      std::vector<Complex> drho(direction ? mesh : 0);
       std::vector<Complex> rho(mesh), adj(g ? mesh : 0);
       double totalq = 0, totalg = 0;
       for (size_t i = 0; i < n; ++i) {
         totalq += q[i * nc + ch];
         if (g)
           totalg += (*g)[i * nc + ch];
-        visit(i, [&](size_t idx, double w, const Vec &) {
+        visit(i, [&](size_t idx, double w, const Vec &dw) {
+          if (direction)
+            drho[idx] += weight_tangent(i, dw) * q[i * nc + ch];
           rho[idx] += w * q[i * nc + ch];
           if (g)
             adj[idx] += w * (*g)[i * nc + ch];
         });
       }
       fft3(rho, ns, false);
+      if (direction)
+        fft3(drho, ns, false);
       if (g)
         fft3(adj, ns, false);
       for (size_t j = 0; j < mesh; ++j) {
         if (g) {
           double product = (std::conj(adj[j]) * rho[j]).real();
           for (int t = 0; t < 6; ++t)
-            out.stress[t] += product * dk[j][t] / volume;
+            channel_stress[ch][t] += product * dk[j][t] / volume;
           adj[j] *= kernel[j];
         }
         rho[j] *= kernel[j];
+        if (direction)
+          drho[j] *= kernel[j];
       }
       fft3(rho, ns, true);
+      if (direction)
+        fft3(drho, ns, true);
       if (g)
         fft3(adj, ns, true);
       const double self = -.5 * std::sqrt(2 / pi) / p.smearing,
@@ -311,21 +403,44 @@ P3MResult p3m(const AtomicSystem &s, const NeighborList &nl,
           dq[i * nc + ch] += self * (*g)[i * nc + ch] + bg * totalg;
         visit(i, [&](size_t idx, double w, const Vec &dw) {
           pot[i * nc + ch] += w * rho[idx].real();
+          if (direction)
+            tangent[i * nc + ch] +=
+                weight_tangent(i, dw) * rho[idx].real() + w * drho[idx].real();
           if (g) {
             dq[i * nc + ch] += w * adj[idx].real();
             double scale = (*g)[i * nc + ch] * rho[idx].real() +
                            q[i * nc + ch] * adj[idx].real();
             for (int a = 0; a < 3; ++a)
               for (int b = 0; b < 3; ++b)
-                out.forces[3 * i + a] -= scale * dw[b] * ns[b] * inv[a][b];
+                channel_forces[ch][3 * i + a] -=
+                    scale * dw[b] * ns[b] * inv[a][b];
           }
         });
       }
       if (g)
         for (int t = 0; t < 3; ++t)
-          out.stress[t] -= bg * totalq * totalg / volume;
-    }
+          channel_stress[ch][t] -= bg * totalq * totalg / volume;
+    };
+    const int workers = std::max(1, std::min(threads, channels));
+    std::vector<std::future<void>> jobs;
+    for (int worker = 1; worker < workers; ++worker)
+      jobs.push_back(std::async(std::launch::async, [&, worker] {
+        for (size_t ch = worker; ch < nc; ch += workers)
+          channel(ch);
+      }));
+    for (size_t ch = 0; ch < nc; ch += workers)
+      channel(ch);
+    for (auto &job : jobs)
+      job.get();
+    if (g)
+      for (size_t ch = 0; ch < nc; ++ch) {
+        for (size_t i = 0; i < 3 * n; ++i)
+          out.forces[i] += channel_forces[ch][i];
+        for (int i = 0; i < 6; ++i)
+          out.stress[i] += channel_stress[ch][i];
+      }
   }
+  out.potential_tangent.assign(tangent.begin(), tangent.end());
   out.potentials.assign(pot.begin(), pot.end());
   out.charge_gradient.assign(dq.begin(), dq.end());
   return out;
