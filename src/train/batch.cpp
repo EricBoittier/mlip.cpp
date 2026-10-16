@@ -89,7 +89,10 @@ TargetScaling TargetScaling::fit(const MemmapSplit &train) {
     }
   }
   sc.energy_scale = std::sqrt(e2 / train.size());
-  for (auto &[Z, sc2] : f2) sc.force_scale[Z] = sc2.second ? std::sqrt(sc2.first / sc2.second) : 1.0;
+  // a species whose forces are all zero (MPtrj's Ne and Ar: single-element fcc cells) has RMS 0,
+  // and dividing the targets by it gives NaN; such species keep scale 1
+  for (auto &[Z, sc2] : f2)
+    sc.force_scale[Z] = sc2.second && sc2.first > 0.0 ? std::sqrt(sc2.first / sc2.second) : 1.0;
   return sc;
 }
 
