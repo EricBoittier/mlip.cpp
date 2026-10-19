@@ -202,7 +202,10 @@ else()
         # O(rows^2)
         # CPU RMS_NORM_BACK / SOFT_MAX_BACK: ggml-alloc runs them in place,
         # but the kernels copied one input over the other before reading it
-        PATCHES "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-get-rows-back-scatter.patch"
+        # applied by cmake/apply_patches.cmake, which skips a set it already
+        # applied (CPM's PATCHES re-run `patch` on every re-configure and fail)
+        PATCH_COMMAND "${CMAKE_COMMAND}" -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/apply_patches.cmake" --
+                "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-get-rows-back-scatter.patch"
                 "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cpu-norm-softmax-back-inplace.patch"
         # Metal SOFT_MAX_BACK: only read initialized simdgroup partial sums.
                 "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-metal-softmax-back-reduction.patch"
