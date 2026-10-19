@@ -1,6 +1,7 @@
 #include "md/md_kernels.h"
 
 #include "core/adaptive_cutoff.h"
+#include "core/padding.h"
 
 #include <cuda_runtime.h>
 
@@ -167,8 +168,9 @@ __global__ void pack_kernel(int n, int K, int M, const int32_t *cand_j, const in
   atomicMax(max_kept, idx);
   for (int s = idx; s < M; s++) {
     const int f = i * M + s;
-    g_ns[f] = 0, g_pm[f] = 1.0f, g_cv[f] = static_cast<float>(cutoff), g_rev[f] = 0;
-    for (int c = 0; c < 3; c++) g_ev[3 * f + c] = 0.0f;
+    // core/padding.h: an ordinary edge at the cutoff, as metatrain
+    g_ns[f] = padding::kSpecies, g_pm[f] = 1.0f, g_cv[f] = static_cast<float>(cutoff), g_rev[f] = 0;
+    padding::edge(static_cast<float>(cutoff), &g_ev[3 * f]);
   }
 }
 

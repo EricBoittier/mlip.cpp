@@ -1,4 +1,5 @@
 #include "train/batch.h"
+#include "core/padding.h"
 
 #include <algorithm>
 #include <cmath>
@@ -144,8 +145,10 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
     return it->second;
   };
 
-  b.neighbor_species.assign(n * m, 0);
-  b.edge_vectors.assign(n * m * 3, 0.0f);
+  b.neighbor_species.assign(n * m, padding::kSpecies);
+  // padded slots: core/padding.h (an ordinary edge at the cutoff, as metatrain)
+  b.edge_vectors.resize(static_cast<size_t>(n) * m * 3);
+  for (int f = 0; f < n * m; f++) padding::edge(cutoff, &b.edge_vectors[3 * static_cast<size_t>(f)]);
   b.padding_mask.assign(n * m, 1.0f);
   b.reverse_neighbor_index.assign(n * m, 0);
   b.cutoff_values.assign(n * m, cutoff);

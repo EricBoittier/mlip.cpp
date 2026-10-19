@@ -33,7 +33,7 @@ def main():
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore")
         model = load_local_model(a.model).to(getattr(torch, a.dtype)).eval()
-        calc = MetatomicCalculator(model.export(), non_conservative=True, do_gradients_with_energy=False,
+        calc = MetatomicCalculator(model.export(), non_conservative="forces", do_gradients_with_energy=False,
                                    device="cpu")
     d = a.split
     na = np.load(f"{d}/na.npy")

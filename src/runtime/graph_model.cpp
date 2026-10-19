@@ -1,6 +1,7 @@
 #include "graph_model.h"
 #include "core/adaptive_cutoff.h"
 #include "core/gguf_loader.h"
+#include "core/padding.h"
 #include "core/p3m.h"
 
 #include <nlohmann/json.hpp>
@@ -906,9 +907,11 @@ ModelResult GraphModel::predict_single(
     species_data[i] = it->second;
   }
 
-  std::vector<int32_t> ns_data(total_slots, 0);
-  std::vector<float> ev_data(total_slots * 3, 0.0f);
-  std::vector<float> ed_data(total_slots, 0.0f);
+  std::vector<int32_t> ns_data(total_slots, padding::kSpecies);
+  // padded slots: core/padding.h (an ordinary edge at the cutoff, as metatrain)
+  std::vector<float> ev_data(total_slots * 3);
+  std::vector<float> ed_data(total_slots, cutoff_);
+  for (int f = 0; f < total_slots; f++) padding::edge(cutoff_, &ev_data[3 * f]);
   std::vector<float> pm_data(total_slots, 1.0f);  // 1.0 = padded
   std::vector<float> cf_data(total_slots, 0.0f);
   std::vector<float> cv_data(total_slots, cutoff_);
