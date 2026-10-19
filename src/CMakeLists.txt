@@ -156,4 +156,20 @@ if(MLIPCPP_BUILD_TRAINING AND UNIX AND NOT EMSCRIPTEN)
     add_executable(mlipcpp-train-check bin/mlipcpp_train_check.cpp)
     target_link_libraries(mlipcpp-train-check PRIVATE mlipcpp_train)
     target_link_options(mlipcpp-train-check PRIVATE -rdynamic)
+
+    # GPU molecular dynamics (mlipcpp-md): CUDA kernels next to the ggml graph
+    if(MLIPCPP_USE_CUDA)
+        enable_language(CUDA)
+        find_package(CUDAToolkit REQUIRED)
+        add_library(mlipcpp_md STATIC md/md_engine.cpp md/md_kernels.cu)
+        target_include_directories(mlipcpp_md PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${ggml_SOURCE_DIR}/include
+                                   ${ggml_SOURCE_DIR}/src) # ggml-impl.h: ggml_graph_view
+        target_link_libraries(mlipcpp_md PUBLIC mlipcpp ggml CUDA::cudart)
+        set_target_properties(mlipcpp_md PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        target_compile_options(mlipcpp_md PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra>)
+
+        add_executable(mlipcpp-md bin/mlipcpp_md.cpp)
+        target_link_libraries(mlipcpp-md PRIVATE mlipcpp_md mlipcpp_train)
+        target_link_options(mlipcpp-md PRIVATE -rdynamic)
+    endif()
 endif()

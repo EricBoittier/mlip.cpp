@@ -313,11 +313,18 @@ def metatrain_baselines(model):
         weights = getattr(getattr(additive, "model", None), "weights", {})
         if "energy" in weights:
             comp = by_type(weights["energy"].block(0))
-    scales = getattr(getattr(getattr(model, "scaler", None), "model", None), "scales", {})
+    scaler = getattr(getattr(model, "scaler", None), "model", None)
+    scales = getattr(scaler, "scales", {})
     if "energy" in scales:
         e_scale = float(scales["energy"].block(0).values.reshape(-1)[0])
     if "non_conservative_force" in scales:
-        f_scales = by_type(scales["non_conservative_force"].block(0))
+        # the scaler's per-type rows are labelled by type *index* (0..n_types-1),
+        # in the order of scaler.atomic_types, not by atomic number
+        block = scales["non_conservative_force"].block(0)
+        Z = scaler.atomic_types.tolist()
+        idx = block.samples.values[:, 0].tolist()
+        vals = block.values.reshape(len(idx), -1)[:, 0]
+        f_scales = {int(Z[i]): float(v) for i, v in zip(idx, vals)}
     return comp, e_scale, f_scales
 
 

@@ -1278,7 +1278,7 @@ ggml_tensor *GraphInterpreter::build_softmax(ggml_context *ctx,
     std::memcpy(&v, reinterpret_cast<const float *>(t->op_params) + i, sizeof v);
     return v;
   };
-  if (fuse && !mask && a->op == GGML_OP_ADD && a->src[0]->op == GGML_OP_SCALE && param(a->src[0], 1) == 0.0f) {
+  if (fuse && !input_gradients_ && !mask && a->op == GGML_OP_ADD && a->src[0]->op == GGML_OP_SCALE && param(a->src[0], 1) == 0.0f) {
     ggml_tensor *x = a->src[0]->src[0], *bias = a->src[1];
     if (!depends_on_parameter(bias) && x->type == GGML_TYPE_F32 &&
         ggml_is_contiguous(x) && bias->type == GGML_TYPE_F32 &&

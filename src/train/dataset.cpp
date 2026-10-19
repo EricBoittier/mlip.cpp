@@ -1,5 +1,7 @@
 #include "train/dataset.h"
 
+#include "core/adaptive_cutoff.h"
+
 #include "core/log.h"
 #include "mlipcpp/neighbor_list.h"
 
@@ -140,42 +142,15 @@ struct LocalEdges {
   int32_t max_neighbors = 0;
 };
 
-// metatrain pet/modules/adaptive_cutoff.py, get_adaptive_cutoffs_solver, in
-// double: 10 Newton-bisection steps on the smoothed count, then the IFT step
-// (one more Newton step with the clamped bump), clamped to [cutoff/16, cutoff].
+// metatrain's "solver" adaptive cutoff (core/adaptive_cutoff.h), in double.
 // Edges sorted by centre: atom i's are [start[i], start[i+1]).
 std::vector<double> adaptive_radii(const std::vector<int32_t> &start, const std::vector<double> &dist,
                                    double cutoff, const AdaptiveCutoff &a) {
   const int n = static_cast<int>(start.size()) - 1;
-  const double N = a.n_target, w = a.width, inv = 1.0 / cutoff;
   std::vector<double> radii(n);
-  for (int i = 0; i < n; i++) {
-    // (n_total, dn/dr) at r; `loop`: the solver's exact 0/1 outside the taper,
-    // else cutoff_func_bump (clamped) everywhere, as in the IFT residual
-    auto count = [&](double r, bool loop) {
-      double cnt = 0, dcnt = 0;
-      for (int k = start[i]; k < start[i + 1]; k++) {
-        const double sc = (dist[k] - (r - w)) / w, s = std::numbers::pi * std::clamp(sc, 1e-6, 1.0 - 1e-6);
-        const double sn = std::sin(s), th = std::tanh(std::cos(s) / sn);
-        if (!loop) cnt += 0.5 * (1.0 + th);
-        else if (sc > 0.0 && sc < 1.0) cnt += 0.5 * (1.0 + th), dcnt += 0.5 * std::numbers::pi / w * (1.0 - th * th) / (sn * sn);
-        else if (sc <= 0.0) cnt += 1.0;
-      }
-      const double x = r * inv;
-      return std::pair{cnt + N * x * x * x, dcnt + 3.0 * N * x * x * inv};
-    };
-    double lo = 0.0, hi = cutoff, r = 0.5 * cutoff;
-    for (int it = 0; it < 10; it++) {
-      const auto [cnt, dcnt] = count(r, true);
-      const double f = cnt - N;
-      if (f <= 0) lo = r;
-      else hi = r;
-      const double rn = r - f / std::max(dcnt, 1e-6);
-      r = rn >= lo && rn <= hi ? rn : 0.5 * (lo + hi);
-    }
-    const double dn_root = count(r, true).second, residual = count(r, false).first - N;
-    radii[i] = std::clamp(r - residual / std::max(dn_root, 1e-6), cutoff / 16.0, cutoff);
-  }
+  for (int i = 0; i < n; i++)
+    radii[i] = adaptive::solve(start[i + 1] - start[i], [&](int k) { return dist[start[i] + k]; },
+                               cutoff, a.n_target, a.width).r;
   return radii;
 }
 

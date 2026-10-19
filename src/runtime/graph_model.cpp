@@ -1,4 +1,5 @@
 #include "graph_model.h"
+#include "core/adaptive_cutoff.h"
 #include "core/gguf_loader.h"
 #include "core/p3m.h"
 
@@ -9,9 +10,12 @@
 #include <ggml.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
+#include <numeric>
 #include <cmath>
 #include <cstring>
 #include <sstream>
@@ -676,18 +680,82 @@ ModelResult GraphModel::predict_single(
   AdaptiveCutoffCache adapt_cache;
   bool have_adaptive = false;
 
+  // d atomic_cutoff[center] / d distance, per edge of the full list (the
+  // implicit position dependence the graph does not see)
+  std::vector<double> cutoff_jacobian;
+  const bool solver = adaptive_cutoff_method_ == "solver";
+
   if (num_neighbors_adaptive_ > 0.0f) {
     full_nlist = nlist;  // copy of pre-filter list
+    const int n_in = nlist.num_pairs();
+    std::vector<float> atomic_cutoffs;
+    std::vector<int> canonical(n_in);  // the edge of the pair (i->j, j->i) whose distance decides
+    std::iota(canonical.begin(), canonical.end(), 0);
+    if (solver) {
+      // as in training (train/dataset.cpp): radii in double from the edges
+      // of each centre, one keep decision per edge pair
+      std::vector<std::vector<int>> by_center(n_atoms);
+      for (int e = 0; e < n_in; e++) by_center[nlist.centers[e]].push_back(e);
+      const bool shifts = !nlist.cell_shifts.empty();
+      auto key = [&](int i, int j, int s0, int s1, int s2) { return std::tuple{i, j, s0, s1, s2}; };
+      std::map<std::tuple<int, int, int, int, int>, int> index;
+      for (int e = 0; e < n_in; e++) {
+        const auto s = shifts ? nlist.cell_shifts[e] : std::array<int32_t, 3>{0, 0, 0};
+        index[key(nlist.centers[e], nlist.neighbors[e], s[0], s[1], s[2])] = e;
+      }
+      for (int e = 0; e < n_in; e++) {
+        const auto s = shifts ? nlist.cell_shifts[e] : std::array<int32_t, 3>{0, 0, 0};
+        auto it = index.find(key(nlist.neighbors[e], nlist.centers[e], -s[0], -s[1], -s[2]));
+        if (it != index.end()) canonical[e] = std::min(e, it->second);
+      }
+      auto dist = [&](int e) {
+        const auto &v = nlist.edge_vectors[e];
+        return std::sqrt(double(v[0]) * v[0] + double(v[1]) * v[1] + double(v[2]) * v[2]) + 1e-15;
+      };
+      std::vector<adaptive::Radius> radii(n_atoms);
+      atomic_cutoffs.resize(n_atoms);
+      for (int i = 0; i < n_atoms; i++) {
+        const auto &es = by_center[i];
+        radii[i] = adaptive::solve(static_cast<int>(es.size()), [&](int k) { return dist(es[k]); },
+                                   cutoff_, num_neighbors_adaptive_, cutoff_width_adaptive_);
+        atomic_cutoffs[i] = static_cast<float>(radii[i].r);
+      }
+      cutoff_jacobian.resize(n_in);
+      for (int e = 0; e < n_in; e++)
+        cutoff_jacobian[e] = adaptive::ddist(dist(e), radii[nlist.centers[e]], cutoff_width_adaptive_);
+      // the keep test and pair cutoff in double, as training caches them
+      std::vector<double> pc(n_in), d(n_in);
+      for (int e = 0; e < n_in; e++)
+        pc[e] = 0.5 * (radii[nlist.centers[e]].r + radii[nlist.neighbors[e]].r), d[e] = dist(e);
+      std::vector<char> keep(n_in);
+      for (int e = 0; e < n_in; e++) keep[e] = d[canonical[e]] <= pc[canonical[e]];
+      int n_out = 0;
+      std::vector<float> kept_pair_cutoffs;
+      for (int e = 0; e < n_in; e++) {
+        if (!keep[e]) continue;
+        nlist.centers[n_out] = nlist.centers[e];
+        nlist.neighbors[n_out] = nlist.neighbors[e];
+        nlist.edge_vectors[n_out] = nlist.edge_vectors[e];
+        nlist.distances[n_out] = nlist.distances[e];
+        if (shifts) nlist.cell_shifts[n_out] = nlist.cell_shifts[e];
+        kept_pair_cutoffs.push_back(static_cast<float>(pc[e]));
+        ++n_out;
+      }
+      nlist.centers.resize(n_out);
+      nlist.neighbors.resize(n_out);
+      nlist.edge_vectors.resize(n_out);
+      nlist.distances.resize(n_out);
+      if (shifts) nlist.cell_shifts.resize(n_out);
+      pair_cutoffs = std::move(kept_pair_cutoffs);
+    } else {
     compute_adaptive_cutoffs_with_state(
         nlist.centers, nlist.distances,
         num_neighbors_adaptive_, n_atoms, cutoff_, adapt_cache,
         /*min_cutoff=*/0.5f,
         /*effective_width=*/cutoff_width_);
-    have_adaptive = true;
-    const auto &atomic_cutoffs = adapt_cache.atomic_cutoffs;
+    atomic_cutoffs = adapt_cache.atomic_cutoffs;
 
     // Compact nlist in place: keep edge e iff distances[e] <= pair_cutoff
-    const int n_in = nlist.num_pairs();
     std::vector<float> kept_pair_cutoffs;
     kept_pair_cutoffs.reserve(n_in);
     int n_out = 0;
@@ -714,6 +782,21 @@ ModelResult GraphModel::predict_single(
     nlist.distances.resize(n_out);
     if (!nlist.cell_shifts.empty()) nlist.cell_shifts.resize(n_out);
     pair_cutoffs = std::move(kept_pair_cutoffs);
+    // J[e] = sum_p X[k, p] * bump'(d, probe_p)
+    cutoff_jacobian.resize(n_in);
+    for (int e = 0; e < n_in; e++) {
+      const int k = full_nlist.centers[e];
+      const float d = full_nlist.distances[e];
+      double J = 0.0;
+      if (d > 0.0f) {
+        const double *Xk = &adapt_cache.diff_jacobian[static_cast<size_t>(k) * adapt_cache.n_probes];
+        for (int p = 0; p < adapt_cache.n_probes; p++)
+          J += Xk[p] * bump_derivative(d, adapt_cache.probes[p], adapt_cache.effective_width);
+      }
+      cutoff_jacobian[e] = J;
+    }
+    }
+    have_adaptive = true;
   }
 
   // Count max neighbors after any adaptive filtering
@@ -969,13 +1052,16 @@ ModelResult GraphModel::predict_single(
     };
   }
   ggml_tensor *output = nullptr;
+  interp_.set_input_gradients(compute_forces);
   try {
     output = interp_.build(compute_ctx);
   } catch (...) {
     interp_.coulomb_application = {};
+    interp_.set_input_gradients(false);
     throw;
   }
   interp_.coulomb_application = {};
+  interp_.set_input_gradients(false);
   if (p3m_ && !lr_charges)
     throw std::runtime_error("Missing PET-LR charge application");
   if (!output) {
@@ -1190,6 +1276,38 @@ ModelResult GraphModel::predict_single(
         }
       }
 
+      // Adaptive cutoff: E depends on positions through atomic_cutoffs too.
+      // S[k] = sum over edges touching k of dE/dcutoff_values (each edge's
+      // pair cutoff is the mean of its two atomic cutoffs, hence the 1/2);
+      // edge e = (k -> l) of the full list then adds g_e = S[k] J[e] v_e / d_e
+      // to dE/dv_e, like the graph's own edge-vector gradient.
+      std::vector<std::array<double, 3>> chain_grad;
+      if (have_adaptive && cutoff_values_t) {
+        ggml_tensor *cv_grad = ggml_graph_get_grad(cgraph, cutoff_values_t);
+        if (cv_grad && cv_grad->data) {
+          std::vector<float> C(ggml_nelements(cv_grad));
+          ggml_backend_tensor_get(cv_grad, C.data(), 0, ggml_nbytes(cv_grad));
+          std::vector<double> S(n_atoms, 0.0);
+          for (int flat = 0; flat < total_slots; flat++) {
+            if (pm_data[flat] > 0.5f || neighbor_atoms_vec[flat] < 0) continue;
+            S[flat / max_neighbors] += 0.5 * C[flat];
+            S[neighbor_atoms_vec[flat]] += 0.5 * C[flat];
+          }
+          chain_grad.resize(full_nlist.num_pairs());
+          for (int e = 0; e < full_nlist.num_pairs(); e++) {
+            const int k = full_nlist.centers[e], l = full_nlist.neighbors[e];
+            const auto &v = full_nlist.edge_vectors[e];
+            const double d = std::sqrt(double(v[0]) * v[0] + double(v[1]) * v[1] + double(v[2]) * v[2]);
+            const double coef = d > 0.0 ? S[k] * cutoff_jacobian[e] / d : 0.0;
+            for (int c = 0; c < 3; c++) {
+              chain_grad[e][c] = coef * v[c];
+              result.forces[k * 3 + c] += static_cast<float>(chain_grad[e][c]);
+              result.forces[l * 3 + c] -= static_cast<float>(chain_grad[e][c]);
+            }
+          }
+        }
+      }
+
       // Apply energy scale
       for (int i = 0; i < n_atoms * 3; i++) {
         result.forces[i] *= energy_scale_;
@@ -1231,68 +1349,15 @@ ModelResult GraphModel::predict_single(
               result.stress[5] += 0.5f * (ex * gy + ey * gx); // xy
             }
           }
-          // Chain-rule correction: the model's autograd doesn't see the
-          // implicit dependence of pair_cutoffs on edge_distances (the C++
-          // adaptive cutoff math). When cutoff_values_t was marked as a
-          // ggml param, its gradient C[e] = ∂E/∂cutoff_values[e] is also
-          // available; combined with the analytic Jacobian J[e'] =
-          // ∂atomic_cutoffs[i_{e'}]/∂d_{e'} we recover the missing virial
-          // term. Skipped when adaptive cutoff isn't active.
-          if (have_adaptive && cutoff_values_t) {
-            ggml_tensor *cv_grad = ggml_graph_get_grad(cgraph, cutoff_values_t);
-            if (cv_grad && cv_grad->data) {
-              std::vector<float> cv_grad_data(ggml_nelements(cv_grad));
-              ggml_backend_tensor_get(cv_grad, cv_grad_data.data(), 0,
-                                      ggml_nbytes(cv_grad));
-
-              // S[k] = Σ_e (in filtered list, edge e touches atom k) C_e
-              std::vector<double> S(n_atoms, 0.0);
-              for (int ca = 0; ca < n_atoms; ca++) {
-                for (int slot = 0; slot < max_neighbors; slot++) {
-                  int flat_idx = ca * max_neighbors + slot;
-                  if (pm_data[flat_idx] > 0.5f) continue;
-                  int na = neighbor_atoms_vec[flat_idx];
-                  if (na < 0) continue;
-                  double c = static_cast<double>(cv_grad_data[flat_idx]);
-                  S[ca] += c;
-                  S[na] += c;
-              }
-              }
-              // S[k] is symmetric in i↔j averaging since cv[e] = 0.5*(a[i]+a[j])
-              // and we summed C over both endpoints for each edge.
-
-              const int n_probes = adapt_cache.n_probes;
-              const auto &probes = adapt_cache.probes;
-              const auto &X = adapt_cache.diff_jacobian;
-              const float ew = adapt_cache.effective_width;
-
-              double corr[6] = {0, 0, 0, 0, 0, 0};
-              for (int e = 0; e < full_nlist.num_pairs(); e++) {
-                int k = full_nlist.centers[e];
-                double d = static_cast<double>(full_nlist.distances[e]);
-                if (d <= 0.0) continue;
-                // J[e] = Σ_p X[k, p] * bump_derivative(d, probes[p], ew)
-                double J = 0.0;
-                const double *Xk = &X[static_cast<size_t>(k) * n_probes];
-                for (int p = 0; p < n_probes; p++) {
-                  J += Xk[p] * bump_derivative(static_cast<float>(d),
-                                               probes[p], ew);
-                }
-                if (J == 0.0) continue;
-                double coef = 0.5 * J * S[k] / d;
-                const auto &r = full_nlist.edge_vectors[e];
-                double ex = r[0], ey = r[1], ez = r[2];
-                corr[0] += coef * ex * ex;
-                corr[1] += coef * ey * ey;
-                corr[2] += coef * ez * ez;
-                corr[3] += 0.5 * coef * (ey * ez + ez * ey);
-                corr[4] += 0.5 * coef * (ex * ez + ez * ex);
-                corr[5] += 0.5 * coef * (ex * ey + ey * ex);
-              }
-              for (int i = 0; i < 6; i++) {
-                result.stress[i] += static_cast<float>(corr[i]);
-              }
-            }
+          for (int e = 0; e < static_cast<int>(chain_grad.size()); e++) {
+            const auto &r = full_nlist.edge_vectors[e];
+            const auto &g = chain_grad[e];
+            result.stress[0] += static_cast<float>(r[0] * g[0]);
+            result.stress[1] += static_cast<float>(r[1] * g[1]);
+            result.stress[2] += static_cast<float>(r[2] * g[2]);
+            result.stress[3] += static_cast<float>(0.5 * (r[1] * g[2] + r[2] * g[1]));
+            result.stress[4] += static_cast<float>(0.5 * (r[0] * g[2] + r[2] * g[0]));
+            result.stress[5] += static_cast<float>(0.5 * (r[0] * g[1] + r[1] * g[0]));
           }
 
           for (int i = 0; i < 6; i++) {

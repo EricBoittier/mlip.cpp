@@ -102,6 +102,11 @@ public:
   // dump_all_tensors().
   void capture_all_outputs(const CaptureCallback &cb) const;
 
+  // Graphs differentiated with respect to the inputs (forces) need the
+  // gradient of the attention bias (the cutoff factors): softmax has none for
+  // its mask, so the bias is not folded into one there.
+  void set_input_gradients(bool on) { input_gradients_ = on; }
+
 private:
   // The IR graph
   GIRGraph graph_;
@@ -147,6 +152,7 @@ private:
   ggml_tensor *build_mul_mat(ggml_context *ctx, const GIRNode &node);
   ggml_tensor *build_matmul(ggml_context *ctx, const GIRNode &node);
   ggml_tensor *build_fused_attention(ggml_context *ctx, const GIRNode &node);
+  bool input_gradients_ = false;
   const GIRNode *find_node(const std::string &ref) const;
   std::vector<const GIRNode *> consumers(int id) const;
   ggml_tensor *build_chunk_linear(ggml_context *ctx, const GIRNode &node, int64_t index,

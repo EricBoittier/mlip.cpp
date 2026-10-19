@@ -1,0 +1,16 @@
+diff --git a/src/ggml-cuda/mmf.cu b/src/ggml-cuda/mmf.cu
+index aad4c34a..e9898c99 100644
+--- a/src/ggml-cuda/mmf.cu
++++ b/src/ggml-cuda/mmf.cu
+@@ -180,6 +180,11 @@ bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const
+ 
+     switch (type) {
+         case GGML_TYPE_F32:
++            // the F32 kernels run on TF32 tensor cores: GGML_CUDA_NO_TF32=1 (full
++            // FP32, as for cuBLAS) leaves these products to the FP32 paths
++            if (getenv("GGML_CUDA_NO_TF32") != nullptr) {
++                return false;
++            }
+             return ampere_mma_available(cc) || amd_mfma_available(cc);
+         case GGML_TYPE_F16:
+             return volta_mma_available(cc) || turing_mma_available(cc) || amd_wmma_available(cc) || amd_mfma_available(cc);

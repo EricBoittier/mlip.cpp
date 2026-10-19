@@ -228,6 +228,12 @@ else()
         # CUDA graph capture for one chosen static graph (the optimizer step)
         # while GGML_CUDA_DISABLE_GRAPHS keeps it off for the dynamic ones
                 "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-graph-allow.patch"
+        # gradient of the fused PET attention w.r.t. its bias (the cutoff
+        # factors): GGML_OP_PET_ATTN_BACK_BIAS, needed for forces -dE/dx
+                "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-pet-attention-bias-grad.patch"
+        # GGML_CUDA_NO_TF32=1 also keeps F32 products off the TF32 tensor-core
+        # mmf kernels (used for <= 16 columns, i.e. small structures)
+                "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-no-tf32-mmf.patch"
         EXCLUDE_FROM_ALL YES
     )
 endif()

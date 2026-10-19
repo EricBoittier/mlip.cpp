@@ -1,0 +1,312 @@
+diff --git a/include/ggml.h b/include/ggml.h
+index 1aac6c7f..0e2d26fb 100644
+--- a/include/ggml.h
++++ b/include/ggml.h
+@@ -580,6 +580,7 @@ extern "C" {
+         GGML_OP_PET_ATTN,
+         GGML_OP_PET_ATTN_BACK,
+         GGML_OP_NEWTON_SCHULZ,
++        GGML_OP_PET_ATTN_BACK_BIAS,
+ 
+         GGML_OP_COUNT,
+     };
+@@ -1782,6 +1783,18 @@ extern "C" {
+             int                   n_head,
+             float                 scale);
+ 
++    // gradient of ggml_pet_attn w.r.t. bias ([L, L, 1, N]): per sequence,
++    //   sum_h P_h (dO_h V_h^T - rowsum(dO_h * O_h))
++    // with P_h recomputed from the log-sum-exps in the result
++    GGML_API struct ggml_tensor * ggml_pet_attn_back_bias(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * qkv,
++            struct ggml_tensor  * bias,
++            struct ggml_tensor  * result,
++            struct ggml_tensor  * grad,
++            int                   n_head,
++            float                 scale);
++
+     // Muon's quintic Newton-Schulz iteration on each matrix x[:, :, i]
+     // (F32, contiguous, ne[3] == 1): x / (|x|_F + 1e-7), then `steps` times
+     //   X = a X + (b A + c A^2) X,  A = X X^T over the shorter side
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index a490e2d6..0b186617 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -1882,6 +1882,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_pet_attn_back(params, tensor);
+             } break;
++        case GGML_OP_PET_ATTN_BACK_BIAS:
++            {
++                ggml_compute_forward_pet_attn_back_bias(params, tensor);
++            } break;
+         case GGML_OP_NEWTON_SCHULZ:
+             {
+                 ggml_compute_forward_newton_schulz(params, tensor);
+@@ -2327,6 +2331,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+         case GGML_OP_SOFT_MAX_BACK:
+         case GGML_OP_PET_ATTN:
+         case GGML_OP_PET_ATTN_BACK:
++        case GGML_OP_PET_ATTN_BACK_BIAS:
+         case GGML_OP_NEWTON_SCHULZ:
+         case GGML_OP_ROPE:
+         case GGML_OP_ROPE_BACK:
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+index 572e8005..02f11303 100644
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -11306,6 +11306,45 @@ void ggml_compute_forward_pet_attn_back(const ggml_compute_params * params, ggml
+     }
+ }
+ 
++// ggml_compute_forward_pet_attn_back_bias: dbias[n][i][j] = sum_h p (dp - D_i)
++
++void ggml_compute_forward_pet_attn_back_bias(const ggml_compute_params * params, ggml_tensor * dst) {
++    const ggml_tensor * qkv  = dst->src[0];
++    const ggml_tensor * bias = dst->src[1];
++    const ggml_tensor * res  = dst->src[2];
++    const ggml_tensor * grad = dst->src[3];
++    const int   H     = ggml_get_op_params_i32(dst, 0);
++    const float scale = ggml_get_op_params_f32(dst, 1);
++    const int64_t D = qkv->ne[0], d = D / H, L = qkv->ne[2], N = qkv->ne[3];
++
++    std::vector<float> x32;
++    for (int64_t n = params->ith; n < N; n += params->nth) {
++        const float * x = pet_attn_qkv_f32(qkv, n, x32);
++        auto in = [&](int64_t i, int s) { return x + (i*3 + s)*D; };
++        auto r  = [&](const ggml_tensor * t, int64_t i) { return (const float *) ((const char *) t->data + n*t->nb[2] + i*t->nb[1]); };
++        for (int64_t i = 0; i < L; i++) {
++            const float * b  = (const float *) ((const char *) bias->data + n*bias->nb[3] + i*bias->nb[1]);
++            float       * db = (float *) ((char *) dst->data + n*dst->nb[3] + i*dst->nb[1]);
++            for (int64_t j = 0; j < L; j++) db[j] = 0.0f;
++            for (int h = 0; h < H; h++) {
++                const float * q  = in(i, 0) + h*d;
++                const float * o  = r(res, i) + h*d;
++                const float * dO = r(grad, i) + h*d;
++                const float lse  = r(res, i)[D + h];
++                float Di = 0.0f;
++                for (int64_t c = 0; c < d; c++) Di += dO[c]*o[c];
++                for (int64_t j = 0; j < L; j++) {
++                    const float * k = in(j, 1) + h*d;
++                    const float * v = in(j, 2) + h*d;
++                    float s = 0.0f, dp = 0.0f;
++                    for (int64_t c = 0; c < d; c++) s += q[c]*k[c], dp += dO[c]*v[c];
++                    db[j] += expf(scale*s + b[j] - lse)*(dp - Di);
++                }
++            }
++        }
++    }
++}
++
+ // ggml_compute_forward_newton_schulz: reference implementation (thread 0),
+ // same algebra as the CUDA kernel (column-major M = X^T, Gram over the
+ // shorter side, B = c G^2 + b G + a I folded into one product)
+diff --git a/src/ggml-cpu/ops.h b/src/ggml-cpu/ops.h
+index a6caf478..3945feeb 100644
+--- a/src/ggml-cpu/ops.h
++++ b/src/ggml-cpu/ops.h
+@@ -62,6 +62,7 @@ void ggml_compute_forward_soft_max(const struct ggml_compute_params * params, st
+ void ggml_compute_forward_soft_max_ext_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_pet_attn(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_pet_attn_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_pet_attn_back_bias(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_newton_schulz(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_rope(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_rope_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index 46ff61bf..62b85fd2 100644
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -2732,6 +2732,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+         case GGML_OP_PET_ATTN_BACK:
+             ggml_cuda_op_pet_attn_back(ctx, dst);
+             break;
++        case GGML_OP_PET_ATTN_BACK_BIAS:
++            ggml_cuda_op_pet_attn_back_bias(ctx, dst);
++            break;
+         case GGML_OP_NEWTON_SCHULZ:
+             ggml_cuda_op_newton_schulz(ctx, dst);
+             break;
+@@ -4914,6 +4917,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+         }
+         case GGML_OP_PET_ATTN:
+         case GGML_OP_PET_ATTN_BACK:
++        case GGML_OP_PET_ATTN_BACK_BIAS:
+             return ggml_cuda_pet_attn_supported(op);
+         case GGML_OP_NEWTON_SCHULZ:
+             return ggml_cuda_newton_schulz_supported(op);
+diff --git a/src/ggml-cuda/pet-attn.cu b/src/ggml-cuda/pet-attn.cu
+index 91723910..4e6e98a5 100644
+--- a/src/ggml-cuda/pet-attn.cu
++++ b/src/ggml-cuda/pet-attn.cu
+@@ -522,6 +522,9 @@ bool ggml_cuda_pet_attn_supported(const ggml_tensor * op) {
+     for (int i = 0; i < GGML_MAX_SRC && op->src[i]; i++)
+         if ((op->src[i]->type != GGML_TYPE_F32 && !(i == 0 && op->src[i]->type == GGML_TYPE_F16)) ||
+             !ggml_is_contiguous(op->src[i])) return false;
++    if (op->op == GGML_OP_PET_ATTN_BACK_BIAS &&
++        ((2*op->src[0]->ne[0] + 2*H)*(int64_t) sizeof(float) > MAX_SMEM || op->src[0]->ne[3] > 65535 ||
++         op->src[0]->ne[2] > 65535)) return false;
+     return (d == 8 || d == 16 || d == 32 || d == 64) && H <= 256 && op->src[0]->ne[2] <= (1 << 28);
+ }
+ 
+@@ -1126,3 +1129,76 @@ static void pet_attn_dispatch(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+ 
+ void ggml_cuda_op_pet_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) { pet_attn_dispatch(ctx, dst, false); }
+ void ggml_cuda_op_pet_attn_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) { pet_attn_dispatch(ctx, dst, true); }
++
++// GGML_OP_PET_ATTN_BACK_BIAS: one block per (query row i, sequence n), the
++// threads over the keys j; P is recomputed from the stored log-sum-exps,
++//   dbias[n][i][j] = sum_h p_hij (dO_hi . v_hj - dO_hi . o_hi)
++template <int d, typename T>
++static __global__ void pet_attn_bwd_bias(
++        const T * __restrict__ qkv, const float * __restrict__ bias, const float * __restrict__ res,
++        const float * __restrict__ grad, float * __restrict__ dbias, const int H, const int L, const float scale) {
++    extern __shared__ float sm[];
++    const int D = H*d, i = blockIdx.x;
++    const int64_t n = blockIdx.y;
++    float * q = sm, * dO = sm + D, * lse = sm + 2*D, * Di = lse + H;
++    const T * x = qkv + n*L*3*D;
++    const float * ri = res  + (n*L + i)*(D + H);
++    const float * gi = grad + (n*L + i)*(D + H);
++    for (int c = threadIdx.x; c < D; c += blockDim.x) q[c] = ld_f(x + (int64_t) i*3*D + c), dO[c] = gi[c];
++    for (int h = threadIdx.x; h < H; h += blockDim.x) lse[h] = ri[D + h];
++    __syncthreads();
++    for (int h = threadIdx.x; h < H; h += blockDim.x) {
++        float s = 0.0f;
++#pragma unroll
++        for (int c = 0; c < d; c++) s += dO[h*d + c]*ri[h*d + c];
++        Di[h] = s;
++    }
++    __syncthreads();
++    const float * b  = bias  + (n*L + i)*L;
++    float       * db = dbias + (n*L + i)*L;
++    for (int j = threadIdx.x; j < L; j += blockDim.x) {
++        const T * k = x + ((int64_t) j*3 + 1)*D, * v = k + D;
++        float acc = 0.0f;
++        for (int h = 0; h < H; h++) {
++            float s = 0.0f, dp = 0.0f;
++#pragma unroll
++            for (int c = 0; c < d; c++) s += q[h*d + c]*ld_f(k + h*d + c), dp += dO[h*d + c]*ld_f(v + h*d + c);
++            acc += expf(scale*s + b[j] - lse[h])*(dp - Di[h]);
++        }
++        db[j] = acc;
++    }
++}
++
++template <int d, typename T>
++static void pet_attn_launch_bias(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * qkv = dst->src[0];
++    const int   H     = ggml_get_op_params_i32(dst, 0);
++    const float scale = ggml_get_op_params_f32(dst, 1);
++    const int   L     = (int) qkv->ne[2];
++    const int64_t N   = qkv->ne[3];
++    if (N == 0 || L == 0) return;
++    const size_t smem = (2*(size_t) H*d + 2*H)*sizeof(float);
++    GGML_ASSERT(smem <= MAX_SMEM && N <= 65535);
++    const int threads = std::min(128, (L + 31)/32*32);
++    pet_attn_bwd_bias<d, T><<<dim3((unsigned) L, (unsigned) N), threads, smem, ctx.stream()>>>(
++        (const T *) qkv->data, (const float *) dst->src[1]->data, (const float *) dst->src[2]->data,
++        (const float *) dst->src[3]->data, (float *) dst->data, H, L, scale);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++template <typename T>
++static void pet_attn_bias_dispatch_t(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const int H = ggml_get_op_params_i32(dst, 0), d = (int) (dst->src[0]->ne[0] / H);
++    switch (d) {
++        case  8: pet_attn_launch_bias< 8, T>(ctx, dst); break;
++        case 16: pet_attn_launch_bias<16, T>(ctx, dst); break;
++        case 32: pet_attn_launch_bias<32, T>(ctx, dst); break;
++        case 64: pet_attn_launch_bias<64, T>(ctx, dst); break;
++        default: GGML_ABORT("pet_attn_back_bias: unsupported head size");
++    }
++}
++
++void ggml_cuda_op_pet_attn_back_bias(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    if (dst->src[0]->type == GGML_TYPE_F16) pet_attn_bias_dispatch_t<half>(ctx, dst);
++    else                                    pet_attn_bias_dispatch_t<float>(ctx, dst);
++}
+diff --git a/src/ggml-cuda/pet-attn.cuh b/src/ggml-cuda/pet-attn.cuh
+index fe9f1f10..7c6c39ea 100644
+--- a/src/ggml-cuda/pet-attn.cuh
++++ b/src/ggml-cuda/pet-attn.cuh
+@@ -4,3 +4,4 @@
+ bool ggml_cuda_pet_attn_supported(const ggml_tensor * op);
+ void ggml_cuda_op_pet_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ void ggml_cuda_op_pet_attn_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++void ggml_cuda_op_pet_attn_back_bias(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+diff --git a/src/ggml.c b/src/ggml.c
+index 1250c485..059ae4a1 100644
+--- a/src/ggml.c
++++ b/src/ggml.c
+@@ -1067,9 +1067,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "PET_ATTN",
+     "PET_ATTN_BACK",
+     "NEWTON_SCHULZ",
++    "PET_ATTN_BACK_BIAS",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
++static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1181,9 +1182,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "pet_attn(qkv,bias)",
+     "pet_attn_back(qkv,bias,o,do)",
+     "newton_schulz(x)",
++    "pet_attn_back_bias(qkv,bias,o,do)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
++static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -4121,6 +4123,32 @@ struct ggml_tensor * ggml_pet_attn_back(
+     return dqkv;
+ }
+ 
++struct ggml_tensor * ggml_pet_attn_back_bias(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * qkv,
++        struct ggml_tensor  * bias,
++        struct ggml_tensor  * result,
++        struct ggml_tensor  * grad,
++        int                   n_head,
++        float                 scale) {
++    GGML_ASSERT(ggml_are_same_shape(result, grad) && grad->type == GGML_TYPE_F32);
++    GGML_ASSERT(result->ne[0] == qkv->ne[0] + n_head);
++
++    struct ggml_tensor * dbias = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, bias->ne);
++
++    int32_t params[2] = { n_head, 0 };
++    memcpy(params + 1, &scale, sizeof(float));
++    ggml_set_op_params(dbias, params, sizeof(params));
++
++    dbias->op     = GGML_OP_PET_ATTN_BACK_BIAS;
++    dbias->src[0] = qkv;
++    dbias->src[1] = bias;
++    dbias->src[2] = result;
++    dbias->src[3] = grad;
++
++    return dbias;
++}
++
+ // ggml_newton_schulz
+ 
+ struct ggml_tensor * ggml_newton_schulz_multi_coeffs(
+@@ -6857,7 +6885,11 @@ static void ggml_compute_backward(
+                 const float   scale  = ggml_get_op_params_f32(tensor, 1);
+                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_pet_attn_back(ctx, src0, src1, tensor, grad, n_head, scale));
+             }
+-            GGML_ASSERT(!src1_needs_grads && "backward pass for the attention bias not implemented");
++            if (src1_needs_grads) {
++                const int32_t n_head = ggml_get_op_params_i32(tensor, 0);
++                const float   scale  = ggml_get_op_params_f32(tensor, 1);
++                ggml_add_or_set(ctx, cgraph, isrc1, ggml_pet_attn_back_bias(ctx, src0, src1, tensor, grad, n_head, scale));
++            }
+         } break;
+         case GGML_OP_ROPE: {
+             if (src0_needs_grads) {
