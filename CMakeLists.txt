@@ -237,6 +237,10 @@ else()
         # GGML_CUDA_NO_TF32=1 also keeps F32 products off the TF32 tensor-core
         # mmf kernels (used for <= 16 columns, i.e. small structures)
                 "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-no-tf32-mmf.patch"
+        # forward-mode derivative of the fused PET attention and its gradients
+        # (GGML_OP_PET_ATTN_JVP*, CPU + CUDA): conservative training without
+        # storing any L x L matrix (runtime/graph_jvp.h)
+                "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-pet-attention-jvp.patch"
         EXCLUDE_FROM_ALL YES
     )
 endif()
