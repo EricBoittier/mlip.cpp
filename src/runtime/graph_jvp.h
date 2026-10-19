@@ -1,6 +1,8 @@
 #pragma once
+#include <cstdlib>
 #include <cstring>
 #include <ggml.h>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -9,7 +11,8 @@ namespace mlipcpp::runtime {
 // Forward directional differentiation. Tangents are ordinary differentiable
 // ggml expressions: reversing the result gives mixed energy derivatives.
 // The fused SiLU/softmax derivative operations have explicit backward rules.
-// Missing tangents mean zero.
+// A null tangent means zero (the value does not depend on the seeds); an op
+// without a rule, or a tangent reaching an operand a rule ignores, throws.
 class GraphJVP {
   ggml_context *c;
   std::unordered_map<ggml_tensor *, ggml_tensor *> tangents;
@@ -20,13 +23,70 @@ class GraphJVP {
     return a && b ? ggml_mul(c, a, b) : nullptr;
   }
   ggml_tensor *neg(ggml_tensor *a) { return a ? ggml_neg(c, a) : nullptr; }
+  // a / b with b broadcast explicitly: ggml's DIV backward needs equal shapes
+  ggml_tensor *div(ggml_tensor *a, ggml_tensor *b) {
+    return ggml_div(c, a, ggml_are_same_shape(a, b) ? b : ggml_repeat(c, b, a));
+  }
   ggml_tensor *zero(ggml_tensor *a) {
     // scale(x,0) is unsafe for masked -infinity values.
     return ggml_fill(c, ggml_dup_tensor(c, a), 0);
   }
+  // Fused PET attention r = [o | lse] (ggml_pet_attn: qkv [D, 3, L, N], bias
+  // [L, L, 1, N], r [D + H, L, N]), differentiated through the unfused
+  // expression: S = scale K^T Q + bias, P = softmax(S), o = V P per head,
+  //   dS = scale (dK^T Q + K^T dQ) + dbias, dP = P (dS - sum(P dS)),
+  //   do = V dP + dV P, dlse = sum(P dS).
+  // P is recomputed as an ordinary softmax and stored ([L, L, H, N]), so the
+  // reverse pass through the tangent uses the standard backward rules.
+  ggml_tensor *pet_attn(ggml_tensor *r, ggml_tensor *dqkv, ggml_tensor *dbias) {
+    auto *qkv = r->src[0], *bias = r->src[1];
+    if (qkv->type != GGML_TYPE_F32)
+      throw std::runtime_error("JVP of PET attention needs F32 qkv");
+    const int H = r->op_params[0];
+    float scale;
+    std::memcpy(&scale, r->op_params + 1, sizeof(scale));
+    const int64_t D = qkv->ne[0], d = D / H, L = qkv->ne[2], N = qkv->ne[3];
+    // slot s of a [D, 3, L, N] tensor as heads [d, L, H, N]
+    auto heads = [&](ggml_tensor *t, int s) {
+      t = ggml_view_4d(c, t, d, H, L, N, d * sizeof(float), t->nb[2], t->nb[3],
+                       s * t->nb[1]);
+      return ggml_cont(c, ggml_permute(c, t, 0, 2, 1, 3));
+    };
+    auto *Q = heads(qkv, 0), *K = heads(qkv, 1), *V = heads(qkv, 2);
+    auto *P = ggml_soft_max(c, ggml_add(c, ggml_scale(c, ggml_mul_mat(c, K, Q), scale),
+                                        bias)); // [L_k, L_q, H, N]
+    auto *Vt = ggml_cont(c, ggml_transpose(c, V)); // [L_k, d, H, N]
+    ggml_tensor *dS = dbias ? ggml_repeat(c, dbias, P) : nullptr, *dO = nullptr;
+    if (dqkv) {
+      dqkv = ggml_cont(c, dqkv);
+      auto *dQ = heads(dqkv, 0), *dK = heads(dqkv, 1), *dV = heads(dqkv, 2);
+      dS = add(dS, ggml_scale(c, ggml_add(c, ggml_mul_mat(c, dK, Q),
+                                          ggml_mul_mat(c, K, dQ)),
+                              scale));
+      dO = ggml_mul_mat(c, ggml_cont(c, ggml_transpose(c, dV)), P);
+    }
+    dO = add(dO, ggml_mul_mat(c, Vt, ggml_soft_max_ext_back(c, dS, P, 1, 0)));
+    // [d, L, H, N] -> [D, L, N]; dlse [1, L, H, N] -> [H, L, N]
+    dO = ggml_reshape_3d(c, ggml_cont(c, ggml_permute(c, dO, 0, 2, 1, 3)), D, L, N);
+    auto *dlse = ggml_sum_rows(c, ggml_mul(c, P, dS));
+    dlse = ggml_reshape_3d(c, ggml_cont(c, ggml_permute(c, dlse, 1, 2, 0, 3)), H, L, N);
+    return ggml_concat(c, dO, dlse, 0);
+  }
+
+  // throw, or (diagnostics) count the op and treat its tangent as zero
+  ggml_tensor *unsupported(const std::string &what) {
+    if (!missing)
+      throw std::runtime_error("JVP: " + what);
+    (*missing)[what]++;
+    return nullptr;
+  }
 
 public:
   explicit GraphJVP(ggml_context *ctx) : c(ctx) {}
+  std::map<std::string, int> *missing = nullptr;
+  // PET attention through ggml_pet_attn_jvp (nothing L x L stored), else the
+  // unfused expression (pet_attn above); MLIPCPP_JVP_UNFUSED_ATTN=1: unfused
+  bool fused_attention = std::getenv("MLIPCPP_JVP_UNFUSED_ATTN") == nullptr;
   void seed(ggml_tensor *x, ggml_tensor *v) { tangents[x] = v; }
   ggml_tensor *operator()(ggml_tensor *x) {
     if (!x)
@@ -36,8 +96,14 @@ public:
     auto *a = x->src[0], *b = x->src[1];
     auto *u = (*this)(a), *v = (*this)(b);
     ggml_tensor *t = nullptr;
-    if (!u && !v)
+    bool extra = false; // a tangent on src[2..]: only rules that read them may proceed
+    for (int i = 2; i < GGML_MAX_SRC; i++)
+      extra = (*this)(x->src[i]) || extra;
+    if (!u && !v && !extra)
       return tangents[x] = nullptr;
+    if (extra)
+      return tangents[x] = unsupported("tangent on an extra operand of " +
+                                       std::string(ggml_op_desc(x)));
     float f;
     std::memcpy(&f, x->op_params, sizeof(f));
     switch (x->op) {
@@ -54,8 +120,7 @@ public:
       t = add(mul(u, b), mul(a, v));
       break;
     case GGML_OP_DIV:
-      t = add(u ? ggml_div(c, u, b) : nullptr,
-              v ? neg(ggml_div(c, mul(x, v), b)) : nullptr);
+      t = add(u ? div(u, b) : nullptr, v ? neg(div(mul(x, v), b)) : nullptr);
       break;
     case GGML_OP_CLAMP: {
       float hi;
@@ -114,8 +179,10 @@ public:
       size_t offset;
       std::memcpy(&offset, x->op_params, sizeof(offset));
       // Preserve source layout: a tangent may have been formed contiguously.
-      if (!ggml_is_contiguous(a))
-        throw std::runtime_error("JVP view of noncontiguous source");
+      if (!ggml_is_contiguous(a)) {
+        t = unsupported("VIEW of a noncontiguous source");
+        break;
+      }
       t = ggml_view_4d(c, ggml_cont(c, u), x->ne[0], x->ne[1], x->ne[2],
                        x->ne[3], x->nb[1], x->nb[2], x->nb[3], offset);
       break;
@@ -134,13 +201,49 @@ public:
       t = ggml_concat(c, u ? u : zero(a), v ? v : zero(b), x->op_params[0]);
       break;
     case GGML_OP_SOFT_MAX: {
+      // y = softmax(f a + mask): dy = y (w - sum(y w)), w = f u + dmask
       float bias;
       std::memcpy(&bias, x->op_params + 1, sizeof(bias));
-      if (bias != 0 || v)
-        throw std::runtime_error("JVP softmax with differentiable mask/ALiBi");
-      t = ggml_soft_max_ext_back(c, u, x, f, 0);
+      if (bias != 0)
+        throw std::runtime_error("JVP softmax with ALiBi");
+      if (!v)
+        t = ggml_soft_max_ext_back(c, u, x, f, 0);
+      else
+        t = ggml_soft_max_ext_back(
+            c, add(u ? ggml_scale(c, u, f) : nullptr, ggml_repeat(c, v, x)), x,
+            1, 0);
       break;
     }
+    case GGML_OP_RMS_NORM: {
+      // y = a / s, s = sqrt(mean(a^2) + eps): dy = (u - y mean(y u)) / s
+      const float inv = 1.0f / a->ne[0];
+      auto *s = ggml_sqrt(c, ggml_scale_bias(c, ggml_sum_rows(c, ggml_sqr(c, a)), inv, f));
+      auto *yu = ggml_scale(c, ggml_sum_rows(c, ggml_mul(c, x, u)), inv);
+      t = div(ggml_sub(c, u, ggml_mul(c, x, yu)), s);
+      break;
+    }
+    case GGML_OP_NORM: {
+      // y = (a - mean(a)) / s, s = sqrt(var(a) + eps):
+      // dy = (u - mean(u) - y mean(y u)) / s
+      const float inv = 1.0f / a->ne[0];
+      auto *d = ggml_sub(c, a, ggml_scale(c, ggml_sum_rows(c, a), inv));
+      auto *s = ggml_sqrt(c, ggml_scale_bias(c, ggml_sum_rows(c, ggml_sqr(c, d)), inv, f));
+      auto *yu = ggml_scale(c, ggml_sum_rows(c, ggml_mul(c, x, u)), inv);
+      auto *um = ggml_scale(c, ggml_sum_rows(c, u), inv);
+      t = div(ggml_sub(c, ggml_sub(c, u, um), ggml_mul(c, x, yu)), s);
+      break;
+    }
+    case GGML_OP_PET_ATTN:
+      if (fused_attention && a->type == GGML_TYPE_F32) {
+        float scale;
+        std::memcpy(&scale, x->op_params + 1, sizeof(scale));
+        t = ggml_pet_attn_jvp(c, a, b, u ? ggml_cont(c, u) : nullptr,
+                              v ? ggml_cont(c, v) : nullptr, x->op_params[0],
+                              scale);
+      } else {
+        t = pet_attn(x, u, v);
+      }
+      break;
     case GGML_OP_UNARY:
       switch (ggml_get_unary_op(x)) {
       case GGML_UNARY_OP_NEG:
@@ -169,13 +272,11 @@ public:
         t = mul(ggml_scale_bias(c, ggml_sqr(c, x), -1, 1), u);
         break;
       default:
-        throw std::runtime_error("Unsupported JVP unary: " +
-                                 std::string(ggml_op_desc(x)));
+        t = unsupported(std::string("unary ") + ggml_op_desc(x));
       }
       break;
     default:
-      throw std::runtime_error("Unsupported JVP op: " +
-                               std::string(ggml_op_desc(x)));
+      t = unsupported(ggml_op_desc(x));
     }
     if (t && !ggml_are_same_shape(t, x))
       t = ggml_repeat(c, t, x);
