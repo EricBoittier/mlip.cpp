@@ -188,6 +188,17 @@ int edges(const Args &a) {
   // the engine's inputs: every kept slot's reverse holds -v, the neighbour
   // species is the neighbour's, and the CPU list has an edge of that length
   const auto in = eng.inputs();
+  if (auto f = a.get("dump-inputs"); !f.empty()) {
+    // int32 n, M; int32 species[n], neighbor_species[n M], reverse[n M];
+    // float32 edge_vectors[n M 3], padding_mask[n M] (1 = padded), cutoff_values[n M]
+    std::ofstream o(f, std::ios::binary);
+    const int32_t hdr[2] = {static_cast<int32_t>(sys.num_atoms()), in.M};
+    auto put = [&](const auto &v) { o.write(reinterpret_cast<const char *>(v.data()), v.size() * sizeof v[0]); };
+    o.write(reinterpret_cast<const char *>(hdr), sizeof hdr);
+    put(in.species), put(in.neighbor_species), put(in.reverse), put(in.edge_vectors), put(in.padding_mask),
+        put(in.cutoff_values);
+    fmt::print("wrote the engine inputs to {} (n {}, M {})\n", f, hdr[0], hdr[1]);
+  }
   const int M = in.M;
   int bad_rev = 0, bad_rev2 = 0, bad_len = 0, kept = 0;
   double worst = 0;
