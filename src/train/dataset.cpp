@@ -234,6 +234,38 @@ LocalEdges build_one(const MemmapSplit &split, int64_t s,
   return out;
 }
 
+// the full list of build_one (before apply_adaptive), edges sorted by centre
+TaperEdges taper_one(const MemmapSplit &split, int64_t s, double cutoff, const AdaptiveCutoff &a) {
+  const NeighborList nl = NeighborListBuilder(NeighborListOptions{static_cast<float>(cutoff), true, false})
+                              .build(split.system(s));
+  const int E = nl.num_pairs(), n = split.n_atoms(s);
+  std::vector<int> order(E);
+  std::iota(order.begin(), order.end(), 0);
+  std::stable_sort(order.begin(), order.end(), [&](int x, int y) { return nl.centers[x] < nl.centers[y]; });
+  std::vector<int32_t> start(n + 1, 0);
+  std::vector<double> dist(E);
+  for (int k = 0; k < E; k++) {
+    const auto &v = nl.edge_vectors[order[k]];
+    start[nl.centers[order[k]] + 1]++;
+    dist[k] = std::sqrt(double(v[0]) * v[0] + double(v[1]) * v[1] + double(v[2]) * v[2]) + 1e-15;
+  }
+  for (int i = 0; i < n; i++) start[i + 1] += start[i];
+  TaperEdges t;
+  for (int i = 0; i < n; i++) {
+    const adaptive::Radius r = adaptive::solve(start[i + 1] - start[i], [&](int k) { return dist[start[i] + k]; },
+                                               cutoff, a.n_target, a.width);
+    for (int k = start[i]; k < start[i + 1]; k++) {
+      const double J = adaptive::ddist(dist[k], r, a.width);
+      if (J == 0.0) continue;
+      t.center.push_back(i);
+      t.neighbor.push_back(nl.neighbors[order[k]]);
+      t.vector.push_back(nl.edge_vectors[order[k]]);
+      t.jacobian.push_back(static_cast<float>(J));
+    }
+  }
+  return t;
+}
+
 template <typename V> void write_vec(std::ofstream &f, const std::vector<V> &v) {
   f.write(reinterpret_cast<const char *>(v.data()), v.size() * sizeof(V));
 }
@@ -361,6 +393,10 @@ NeighborCache NeighborCache::load_or_build(const MemmapSplit &split, float cutof
     log::info("neighbour lists: cached to {}", cache_path);
   }
   return nc;
+}
+
+TaperEdges taper_edges(const MemmapSplit &split, int64_t s, float cutoff, const AdaptiveCutoff &adaptive) {
+  return adaptive.enabled() ? taper_one(split, s, cutoff, adaptive) : TaperEdges{};
 }
 
 } // namespace mlipcpp::train

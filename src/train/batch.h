@@ -44,6 +44,10 @@ struct Batch {
   std::vector<float> padding_mask;         // [n_atoms, max_nb], 1 = padded
   std::vector<int32_t> reverse_neighbor_index; // [n_atoms * max_nb]
   std::vector<float> cutoff_values;        // [n_atoms, max_nb]
+  std::vector<int32_t> neighbor_atom;      // [n_atoms, max_nb]: the neighbour's batch index (-1: padded)
+  // nl.taper: every structure's TaperEdges, in batch atom indices, vectors rotated
+  std::vector<int32_t> taper_center, taper_neighbor;
+  std::vector<float> taper_vector, taper_jacobian; // [E_t, 3], [E_t]
 
   std::vector<float> atom_weight;   // [n_systems, n_atoms]: 1/N_s if atom in s
   std::vector<float> energy_target; // [n_systems]: (E - comp) / (s_E N_s)

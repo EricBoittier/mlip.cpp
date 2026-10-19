@@ -1,5 +1,6 @@
-// Train PET (energy + direct non-conservative forces) on a metatrain
-// MemmapDataset, data-parallel over GPUs. See src/train/trainer.h.
+// Train PET (energy + direct non-conservative forces, or with --conservative
+// -dE/dx as well) on a metatrain MemmapDataset, data-parallel over GPUs. See
+// src/train/trainer.h.
 #include "train/crash.h"
 #include "train/trainer.h"
 
@@ -22,17 +23,21 @@ int main(int argc, char **argv) {
                "          [--graph-cache {}] [--prefetch {}] [--pack step|worker] [--optimizer adam|muon] [--muon-momentum {}]\n"
                "          [--muon-lr-scale {}] [--muon-ns-steps {}]\n"
                "          [--dump-errors PREFIX] [--log-errors FILE] [--log-errors-epochs {}] [--exclude DIR]\n"
+               "          [--conservative] [--energy-weight {}] [--force-weight {}] [--nc-force-weight {}] [--model-baselines]\n"
                "--dump-errors writes PREFIX.{{val,test}}.bin, --log-errors the training structures' errors\n"
                "before each update (24-byte records, see SystemError); --exclude DIR drops the split\n"
                "indices in DIR/{{train,val,test}}.npy;\n"
                "--tile-nb-ratio > 1 pads micro-batches to a geometric grid of shapes and\n"
                "replays cached graphs (CUDA graphs);\n"
                "--gpus 0 trains on the CPU; --batch-size counts structures per GPU;\n"
+               "--conservative puts the force loss on -dE/dx (forward-mode tangents, about 3x the\n"
+               "step), the direct head keeping a term of its own (weights: --*-weight);\n"
+               "--model-baselines (fine-tuning) keeps --init's composition and scales;\n"
                "--epochs 0 only evaluates --init on val/ and test/ (-o is ignored).\n",
                argv[0], o.epochs, o.batch_size, o.n_gpus, o.lr, o.warmup_fraction,
                o.grad_clip, o.seed, o.n_threads, o.log_every, o.mb_growth, o.mb_budget,
                o.tile_atom_ratio, o.graph_cache, o.prefetch, o.muon_momentum, o.muon_lr_scale, o.muon_ns_steps,
-               o.log_errors_epochs);
+               o.log_errors_epochs, o.energy_weight, o.force_weight, o.nc_force_weight);
     std::exit(2);
   };
   for (int i = 1; i < argc; i++) {
@@ -69,6 +74,11 @@ int main(int argc, char **argv) {
     else if (a == "--log-errors") o.log_errors = val();
     else if (a == "--log-errors-epochs") o.log_errors_epochs = std::stoi(val());
     else if (a == "--exclude") o.exclude = val();
+    else if (a == "--conservative") o.conservative = true;
+    else if (a == "--energy-weight") o.energy_weight = std::stod(val());
+    else if (a == "--force-weight") o.force_weight = std::stod(val());
+    else if (a == "--nc-force-weight") o.nc_force_weight = std::stod(val());
+    else if (a == "--model-baselines") o.model_baselines = true;
     else usage();
   }
   if (o.data_dir.empty() || o.init_gguf.empty() || o.output.empty()) usage();

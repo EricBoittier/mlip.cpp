@@ -5,6 +5,10 @@ mlipcpp-train-check dumps the loss and the flat parameter gradients of one
 fixed batch; this script evaluates the same structures through metatrain's
 own `PET.forward` (training mode: raw outputs, no scaler or composition), in
 float64, with the composition and scales the C++ side fitted, and compares.
+With a conservative dump (mlipcpp-train-check --conservative 1) the force loss
+is on -dE/dx (autograd through the positions, adaptive cutoff included), the
+direct head keeping its term; the parameter gradients are then second
+derivatives (double backward).
 
     python check_gradients.py --init init.pt --data DIR --dump DIR
 """
@@ -54,17 +58,19 @@ def main():
     fscale = {int(k): v for k, v in meta["force_scale"].items()}
     s_e = meta["energy_scale"]
 
-    systems, e_target, f_target = [], [], []
+    cons = meta.get("conservative")
+    systems, e_target, f_target, f_phys = [], [], [], []
     for s in meta["ids"]:
         lo, hi = split["na"][s], split["na"][s + 1]
         types = torch.tensor(split["a"][lo:hi])
         cell = torch.tensor(split["c"][s], dtype=torch.float64)
-        system = System(types=types, positions=torch.tensor(split["x"][lo:hi], dtype=torch.float64),
-                        cell=cell, pbc=(cell != 0).any(dim=1))
+        positions = torch.tensor(split["x"][lo:hi], dtype=torch.float64, requires_grad=cons is not None)
+        system = System(types=types, positions=positions, cell=cell, pbc=(cell != 0).any(dim=1))
         systems.append(get_system_with_neighbor_lists(system, nl_options))
         n = hi - lo
         e_target.append((split["e"][s] - sum(comp[int(z)] for z in types)) / (s_e * n))
         f_target.append(split["f"][lo:hi] / np.array([fscale[int(z)] for z in types])[:, None])
+        f_phys.append(split["f"][lo:hi])
 
     out = model(systems, {"energy": ModelOutput(sample_kind="atom"),
                           "non_conservative_force": ModelOutput(sample_kind="atom")})
@@ -74,13 +80,24 @@ def main():
     e_pa = torch.stack([chunk.sum() / len(chunk) for chunk in torch.split(e_atom, counts)])
     loss_e = ((e_pa - torch.tensor(e_target, dtype=torch.float64)) ** 2).mean()
     loss_f = ((f_atom - torch.tensor(np.concatenate(f_target), dtype=torch.float64)) ** 2).mean()
-    loss = loss_e + loss_f
+    if cons:
+        # -dE/dx of the scaled energy against F / s_E, kept differentiable
+        grads = torch.autograd.grad(e_atom.sum(), [s.positions for s in systems], create_graph=True)
+        f_cons = -torch.cat(grads)
+        loss_fc = ((f_cons - torch.tensor(np.concatenate(f_phys) / s_e, dtype=torch.float64)) ** 2).mean()
+        loss_e, loss_nc = cons["energy_weight"] * loss_e, cons["nc_force_weight"] * loss_f
+        loss_f = cons["force_weight"] * loss_fc
+        loss = loss_e + loss_f + loss_nc
+    else:
+        loss = loss_e + loss_f
     loss.backward()
 
     print(f"loss   torch {loss.item():.8g}  mlipcpp {meta['loss']:.8g}  "
           f"rel {abs(loss.item() - meta['loss']) / abs(loss.item()):.2e}")
     print(f"loss_E torch {loss_e.item():.8g}  mlipcpp {meta['loss_energy']:.8g}")
     print(f"loss_F torch {loss_f.item():.8g}  mlipcpp {meta['loss_force']:.8g}")
+    if cons:
+        print(f"loss_F_nc torch {loss_nc.item():.8g}  mlipcpp {cons['loss_nc']:.8g}")
 
     # GGUF tensor names are the export wrapper's parameter names, '.' -> '_'
     pet = _unwrap_to_pet(model)

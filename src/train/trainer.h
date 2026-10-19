@@ -55,6 +55,14 @@ struct TrainOptions {
   int log_errors_epochs = 1;
   // drop structures: DIR/{train,val,test}.npy hold split indices ("" = none)
   std::string exclude;
+  // conservative forces -dE/dx (Worker::Conservative): the force loss is on
+  // them, the direct head keeps a term of its own; loss weights of the
+  // energy, the conservative and the direct forces
+  bool conservative = false;
+  double energy_weight = 1.0, force_weight = 1.0, nc_force_weight = 1.0;
+  // fine-tuning: keep the composition and scales stored in --init instead of
+  // fitting them on the training set
+  bool model_baselines = false;
 };
 
 /// One structure's errors: energy per atom (prediction - target, eV/atom) and
@@ -73,8 +81,9 @@ static_assert(sizeof(SystemError) == 24);
 /// Squared errors of one batch: scaled (the loss) and physical (metrics).
 struct StepStats {
   double loss = 0, loss_energy = 0, loss_force = 0;
+  double loss_nc = 0, se_force_nc = 0; // conservative mode: the direct head's term and (eV/Å)^2
   double se_energy_per_atom = 0; // Σ_s (ΔE_s / N_s)^2, eV^2
-  double se_force = 0;           // Σ_i,k ΔF_ik^2, (eV/Å)^2
+  double se_force = 0;           // Σ_i,k ΔF_ik^2, (eV/Å)^2 (conservative mode: of -dE/dx)
   int64_t n_systems = 0, n_force_components = 0;
 
   StepStats &operator+=(const StepStats &o);
@@ -118,6 +127,19 @@ public:
   /// (before allocation) and after compute.
   std::function<void(ggml_cgraph *)> after_build, after_compute;
 
+  /// Conservative forces F = -dE/dx. run() then computes two graphs per
+  /// batch: the forward pass and its backward pass to the edge vectors and
+  /// the cutoff values, for the forces (on the host: edge gradients to
+  /// atoms, plus the adaptive radii's chain through Batch::taper_*); then the
+  /// loss with the forward-mode tangent of E along the force residual
+  /// (runtime/graph_jvp.h), whose weight gradient is the force loss's, and
+  /// its backward pass to the weights (accumulated as in the direct mode).
+  /// Loss = energy * L_E + force * L_F(-dE/dx) + nc_force * L_F(direct head).
+  struct Conservative {
+    bool on = false;
+    double energy = 1.0, force = 1.0, nc_force = 1.0;
+  } conservative;
+
   /// Profiling: compute node by node (synchronised) and accumulate, per op
   /// ("fwd:OP" / "bwd:OP"), wall time, FLOPs and ideal bytes (every operand
   /// read and the result written once). Slow; diagnostics only.
@@ -158,6 +180,7 @@ private:
     ggml_tensor *stats = nullptr, *loss_grad = nullptr;
     ggml_tensor *per_system = nullptr; // [S, 2]: d_energy (scaled, per atom), mean |dF|^2 per atom (physical)
     ggml_tensor *per_atom = nullptr;   // [1, n]: |dF|^2 per atom (physical)
+    ggml_tensor *out = nullptr, *grad_v = nullptr, *grad_c = nullptr; // FORCES: (e | F_nc) per atom, dE/dv, dE/dc
     int n_forward = 0;
     std::vector<std::pair<ggml_tensor *, float>> constants;
     // cached graphs: inputs packed at the start of `persist` (one upload
@@ -168,14 +191,22 @@ private:
     uint64_t last_use = 0;
     ~StepGraph();
   };
-  std::unique_ptr<StepGraph> build_graph(int n, int m, int S, bool backward, bool cached);
-  StepGraph &cached_graph(int n, int m, int S, bool backward);
-  void upload_inputs(StepGraph &g, const Batch &b);
+  /// graph kinds: the loss (FORWARD / BACKWARD to the weights); conservative
+  /// mode's FORCES (backward to the edge vectors and cutoff values) and MIXED
+  /// (the loss with the tangent term, backward to the weights)
+  enum Mode { FORWARD, BACKWARD, FORCES, MIXED };
+  std::unique_ptr<StepGraph> build_graph(int n, int m, int S, Mode mode, bool cached);
+  StepGraph &graph(int n, int m, int S, Mode mode, std::unique_ptr<StepGraph> &once);
+  StepGraph &cached_graph(int n, int m, int S, Mode mode);
+  void upload_inputs(StepGraph &g, const Batch &b, const std::vector<float> *dv = nullptr,
+                     const std::vector<float> *dc = nullptr);
+  void compute(StepGraph &g);
+  StepStats run_conservative(const Batch &b, double energy_scale, bool backward);
 
-  std::map<std::tuple<int, int, int, bool>, std::unique_ptr<StepGraph>> cache_;
+  std::map<std::tuple<int, int, int, int>, std::unique_ptr<StepGraph>> cache_;
   size_t cache_limit_ = 0;
   uint64_t clock_ = 0;
-  size_t ctx_bytes_[2] = {0, 0};  // graph context size (forward, backward); measured on the first build
+  size_t ctx_bytes_[4] = {0, 0, 0, 0};  // graph context size per Mode; measured on the first build
   std::vector<uint8_t> staging_;   // host side of the input blob
 
   runtime::GraphModel model_;

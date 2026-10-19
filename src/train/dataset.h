@@ -82,6 +82,16 @@ struct AdaptiveCutoff {
   bool enabled() const { return n_target > 0; }
 };
 
+/// The edges of structure s's full (fixed-cutoff) list that move an adaptive
+/// radius: d r_i / d d_ik != 0 (core/adaptive_cutoff.h), with that
+/// derivative. -dE/dx has a term through the radii (pair cutoffs
+/// (r_i + r_j) / 2), and these edges include ones the pair cutoffs dropped.
+struct TaperEdges {
+  std::vector<int32_t> center, neighbor; // local atom indices
+  std::vector<std::array<float, 3>> vector;
+  std::vector<float> jacobian; // d r_center / d |vector|
+};
+
 struct NeighborCache {
   float cutoff = 0.0f;
   AdaptiveCutoff adaptive;
@@ -90,6 +100,9 @@ struct NeighborCache {
   std::vector<int32_t> center, neighbor, slot, reverse; // [E], local indices
   std::vector<std::array<float, 3>> vector; // [E], unrotated
   std::vector<float> pair_cutoff;            // [E] with an adaptive cutoff, else empty (= cutoff)
+  /// conservative training with an adaptive cutoff: make_batch adds every
+  /// structure's taper_edges (rebuilt from the positions, not cached)
+  bool taper = false;
 
   int64_t n_edges() const { return edge_offset.back(); }
 
@@ -99,5 +112,7 @@ struct NeighborCache {
                                      const std::string &cache_path,
                                      int n_threads, const AdaptiveCutoff &adaptive = {});
 };
+
+TaperEdges taper_edges(const MemmapSplit &split, int64_t s, float cutoff, const AdaptiveCutoff &adaptive);
 
 } // namespace mlipcpp::train

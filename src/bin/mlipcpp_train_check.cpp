@@ -3,6 +3,7 @@
 // scripts/train/check_gradients.py to compare against PyTorch autograd.
 //
 //   mlipcpp-train-check --data DIR --init INIT.gguf --out DIR [--n 64] [--gpus 1]
+//                       [--conservative 1 --energy-weight W --force-weight W --nc-force-weight W]
 #include "train/crash.h"
 #include "train/trainer.h"
 
@@ -30,6 +31,7 @@ int main(int argc, char **argv) {
   std::string data, init, out, cache_dir;
   int n = 64, gpus = 1;
   bool node_grads_on = false, mb_failed = false, profile = false, sweep = false;
+  Worker::Conservative cons;
   double tile_ratio = 1.25, tol = 1e-3;
   for (int i = 1; i + 1 < argc; i += 2) {
     const std::string a = argv[i], v = argv[i + 1];
@@ -44,6 +46,10 @@ int main(int argc, char **argv) {
     else if (a == "--sweep") sweep = v == "1";
     else if (a == "--tile-nb-ratio") tile_ratio = std::stod(v);
     else if (a == "--tol") tol = std::stod(v); // max relative gradient difference
+    else if (a == "--conservative") cons.on = v == "1";
+    else if (a == "--energy-weight") cons.energy = std::stod(v);
+    else if (a == "--force-weight") cons.force = std::stod(v);
+    else if (a == "--nc-force-weight") cons.nc_force = std::stod(v);
   }
   // the node-by-node profile computes one-node graph views; ggml's CUDA graph
   // cache (keyed by the first node's address) could replay a stale capture
@@ -55,10 +61,12 @@ int main(int argc, char **argv) {
   }
   MemmapSplit split(data + "/train");
   Worker worker(init, gpus > 0 ? 0 : -1);
+  worker.conservative = cons;
   const TargetScaling sc = TargetScaling::fit(split);
   const AdaptiveCutoff adaptive = adaptive_cutoff(worker.model());
   NeighborCache nl = NeighborCache::load_or_build(
       split, worker.model().cutoff(), cache_path(cache_dir, split, worker.model().cutoff(), adaptive), 8, adaptive);
+  nl.taper = cons.on && adaptive.enabled();
   std::vector<int64_t> ids(n);
   std::iota(ids.begin(), ids.end(), 0);
   Batch b = make_batch(split, nl, ids, {}, worker.model().species_to_index(), sc, worker.model().cutoff());
@@ -97,9 +105,11 @@ int main(int argc, char **argv) {
   worker.zero_grads();
   StepStats st = worker.run(b, sc.energy_scale, true);
   const std::vector<float> grads = worker.get_grads();
-  fmt::print("loss {:.8g} (E {:.8g}, F {:.8g}); {} atoms, {} neighbours max; "
+  fmt::print("loss {:.8g} (E {:.8g}, F {:.8g}{}); {} atoms, {} neighbours max; "
              "build {:.1f} ms, alloc {:.1f} ms, compute {:.1f} ms\n",
-             st.loss, st.loss_energy, st.loss_force, b.n_atoms, b.max_neighbors,
+             st.loss, st.loss_energy, st.loss_force,
+             cons.on ? fmt::format(", F_nc {:.8g}, {} taper edges", st.loss_nc, b.taper_center.size()) : "",
+             b.n_atoms, b.max_neighbors,
              1e3 * worker.t_build, 1e3 * worker.t_alloc, 1e3 * worker.t_compute);
 
   // micro-batching must reproduce the full-batch loss and gradients
@@ -166,6 +176,7 @@ int main(int argc, char **argv) {
   // gradients on every repetition
   if (!node_grads_on && tile_ratio > 1) {
     Worker tiled(init, gpus > 0 ? 0 : -1, 256);
+    tiled.conservative = cons;
     tiled.set_params(worker.get_params());
     const Tiling tiling{tile_ratio, 1.25, n};
     const double growths[] = {2.0, 1e9};
@@ -341,6 +352,9 @@ int main(int argc, char **argv) {
   nlohmann::json meta;
   meta["ids"] = ids;
   meta["loss"] = st.loss, meta["loss_energy"] = st.loss_energy, meta["loss_force"] = st.loss_force;
+  if (cons.on)
+    meta["conservative"] = {{"energy_weight", cons.energy}, {"force_weight", cons.force},
+                            {"nc_force_weight", cons.nc_force}, {"loss_nc", st.loss_nc}};
   meta["energy_scale"] = sc.energy_scale;
   for (auto [Z, c] : sc.composition) meta["composition"][std::to_string(Z)] = c;
   for (auto [Z, s] : sc.force_scale) meta["force_scale"][std::to_string(Z)] = s;

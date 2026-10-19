@@ -1,5 +1,7 @@
 #include "train/trainer.h"
 
+#include "runtime/graph_jvp.h"
+
 #include <ggml-backend.h>
 #include <ggml.h>
 #include <ggml-impl.h> // ggml_graph_view, for profiling
@@ -216,6 +218,7 @@ std::string cache_path(const std::string &cache_dir, const MemmapSplit &split, f
 
 StepStats &StepStats::operator+=(const StepStats &o) {
   loss += o.loss, loss_energy += o.loss_energy, loss_force += o.loss_force;
+  loss_nc += o.loss_nc, se_force_nc += o.se_force_nc;
   se_energy_per_atom += o.se_energy_per_atom, se_force += o.se_force;
   n_systems += o.n_systems, n_force_components += o.n_force_components;
   return *this;
@@ -375,7 +378,7 @@ static std::pair<double, double> node_cost(const ggml_tensor *t) {
 }
 
 Worker::GraphCost Worker::graph_cost(int n, int m, int S, bool backward) {
-  auto g = build_graph(n, m, S, backward, false);
+  auto g = build_graph(n, m, S, backward ? BACKWARD : FORWARD, false);
   GraphCost c;
   for (int i = 0; i < ggml_graph_n_nodes(g->gf); i++) {
     auto [f, b] = node_cost(ggml_graph_node(g->gf, i));
@@ -387,7 +390,10 @@ Worker::GraphCost Worker::graph_cost(int n, int m, int S, bool backward) {
   return c;
 }
 
-std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, bool backward, bool cached) {
+std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode mode, bool cached) {
+  const bool backward = mode != FORWARD;
+  // the tangent graph and its reverse pass: several times the loss graph
+  const size_t graph_size = mode == MIXED ? 8 * GRAPH_SIZE : GRAPH_SIZE;
   auto g = std::make_unique<StepGraph>();
   auto &interp = model_.interpreter();
   interp.set_dimension("n_atoms", n);
@@ -397,10 +403,10 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, bool
 
   // every shape has the same topology: the first build measures the context
   // (cached graphs keep theirs, so it is kept tight)
-  size_t &ctx_bytes = ctx_bytes_[backward];
+  size_t &ctx_bytes = ctx_bytes_[mode];
   const bool measure = ctx_bytes == 0;
-  g->ctx = ggml_init({measure ? ggml_tensor_overhead() * GRAPH_SIZE * 2 +
-                                    ggml_graph_overhead_custom(GRAPH_SIZE, true)
+  g->ctx = ggml_init({measure ? ggml_tensor_overhead() * graph_size * 2 +
+                                    ggml_graph_overhead_custom(graph_size, true)
                               : ctx_bytes,
                       nullptr, /*no_alloc=*/true});
   ggml_context *ctx = g->ctx;
@@ -412,58 +418,99 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, bool
   // ggml shapes are the reversed PyTorch shapes; order = upload_inputs
   interp.set_input("species", in(GGML_TYPE_I32, {n}, "species"));
   interp.set_input("neighbor_species", in(GGML_TYPE_I32, {m, n}, "neighbor_species"));
-  interp.set_input("edge_vectors", in(GGML_TYPE_F32, {3, m, n}, "edge_vectors"));
+  ggml_tensor *edges = in(GGML_TYPE_F32, {3, m, n}, "edge_vectors");
+  interp.set_input("edge_vectors", edges);
   interp.set_input("padding_mask", in(GGML_TYPE_F32, {m, n}, "padding_mask"));
   interp.set_input("reverse_neighbor_index",
                    in(GGML_TYPE_I32, {int64_t(n) * m}, "reverse_neighbor_index"));
-  interp.set_input("cutoff_values", in(GGML_TYPE_F32, {m, n}, "cutoff_values"));
-  ggml_tensor *atom_weight = in(GGML_TYPE_F32, {n, S}, "atom_weight");
-  ggml_tensor *energy_target = in(GGML_TYPE_F32, {S, 1}, "energy_target");
-  ggml_tensor *force_target = in(GGML_TYPE_F32, {3, n}, "force_target");
-  ggml_tensor *force_mask = in(GGML_TYPE_F32, {1, n}, "force_mask");
-  ggml_tensor *force_scale = in(GGML_TYPE_F32, {1, n}, "force_scale");
-  // per-step loss normalisation (1/S, 1/3N of the whole step): inputs, so a
-  // cached graph serves every step
-  ggml_tensor *norms = in(GGML_TYPE_F32, {2}, "loss_norms");
-  ggml_tensor *e_norm = ggml_view_1d(ctx, norms, 1, 0);
-  ggml_tensor *f_norm = ggml_view_1d(ctx, norms, 1, sizeof(float));
-
-  // out: [n_atoms, 4] = (energy | force) per atom; ggml ne = (4, n)
-  ggml_tensor *out = interp.build(ctx);
-  ggml_tensor *energy = ggml_reshape_2d(
-      ctx, ggml_cont(ctx, ggml_view_2d(ctx, out, 1, n, out->nb[1], 0)), n, 1);
-  ggml_tensor *force = ggml_cont(ctx, ggml_view_2d(ctx, out, 3, n, out->nb[1], sizeof(float)));
-  // metatrain's average_by_num_atoms: per-structure Σ_i e_i / N
-  ggml_tensor *d_energy = ggml_sub(ctx, ggml_mul_mat(ctx, atom_weight, energy), energy_target);
-  ggml_tensor *d_force = ggml_mul(ctx, ggml_sub(ctx, force, force_target), force_mask);
-  ggml_tensor *loss_e = ggml_mul(ctx, ggml_sum(ctx, ggml_sqr(ctx, d_energy)), e_norm);
-  ggml_tensor *loss_f = ggml_mul(ctx, ggml_sum(ctx, ggml_sqr(ctx, d_force)), f_norm);
-  ggml_tensor *loss = ggml_add(ctx, loss_e, loss_f);
-  // physical force squared error, for the metrics (not differentiated)
-  ggml_tensor *se_f = ggml_sum(ctx, ggml_sqr(ctx, ggml_mul(ctx, d_force, force_scale)));
-  g->stats = ggml_concat(ctx, ggml_concat(ctx, ggml_concat(ctx, loss, loss_e, 0), loss_f, 0), se_f, 0);
-  ggml_set_output(g->stats);
-  // per structure: energy error and the atom-mean physical force squared error
-  g->per_atom = ggml_sum_rows(ctx, ggml_sqr(ctx, ggml_mul(ctx, d_force, force_scale)));
-  ggml_set_output(g->per_atom);
-  g->per_system = ggml_concat(ctx, d_energy, ggml_mul_mat(ctx, atom_weight, ggml_reshape_2d(ctx, g->per_atom, n, 1)), 1);
-  ggml_set_output(g->per_system);
-
-  g->gf = ggml_new_graph_custom(ctx, GRAPH_SIZE, backward);
-  ggml_build_forward_expand(g->gf, g->stats);
-  ggml_build_forward_expand(g->gf, g->per_system);
-  g->n_forward = ggml_graph_n_nodes(g->gf);
-  if (backward) {
-    ggml_set_loss(loss);
-    // parameter gradients accumulate in place into the persistent views
-    std::vector<ggml_tensor *> accs(ggml_graph_n_nodes(g->gf), nullptr);
-    for (int i = 0; i < ggml_graph_n_nodes(g->gf); i++) {
-      auto it = acc_.find(ggml_graph_node(g->gf, i));
-      if (it != acc_.end()) accs[i] = it->second;
-    }
-    ggml_build_backward_expand(ctx, g->gf, accs.data());
-    g->loss_grad = ggml_graph_get_grad_acc(g->gf, loss);
+  ggml_tensor *cv = in(GGML_TYPE_F32, {m, n}, "cutoff_values");
+  interp.set_input("cutoff_values", cv);
+  if (mode == FORCES) {
+    // dE/d(edge vectors, cutoff values) of E = sum of the atomic energies;
+    // the weights are not differentiated (their flags restored after)
+    ggml_set_param(edges), ggml_set_param(cv);
+    for (ggml_tensor *p : params_) p->flags &= ~GGML_TENSOR_FLAG_PARAM;
+    g->out = interp.build(ctx);
+    ggml_set_output(g->out);
+    ggml_tensor *E = ggml_sum(ctx, ggml_cont(ctx, ggml_view_2d(ctx, g->out, 1, n, g->out->nb[1], 0)));
+    g->gf = ggml_new_graph_custom(ctx, graph_size, true);
+    ggml_build_forward_expand(g->gf, g->out);
+    ggml_build_forward_expand(g->gf, E);
+    g->n_forward = ggml_graph_n_nodes(g->gf);
+    ggml_set_loss(E);
+    ggml_build_backward_expand(ctx, g->gf, nullptr);
+    for (ggml_tensor *p : params_) ggml_set_param(p);
+    g->grad_v = ggml_graph_get_grad(g->gf, edges);
+    g->grad_c = ggml_graph_get_grad(g->gf, cv);
+    if (!g->grad_v) throw std::runtime_error("conservative forces: E does not depend on the edge vectors");
+    ggml_set_output(g->grad_v);
+    if (g->grad_c) ggml_set_output(g->grad_c);
+    g->loss_grad = ggml_graph_get_grad_acc(g->gf, E);
     ggml_set_input(g->loss_grad);
+  } else {
+    ggml_tensor *atom_weight = in(GGML_TYPE_F32, {n, S}, "atom_weight");
+    ggml_tensor *energy_target = in(GGML_TYPE_F32, {S, 1}, "energy_target");
+    ggml_tensor *force_target = in(GGML_TYPE_F32, {3, n}, "force_target");
+    ggml_tensor *force_mask = in(GGML_TYPE_F32, {1, n}, "force_mask");
+    ggml_tensor *force_scale = in(GGML_TYPE_F32, {1, n}, "force_scale");
+    // per-step loss normalisation (1/S, 1/3N of the whole step): inputs, so a
+    // cached graph serves every step
+    ggml_tensor *norms = in(GGML_TYPE_F32, {2}, "loss_norms");
+    ggml_tensor *e_norm = ggml_view_1d(ctx, norms, 1, 0);
+    ggml_tensor *f_norm = ggml_view_1d(ctx, norms, 1, sizeof(float));
+
+    // MIXED: tangents of the edge vectors and cutoff values (the force
+    // residual, Worker::run_conservative)
+    ggml_tensor *dv = mode == MIXED ? in(GGML_TYPE_F32, {3, m, n}, "edge_tangent") : nullptr;
+    ggml_tensor *dc = mode == MIXED ? in(GGML_TYPE_F32, {m, n}, "cutoff_tangent") : nullptr;
+
+    // out: [n_atoms, 4] = (energy | force) per atom; ggml ne = (4, n)
+    ggml_tensor *out = interp.build(ctx);
+    ggml_tensor *energy = ggml_reshape_2d(
+        ctx, ggml_cont(ctx, ggml_view_2d(ctx, out, 1, n, out->nb[1], 0)), n, 1);
+    ggml_tensor *force = ggml_cont(ctx, ggml_view_2d(ctx, out, 3, n, out->nb[1], sizeof(float)));
+    // metatrain's average_by_num_atoms: per-structure Σ_i e_i / N
+    ggml_tensor *d_energy = ggml_sub(ctx, ggml_mul_mat(ctx, atom_weight, energy), energy_target);
+    ggml_tensor *d_force = ggml_mul(ctx, ggml_sub(ctx, force, force_target), force_mask);
+    ggml_tensor *loss_e = ggml_mul(ctx, ggml_sum(ctx, ggml_sqr(ctx, d_energy)), e_norm);
+    ggml_tensor *loss_f = ggml_mul(ctx, ggml_sum(ctx, ggml_sqr(ctx, d_force)), f_norm);
+    ggml_tensor *loss = ggml_add(ctx, loss_e, loss_f);
+    if (mode == MIXED) {
+      // - <dE/dx, u> along the scaled residual u: its weight gradient is the
+      // conservative force loss's (u held fixed)
+      runtime::GraphJVP jvp(ctx);
+      jvp.seed(edges, dv);
+      jvp.seed(cv, dc);
+      ggml_tensor *J = jvp(ggml_sum(ctx, energy));
+      if (!J) throw std::runtime_error("conservative forces: E has no tangent");
+      loss = ggml_sub(ctx, loss, J);
+    }
+    // physical force squared error, for the metrics (not differentiated)
+    ggml_tensor *se_f = ggml_sum(ctx, ggml_sqr(ctx, ggml_mul(ctx, d_force, force_scale)));
+    g->stats = ggml_concat(ctx, ggml_concat(ctx, ggml_concat(ctx, loss, loss_e, 0), loss_f, 0), se_f, 0);
+    ggml_set_output(g->stats);
+    // per structure: energy error and the atom-mean physical force squared error
+    g->per_atom = ggml_sum_rows(ctx, ggml_sqr(ctx, ggml_mul(ctx, d_force, force_scale)));
+    ggml_set_output(g->per_atom);
+    g->per_system = ggml_concat(ctx, d_energy, ggml_mul_mat(ctx, atom_weight, ggml_reshape_2d(ctx, g->per_atom, n, 1)), 1);
+    ggml_set_output(g->per_system);
+
+    g->gf = ggml_new_graph_custom(ctx, graph_size, backward);
+    ggml_build_forward_expand(g->gf, g->stats);
+    ggml_build_forward_expand(g->gf, g->per_system);
+    g->n_forward = ggml_graph_n_nodes(g->gf);
+    if (backward) {
+      ggml_set_loss(loss);
+      // parameter gradients accumulate in place into the persistent views
+      std::vector<ggml_tensor *> accs(ggml_graph_n_nodes(g->gf), nullptr);
+      for (int i = 0; i < ggml_graph_n_nodes(g->gf); i++) {
+        auto it = acc_.find(ggml_graph_node(g->gf, i));
+        if (it != acc_.end()) accs[i] = it->second;
+      }
+      ggml_build_backward_expand(ctx, g->gf, accs.data());
+      g->loss_grad = ggml_graph_get_grad_acc(g->gf, loss);
+      ggml_set_input(g->loss_grad);
+    }
   }
   g->constants = interp.take_constants();
   if (g->loss_grad) g->constants.emplace_back(g->loss_grad, 1.0f);
@@ -496,8 +543,8 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, bool
   return g;
 }
 
-Worker::StepGraph &Worker::cached_graph(int n, int m, int S, bool backward) {
-  const auto key = std::make_tuple(n, m, S, backward);
+Worker::StepGraph &Worker::cached_graph(int n, int m, int S, Mode mode) {
+  const auto key = std::make_tuple(n, m, S, int(mode));
   auto it = cache_.find(key);
   if (it != cache_.end()) {
     cache_hits++;
@@ -509,7 +556,7 @@ Worker::StepGraph &Worker::cached_graph(int n, int m, int S, bool backward) {
     cache_.erase(std::min_element(cache_.begin(), cache_.end(), [](auto &a, auto &b) {
       return a.second->last_use < b.second->last_use;
     }));
-  auto g = build_graph(n, m, S, backward, true);
+  auto g = build_graph(n, m, S, mode, true);
   // all cached graphs share the compute buffer (they run one at a time); when
   // it has to grow, the old buffer is freed and every other graph dangles
   const size_t before = compute_buffer_bytes();
@@ -520,18 +567,23 @@ Worker::StepGraph &Worker::cached_graph(int n, int m, int S, bool backward) {
   return *(cache_[key] = std::move(g));
 }
 
-void Worker::upload_inputs(StepGraph &g, const Batch &b) {
-  const auto [e_norm, f_norm] = loss_norms(b);
+void Worker::upload_inputs(StepGraph &g, const Batch &b, const std::vector<float> *dv,
+                           const std::vector<float> *dc) {
+  auto [e_norm, f_norm] = loss_norms(b);
+  if (conservative.on) e_norm *= conservative.energy, f_norm *= conservative.nc_force;
   const float norms[2] = {e_norm, f_norm};
   auto span = [](const auto &v) {
     return std::pair<const void *, size_t>(v.data(), v.size() * sizeof(v[0]));
   };
-  const std::pair<const void *, size_t> src[] = {
+  // in build_graph's order: the model's inputs, the loss's, the tangents
+  std::vector<std::pair<const void *, size_t>> src = {
       span(b.species),        span(b.neighbor_species), span(b.edge_vectors),
-      span(b.padding_mask),   span(b.reverse_neighbor_index), span(b.cutoff_values),
-      span(b.atom_weight),    span(b.energy_target),   span(b.force_target),
-      span(b.force_mask),     span(b.force_scale),      {norms, sizeof norms}};
-  if (std::size(src) != g.inputs.size()) throw std::logic_error("upload_inputs: input count");
+      span(b.padding_mask),   span(b.reverse_neighbor_index), span(b.cutoff_values)};
+  if (g.inputs.size() > src.size())
+    src.insert(src.end(), {span(b.atom_weight), span(b.energy_target), span(b.force_target),
+                           span(b.force_mask), span(b.force_scale), {norms, sizeof norms}});
+  if (dv) src.insert(src.end(), {span(*dv), span(*dc)});
+  if (src.size() != g.inputs.size()) throw std::logic_error("upload_inputs: input count");
   for (size_t i = 0; i < g.inputs.size(); i++)
     if (ggml_nbytes(g.inputs[i]) != src[i].second)
       throw std::logic_error(std::string("upload size mismatch for ") + ggml_get_name(g.inputs[i]));
@@ -548,31 +600,26 @@ void Worker::upload_inputs(StepGraph &g, const Batch &b) {
   }
 }
 
-StepStats Worker::run(const Batch &b, double energy_scale, bool backward) {
+Worker::StepGraph &Worker::graph(int n, int m, int S, Mode mode, std::unique_ptr<StepGraph> &once) {
   auto t0 = clock_type::now();
-  const int n = b.n_atoms, m = b.max_neighbors, S = b.n_systems;
-  std::unique_ptr<StepGraph> once;
-  StepGraph *g;
   if (cache_limit_ > 0) {
-    g = &cached_graph(n, m, S, backward);
-    t_build = seconds_since(t0), t_alloc = 0;
-  } else {
-    once = build_graph(n, m, S, backward, false);
-    g = once.get();
-    t_build = seconds_since(t0);
-    t0 = clock_type::now();
-    if (!ggml_gallocr_alloc_graph(galloc_, g->gf))
-      throw std::runtime_error(fmt::format("cannot allocate the graph ({} atoms x {} neighbours)", n, m));
-    fill_constants(g->constants);
-    t_alloc = seconds_since(t0);
+    StepGraph &g = cached_graph(n, m, S, mode);
+    t_build += seconds_since(t0);
+    return g;
   }
-
+  once = build_graph(n, m, S, mode, false);
+  t_build += seconds_since(t0);
   t0 = clock_type::now();
-  upload_inputs(*g, b);
-  t_upload = seconds_since(t0);
+  if (!ggml_gallocr_alloc_graph(galloc_, once->gf))
+    throw std::runtime_error(fmt::format("cannot allocate the graph ({} atoms x {} neighbours)", n, m));
+  fill_constants(once->constants);
+  t_alloc += seconds_since(t0);
+  return *once;
+}
 
-  t0 = clock_type::now();
-  ggml_cgraph *gf = g->gf;
+void Worker::compute(StepGraph &g) {
+  auto t0 = clock_type::now();
+  ggml_cgraph *gf = g.gf;
   if (profile) {
     for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
       ggml_cgraph one = ggml_graph_view(gf, i, i + 1);
@@ -581,13 +628,13 @@ StepStats Worker::run(const Batch &b, double energy_scale, bool backward) {
         throw std::runtime_error("graph compute failed");
       ggml_backend_synchronize(model_.backend());
       const ggml_tensor *node = ggml_graph_node(gf, i);
-      auto &s = profile_ops[std::string(i < g->n_forward ? "fwd:" : "bwd:") + ggml_op_desc(node)];
+      auto &s = profile_ops[std::string(i < g.n_forward ? "fwd:" : "bwd:") + ggml_op_desc(node)];
       auto [f, b] = node_cost(node);
       const double ms = 1e3 * seconds_since(tn);
       s.ms += ms, s.count++, s.flops += f, s.bytes += b;
       if (node->op == GGML_OP_CONT || node->op == GGML_OP_CPY) {
         // what the copy materialises: the chain of views down to the producer
-        std::string key = std::string(i < g->n_forward ? "fwd:" : "bwd:") + ggml_op_desc(node) + " <-";
+        std::string key = std::string(i < g.n_forward ? "fwd:" : "bwd:") + ggml_op_desc(node) + " <-";
         const ggml_tensor *t = node->src[0];
         for (int depth = 0; t && depth < 4; depth++, t = t->src[0]) {
           key += std::string(" ") + ggml_op_desc(t);
@@ -598,7 +645,7 @@ StepStats Worker::run(const Batch &b, double energy_scale, bool backward) {
         auto &c = profile_copies[key];
         c.ms += ms, c.count++, c.bytes += b;
       }
-      profile_nodes.push_back({ms, fmt::format("{}:{} {} [{} {} {} {}]{}", i < g->n_forward ? "fwd" : "bwd",
+      profile_nodes.push_back({ms, fmt::format("{}:{} {} [{} {} {} {}]{}", i < g.n_forward ? "fwd" : "bwd",
                                                ggml_op_desc(node), node->name, node->ne[0], node->ne[1],
                                                node->ne[2], node->ne[3],
                                                ggml_is_contiguous(node) ? "" : " non-contiguous")});
@@ -606,8 +653,21 @@ StepStats Worker::run(const Batch &b, double energy_scale, bool backward) {
   } else if (ggml_backend_graph_compute(model_.backend(), gf) != GGML_STATUS_SUCCESS) {
     throw std::runtime_error("graph compute failed");
   }
-  t_compute = seconds_since(t0);
-  if (after_compute) after_compute(gf);
+  t_compute += seconds_since(t0);
+  if (after_compute) after_compute(g.gf);
+}
+
+StepStats Worker::run(const Batch &b, double energy_scale, bool backward) {
+  t_build = t_alloc = t_upload = t_compute = t_download = 0;
+  if (conservative.on) return run_conservative(b, energy_scale, backward);
+  const int n = b.n_atoms, m = b.max_neighbors, S = b.n_systems;
+  std::unique_ptr<StepGraph> once;
+  StepGraph *g = &graph(n, m, S, backward ? BACKWARD : FORWARD, once);
+
+  auto t0 = clock_type::now();
+  upload_inputs(*g, b);
+  t_upload = seconds_since(t0);
+  compute(*g);
 
   t0 = clock_type::now();
   float stats[4];
@@ -635,6 +695,130 @@ StepStats Worker::run(const Batch &b, double energy_scale, bool backward) {
     }
   }
   t_download = seconds_since(t0);
+  return st;
+}
+
+StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool backward) {
+  const int n = b.n_atoms, m = b.max_neighbors, S = b.n_systems;
+  const auto [e_norm, f_norm] = loss_norms(b);
+  const Conservative &w = conservative;
+
+  // 1. forward + backward to the edge vectors and cutoff values
+  std::unique_ptr<StepGraph> once;
+  StepGraph &gf = graph(n, m, S, FORCES, once);
+  auto t0 = clock_type::now();
+  upload_inputs(gf, b);
+  t_upload += seconds_since(t0);
+  compute(gf);
+  t0 = clock_type::now();
+  std::vector<float> out(4 * static_cast<size_t>(n)), gv(3 * static_cast<size_t>(n) * m), gc;
+  ggml_backend_tensor_get(gf.out, out.data(), 0, out.size() * sizeof(float));
+  ggml_backend_tensor_get(gf.grad_v, gv.data(), 0, gv.size() * sizeof(float));
+  const bool taper = !b.taper_center.empty();
+  if (taper) {
+    if (!gf.grad_c) throw std::runtime_error("conservative forces: no cutoff-value gradient");
+    gc.resize(static_cast<size_t>(n) * m);
+    ggml_backend_tensor_get(gf.grad_c, gc.data(), 0, gc.size() * sizeof(float));
+  }
+  once.reset();
+  t_download += seconds_since(t0);
+
+  // 2. F = -dE/dx (scaled energy units): edge gradients to their atoms, and
+  // through the adaptive radii, dE/dr_k = S_k = sum over edges touching k
+  // of dE/dc / 2 (pair cutoffs (r_i + r_j) / 2), along the taper edges
+  // (k -> l): dE/dv += S_k J v / |v| (runtime/graph_model.cpp's chain)
+  auto real = [&](int f) { return b.padding_mask[f] < 0.5f && b.neighbor_atom[f] >= 0; };
+  std::vector<double> F(3 * static_cast<size_t>(n), 0.0);
+  for (int f = 0; f < n * m; f++) {
+    if (!real(f)) continue;
+    const int i = f / m, k = b.neighbor_atom[f];
+    for (int c = 0; c < 3; c++) F[3 * i + c] += gv[3 * f + c], F[3 * k + c] -= gv[3 * f + c];
+  }
+  std::vector<double> Sk;
+  if (taper) {
+    Sk.assign(n, 0.0);
+    for (int f = 0; f < n * m; f++)
+      if (real(f)) Sk[f / m] += 0.5 * gc[f], Sk[b.neighbor_atom[f]] += 0.5 * gc[f];
+    for (size_t t = 0; t < b.taper_center.size(); t++) {
+      const int k = b.taper_center[t], l = b.taper_neighbor[t];
+      const float *v = &b.taper_vector[3 * t];
+      const double d = std::sqrt(double(v[0]) * v[0] + double(v[1]) * v[1] + double(v[2]) * v[2]);
+      const double coef = d > 0 ? Sk[k] * b.taper_jacobian[t] / d : 0.0;
+      for (int c = 0; c < 3; c++) F[3 * k + c] += coef * v[c], F[3 * l + c] -= coef * v[c];
+    }
+  }
+
+  // the loss terms and metrics; force targets are physical F / s_Z, the
+  // conservative ones F / s_E (the gradient of the scaled energy)
+  StepStats st;
+  st.n_systems = b.n_real_systems;
+  std::vector<double> d_e(S, 0.0), u(3 * static_cast<size_t>(n), 0.0), fse(S, 0.0);
+  for (int k = 0; k < S; k++) {
+    for (int a = 0; a < n; a++) d_e[k] += double(b.atom_weight[static_cast<size_t>(k) * n + a]) * out[4 * a];
+    d_e[k] -= b.energy_target[k];
+    st.loss_energy += w.energy * e_norm * d_e[k] * d_e[k];
+    st.se_energy_per_atom += d_e[k] * d_e[k] * energy_scale * energy_scale;
+  }
+  std::vector<float> per_atom(n, 0.0f);
+  for (int a = 0, sys = 0, left = S ? b.n_per_system[0] : 0; a < n; a++) {
+    if (b.force_mask[a] == 0.0f) continue;
+    while (left == 0 && sys + 1 < S) left = b.n_per_system[++sys];
+    left--;
+    st.n_force_components += 3;
+    double e2 = 0;
+    for (int c = 0; c < 3; c++) {
+      const double target = double(b.force_target[3 * a + c]) * b.force_scale[a];
+      const double r = F[3 * a + c] - target / energy_scale, rnc = out[4 * a + 1 + c] - b.force_target[3 * a + c];
+      st.loss_force += w.force * f_norm * r * r;
+      st.loss_nc += w.nc_force * f_norm * rnc * rnc;
+      st.se_force_nc += std::pow(rnc * b.force_scale[a], 2);
+      e2 += std::pow(r * energy_scale, 2);
+      u[3 * a + c] = 2 * w.force * f_norm * r;
+    }
+    st.se_force += e2;
+    per_atom[a] = static_cast<float>(e2);
+    fse[sys] += e2;
+  }
+  st.loss = st.loss_energy + st.loss_force + st.loss_nc;
+  if (system_errors) {
+    for (int k = 0; k < b.n_real_systems; k++)
+      system_errors->push_back({b.ids[k], -1, b.n_per_system[k], static_cast<float>(d_e[k] * energy_scale),
+                                static_cast<float>(fse[k])});
+    if (atom_errors) { // real atoms come first, structure by structure
+      const int n_real = std::accumulate(b.n_per_system.begin(), b.n_per_system.begin() + b.n_real_systems, 0);
+      atom_errors->insert(atom_errors->end(), per_atom.begin(), per_atom.begin() + n_real);
+    }
+  }
+  if (!backward) return st;
+
+  // 3. tangents along u (atoms): edge (i -> k) moves by u_k - u_i, a pair
+  // cutoff by (dr_i + dr_k) / 2, dr_k = sum over taper edges (k -> l) of
+  // J (v / |v|) . (u_l - u_k); then the loss minus <dE/dx, -u>, backward
+  std::vector<float> dv(3 * static_cast<size_t>(n) * m, 0.0f), dc(static_cast<size_t>(n) * m, 0.0f);
+  for (int f = 0; f < n * m; f++) {
+    if (!real(f)) continue;
+    const int i = f / m, k = b.neighbor_atom[f];
+    for (int c = 0; c < 3; c++) dv[3 * f + c] = static_cast<float>(u[3 * k + c] - u[3 * i + c]);
+  }
+  if (taper) {
+    std::vector<double> dr(n, 0.0);
+    for (size_t t = 0; t < b.taper_center.size(); t++) {
+      const int k = b.taper_center[t], l = b.taper_neighbor[t];
+      const float *v = &b.taper_vector[3 * t];
+      const double d = std::sqrt(double(v[0]) * v[0] + double(v[1]) * v[1] + double(v[2]) * v[2]);
+      if (!(d > 0)) continue;
+      double proj = 0;
+      for (int c = 0; c < 3; c++) proj += v[c] * (u[3 * l + c] - u[3 * k + c]);
+      dr[k] += b.taper_jacobian[t] * proj / d;
+    }
+    for (int f = 0; f < n * m; f++)
+      if (real(f)) dc[f] = static_cast<float>(0.5 * (dr[f / m] + dr[b.neighbor_atom[f]]));
+  }
+  StepGraph &gm = graph(n, m, S, MIXED, once);
+  t0 = clock_type::now();
+  upload_inputs(gm, b, &dv, &dc);
+  t_upload += seconds_since(t0);
+  compute(gm);
   return st;
 }
 
@@ -1200,6 +1384,10 @@ void train(const TrainOptions &o) {
     workers.push_back(std::make_unique<Worker>(
         o.init_gguf, o.n_gpus == 0 ? -1 : w,
         o.tile_nb_ratio > 1 ? static_cast<size_t>(o.graph_cache) : 0));
+  for (auto &w : workers) w->conservative = {o.conservative, o.energy_weight, o.force_weight, o.nc_force_weight};
+  if (o.conservative)
+    fmt::print("conservative forces -dE/dx: loss weights energy {}, forces {}, direct forces {}\n", o.energy_weight,
+               o.force_weight, o.nc_force_weight);
   Worker &w0 = *workers[0];
   const float cutoff = w0.model().cutoff();
   const auto &species = w0.model().species_to_index();
@@ -1211,7 +1399,7 @@ void train(const TrainOptions &o) {
   const bool eval_only = o.epochs == 0;
   auto t0 = clock_type::now();
   TargetScaling scaling;
-  if (eval_only) {
+  if (eval_only || o.model_baselines) {
     for (auto [Z, c] : w0.model().composition_energies()) scaling.composition[Z] = c;
     for (auto [Z, f] : w0.model().nc_force_scales()) scaling.force_scale[Z] = f;
     scaling.energy_scale = w0.model().energy_scale();
@@ -1219,7 +1407,7 @@ void train(const TrainOptions &o) {
     scaling = TargetScaling::fit(train_split);
   }
   fmt::print("targets ({}): composition for {} species, energy scale {:.6g} eV/atom ({:.1f} s)\n",
-             eval_only ? "from the model" : "fitted", scaling.composition.size(),
+             eval_only || o.model_baselines ? "from the model" : "fitted", scaling.composition.size(),
              scaling.energy_scale, seconds_since(t0));
 
   t0 = clock_type::now();
@@ -1227,8 +1415,10 @@ void train(const TrainOptions &o) {
   if (adaptive.enabled())
     fmt::print("adaptive cutoff: {} neighbours (solver, taper {} A) within {} A\n", adaptive.n_target, adaptive.width, cutoff);
   auto nl = [&](const MemmapSplit &s) {
-    return NeighborCache::load_or_build(s, cutoff, cache_path(o.cache_dir, s, cutoff, adaptive), o.n_threads,
-                                        adaptive);
+    NeighborCache c = NeighborCache::load_or_build(s, cutoff, cache_path(o.cache_dir, s, cutoff, adaptive),
+                                                   o.n_threads, adaptive);
+    c.taper = o.conservative && adaptive.enabled(); // the radii's share of -dE/dx
+    return c;
   };
   const NeighborCache nl_train = eval_only ? NeighborCache{} : nl(train_split),
                       nl_val = nl(val_split), nl_test = nl(test_split);
@@ -1320,6 +1510,11 @@ void train(const TrainOptions &o) {
   auto rmse = [](const StepStats &s) {
     return std::pair{1e3 * std::sqrt(s.se_energy_per_atom / s.n_systems),
                      1e3 * std::sqrt(s.se_force / s.n_force_components)};
+  };
+  // conservative mode: the direct head's force RMSE too
+  auto nc_rmse = [&](const StepStats &s) {
+    return o.conservative ? fmt::format(", F_nc {:.2f} meV/A", 1e3 * std::sqrt(s.se_force_nc / s.n_force_components))
+                          : std::string();
   };
 
   // step packing: the cost model is refitted to measured micro-batch times
@@ -1441,11 +1636,12 @@ void train(const TrainOptions &o) {
       for (auto &s : st) ep += s, step_total += s;
       if ((step + 1) % o.log_every == 0) {
         const double el = seconds_since(t_epoch);
-        fmt::print("epoch {} step {}/{}: loss {:.4g} (E {:.4g}, F {:.4g}) lr {:.3g} |g| {:.3g} | "
+        fmt::print("epoch {} step {}/{}: loss {:.4g} (E {:.4g}, F {:.4g}{}) lr {:.3g} |g| {:.3g} | "
                    "{:.1f} struct/s; per step: wait {:.1f} ms, gpu {:.1f} (build {:.1f}, compute {:.1f}), "
                    "sync {:.1f} ms; {:.2f} micro-batches/worker; graphs {} cached ({:.1f} GB buffer), {} misses, {} flushes\n",
                    epoch, step + 1, steps_per_epoch, step_total.loss / W, step_total.loss_energy / W,
                    step_total.loss_force / W,
+                   o.conservative ? fmt::format(", F_nc {:.4g}", step_total.loss_nc / W) : std::string(),
                    lr, norm, (step + 1) * W * B / el, 1e3 * t_wait / (step + 1),
                    1e3 * t_gpu / (step + 1), 1e3 * t_build / (step + 1),
                    1e3 * t_compute / (step + 1), 1e3 * t_sync / (step + 1),
@@ -1469,9 +1665,9 @@ void train(const TrainOptions &o) {
     const StepStats val = evaluate(val_split, nl_val, ids_val);
     auto [ve, vf] = rmse(val);
     fmt::print("epoch {} done: train {:.1f} s ({:.1f} struct/s, mean loss {:.4g}), RMSE E {:.2f} meV/atom, "
-               "F {:.2f} meV/A | val ({:.1f} s) RMSE E {:.2f} meV/atom, F {:.2f} meV/A\n",
-               epoch, t_train, ep.n_systems / t_train, ep.loss / done, tre, trf,
-               seconds_since(t), ve, vf);
+               "F {:.2f} meV/A{} | val ({:.1f} s) RMSE E {:.2f} meV/atom, F {:.2f} meV/A{}\n",
+               epoch, t_train, ep.n_systems / t_train, ep.loss / done, tre, trf, nc_rmse(ep),
+               seconds_since(t), ve, vf, nc_rmse(val));
     std::fflush(stdout);
     params = w0.get_params(); // the master copy lives on device 0
     write_gguf(o.init_gguf, fmt::format("{}.epoch{}", o.output, epoch), w0, params, scaling);
@@ -1500,12 +1696,15 @@ void train(const TrainOptions &o) {
     return st;
   };
   if (eval_only || !o.dump_errors.empty()) {
-    auto [ve, vf] = rmse(dump("val", [&] { return evaluate(val_split, nl_val, ids_val); }));
-    fmt::print("val: RMSE E {:.2f} meV/atom, F {:.2f} meV/A over {} structures\n", ve, vf, ids_val.size());
+    const StepStats val = dump("val", [&] { return evaluate(val_split, nl_val, ids_val); });
+    auto [ve, vf] = rmse(val);
+    fmt::print("val: RMSE E {:.2f} meV/atom, F {:.2f} meV/A{} over {} structures\n", ve, vf, nc_rmse(val),
+               ids_val.size());
   }
   const StepStats test = dump("test", [&] { return evaluate(test_split, nl_test, ids_test); });
   auto [te, tf] = rmse(test);
-  fmt::print("test: RMSE E {:.2f} meV/atom, F {:.2f} meV/A over {} structures\n", te, tf, test.n_systems);
+  fmt::print("test: RMSE E {:.2f} meV/atom, F {:.2f} meV/A{} over {} structures\n", te, tf, nc_rmse(test),
+             test.n_systems);
   std::fflush(stdout);
   if (!eval_only) {
     params = w0.get_params();

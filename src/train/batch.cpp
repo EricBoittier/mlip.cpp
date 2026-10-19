@@ -152,6 +152,7 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
   b.padding_mask.assign(n * m, 1.0f);
   b.reverse_neighbor_index.assign(n * m, 0);
   b.cutoff_values.assign(n * m, cutoff);
+  b.neighbor_atom.assign(n * m, -1);
   b.atom_weight.assign(static_cast<size_t>(b.n_systems) * n, 0.0f);
   b.energy_target.assign(b.n_systems, 0.0f);
   b.force_target.assign(n * 3, 0.0f);
@@ -197,9 +198,21 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
       rotate(nl.vector[e].data(), &b.edge_vectors[3 * flat]);
       b.padding_mask[flat] = 0.0f;
       if (!nl.pair_cutoff.empty()) b.cutoff_values[flat] = nl.pair_cutoff[e];
+      b.neighbor_atom[flat] = offset + nl.neighbor[e];
       const int32_t r = nl.reverse[e];
       b.reverse_neighbor_index[flat] =
           r >= 0 ? (offset + nl.center[e0 + r]) * m + nl.slot[e0 + r] : flat;
+    }
+    if (nl.taper) {
+      const TaperEdges t = taper_edges(split, s, nl.cutoff, nl.adaptive);
+      for (size_t e = 0; e < t.center.size(); e++) {
+        b.taper_center.push_back(offset + t.center[e]);
+        b.taper_neighbor.push_back(offset + t.neighbor[e]);
+        float v[3];
+        rotate(t.vector[e].data(), v);
+        b.taper_vector.insert(b.taper_vector.end(), v, v + 3);
+        b.taper_jacobian.push_back(t.jacobian[e]);
+      }
     }
     offset += ns;
   }
