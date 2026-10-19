@@ -20,6 +20,7 @@
 //       [--traj FILE.xyz --traj-every 100] [--thermo FILE.tsv]
 //       NVE from Maxwell-Boltzmann velocities; dt in fs, --steps counts dt steps.
 
+#include "core/adaptive_cutoff.h"
 #include "md/md_engine.h"
 #include "mlipcpp/io.h"
 #include "mlipcpp/neighbor_list.h"
@@ -141,8 +142,27 @@ int edges(const Args &a) {
       fmt::print("cell {}: {:.4f} {:.4f} {:.4f} pbc {}\n", k, c->matrix[k][0], c->matrix[k][1], c->matrix[k][2], c->periodic[k]);
   fmt::print("E engine {:.6f}  cpu {:.6f}  diff/atom {:.3f} meV; edges engine {} cpu {}\n", E, r.energy,
              1e3 * (E - r.energy) / sys.num_atoms(), eng.n_edges(), nl.num_pairs());
+  // GraphModel's adaptive radii (solver, double, from the full list) and the
+  // edges it keeps: d <= mean of the two radii
+  std::vector<std::vector<double>> dist(sys.num_atoms());
+  for (int e = 0; e < nl.num_pairs(); e++) {
+    const auto &v = nl.edge_vectors[e];
+    dist[nl.centers[e]].push_back(std::sqrt(double(v[0]) * v[0] + double(v[1]) * v[1] + double(v[2]) * v[2]) + 1e-15);
+  }
+  std::vector<double> rad(sys.num_atoms(), ref.cutoff());
+  if (ref.num_neighbors_adaptive() > 0)
+    for (int i = 0; i < sys.num_atoms(); i++)
+      rad[i] = adaptive::solve(static_cast<int>(dist[i].size()), [&](int k) { return dist[i][k]; }, ref.cutoff(),
+                               ref.num_neighbors_adaptive(), ref.cutoff_width_adaptive()).r;
+  std::vector<int> n_keep(sys.num_atoms(), 0);
+  for (int e = 0; e < nl.num_pairs(); e++) {
+    const auto &v = nl.edge_vectors[e];
+    const double d = std::sqrt(double(v[0]) * v[0] + double(v[1]) * v[1] + double(v[2]) * v[2]) + 1e-15;
+    n_keep[nl.centers[e]] += d <= 0.5 * (rad[nl.centers[e]] + rad[nl.neighbors[e]]);
+  }
   for (int i = 0; i < sys.num_atoms(); i++)
-    fmt::print("  atom {} Z {}: engine {} cpu {}{}\n", i, sys.atomic_numbers()[i], gpu[i], cpu[i], gpu[i] != cpu[i] ? "  <--" : "");
+    fmt::print("  atom {} Z {}: engine {} cpu {} kept {} radius {:.9f}{}\n", i, sys.atomic_numbers()[i], gpu[i], cpu[i],
+               n_keep[i], rad[i], gpu[i] != n_keep[i] ? "  <--" : "");
   // translation invariance of the CPU model: at the engine's (wrapped)
   // positions, and with every atom moved by the same vector
   {
