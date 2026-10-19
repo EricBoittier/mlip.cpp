@@ -1256,6 +1256,9 @@ ggml_tensor *GraphInterpreter::build_clamp(ggml_context *ctx,
   // edges) the floor is 0, so log gives -inf and the padded slot drops out of
   // the softmax, as if absent (metatrain has no slot there at all).
   if (exact_padding_mask_ && min_val == 1e-15f) min_val = 0.0f;
+  // diagnostics: MLIPCPP_PAD_FLOOR=1e-30 moves that bias to log(floor)
+  static const char *floor_env = std::getenv("MLIPCPP_PAD_FLOOR");
+  if (floor_env && min_val == 1e-15f) min_val = std::strtof(floor_env, nullptr);
   return ggml_clamp(ctx, a, min_val, max_val);
 }
 
