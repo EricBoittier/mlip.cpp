@@ -2,6 +2,11 @@
 
 #include "runtime/graph_jvp.h"
 
+#ifdef MLIPCPP_NCCL
+#include <cuda_runtime.h>
+#include <nccl.h>
+#endif
+
 #include <ggml-backend.h>
 #include <ggml.h>
 #include <ggml-impl.h> // ggml_graph_view, for profiling
@@ -17,6 +22,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <mutex>
 #include <filesystem>
 #include <functional>
@@ -950,9 +956,76 @@ bool allow_cuda_graph(ggml_backend_t backend, ggml_cgraph *graph) {
 }
 } // namespace
 
+#ifdef MLIPCPP_NCCL
+namespace {
+void nccl_check(ncclResult_t r, const char *what) {
+  if (r != ncclSuccess) throw std::runtime_error(fmt::format("{}: {}", what, ncclGetErrorString(r)));
+}
+void cuda_check(cudaError_t r, const char *what) {
+  if (r != cudaSuccess) throw std::runtime_error(fmt::format("{}: {}", what, cudaGetErrorString(r)));
+}
+} // namespace
+
+// one communicator and one stream per device (workers_[w] on CUDA device w)
+struct Optimizer::Nccl {
+  std::vector<ncclComm_t> comms;
+  std::vector<cudaStream_t> streams;
+  explicit Nccl(int W) : comms(W), streams(W) {
+    std::vector<int> devices(W);
+    std::iota(devices.begin(), devices.end(), 0);
+    nccl_check(ncclCommInitAll(comms.data(), W, devices.data()), "ncclCommInitAll");
+    for (int d = 0; d < W; d++) {
+      cuda_check(cudaSetDevice(d), "cudaSetDevice");
+      cuda_check(cudaStreamCreateWithFlags(&streams[d], cudaStreamNonBlocking), "cudaStreamCreate");
+    }
+  }
+  ~Nccl() {
+    for (size_t d = 0; d < comms.size(); d++) {
+      cudaSetDevice(static_cast<int>(d));
+      cudaStreamDestroy(streams[d]);
+      ncclCommDestroy(comms[d]);
+    }
+  }
+};
+#else
+struct Optimizer::Nccl {};
+#endif
+
+namespace {
+std::vector<Worker *> raw(std::vector<std::unique_ptr<Worker>> &workers) {
+  std::vector<Worker *> out;
+  for (auto &w : workers) out.push_back(w.get());
+  return out;
+}
+} // namespace
+
 Optimizer::Optimizer(std::vector<std::unique_ptr<Worker>> &workers, double clip, bool muon,
-                     double muon_momentum, double muon_lr_scale, int ns_steps)
+                     double muon_momentum, double muon_lr_scale, int ns_steps, bool allreduce)
+    : Optimizer(raw(workers), clip, muon, muon_momentum, muon_lr_scale, ns_steps, allreduce) {}
+
+Optimizer::Optimizer(const std::vector<Worker *> &workers, double clip, bool muon, double muon_momentum,
+                     double muon_lr_scale, int ns_steps, bool allreduce)
     : workers_(workers), muon_lr_scale_(muon_lr_scale) {
+  if (allreduce && workers_.size() > 1) {
+#ifdef MLIPCPP_NCCL
+    // one single-device optimizer per worker; the gradients are averaged in
+    // place first (step_allreduce), so every replica takes the same step
+    for (Worker *w : workers_)
+      replicas_.push_back(std::make_unique<Optimizer>(std::vector<Worker *>{w}, clip, muon, muon_momentum,
+                                                      muon_lr_scale, ns_steps, false));
+    n_muon_tensors = replicas_[0]->n_muon_tensors;
+    muon_groups = replicas_[0]->muon_groups;
+    graph_captured_ = replicas_[0]->graph_captured_;
+    nccl_ = std::make_unique<Nccl>(static_cast<int>(workers_.size()));
+    int version = 0;
+    ncclGetVersion(&version);
+    allreduce_info = fmt::format("NCCL {} all-reduce (average) over {} devices, a replicated step on each",
+                                 version, workers_.size());
+    return;
+#else
+    throw std::runtime_error("--allreduce 1 needs a build with NCCL (module load nccl, then cmake)");
+#endif
+  }
   Worker &w0 = *workers_[0];
   const auto &params = w0.params();
   const int W = static_cast<int>(workers_.size());
@@ -1283,7 +1356,55 @@ Optimizer::~Optimizer() {
   if (ctx_) ggml_free(ctx_);
 }
 
+double Optimizer::step_allreduce(double lr) {
+#ifdef MLIPCPP_NCCL
+  const size_t W = workers_.size();
+  for (Worker *w : workers_) ggml_backend_synchronize(w->model().backend()); // the gradients are complete
+  nccl_check(ncclGroupStart(), "ncclGroupStart");
+  for (size_t w = 0; w < W; w++) {
+    ggml_tensor *g = workers_[w]->grad_flat();
+    nccl_check(ncclAllReduce(g->data, g->data, ggml_nelements(g), ncclFloat, ncclAvg, nccl_->comms[w], nccl_->streams[w]),
+               "ncclAllReduce");
+  }
+  nccl_check(ncclGroupEnd(), "ncclGroupEnd");
+  for (size_t w = 0; w < W; w++) {
+    cuda_check(cudaSetDevice(static_cast<int>(w)), "cudaSetDevice");
+    cuda_check(cudaStreamSynchronize(nccl_->streams[w]), "ncclAllReduce");
+  }
+  // the replicas step in parallel, each on its own device
+  std::vector<double> norms(W);
+  std::vector<std::thread> pool;
+  std::vector<std::exception_ptr> errors(W);
+  for (size_t w = 0; w < W; w++)
+    pool.emplace_back([&, w] {
+      try {
+        norms[w] = replicas_[w]->step(lr);
+      } catch (...) {
+        errors[w] = std::current_exception();
+      }
+    });
+  for (auto &t : pool) t.join();
+  for (auto &e : errors)
+    if (e) std::rethrow_exception(e);
+  // the same averaged gradient gives the same step everywhere; resync anyway
+  if (++t_ % resync_every == 0) {
+    const std::vector<float> p0 = workers_[0]->get_params();
+    last_drift = 0;
+    for (size_t w = 1; w < W; w++) {
+      const std::vector<float> pw = workers_[w]->get_params();
+      for (size_t i = 0; i < p0.size(); i++) last_drift = std::max(last_drift, double(std::abs(pw[i] - p0[i])));
+      ggml_backend_tensor_copy(workers_[0]->weights_blob(), workers_[w]->weights_blob());
+    }
+  }
+  return norms[0];
+#else
+  (void) lr;
+  throw std::logic_error("step_allreduce without NCCL");
+#endif
+}
+
 double Optimizer::step(double lr) {
+  if (!replicas_.empty()) return step_allreduce(lr);
   Worker &w0 = *workers_[0];
   ++t_;
   const double b1 = 0.9, b2 = 0.999;
@@ -1359,7 +1480,7 @@ double Optimizer::profile(int reps, std::map<std::string, Worker::OpStats> &ops)
 }
 
 void Optimizer::stage(size_t w) {
-  if (staged_[w]) return;
+  if (!replicas_.empty() || staged_[w]) return; // all-reduce: nothing to stage
   if (w > 0) ggml_backend_tensor_copy(workers_[w]->grad_flat(), staging_[w - 1]); // peer copy
   for (size_t d = 1; d <= shards_.size(); d++)
     if (d != w) {
@@ -1461,7 +1582,8 @@ void train(const TrainOptions &o) {
   if (o.optimizer != "adam" && o.optimizer != "muon")
     throw std::runtime_error("--optimizer must be adam or muon");
   Optimizer optimizer(workers, o.grad_clip, o.optimizer == "muon", o.muon_momentum,
-                      o.muon_lr_scale, o.muon_ns_steps);
+                      o.muon_lr_scale, o.muon_ns_steps, o.allreduce);
+  if (!optimizer.allreduce_info.empty()) fmt::print("sync: {}\n", optimizer.allreduce_info);
   fmt::print("optimizer: {}{}; {}\n", o.optimizer,
              o.optimizer == "muon" ? fmt::format(" ({} tensors, momentum {}, lr scale {}, {} NS steps)",
                                                  optimizer.n_muon_tensors, o.muon_momentum,

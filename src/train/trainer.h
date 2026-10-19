@@ -63,6 +63,14 @@ struct TrainOptions {
   // fine-tuning: keep the composition and scales stored in --init instead of
   // fitting them on the training set
   bool model_baselines = false;
+  // several GPUs: average the gradients with one NCCL all-reduce and step a
+  // replica of the optimizer on every device (no gradient staging on device
+  // 0, no weight broadcast); default with a build that has NCCL
+#ifdef MLIPCPP_NCCL
+  bool allreduce = true;
+#else
+  bool allreduce = false;
+#endif
 };
 
 /// One structure's errors: energy per atom (prediction - target, eV/atom) and
@@ -232,8 +240,14 @@ public:
   /// `muon`: 2-D hidden weights (both dims >= 16, not embeddings) take Muon
   /// steps -- momentum, Newton-Schulz orthogonalisation, update RMS matched
   /// to Adam (0.2 sqrt(max dim)) -- at lr * muon_lr_scale; the rest Adam.
+  /// `allreduce` (a build with NCCL, several workers): one replica of this
+  /// optimizer per device, each stepping its worker's parameters after an
+  /// NCCL all-reduce (average) of the gradients in place; every
+  /// `resync_every` steps device 0's weights are copied to the others anyway.
   Optimizer(std::vector<std::unique_ptr<Worker>> &workers, double clip, bool muon = false,
-            double muon_momentum = 0.95, double muon_lr_scale = 1.0, int ns_steps = 5);
+            double muon_momentum = 0.95, double muon_lr_scale = 1.0, int ns_steps = 5, bool allreduce = false);
+  Optimizer(const std::vector<Worker *> &workers, double clip, bool muon, double muon_momentum,
+            double muon_lr_scale, int ns_steps, bool allreduce);
   ~Optimizer();
   /// Copy worker w's (w > 0) gradients to device 0 now (and, with the Muon
   /// split, w's gradients over each other device's range there), from w's
@@ -249,9 +263,16 @@ public:
   double profile(int reps, std::map<std::string, Worker::OpStats> &ops);
   std::vector<std::string> muon_groups; // "ne0 x ne1 x count" per orthogonalised group
   std::string muon_split;               // Newton-Schulz FLOPs per device ("" if not split)
+  std::string allreduce_info;           // "" without the all-reduce
+  int64_t resync_every = 1000;
+  double last_drift = 0;                // max |w_d - w_0| over the replicas at the last resync
 
 private:
-  std::vector<std::unique_ptr<Worker>> &workers_;
+  std::vector<Worker *> workers_;
+  std::vector<std::unique_ptr<Optimizer>> replicas_; // all-reduce mode: one per device
+  struct Nccl;
+  std::unique_ptr<Nccl> nccl_;
+  double step_allreduce(double lr);
   ggml_context *ctx_ = nullptr, *gctx_ = nullptr;
   ggml_backend_buffer_t buf_ = nullptr;
   ggml_gallocr_t galloc_ = nullptr;

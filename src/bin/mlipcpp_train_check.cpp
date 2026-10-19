@@ -348,6 +348,57 @@ int main(int argc, char **argv) {
     }
   }
 
+  // the NCCL all-reduce with replicated optimizers == the step on device 0:
+  // the same random gradients for a few steps, then the parameters; then
+  // each one's wall time per step (gradients included: the all-reduce is part of it)
+  if (gpus >= 2) {
+    for (bool muon : {false, true}) {
+      auto run = [&](bool allreduce) {
+        std::vector<std::unique_ptr<Worker>> ws;
+        for (int d = 0; d < gpus; d++) ws.push_back(std::make_unique<Worker>(init, d));
+        Optimizer opt(ws, 1.0, muon, 0.95, 10.0, 5, allreduce);
+        std::mt19937 rng(11);
+        std::normal_distribution<float> normal(0.0f, 1.0f);
+        std::vector<float> g(ggml_nelements(ws[0]->grad_flat()));
+        auto fill = [&] {
+          for (auto &w : ws) {
+            for (float &x : g) x = normal(rng);
+            ggml_backend_tensor_set(w->grad_flat(), g.data(), 0, g.size() * sizeof(float));
+          }
+        };
+        for (int st = 0; st < 3; st++) fill(), opt.step(1e-3);
+        const auto params = std::make_pair(ws[0]->get_params(), ws.back()->get_params());
+        double ms = 0;
+        for (int r = 0; r < 20; r++) {
+          fill();
+          for (auto &w : ws) ggml_backend_synchronize(w->model().backend());
+          const auto t0 = std::chrono::steady_clock::now();
+          for (size_t w = 0; w < ws.size(); w++) opt.stage(w);
+          opt.step(1e-6);
+          ms += 1e3 * std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / 20;
+        }
+        return std::make_tuple(params.first, params.second, ms, opt.allreduce_info);
+      };
+      const auto [a0, a1, ams, ainfo] = run(true);
+      const auto [b0, b1, bms, binfo] = run(false);
+      auto rel = [](const std::vector<float> &x, const std::vector<float> &y) {
+        double d = 0, s = 0;
+        for (size_t i = 0; i < x.size(); i++) d = std::max(d, double(std::abs(x[i] - y[i]))), s = std::max(s, double(std::abs(x[i])));
+        return d / s;
+      };
+      fmt::print("allreduce ({}, {} GPUs; {}): max relative parameter difference to the device-0 step {:.2e}, "
+                 "replicas {:.2e}; {:.2f} ms per step vs {:.2f}\n",
+                 muon ? "muon" : "adam", gpus, ainfo, rel(a0, b0), rel(a0, a1), ams, bms);
+      // Muon's default bf16 Newton-Schulz turns the summation-order difference
+      // (~1e-7) into ~4e-5 after 3 steps (7.8e-9 with GGML_NS_F32=1)
+      const double tol = muon && !std::getenv("GGML_NS_F32") ? 1e-4 : 1e-5;
+      if (!(rel(a0, b0) < tol) || rel(a0, a1) != 0) {
+        fmt::print("!! the all-reduce changes the step\n");
+        return 1;
+      }
+    }
+  }
+
   std::filesystem::create_directories(out);
   nlohmann::json meta;
   meta["ids"] = ids;
