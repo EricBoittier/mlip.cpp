@@ -620,6 +620,16 @@ ModelResult GraphModel::predict_single(
     const std::function<void()> &post_compute_hook,
     std::vector<float> *parameter_gradients) {
   GraphProfile profile;
+  // Full FP32 on CUDA, as the MD engine: TF32 GEMMs (cuBLAS and ggml's mmf
+  // kernels) put energies up to 14 meV/atom off the CPU / metatrain values on
+  // MPtrj test structures, at no measurable speed gain here. MLIPCPP_TF32=1
+  // keeps TF32. (A process-wide setting, read by the CUDA kernels per call.)
+  static const bool full_fp32 = [] {
+    if (std::getenv("MLIPCPP_TF32")) return false;
+    setenv("GGML_CUDA_NO_TF32", "1", 0);
+    return true;
+  }();
+  (void)full_fp32;
   if (compute_forces && !forces_mode_) {
     throw std::runtime_error(
         "GraphModel: forces requested but model was exported with "
@@ -809,9 +819,18 @@ ModelResult GraphModel::predict_single(
   for (int i = 0; i < n_atoms; i++) {
     max_neighbors = std::max(max_neighbors, neighbor_counts[i]);
   }
-  if (max_neighbors == 0) {
+  // A system without any edge: metatrain has no neighbour slot, so the
+  // attention sees the central token alone. ggml needs at least one slot, and
+  // through PET's finite -34.5 bias a padded slot still competes with the
+  // central token (isolated atoms up to eV off); so it is masked exactly
+  // (-inf) here. The energy then does not depend on the positions: no
+  // backward pass, forces and stress are zero.
+  const bool no_edges = max_neighbors == 0, forces_requested = compute_forces;
+  if (no_edges) {
     max_neighbors = 1;
+    compute_forces = false;
   }
+  interp_.set_exact_padding_mask(no_edges && !std::getenv("MLIPCPP_PAD_EMPTY"));
 
   // Set symbolic dimensions for this system
   interp_.set_dimension("n_atoms", n_atoms);
@@ -1392,6 +1411,15 @@ ModelResult GraphModel::predict_single(
       result.forces[i] += energy_scale_ * correction.forces[i];
     for (size_t i = 0; i < correction.stress.size(); ++i)
       result.stress[i] += energy_scale_ * correction.stress[i];
+  }
+
+  if (no_edges && forces_requested) { // energy independent of the positions
+    result.forces.assign(3 * static_cast<size_t>(n_atoms), 0.0f);
+    result.has_forces = true;
+    if (system.cell()) {
+      result.stress.assign(6, 0.0f);
+      result.has_stress = true;
+    }
   }
 
   profile.mark("readback");

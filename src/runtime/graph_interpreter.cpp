@@ -1251,6 +1251,11 @@ ggml_tensor *GraphInterpreter::build_clamp(ggml_context *ctx,
   ggml_tensor *a = resolve_input(ctx, node.inputs[0]);
   float min_val = static_cast<float>(get_param<double>(node, "min", -INFINITY));
   float max_val = static_cast<float>(get_param<double>(node, "max", INFINITY));
+  // PET's attention bias is log(clamp(cutoff factor, 1e-15)): padded slots get
+  // -34.5, not -inf. With exact_padding_mask (GraphModel, systems without
+  // edges) the floor is 0, so log gives -inf and the padded slot drops out of
+  // the softmax, as if absent (metatrain has no slot there at all).
+  if (exact_padding_mask_ && min_val == 1e-15f) min_val = 0.0f;
   return ggml_clamp(ctx, a, min_val, max_val);
 }
 
