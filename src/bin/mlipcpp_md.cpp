@@ -1,11 +1,18 @@
 // GPU molecular dynamics with a trained PET GGUF (md/md_engine.h).
 //
 //   mlipcpp-md check MODEL DATA_SPLIT [--n 200] [--fd 4] [--max-atoms 256] [--dump PREFIX.test.bin]
+//       [--ids FILE] [--out PREFIX] [--cpu 1] [--gpu-ref 0]
 //       Validates the MD engine on structures of a memmap split: against the
 //       labels, against GraphModel::predict on the CPU (an independent
 //       implementation of the inputs, adaptive cutoff and forces), against the
 //       trainer's own per-structure errors (--dump), and the conservative
 //       forces against finite differences of the energy.
+//       --ids: the structures to check (whitespace-separated indices; no
+//       --n / --max-atoms selection). --cpu 0 skips the CPU GraphModel,
+//       --gpu-ref 1 adds GraphModel on CUDA. --out writes PREFIX.csv (one row
+//       per structure: energies) and PREFIX.forces.bin (float32, 21 per atom:
+//       label, engine direct, engine conservative, CPU direct, CPU cons,
+//       GPU direct, GPU cons; NaN where not computed).
 //
 //   mlipcpp-md run MODEL (--xyz FILE | --data DATA_SPLIT --index I) [--repeat a,b,c]
 //       [--integrator respa|conservative|direct] [--inner 4] [--dt 0.5] [--steps 1000]
@@ -26,6 +33,7 @@
 #include <cstdio>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -102,11 +110,12 @@ void write_frame(std::ofstream &out, const md::Engine &e, int64_t step, double t
                        x[3 * i + 1], x[3 * i + 2], v[3 * i], v[3 * i + 1], v[3 * i + 2]);
 }
 
-struct Acc { // root mean square accumulator
-  double se = 0;
+struct Acc { // root mean square and mean absolute accumulator
+  double se = 0, ae = 0;
   int64_t n = 0;
-  void add(double d) { se += d * d, n++; }
+  void add(double d) { se += d * d, ae += std::abs(d), n++; }
   double rms() const { return n ? std::sqrt(se / n) : NAN; }
+  double mae() const { return n ? ae / n : NAN; }
 };
 
 AtomicSystem load_system(const Args &a);
@@ -192,11 +201,26 @@ int check(const Args &a) {
   const int want = static_cast<int>(a.num("n", 200)), n_fd = static_cast<int>(a.num("fd", 4));
   const int max_atoms = static_cast<int>(a.num("max-atoms", 256));
   md::Engine eng(a.pos[0], 0, a.num("skin", 1.0));
-  runtime::GraphModel ref;
+  const bool use_cpu = a.num("cpu", 1) != 0, use_gpu = a.num("gpu-ref", 0) != 0;
+  runtime::GraphModel ref, gref;
   ref.set_backend_preference(BackendPreference::CPU);
   ref.load_from_gguf(a.pos[0]);
+  if (use_gpu) gref.set_backend_preference(BackendPreference::CUDA), gref.load_from_gguf(a.pos[0]);
   fmt::print("model {}: cutoff {} A, adaptive {} ({}), direct forces {}\n", a.pos[0], ref.cutoff(),
              ref.num_neighbors_adaptive(), ref.adaptive_cutoff_method(), ref.nc_forces() ? "yes" : "no");
+  std::vector<int64_t> ids;
+  if (auto f = a.get("ids"); !f.empty()) {
+    std::ifstream in(f);
+    for (int64_t i; in >> i;) ids.push_back(i);
+    fmt::print("{} structures from {}\n", ids.size(), f);
+  }
+  std::ofstream out_csv;
+  std::unique_ptr<std::FILE, int (*)(std::FILE *)> out_f(nullptr, std::fclose);
+  if (auto o = a.get("out"); !o.empty()) {
+    out_csv.open(o + ".csv"), out_csv << "index,n_atoms,periodic,E_label,E_engine,E_cpu,E_gpu\n";
+    out_f.reset(std::fopen((o + ".forces.bin").c_str(), "wb"));
+    if (!out_f) throw std::runtime_error("cannot open " + o + ".forces.bin");
+  }
 
   // the trainer's per-structure errors (train::SystemError records)
   std::map<int64_t, std::pair<float, float>> dump;
@@ -210,41 +234,72 @@ int check(const Args &a) {
   std::vector<double> fd_steps;
   for (std::string t = a.get("fd-steps", "1e-2,3e-3,1e-3") + ","; !t.empty(); t.erase(0, t.find(',') + 1))
     if (t.find(',') > 0) fd_steps.push_back(std::stod(t.substr(0, t.find(','))));
-  Acc e_lab, fc_lab, fn_lab, e_ref, fc_ref, fn_ref, de_dump, fse_dump, fd_mag;
+  Acc e_lab, fc_lab, fn_lab, e_ref, fc_ref, fn_ref, de_dump, fse_dump, fd_mag, e_gpu, fn_gpu, fc_gpu;
   std::ofstream csv;
   if (auto c = a.get("csv"); !c.empty()) csv.open(c), csv << "index,n_atoms,periodic,edges,E_engine,E_cpu,E_label,E_trainer\n";
   std::vector<Acc> fd_err(fd_steps.size());
   double fc_ref_max = 0, fn_ref_max = 0, e_ref_max = 0, de_dump_max = 0, fse_dump_rel_max = 0;
+  double e_gpu_max = 0, fn_gpu_max = 0, fc_gpu_max = 0;
   int done = 0, n_fd_done = 0;
-  const int64_t stride = std::max<int64_t>(1, split.size() / want);
-  for (int64_t s = 0; s < split.size() && done < want; s += stride) {
+  const int64_t stride = ids.empty() ? std::max<int64_t>(1, split.size() / want) : 1;
+  const int64_t n_try = ids.empty() ? split.size() : static_cast<int64_t>(ids.size());
+  for (int64_t t = 0; t < n_try && (!ids.empty() || done < want); t += stride) {
+    const int64_t s = ids.empty() ? t : ids[t];
     const int n = split.n_atoms(s);
-    if (n < 2 || n > max_atoms) continue;
+    if (n < 2 || (ids.empty() && n > max_atoms)) continue;
     const AtomicSystem sys = split.system(s);
     eng.set_system(sys);
     const double E = eng.evaluate(true);
     const auto Fc = eng.forces_conservative(), Fn = eng.forces_direct();
-    const ModelResult r = ref.predict(sys, true);
+    const ModelResult r = use_cpu ? ref.predict(sys, true) : ModelResult{};
+    const ModelResult g = use_gpu ? gref.predict(sys, true) : ModelResult{};
 
     e_lab.add((E - split.energy(s)) / n);
-    e_ref.add((E - r.energy) / n);
-    e_ref_max = std::max(e_ref_max, std::abs(E - r.energy) / n);
+    if (use_cpu) e_ref.add((E - r.energy) / n), e_ref_max = std::max(e_ref_max, std::abs(E - r.energy) / n);
+    if (use_gpu) e_gpu.add((E - g.energy) / n), e_gpu_max = std::max(e_gpu_max, std::abs(E - g.energy) / n);
     double fse = 0;
+    std::vector<float> row(21 * static_cast<size_t>(n), NAN);
     for (int k = 0; k < 3 * n; k++) {
       const double lab = split.forces(s)[k];
+      float *o = &row[(k / 3) * 21 + k % 3];
+      o[0] = lab, o[6] = Fc[k];
       fc_lab.add(Fc[k] - lab);
-      fc_ref.add(Fc[k] - r.forces[k]);
-      fc_ref_max = std::max(fc_ref_max, std::abs(Fc[k] - r.forces[k]));
-      if (eng.has_direct()) {
-        fn_lab.add(Fn[k] - lab);
-        fn_ref.add(Fn[k] - r.nc_forces[k]);
-        fn_ref_max = std::max(fn_ref_max, std::abs(Fn[k] - double(r.nc_forces[k])));
-        fse += (Fn[k] - lab) * (Fn[k] - lab);
+      if (use_cpu) {
+        o[12] = r.forces[k];
+        fc_ref.add(Fc[k] - r.forces[k]);
+        fc_ref_max = std::max(fc_ref_max, std::abs(Fc[k] - r.forces[k]));
       }
+      if (use_gpu) {
+        o[18] = g.forces[k];
+        fc_gpu.add(Fc[k] - g.forces[k]);
+        fc_gpu_max = std::max(fc_gpu_max, std::abs(Fc[k] - g.forces[k]));
+      }
+      if (eng.has_direct()) {
+        o[3] = Fn[k];
+        fn_lab.add(Fn[k] - lab);
+        fse += (Fn[k] - lab) * (Fn[k] - lab);
+        if (use_cpu) {
+          o[9] = r.nc_forces[k];
+          fn_ref.add(Fn[k] - r.nc_forces[k]);
+          fn_ref_max = std::max(fn_ref_max, std::abs(Fn[k] - double(r.nc_forces[k])));
+        }
+        if (use_gpu) {
+          o[15] = g.nc_forces[k];
+          fn_gpu.add(Fn[k] - g.nc_forces[k]);
+          fn_gpu_max = std::max(fn_gpu_max, std::abs(Fn[k] - double(g.nc_forces[k])));
+        }
+      }
+    }
+    if (out_f) {
+      out_csv << fmt::format("{},{},{},{:.8f},{:.8f},{:.8f},{:.8f}\n", s, n, sys.cell() ? 1 : 0, split.energy(s), E,
+                             use_cpu ? r.energy : NAN, use_gpu ? g.energy : NAN);
+      if (std::fwrite(row.data(), sizeof(float), row.size(), out_f.get()) != row.size())
+        throw std::runtime_error("cannot write the forces");
     }
     if (csv.is_open()) {
       auto it = dump.find(s);
-      csv << fmt::format("{},{},{},{},{:.8f},{:.8f},{:.8f},{}\n", s, n, sys.cell() ? 1 : 0, eng.n_edges(), E, r.energy,
+      csv << fmt::format("{},{},{},{},{:.8f},{:.8f},{:.8f},{}\n", s, n, sys.cell() ? 1 : 0, eng.n_edges(), E,
+                         use_cpu ? r.energy : NAN,
                          split.energy(s), it != dump.end() ? fmt::format("{:.8f}", split.energy(s) + it->second.first * n) : "");
     }
     if (auto it = dump.find(s); it != dump.end()) {
@@ -281,10 +336,17 @@ int check(const Args &a) {
     done++;
   }
   const auto meV = [](const Acc &x) { return 1e3 * x.rms(); };
-  fmt::print("\n{} structures (every {}th of {}, <= {} atoms)\n", done, stride, split.size(), max_atoms);
+  if (ids.empty()) fmt::print("\n{} structures (every {}th of {}, <= {} atoms)\n", done, stride, split.size(), max_atoms);
+  else fmt::print("\n{} structures (of {} listed; 1-atom structures skipped)\n", done, ids.size());
   fmt::print("vs labels:      E {:.2f} meV/atom   F_direct {:.2f} meV/A   F_conservative {:.2f} meV/A\n",
              meV(e_lab), meV(fn_lab), meV(fc_lab));
-  fmt::print("vs CPU GraphModel: E rms {:.3g} max {:.3g} meV/atom   F_direct rms {:.3g} max {:.3g}   "
+  fmt::print("vs labels, MAE: E {:.2f} meV/atom   F_direct {:.2f} meV/A   F_conservative {:.2f} meV/A\n",
+             1e3 * e_lab.mae(), 1e3 * fn_lab.mae(), 1e3 * fc_lab.mae());
+  if (use_gpu)
+    fmt::print("vs CUDA GraphModel: E rms {:.3g} max {:.3g} meV/atom   F_direct rms {:.3g} max {:.3g}   "
+               "F_cons rms {:.3g} max {:.3g} meV/A\n",
+               meV(e_gpu), 1e3 * e_gpu_max, meV(fn_gpu), 1e3 * fn_gpu_max, meV(fc_gpu), 1e3 * fc_gpu_max);
+  if (use_cpu) fmt::print("vs CPU GraphModel: E rms {:.3g} max {:.3g} meV/atom   F_direct rms {:.3g} max {:.3g}   "
              "F_cons rms {:.3g} max {:.3g} meV/A\n",
              meV(e_ref), 1e3 * e_ref_max, meV(fn_ref), 1e3 * fn_ref_max, meV(fc_ref), 1e3 * fc_ref_max);
   if (de_dump.n)
