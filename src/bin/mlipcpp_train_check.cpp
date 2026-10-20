@@ -29,7 +29,7 @@ using namespace mlipcpp::train;
 int main(int argc, char **argv) {
   mlipcpp::train::install_crash_backtrace();
   std::string data, init, out, cache_dir;
-  int n = 64, gpus = 1;
+  int n = 64, gpus = 1, first = 0;
   bool node_grads_on = false, mb_failed = false, profile = false, sweep = false;
   Worker::Conservative cons;
   double tile_ratio = 1.25, tol = 1e-3;
@@ -40,6 +40,7 @@ int main(int argc, char **argv) {
     else if (a == "--out") out = v;
     else if (a == "--cache-dir") cache_dir = v;
     else if (a == "--n") n = std::stoi(v);
+    else if (a == "--first") first = std::stoi(v); // ids first .. first + n - 1
     else if (a == "--gpus") gpus = std::stoi(v);
     else if (a == "--node-grads") node_grads_on = v == "1";
     else if (a == "--profile") profile = v == "1";
@@ -68,7 +69,7 @@ int main(int argc, char **argv) {
       split, worker.model().cutoff(), cache_path(cache_dir, split, worker.model().cutoff(), adaptive), 8, adaptive);
   nl.taper = cons.on && adaptive.enabled();
   std::vector<int64_t> ids(n);
-  std::iota(ids.begin(), ids.end(), 0);
+  std::iota(ids.begin(), ids.end(), first);
   Batch b = make_batch(split, nl, ids, {}, worker.model().species_to_index(), sc, worker.model().cutoff());
 
   // gradient of every IR node output, for scripts/train/compare_node_grads.py

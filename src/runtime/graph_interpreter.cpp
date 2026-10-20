@@ -1058,7 +1058,28 @@ ggml_tensor *GraphInterpreter::build_log(ggml_context *ctx,
     throw std::runtime_error("LOG requires at least 1 input");
   }
   ggml_tensor *a = resolve_input(ctx, node.inputs[0]);
-  return ggml_log(ctx, a);
+  ggml_tensor *t = ggml_log(ctx, a);
+  // MLIPCPP_PAD_EXACT=1: PET's attention bias log(clamp(cutoff factor, 1e-15))
+  // plus log(1 - padding mask), i.e. -inf on padded keys only, added after
+  // the log so its derivative stays finite; real edges with factor 0 keep
+  // -34.5. With the finite bias alone a trained model's output depends on the
+  // padded slots, i.e. on how structures are batched.
+  static const bool exact = std::getenv("MLIPCPP_PAD_EXACT") != nullptr;
+  auto pm_it = inputs_.find("padding_mask");
+  float floor = 0.0f;
+  if (a->op == GGML_OP_CLAMP) std::memcpy(&floor, a->op_params, sizeof(floor));
+  if (exact && a->op == GGML_OP_CLAMP && floor == 1e-15f && pm_it != inputs_.end()) {
+    ggml_tensor *pm = pm_it->second; // [m, n], 1 = padded
+    const int64_t K = pm->ne[0] + 1, N = pm->ne[1];
+    if (t->ne[0] == K && (t->ne[3] == N || (t->ne[2] == N && t->ne[3] == 1))) {
+      ggml_tensor *center = ggml_fill(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, N), 1.0f);
+      ggml_tensor *keep = ggml_concat(ctx, center, ggml_scale_bias(ctx, pm, -1.0f, 1.0f), 0); // [K, N]
+      ggml_tensor *bias = ggml_log(ctx, keep);
+      bias = t->ne[3] == N ? ggml_reshape_4d(ctx, bias, K, 1, 1, N) : ggml_reshape_3d(ctx, bias, K, 1, N);
+      t = ggml_add(ctx, t, bias);
+    }
+  }
+  return t;
 }
 
 ggml_tensor *GraphInterpreter::build_cos(ggml_context *ctx,
