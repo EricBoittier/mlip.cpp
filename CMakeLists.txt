@@ -193,54 +193,68 @@ if(MLIPCPP_GGML_SOURCE_DIR)
     message(STATUS "Using local ggml from: ${MLIPCPP_GGML_SOURCE_DIR}")
     add_subdirectory(${MLIPCPP_GGML_SOURCE_DIR} ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
 else()
-    CPMAddPackage(
-        NAME ggml
-        GITHUB_REPOSITORY peterspackman/ggml
-        GIT_TAG 9be7b7f8
+    # mlip.cpp's ggml patches, applied by cmake/apply_patches.cmake, which
+    # skips a set it already applied (CPM's PATCHES re-run `patch` on every
+    # re-configure and fail)
+    set(MLIPCPP_GGML_PATCHES
         # CUDA GET_ROWS_BACK as a scatter-add: the upstream gather launches one
         # grid row per destination row (> 65535 for PET edge batches) and is
         # O(rows^2)
         # CPU RMS_NORM_BACK / SOFT_MAX_BACK: ggml-alloc runs them in place,
         # but the kernels copied one input over the other before reading it
-        # applied by cmake/apply_patches.cmake, which skips a set it already
-        # applied (CPM's PATCHES re-run `patch` on every re-configure and fail)
-        PATCH_COMMAND "${CMAKE_COMMAND}" -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/apply_patches.cmake" --
-                "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-get-rows-back-scatter.patch"
-                "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cpu-norm-softmax-back-inplace.patch"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-get-rows-back-scatter.patch"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cpu-norm-softmax-back-inplace.patch"
         # Metal SOFT_MAX_BACK: only read initialized simdgroup partial sums.
-                "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-metal-softmax-back-reduction.patch"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-metal-softmax-back-reduction.patch"
         # Parallel Metal reductions for weight, bias, and species gradients.
-                "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-metal-training-reductions.patch"
-            "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-analytic-training-backward.patch"
-            "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-metal-precise-matmul.patch"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-metal-training-reductions.patch"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-analytic-training-backward.patch"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-metal-precise-matmul.patch"
         # CUDA REPEAT_BACK (every bias / broadcast gradient): split the
         # reduction across the grid instead of one serial thread per output
-                "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-repeat-back-split.patch"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-repeat-back-split.patch"
         # fused PET attention (GGML_OP_PET_ATTN, CPU + CUDA, with backward):
         # softmax(scale q k^T + bias) v without storing any L x L matrix
-                "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-pet-attention.patch"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-pet-attention.patch"
         # MUL_MAT backward for a 2-D src0 (every linear layer): both gradients
         # as OUT_PROD GEMMs on the flattened rows, without the transposed
         # copies of activation, gradient and weight (GGML_MUL_MAT_BACK_COPY=1: A/B)
-                "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-mul-mat-back-out-prod.patch"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-mul-mat-back-out-prod.patch"
         # Muon's Newton-Schulz as one op over all the groups (GGML_OP_NEWTON_SCHULZ,
         # ggml_newton_schulz_multi): bf16 storage, one grouped cuBLAS GEMM per
         # stage (GGML_NS_F32=1: fp32/TF32; GGML_NS_LOOP=1: per group); the GPU
         # default (MLIPCPP_NS_OPS=1: the ggml ops)
-                "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-newton-schulz.patch"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-newton-schulz.patch"
         # CUDA graph capture for one chosen static graph (the optimizer step)
         # while GGML_CUDA_DISABLE_GRAPHS keeps it off for the dynamic ones
-                "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-graph-allow.patch"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-graph-allow.patch"
         # gradient of the fused PET attention w.r.t. its bias (the cutoff
         # factors): GGML_OP_PET_ATTN_BACK_BIAS, needed for forces -dE/dx
-                "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-pet-attention-bias-grad.patch"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-pet-attention-bias-grad.patch"
         # GGML_CUDA_NO_TF32=1 also keeps F32 products off the TF32 tensor-core
         # mmf kernels (used for <= 16 columns, i.e. small structures)
-                "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-no-tf32-mmf.patch"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-no-tf32-mmf.patch"
         # forward-mode derivative of the fused PET attention and its gradients
         # (GGML_OP_PET_ATTN_JVP*, CPU + CUDA): conservative training without
         # storing any L x L matrix (runtime/graph_jvp.h)
-                "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-pet-attention-jvp.patch"
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-pet-attention-jvp.patch"
+    )
+    # the source cache is keyed by the ggml tag and the patches' contents:
+    # CPM's default key hashes the arguments, i.e. the patch paths, so every
+    # source tree (a job's snapshot, a worktree) made a new 47 MB patched copy
+    set(_ggml_key "9be7b7f8")
+    foreach(_p IN LISTS MLIPCPP_GGML_PATCHES)
+        file(SHA256 "${_p}" _h)
+        string(APPEND _ggml_key "${_h}")
+    endforeach()
+    string(SHA1 _ggml_key "${_ggml_key}")
+    CPMAddPackage(
+        NAME ggml
+        GITHUB_REPOSITORY peterspackman/ggml
+        GIT_TAG 9be7b7f8
+        CUSTOM_CACHE_KEY "patched-${_ggml_key}"
+        PATCH_COMMAND "${CMAKE_COMMAND}" -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/apply_patches.cmake" --
+                ${MLIPCPP_GGML_PATCHES}
         EXCLUDE_FROM_ALL YES
     )
 endif()
