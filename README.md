@@ -105,6 +105,13 @@ cmake --build . -j
 ./build/bin/graph_inference gguf/pet-mad-s.gguf structure.xyz --forces --stress
 ```
 
+## Training PET on GPUs
+
+`mlipcpp-train` trains and fine-tunes metatrain PET models on CUDA (one node,
+any number of GPUs), with direct or conservative (-dE/dx) forces. See
+[docs/training.md](docs/training.md) for usage, recommended settings and
+measured speeds.
+
 ## PET with long-range features (experimental)
 
 PET checkpoints trained with `long_range.enable: true` can be exported with:
