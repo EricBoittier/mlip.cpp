@@ -111,29 +111,44 @@ void write_gguf(const std::string &src, const std::string &dst, Worker &w,
 
 /// Online least squares for CostModel: decayed normal equations over the
 /// measured micro-batch times, non-negative coefficients (features with a
-/// negative fit are dropped, most negative first).
+/// negative fit are dropped, most negative first). The fixed cost is
+/// floored at the measured per-micro-batch graph build + allocation, which
+/// does not depend on its size: steps of a few large micro-batches leave the
+/// intercept unresolved, a fit of ~0 ms let the plan split at every distinct
+/// neighbour count (176059 / 176431: 280-560 micro-batches per worker at
+/// batch 2048), and the fit then needed ~20 steps to recover. A weak ridge
+/// pulls the other unresolved directions to the prior.
 class CostFit {
 public:
-  void add(double n, double m, double ms) {
+  explicit CostFit(const CostModel &prior) : prior_(prior) {}
+  /// ms: the micro-batch's wall time; fixed_ms: its size-independent part
+  void add(double n, double m, double ms, double fixed_ms) {
     const auto f = scaled(n, m);
     for (int a = 0; a < 3; a++) {
       for (int b = 0; b < 3; b++) A_[a][b] = decay_ * A_[a][b] + f[a] * f[b];
       y_[a] = decay_ * y_[a] + f[a] * ms;
     }
+    fixed_sum_ = decay_ * fixed_sum_ + fixed_ms, fixed_w_ = decay_ * fixed_w_ + 1;
     n_++;
   }
   /// Fitted model, or false while too few samples / no admissible fit.
   bool fit(CostModel &out) const {
     if (n_ < 30) return false;
+    const double floor = fixed_sum_ / fixed_w_;
     std::array<bool, 3> on = {true, true, true};
-    for (int pass = 0; pass < 3; pass++) {
+    std::array<double, 3> held = {}; // values of the features taken out of the solve
+    for (int pass = 0; pass < 4; pass++) {
       std::array<double, 3> c{};
-      if (!solve(on, c)) return false;
+      if (!solve(on, held, c)) return false;
+      if (on[0] && c[0] * scale_[0] < floor) { // the intercept first, at its floor
+        on[0] = false, held[0] = floor / scale_[0];
+        continue;
+      }
       int worst = -1;
-      for (int k = 0; k < 3; k++)
+      for (int k = 1; k < 3; k++)
         if (on[k] && c[k] < 0 && (worst < 0 || c[k] < c[worst])) worst = k;
       if (worst < 0) {
-        for (int k = 0; k < 3; k++) out.c[k] = c[k] * scale_[k];
+        for (int k = 0; k < 3; k++) out.c[k] = (on[k] ? c[k] : held[k]) * scale_[k];
         return true;
       }
       on[worst] = false;
@@ -148,16 +163,19 @@ private:
     for (int k = 0; k < 3; k++) f[k] *= scale_[k];
     return f;
   }
-  bool solve(const std::array<bool, 3> &on, std::array<double, 3> &c) const {
+  bool solve(const std::array<bool, 3> &on, const std::array<double, 3> &held, std::array<double, 3> &c) const {
     std::vector<int> idx;
     for (int k = 0; k < 3; k++)
       if (on[k]) idx.push_back(k);
     const int d = static_cast<int>(idx.size());
-    if (d == 0) return false;
+    c = {};
+    if (d == 0) return true;
     double M[3][4];
     for (int a = 0; a < d; a++) {
-      for (int b = 0; b < d; b++) M[a][b] = A_[idx[a]][idx[b]];
-      M[a][d] = y_[idx[a]];
+      for (int b = 0; b < d; b++) M[a][b] = A_[idx[a]][idx[b]] + (a == b ? ridge_ : 0.0);
+      M[a][d] = y_[idx[a]] + ridge_ * prior_.c[idx[a]] / scale_[idx[a]];
+      for (int k = 0; k < 3; k++)
+        if (!on[k]) M[a][d] -= A_[idx[a]][k] * held[k];
     }
     for (int col = 0; col < d; col++) { // Gauss-Jordan, partial pivoting
       int piv = col;
@@ -171,12 +189,14 @@ private:
         for (int k = col; k <= d; k++) M[r][k] -= f * M[col][k];
       }
     }
-    c = {};
     for (int a = 0; a < d; a++) c[idx[a]] = M[a][d] / M[a][a];
     return std::isfinite(c[0]) && std::isfinite(c[1]) && std::isfinite(c[2]);
   }
   static constexpr double decay_ = 0.995; // ~200 micro-batches of memory
+  static constexpr double ridge_ = 1.0;    // ~ one micro-batch with O(1) scaled features
+  CostModel prior_;
   double A_[3][3] = {}, y_[3] = {};
+  double fixed_sum_ = 0, fixed_w_ = 0;
   int64_t n_ = 0;
 };
 
@@ -1645,8 +1665,11 @@ void train(const TrainOptions &o) {
   if (!step_pack && o.pack != "worker") throw std::runtime_error("--pack must be step or worker");
   const Tiling step_tiling{o.tile_nb_ratio, o.tile_atom_ratio, W * B};
   std::mutex plan_mu;
-  CostModel plan_cost;
-  CostFit cost_fit;
+  // the conservative step (two graphs, forces assembled on the CPU) costs
+  // ~5x as much per micro-batch and ~15x per n(m+1) (176059, wall-clock)
+  const CostModel plan_prior = o.conservative ? CostModel{{10.0, 4e-6, 3e-3}} : CostModel{};
+  CostModel plan_cost = plan_prior;
+  CostFit cost_fit(plan_prior);
 
   // batches of a step: structures perm[step*W*B, +W*B); worker w's rotation
   // stream covers its B of them (the same augmentation in both pack modes).
@@ -1725,12 +1748,17 @@ void train(const TrainOptions &o) {
       // each worker: its micro-batches, gradients summed (= full-batch gradient)
       std::vector<StepStats> st(W);
       std::vector<double> wb(W, 0.0), wc(W, 0.0);
-      std::vector<std::vector<std::array<double, 3>>> samples(W); // (n, m, ms) per micro-batch
+      std::vector<std::vector<std::array<double, 4>>> samples(W); // (n, m, ms, fixed ms) per micro-batch
       for_workers(workers, [&](size_t w) {
         for (const Batch &mb : batches[w]) {
+          // the cost model is fitted to the whole call, not just the GPU
+          // compute: graph builds, allocation, transfers and (conservative)
+          // the force assembly on the CPU are per micro-batch costs too
+          const auto t_mb = clock_type::now();
           st[w] += workers[w]->run(mb, scaling.energy_scale, true);
           wb[w] += workers[w]->t_build, wc[w] += workers[w]->t_compute;
-          samples[w].push_back({double(mb.n_atoms), double(mb.max_neighbors), 1e3 * workers[w]->t_compute});
+          samples[w].push_back({double(mb.n_atoms), double(mb.max_neighbors), 1e3 * seconds_since(t_mb),
+                                1e3 * (workers[w]->t_build + workers[w]->t_alloc)});
         }
         optimizer.stage(w); // ship the gradients while the other workers still compute
       });
@@ -1747,7 +1775,7 @@ void train(const TrainOptions &o) {
       t_sync += seconds_since(t);
       if (step_pack) {
         for (auto &sw : samples)
-          for (auto [n, m, ms] : sw) cost_fit.add(n, m, ms);
+          for (auto [n, m, ms, fixed] : sw) cost_fit.add(n, m, ms, fixed);
         CostModel fitted;
         const bool ok = cost_fit.fit(fitted);
         std::lock_guard<std::mutex> lock(plan_mu);
