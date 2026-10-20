@@ -23,6 +23,13 @@ class GraphJVP {
     return a && b ? ggml_mul(c, a, b) : nullptr;
   }
   ggml_tensor *neg(ggml_tensor *a) { return a ? ggml_neg(c, a) : nullptr; }
+  // a contiguous copy only where the layout needs one: ggml_cont always
+  // copies, and each copy costs again in the reverse pass through the
+  // tangent (MLIPCPP_JVP_CONT=1: always copy, as before)
+  ggml_tensor *cont(ggml_tensor *a) {
+    static const bool always = std::getenv("MLIPCPP_JVP_CONT") != nullptr;
+    return always || !ggml_is_contiguous(a) ? ggml_cont(c, a) : a;
+  }
   // a / b with b broadcast explicitly: ggml's DIV backward needs equal shapes
   ggml_tensor *div(ggml_tensor *a, ggml_tensor *b) {
     return ggml_div(c, a, ggml_are_same_shape(a, b) ? b : ggml_repeat(c, b, a));
@@ -58,7 +65,7 @@ class GraphJVP {
     auto *Vt = ggml_cont(c, ggml_transpose(c, V)); // [L_k, d, H, N]
     ggml_tensor *dS = dbias ? ggml_repeat(c, dbias, P) : nullptr, *dO = nullptr;
     if (dqkv) {
-      dqkv = ggml_cont(c, dqkv);
+      dqkv = cont(dqkv);
       auto *dQ = heads(dqkv, 0), *dK = heads(dqkv, 1), *dV = heads(dqkv, 2);
       dS = add(dS, ggml_scale(c, ggml_add(c, ggml_mul_mat(c, dK, Q),
                                           ggml_mul_mat(c, K, dQ)),
@@ -170,10 +177,10 @@ public:
     case GGML_OP_CONT:
     case GGML_OP_DUP:
     case GGML_OP_CPY:
-      t = u ? ggml_reshape(c, ggml_cont(c, u), x) : nullptr;
+      t = u ? ggml_reshape(c, cont(u), x) : nullptr;
       break;
     case GGML_OP_RESHAPE:
-      t = ggml_reshape(c, ggml_cont(c, u), x);
+      t = ggml_reshape(c, cont(u), x);
       break;
     case GGML_OP_VIEW: {
       size_t offset;
@@ -183,7 +190,7 @@ public:
         t = unsupported("VIEW of a noncontiguous source");
         break;
       }
-      t = ggml_view_4d(c, ggml_cont(c, u), x->ne[0], x->ne[1], x->ne[2],
+      t = ggml_view_4d(c, cont(u), x->ne[0], x->ne[1], x->ne[2],
                        x->ne[3], x->nb[1], x->nb[2], x->nb[3], offset);
       break;
     }
@@ -237,8 +244,8 @@ public:
       if (fused_attention && a->type == GGML_TYPE_F32) {
         float scale;
         std::memcpy(&scale, x->op_params + 1, sizeof(scale));
-        t = ggml_pet_attn_jvp(c, a, b, u ? ggml_cont(c, u) : nullptr,
-                              v ? ggml_cont(c, v) : nullptr, x->op_params[0],
+        t = ggml_pet_attn_jvp(c, a, b, u ? cont(u) : nullptr,
+                              v ? cont(v) : nullptr, x->op_params[0],
                               scale);
       } else {
         t = pet_attn(x, u, v);
@@ -265,7 +272,7 @@ public:
         t = mul(mul(x, ggml_scale_bias(c, x, -1, 1)), u);
         break;
       case GGML_UNARY_OP_SILU: {
-        t = ggml_silu_back(c, ggml_cont(c, u), ggml_cont(c, a));
+        t = ggml_silu_back(c, cont(u), cont(a));
         break;
       }
       case GGML_UNARY_OP_TANH:

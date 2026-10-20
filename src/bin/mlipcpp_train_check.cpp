@@ -284,6 +284,16 @@ int main(int argc, char **argv) {
       fmt::print("  {:>8.2f} ms {:5.1f}%  x{:<5} {:>8.2f} GB  {}\n", v.ms, 100 * v.ms / tot.ms, v.count, v.bytes / 1e9,
                  copies[k].second);
     }
+    std::vector<std::pair<double, std::string>> patterns;
+    for (auto &[k, v] : worker.profile_patterns)
+      if (v.flops < 4 * v.bytes) patterns.push_back({v.bytes, k}); // elementwise and copies, by traffic
+    std::sort(patterns.rbegin(), patterns.rend());
+    fmt::print("elementwise patterns by ideal traffic (OP(src0, src1); views and reshapes skipped):\n");
+    for (size_t k = 0; k < std::min<size_t>(patterns.size(), 30); k++) {
+      const auto &v = worker.profile_patterns[patterns[k].second];
+      fmt::print("  {:>8.2f} GB {:>8.2f} ms {:5.1f}%  x{:<5}  {}\n", v.bytes / 1e9, v.ms, 100 * v.ms / tot.ms, v.count,
+                 patterns[k].second);
+    }
     auto &nodes = worker.profile_nodes;
     std::sort(nodes.rbegin(), nodes.rend());
     fmt::print("slowest nodes:\n");

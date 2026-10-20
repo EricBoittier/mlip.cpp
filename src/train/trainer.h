@@ -164,6 +164,7 @@ public:
   std::vector<float> *atom_errors = nullptr;
   std::map<std::string, OpStats> profile_ops;
   std::map<std::string, OpStats> profile_copies; // CONT / CPY nodes by the view chain they copy
+  std::map<std::string, OpStats> profile_patterns; // "phase:OP(src0 op, src1 op)", fusion candidates
   std::vector<std::pair<double, std::string>> profile_nodes; // (ms, "fwd:OP name [shape]") per node
 
   /// FLOPs, ideal bytes and compute-buffer size of one batch shape's graph:

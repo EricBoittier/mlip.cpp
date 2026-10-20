@@ -662,6 +662,15 @@ void Worker::compute(StepGraph &g) {
       auto [f, b] = node_cost(node);
       const double ms = 1e3 * seconds_since(tn);
       s.ms += ms, s.count++, s.flops += f, s.bytes += b;
+      {
+        auto src_op = [&](int k) {
+          const ggml_tensor *t = node->src[k];
+          while (t && (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE)) t = t->src[0];
+          return t ? std::string(ggml_op_desc(t)) : std::string("-");
+        };
+        auto &p = profile_patterns[phase + ":" + ggml_op_desc(node) + "(" + src_op(0) + ", " + src_op(1) + ")"];
+        p.ms += ms, p.count++, p.flops += f, p.bytes += b;
+      }
       if (node->op == GGML_OP_CONT || node->op == GGML_OP_CPY) {
         // what the copy materialises: the chain of views down to the producer
         std::string key = phase + ":" + ggml_op_desc(node) + " <-";
