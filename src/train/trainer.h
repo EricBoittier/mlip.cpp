@@ -149,7 +149,9 @@ public:
   } conservative;
 
   /// Profiling: compute node by node (synchronised) and accumulate, per op
-  /// ("fwd:OP" / "bwd:OP"), wall time, FLOPs and ideal bytes (every operand
+  /// ("fwd:OP" / "bwd:OP"; conservative mode "F.fwd:OP" / "F.bwd:OP" for the
+  /// FORCES graph and "M.fwd" / "M.tan" / "M.bwd" for MIXED's primal forward,
+  /// tangent and backward), wall time, FLOPs and ideal bytes (every operand
   /// read and the result written once). Slow; diagnostics only.
   struct OpStats {
     double ms = 0, flops = 0, bytes = 0;
@@ -172,8 +174,9 @@ public:
   };
   GraphCost graph_cost(int n, int m, int S, bool backward = true);
 
-  /// Per-phase wall time of the last run(), in seconds.
-  double t_build = 0, t_alloc = 0, t_upload = 0, t_compute = 0, t_download = 0;
+  /// Per-phase wall time of the last run(), in seconds; t_cpu: conservative
+  /// mode's host work (forces from the edge gradients, loss, tangents).
+  double t_build = 0, t_alloc = 0, t_upload = 0, t_compute = 0, t_download = 0, t_cpu = 0;
   int64_t cache_hits = 0, cache_misses = 0, cache_flushes = 0;
   size_t compute_buffer_bytes() const;
   size_t cache_size() const { return cache_.size(); }
@@ -190,6 +193,10 @@ private:
     ggml_tensor *per_atom = nullptr;   // [1, n]: |dF|^2 per atom (physical)
     ggml_tensor *out = nullptr, *grad_v = nullptr, *grad_c = nullptr; // FORCES: (e | F_nc) per atom, dE/dv, dE/dc
     int n_forward = 0;
+    // profile labels: the graph kind, and in MIXED the first tensor made
+    // after the primal forward (nodes past it in the forward part are the tangent)
+    int mode = 0;
+    const ggml_tensor *jvp_mark = nullptr;
     std::vector<std::pair<ggml_tensor *, float>> constants;
     // cached graphs: inputs packed at the start of `persist` (one upload
     // through `blob`), then the constants (filled once)

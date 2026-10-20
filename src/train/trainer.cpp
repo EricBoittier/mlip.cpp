@@ -421,6 +421,7 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
   // the tangent graph and its reverse pass: several times the loss graph
   const size_t graph_size = mode == MIXED ? 8 * GRAPH_SIZE : GRAPH_SIZE;
   auto g = std::make_unique<StepGraph>();
+  g->mode = mode;
   auto &interp = model_.interpreter();
   interp.set_dimension("n_atoms", n);
   interp.set_dimension("max_neighbors", m);
@@ -504,6 +505,7 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
     if (mode == MIXED) {
       // - <dE/dx, u> along the scaled residual u: its weight gradient is the
       // conservative force loss's (u held fixed)
+      g->jvp_mark = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1); // tensors are laid out in creation order
       runtime::GraphJVP jvp(ctx);
       jvp.seed(edges, dv);
       jvp.seed(cv, dc);
@@ -647,6 +649,7 @@ void Worker::compute(StepGraph &g) {
   auto t0 = clock_type::now();
   ggml_cgraph *gf = g.gf;
   if (profile) {
+    const std::string kind = g.mode == FORCES ? "F." : g.mode == MIXED ? "M." : "";
     for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
       ggml_cgraph one = ggml_graph_view(gf, i, i + 1);
       auto tn = clock_type::now();
@@ -654,13 +657,14 @@ void Worker::compute(StepGraph &g) {
         throw std::runtime_error("graph compute failed");
       ggml_backend_synchronize(model_.backend());
       const ggml_tensor *node = ggml_graph_node(gf, i);
-      auto &s = profile_ops[std::string(i < g.n_forward ? "fwd:" : "bwd:") + ggml_op_desc(node)];
+      const std::string phase = kind + (i >= g.n_forward ? "bwd" : g.jvp_mark && node > g.jvp_mark ? "tan" : "fwd");
+      auto &s = profile_ops[phase + ":" + ggml_op_desc(node)];
       auto [f, b] = node_cost(node);
       const double ms = 1e3 * seconds_since(tn);
       s.ms += ms, s.count++, s.flops += f, s.bytes += b;
       if (node->op == GGML_OP_CONT || node->op == GGML_OP_CPY) {
         // what the copy materialises: the chain of views down to the producer
-        std::string key = std::string(i < g.n_forward ? "fwd:" : "bwd:") + ggml_op_desc(node) + " <-";
+        std::string key = phase + ":" + ggml_op_desc(node) + " <-";
         const ggml_tensor *t = node->src[0];
         for (int depth = 0; t && depth < 4; depth++, t = t->src[0]) {
           key += std::string(" ") + ggml_op_desc(t);
@@ -671,7 +675,7 @@ void Worker::compute(StepGraph &g) {
         auto &c = profile_copies[key];
         c.ms += ms, c.count++, c.bytes += b;
       }
-      profile_nodes.push_back({ms, fmt::format("{}:{} {} [{} {} {} {}]{}", i < g.n_forward ? "fwd" : "bwd",
+      profile_nodes.push_back({ms, fmt::format("{}:{} {} [{} {} {} {}]{}", phase,
                                                ggml_op_desc(node), node->name, node->ne[0], node->ne[1],
                                                node->ne[2], node->ne[3],
                                                ggml_is_contiguous(node) ? "" : " non-contiguous")});
@@ -684,7 +688,7 @@ void Worker::compute(StepGraph &g) {
 }
 
 StepStats Worker::run(const Batch &b, double energy_scale, bool backward) {
-  t_build = t_alloc = t_upload = t_compute = t_download = 0;
+  t_build = t_alloc = t_upload = t_compute = t_download = t_cpu = 0;
   if (conservative.on) return run_conservative(b, energy_scale, backward);
   const int n = b.n_atoms, m = b.max_neighbors, S = b.n_systems;
   std::unique_ptr<StepGraph> once;
@@ -748,6 +752,7 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
   }
   once.reset();
   t_download += seconds_since(t0);
+  const auto t_host = clock_type::now();
 
   // 2. F = -dE/dx (scaled energy units): edge gradients to their atoms, and
   // through the adaptive radii, dE/dr_k = S_k = sum over edges touching k
@@ -815,7 +820,7 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
       atom_errors->insert(atom_errors->end(), per_atom.begin(), per_atom.begin() + n_real);
     }
   }
-  if (!backward) return st;
+  if (!backward) return t_cpu = seconds_since(t_host), st;
 
   // 3. tangents along u (atoms): edge (i -> k) moves by u_k - u_i, a pair
   // cutoff by (dr_i + dr_k) / 2, dr_k = sum over taper edges (k -> l) of
@@ -840,6 +845,7 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
     for (int f = 0; f < n * m; f++)
       if (real(f)) dc[f] = static_cast<float>(0.5 * (dr[f / m] + dr[b.neighbor_atom[f]]));
   }
+  t_cpu = seconds_since(t_host);
   StepGraph &gm = graph(n, m, S, MIXED, once);
   t0 = clock_type::now();
   upload_inputs(gm, b, &dv, &dc);

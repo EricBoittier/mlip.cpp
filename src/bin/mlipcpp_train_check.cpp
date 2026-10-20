@@ -237,12 +237,17 @@ int main(int argc, char **argv) {
                                  worker.model().cutoff(), 5e7, 2.0);
     for (int rep = 0; rep < 3; rep++) { // warm-up, then timed
       auto t0 = std::chrono::steady_clock::now();
-      double compute = 0;
+      double build = 0, alloc = 0, upload = 0, compute = 0, download = 0, cpu = 0;
       worker.zero_grads();
-      for (const Batch &mb : mbs) worker.run(mb, sc.energy_scale, true), compute += worker.t_compute;
-      fmt::print("step ({} micro-batches): wall {:.1f} ms, compute {:.1f} ms\n", mbs.size(),
-                 1e3 * std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
-                 1e3 * compute);
+      for (const Batch &mb : mbs) {
+        worker.run(mb, sc.energy_scale, true);
+        build += worker.t_build, alloc += worker.t_alloc, upload += worker.t_upload;
+        compute += worker.t_compute, download += worker.t_download, cpu += worker.t_cpu;
+      }
+      fmt::print("step ({} micro-batches): wall {:.1f} ms = build {:.1f} + alloc {:.1f} + upload {:.1f} + compute {:.1f} "
+                 "+ download {:.1f} + host {:.1f} ms (+ the rest)\n", mbs.size(),
+                 1e3 * std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), 1e3 * build,
+                 1e3 * alloc, 1e3 * upload, 1e3 * compute, 1e3 * download, 1e3 * cpu);
     }
     worker.profile = true;
     for (const Batch &mb : mbs) worker.run(mb, sc.energy_scale, true);
@@ -251,10 +256,20 @@ int main(int argc, char **argv) {
     for (auto &[op, v] : worker.profile_ops)
       rows.push_back({v.ms, op}), tot.ms += v.ms, tot.flops += v.flops, tot.bytes += v.bytes;
     std::sort(rows.rbegin(), rows.rend());
+    std::map<std::string, Worker::OpStats> phases; // by the label before ':'
+    for (auto &[op, v] : worker.profile_ops) {
+      auto &p = phases[op.substr(0, op.find(':'))];
+      p.ms += v.ms, p.count += v.count, p.flops += v.flops, p.bytes += v.bytes;
+    }
+    fmt::print("profile by phase:\n");
+    for (auto &[ph, v] : phases)
+      fmt::print("  {:<6} {:>8.2f} ms {:5.1f}%  x{:<6} {:>9.2f} GFLOP {:>7.2f} TFLOP/s {:>8.2f} GB {:>6.0f} GB/s\n", ph,
+                 v.ms, 100 * v.ms / tot.ms, v.count, v.flops / 1e9, v.flops / v.ms / 1e9, v.bytes / 1e9,
+                 v.bytes / v.ms / 1e6);
     fmt::print("profile (node by node, synchronised; total {:.1f} ms, {:.1f} GFLOP, {:.1f} GB ideal traffic: "
                "{:.2f} TFLOP/s, {:.0f} GB/s):\n", tot.ms, tot.flops / 1e9, tot.bytes / 1e9,
                tot.flops / tot.ms / 1e9, tot.bytes / tot.ms / 1e6);
-    for (size_t k = 0; k < std::min<size_t>(rows.size(), 30); k++) {
+    for (size_t k = 0; k < std::min<size_t>(rows.size(), 40); k++) {
       const auto &v = worker.profile_ops[rows[k].second];
       fmt::print("  {:>8.2f} ms {:5.1f}%  {:<24} x{:<5} {:>9.2f} GFLOP {:>7.2f} TFLOP/s {:>8.2f} GB {:>6.0f} GB/s\n",
                  v.ms, 100 * v.ms / tot.ms, rows[k].second, v.count, v.flops / 1e9, v.flops / v.ms / 1e9,
