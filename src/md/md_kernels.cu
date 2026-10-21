@@ -6,6 +6,8 @@
 #include <cuda_runtime.h>
 
 #include <cstdlib>
+#include <cmath>
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
@@ -119,6 +121,151 @@ __global__ void build_kernel(int n, int K, const double *x, Cell cell, int3 img,
     count[i] = base;
     if (base > K) atomicMax(overflow, base);
   }
+}
+
+struct Grid {
+  int nc[3];
+  bool periodic;  // fractional cells over the periodic cell, else Cartesian over a box
+  double lo[3], scale[3]; // open: cell index = (x - lo) * scale
+};
+
+__device__ inline int3 cell_of_atom(const double *x, int i, const Grid &g, const Inverse &inv) {
+  int c[3];
+  for (int d = 0; d < 3; d++) {
+    double f;
+    if (g.periodic) {
+      f = x[3 * i] * inv.m[d] + x[3 * i + 1] * inv.m[3 + d] + x[3 * i + 2] * inv.m[6 + d];
+      f = (f - floor(f)) * g.nc[d];
+    } else {
+      f = (x[3 * i + d] - g.lo[d]) * g.scale[d];
+    }
+    c[d] = min(max(int(f), 0), g.nc[d] - 1);
+  }
+  return make_int3(c[0], c[1], c[2]);
+}
+
+__global__ void bin_kernel(int n, const double *x, Grid g, Inverse inv, int32_t *cell_of, int32_t *cell_count) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const int3 c = cell_of_atom(x, i, g, inv);
+  const int id = (c.z * g.nc[1] + c.y) * g.nc[0] + c.x;
+  cell_of[i] = id;
+  atomicAdd(cell_count + id, 1);
+}
+
+// exclusive scan of the cell counts in one block: start[0..ncell]
+__global__ void scan_kernel(int ncell, const int32_t *count, int32_t *start) {
+  __shared__ int32_t part[1024];
+  const int t = threadIdx.x, chunk = (ncell + 1023) / 1024, b = t * chunk, e = min(b + chunk, ncell);
+  int32_t s = 0;
+  for (int k = b; k < e; k++) s += count[k];
+  part[t] = s;
+  __syncthreads();
+  if (t == 0) {
+    int32_t acc = 0;
+    for (int k = 0; k < 1024; k++) {
+      const int32_t v = part[k];
+      part[k] = acc, acc += v;
+    }
+    start[ncell] = acc;
+  }
+  __syncthreads();
+  s = part[t];
+  for (int k = b; k < e; k++) start[k] = s, s += count[k];
+}
+
+__global__ void fill_kernel(int n, const int32_t *cell_of, const int32_t *start, int32_t *fill, int32_t *atoms) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const int c = cell_of[i];
+  atoms[start[c] + atomicAdd(fill + c, 1)] = i;
+}
+
+__device__ inline bool before(int ja, const Shift &a, int jb, const Shift &b) {
+  if (ja != jb) return ja < jb;
+  for (int c = 0; c < 3; c++)
+    if (a.s[c] != b.s[c]) return a.s[c] < b.s[c];
+  return false;
+}
+
+// atom i's candidates from the 27 cells around its own, then sorted by
+// (j, shift): the order of the all-pairs kernel
+__global__ void gather_kernel(int n, int K, const double *x, Cell cell, Grid g, Inverse inv, const int32_t *cell_of,
+                              const int32_t *start, const int32_t *atoms, double rc2, int32_t *cand_j, Shift *cand_s,
+                              int32_t *count, int32_t *overflow) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  float cf[9];
+  for (int q = 0; q < 9; q++) cf[q] = float(cell.m[q]);
+  const float screen2 = float(rc2) * 1.001f + 1e-3f;
+  const int3 ci = cell_of_atom(x, i, g, inv);
+  const int me[3] = {ci.x, ci.y, ci.z};
+  int k = 0;
+  for (int dz = -1; dz <= 1; dz++)
+    for (int dy = -1; dy <= 1; dy++)
+      for (int dx = -1; dx <= 1; dx++) {
+        const int dd[3] = {dx, dy, dz};
+        int nb[3];
+        Shift s{{0, 0, 0}};
+        bool inside = true;
+        for (int d = 0; d < 3; d++) {
+          nb[d] = me[d] + dd[d];
+          if (nb[d] < 0 || nb[d] >= g.nc[d]) {
+            if (!g.periodic) inside = false;
+            const int w = nb[d] < 0 ? -1 : 1;
+            s.s[d] = int8_t(w), nb[d] -= w * g.nc[d];
+          }
+        }
+        if (!inside) continue;
+        const int c = (nb[2] * g.nc[1] + nb[1]) * g.nc[0] + nb[0];
+        for (int p = start[c]; p < start[c + 1]; p++) {
+          const int j = atoms[p];
+          if (i == j && s.s[0] == 0 && s.s[1] == 0 && s.s[2] == 0) continue;
+          float d2 = 0;
+          for (int q = 0; q < 3; q++) {
+            const float t = float(x[3 * j + q] - x[3 * i + q]) + s.s[0] * cf[q] + s.s[1] * cf[3 + q] + s.s[2] * cf[6 + q];
+            d2 += t * t;
+          }
+          if (d2 > screen2) continue;
+          double v[3];
+          pair_vector(x, cell, i, j, s, v);
+          if (v[0] * v[0] + v[1] * v[1] + v[2] * v[2] >= rc2) continue;
+          if (k < K) cand_j[i * K + k] = j, cand_s[i * K + k] = s;
+          k++;
+        }
+      }
+  count[i] = k;
+  if (k > K) {
+    atomicMax(overflow, k);
+    return;
+  }
+  int32_t *cj = cand_j + i * K;
+  Shift *cs = cand_s + i * K;
+  for (int a = 1; a < k; a++) {
+    const int j = cj[a];
+    const Shift t = cs[a];
+    int b = a - 1;
+    for (; b >= 0 && before(j, t, cj[b], cs[b]); b--) cj[b + 1] = cj[b], cs[b + 1] = cs[b];
+    cj[b + 1] = j, cs[b + 1] = t;
+  }
+}
+
+// bounding box of the positions, one block: lo[3], hi[3]
+__global__ void bbox_kernel(int n, const double *x, double *out) {
+  __shared__ double lo[3][256], hi[3][256];
+  const int t = threadIdx.x;
+  double l[3] = {1e300, 1e300, 1e300}, h[3] = {-1e300, -1e300, -1e300};
+  for (int i = t; i < n; i += 256)
+    for (int d = 0; d < 3; d++) l[d] = fmin(l[d], x[3 * i + d]), h[d] = fmax(h[d], x[3 * i + d]);
+  for (int d = 0; d < 3; d++) lo[d][t] = l[d], hi[d][t] = h[d];
+  __syncthreads();
+  for (int o = 128; o > 0; o >>= 1) {
+    if (t < o)
+      for (int d = 0; d < 3; d++) lo[d][t] = fmin(lo[d][t], lo[d][t + o]), hi[d][t] = fmax(hi[d][t], hi[d][t + o]);
+    __syncthreads();
+  }
+  if (t == 0)
+    for (int d = 0; d < 3; d++) out[d] = lo[d][0], out[3 + d] = hi[d][0];
 }
 
 __global__ void reverse_kernel(int n, int K, const int32_t *cand_j, const Shift *cand_s,
@@ -341,24 +488,122 @@ Cell make_cell(const State &s) {
 
 } // namespace
 
+struct CellList {
+  int32_t *cell_of = nullptr, *atoms = nullptr; // [n]
+  int32_t *count = nullptr, *start = nullptr;   // [ncell], [ncell + 1]
+  double *bbox = nullptr;                       // [6]
+  int n_cap = 0, cell_cap = 0;
+};
+
+void free_cells(State &s) {
+  if (!s.cells) return;
+  for (void *p : {(void *)s.cells->cell_of, (void *)s.cells->atoms, (void *)s.cells->count, (void *)s.cells->start,
+                  (void *)s.cells->bbox})
+    if (p) cudaFree(p);
+  delete s.cells;
+  s.cells = nullptr;
+}
+
+namespace {
+template <class T> void grow(T *&p, int &cap, int want) {
+  if (want <= cap) return;
+  if (p) check(cudaFree(p), "free");
+  check(cudaMalloc(&p, sizeof(T) * size_t(want)), "malloc");
+  cap = want;
+}
+
+// the cell grid for build_list, or false for the all-pairs kernel
+bool make_grid(State &s, double rc, Grid &g) {
+  static const char *mode = std::getenv("MLIPCPP_GPU_NL");
+  const bool force_cells = mode && std::string(mode) == "cells", force_pairs = mode && std::string(mode) == "pairs";
+  if (force_pairs || (!force_cells && s.n < 256)) return false;
+  const bool all = s.pbc[0] && s.pbc[1] && s.pbc[2], none = !s.pbc[0] && !s.pbc[1] && !s.pbc[2];
+  if (!all && !none) return false;
+  g.periodic = all;
+  if (all) {
+    const double *m = s.cell;
+    auto cross = [&](int a, int b, double out[3]) {
+      out[0] = m[3 * a + 1] * m[3 * b + 2] - m[3 * a + 2] * m[3 * b + 1];
+      out[1] = m[3 * a + 2] * m[3 * b] - m[3 * a] * m[3 * b + 2];
+      out[2] = m[3 * a] * m[3 * b + 1] - m[3 * a + 1] * m[3 * b];
+    };
+    double c12[3];
+    cross(1, 2, c12);
+    const double volume = std::abs(m[0] * c12[0] + m[1] * c12[1] + m[2] * c12[2]);
+    for (int d = 0; d < 3; d++) {
+      double w[3];
+      cross((d + 1) % 3, (d + 2) % 3, w);
+      const double height = volume / std::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+      g.nc[d] = int(std::min(height / rc, 1024.0));
+      if (g.nc[d] < 3) return false; // the 27 neighbour cells would repeat
+    }
+  } else {
+    if (!s.cells) s.cells = new CellList();
+    int one = 0;
+    if (!s.cells->bbox) grow(s.cells->bbox, one, 6);
+    bbox_kernel<<<1, 256>>>(s.n, s.x, s.cells->bbox);
+    check(cudaGetLastError(), "bbox_kernel");
+    double b[6];
+    check(cudaMemcpy(b, s.cells->bbox, sizeof b, cudaMemcpyDeviceToHost), "bbox");
+    for (int d = 0; d < 3; d++) {
+      const double extent = b[3 + d] - b[d];
+      g.nc[d] = std::max(1, int(std::min(extent / rc, 1024.0)));
+      g.lo[d] = b[d];
+      g.scale[d] = extent > 0 ? g.nc[d] / extent : 0.0;
+    }
+  }
+  // no more cells than ~ atoms: coarser cells (still at least rc) for sparse systems
+  while (double(g.nc[0]) * g.nc[1] * g.nc[2] > 4.0 * s.n + 64) {
+    int &d = g.nc[0] >= g.nc[1] && g.nc[0] >= g.nc[2] ? g.nc[0] : g.nc[1] >= g.nc[2] ? g.nc[1] : g.nc[2];
+    if (g.periodic && d / 2 < 3) break;
+    const int old = d;
+    d = std::max(1, d / 2);
+    if (!g.periodic) {
+      const int k = int(&d - g.nc);
+      g.scale[k] *= double(d) / old;
+    }
+  }
+  return true;
+}
+} // namespace
+
 void build_list(State &s, const Cutoff &cut) {
   const Cell cell = make_cell(s);
   const bool any_pbc = s.pbc[0] || s.pbc[1] || s.pbc[2];
+  Inverse inv{{1, 0, 0, 0, 1, 0, 0, 0, 1}};
   if (any_pbc) {
     const double *m = s.cell;
     const double det = m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6]) +
                        m[2] * (m[3] * m[7] - m[4] * m[6]);
-    const Inverse inv{{(m[4] * m[8] - m[5] * m[7]) / det, (m[2] * m[7] - m[1] * m[8]) / det,
-                     (m[1] * m[5] - m[2] * m[4]) / det, (m[5] * m[6] - m[3] * m[8]) / det,
-                     (m[0] * m[8] - m[2] * m[6]) / det, (m[2] * m[3] - m[0] * m[5]) / det,
-                     (m[3] * m[7] - m[4] * m[6]) / det, (m[1] * m[6] - m[0] * m[7]) / det,
-                     (m[0] * m[4] - m[1] * m[3]) / det}};
+    inv = Inverse{{(m[4] * m[8] - m[5] * m[7]) / det, (m[2] * m[7] - m[1] * m[8]) / det,
+                   (m[1] * m[5] - m[2] * m[4]) / det, (m[5] * m[6] - m[3] * m[8]) / det,
+                   (m[0] * m[8] - m[2] * m[6]) / det, (m[2] * m[3] - m[0] * m[5]) / det,
+                   (m[3] * m[7] - m[4] * m[6]) / det, (m[1] * m[6] - m[0] * m[7]) / det,
+                   (m[0] * m[4] - m[1] * m[3]) / det}};
     LAUNCH(wrap_kernel, s.n, s.n, s.x, cell, inv);
   }
   check(cudaMemcpy(s.x_ref, s.x, sizeof(double) * 3 * s.n, cudaMemcpyDeviceToDevice), "x_ref");
   const double rc = cut.cutoff + cut.skin;
-  LAUNCH(build_kernel, 32 * s.n, s.n, s.K, s.x, cell, int3{s.images[0], s.images[1], s.images[2]}, rc * rc,
-         s.cand_j, s.cand_s, s.count, s.scalars);
+  Grid g{};
+  if (make_grid(s, rc, g)) {
+    if (!s.cells) s.cells = new CellList();
+    CellList &c = *s.cells;
+    const int ncell = g.nc[0] * g.nc[1] * g.nc[2];
+    int n_cap = c.n_cap, cell_cap = c.cell_cap;
+    grow(c.cell_of, c.n_cap, s.n), grow(c.atoms, n_cap, s.n);
+    grow(c.count, c.cell_cap, ncell + 1), grow(c.start, cell_cap, ncell + 1);
+    check(cudaMemset(c.count, 0, sizeof(int32_t) * ncell), "memset");
+    LAUNCH(bin_kernel, s.n, s.n, s.x, g, inv, c.cell_of, c.count);
+    scan_kernel<<<1, 1024>>>(ncell, c.count, c.start);
+    check(cudaGetLastError(), "scan_kernel");
+    check(cudaMemset(c.count, 0, sizeof(int32_t) * ncell), "memset");
+    LAUNCH(fill_kernel, s.n, s.n, c.cell_of, c.start, c.count, c.atoms);
+    LAUNCH(gather_kernel, s.n, s.n, s.K, s.x, cell, g, inv, c.cell_of, c.start, c.atoms, rc * rc, s.cand_j, s.cand_s,
+           s.count, s.scalars);
+  } else {
+    LAUNCH(build_kernel, 32 * s.n, s.n, s.K, s.x, cell, int3{s.images[0], s.images[1], s.images[2]}, rc * rc,
+           s.cand_j, s.cand_s, s.count, s.scalars);
+  }
   LAUNCH(reverse_kernel, s.n * s.K, s.n, s.K, s.cand_j, s.cand_s, s.count, s.cand_rev);
 }
 

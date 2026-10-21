@@ -14,6 +14,8 @@ struct Shift {
   int8_t s[3];
 };
 
+struct CellList; // build_list's binning buffers (md_kernels.cu)
+
 /// Device state owned by the engine (all pointers are device memory).
 struct State {
   int n = 0, K = 0, M = 0;
@@ -36,6 +38,7 @@ struct State {
   double *chain = nullptr; // [n*K, 3]
   double *f_cons = nullptr, *f_nc = nullptr; // [n, 3]
   int32_t *scalars = nullptr; // [0] overflow (list), [1] max kept, [2] max displacement^2 (float bits)
+  CellList *cells = nullptr;  // made by build_list when it bins the atoms; free_cells
 };
 
 /// Model inputs and outputs: device pointers into the ggml tensors.
@@ -51,7 +54,14 @@ struct Cutoff {
   double n_target = 0, width = 1; // adaptive (n_target 0: fixed cutoff)
 };
 
-void build_list(State &s, const Cutoff &c);          // sets scalars[0] on overflow
+/// Candidates within cutoff + skin of each atom, in (j, shift) order; sets
+/// scalars[0] on overflow. Atoms are binned into cells of at least that size
+/// when the cell is periodic in all three directions (each at least three
+/// cells across) or in none, and n >= 256; otherwise every pair and image is
+/// tested. MLIPCPP_GPU_NL=cells|pairs forces one of the two (cells when
+/// possible).
+void build_list(State &s, const Cutoff &c);
+void free_cells(State &s);
 void prepare_inputs(State &s, const Cutoff &c, const Graph &g); // edges, radii, pack; scalars[1] = max kept
 void conservative_forces(State &s, const Cutoff &c, const Graph &g, double energy_scale);
 /// Per-atom virials sum over edges of v (x) dE/dv, symmetrised, [n, 6] as

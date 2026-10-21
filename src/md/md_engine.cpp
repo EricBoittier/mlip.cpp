@@ -91,6 +91,7 @@ Engine::Engine(const std::string &gguf, int device, double skin) {
 
 Engine::~Engine() {
   free_graph();
+  gpu::free_cells(st_);
   if (galloc_) ggml_gallocr_free(galloc_);
   for (void *p : {(void *)st_.x, (void *)st_.v, (void *)st_.x_ref, (void *)st_.inv_mass, (void *)st_.species,
                   (void *)st_.nc_scale, (void *)st_.cand_j, (void *)st_.cand_rev, (void *)st_.count,

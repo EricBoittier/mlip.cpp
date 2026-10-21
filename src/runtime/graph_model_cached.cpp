@@ -111,6 +111,7 @@ struct DeviceInputs {
     dalloc(st.cand_d, E), dalloc(st.cand_slot, E), dalloc(st.chain, 3 * E);
   }
   ~DeviceInputs() {
+    md::gpu::free_cells(st);
     for (void *p : {(void *)st.x, (void *)st.x_ref, (void *)st.species, (void *)st.count, (void *)st.nkept,
                     (void *)st.r, (void *)st.root, (void *)st.dn_root, (void *)st.clamped, (void *)st.dEdr,
                     (void *)st.f_cons, (void *)virial, (void *)st.scalars, (void *)st.cand_j, (void *)st.cand_rev,
