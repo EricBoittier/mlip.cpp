@@ -248,6 +248,13 @@ else()
         # CUDA PET_ATTN_BACK_BIAS: one block per sequence with its q, k, v, dO
         # tiles in shared memory (GGML_PET_BIAS_ROWS=1: the per-row kernel)
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-pet-attn-bias-seq.patch"
+        # GGML_GLU_OP_SIGLU (sigmoid(a) * b) and SIGLU_BACK, CPU + CUDA, with
+        # the backward pass of SIGLU as two fused passes (PET's gated MLPs)
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-siglu.patch"
+        # the gradient of a view that is a box of its source (a split, the
+        # fused attention's outputs) as one PAD instead of zeros + ACC
+        # (GGML_VIEW_GRAD_ACC=1: zeros + ACC)
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-view-grad-pad.patch"
     )
     # the source cache is keyed by the ggml tag and the patches' contents:
     # CPM's default key hashes the arguments, i.e. the patch paths, so every

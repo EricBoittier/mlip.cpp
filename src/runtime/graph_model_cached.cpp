@@ -185,6 +185,9 @@ void GraphModel::build_cached_graph(int n, int M, bool exact_mask, bool backward
   interp_.set_dimension("n_edges", int64_t(n) * M);
   interp_.set_dimension("max_neighbors_plus_one", M + 1);
   interp_.set_exact_padding_mask(exact_mask);
+  static const bool no_fuse = std::getenv("MLIPCPP_NO_FUSED_GLU") != nullptr;
+  const std::string_view backend = ggml_backend_name(compute_backend_);
+  interp_.set_fuse_glu(!no_fuse && (backend.rfind("CUDA", 0) == 0 || backend.rfind("CPU", 0) == 0));
   g->ctx = ggml_init({ggml_tensor_overhead() * GRAPH_SIZE * 2 + ggml_graph_overhead_custom(GRAPH_SIZE, true) +
                           ggml_graph_overhead_custom(GRAPH_SIZE, false),
                       nullptr, /*no_alloc=*/true});
@@ -221,9 +224,11 @@ void GraphModel::build_cached_graph(int n, int M, bool exact_mask, bool backward
     out = interp_.build(ctx);
   } catch (...) {
     interp_.set_input_gradients(false);
+    interp_.set_fuse_glu(false);
     throw;
   }
   interp_.set_input_gradients(false);
+  interp_.set_fuse_glu(false);
   if (!out) throw std::runtime_error("GraphModel: cannot build the model graph");
   // [1, n] contiguous outputs (a view of `out` would not keep the allocator
   // from reusing its memory in the backward pass)

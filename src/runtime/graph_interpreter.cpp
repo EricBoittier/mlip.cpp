@@ -535,6 +535,17 @@ ggml_tensor *GraphInterpreter::build_mul(ggml_context *ctx,
   if (ggml_nelements(a) < ggml_nelements(b)) {
     std::swap(a, b);
   }
+  if (fuse_glu_) {
+    auto sigmoid_of = [](ggml_tensor *t) {
+      return t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == GGML_UNARY_OP_SIGMOID ? t->src[0] : nullptr;
+    };
+    for (auto [s, g] : {std::pair(a, b), std::pair(b, a)}) {
+      ggml_tensor *x = sigmoid_of(s);
+      if (x && ggml_are_same_shape(x, g) && x->type == GGML_TYPE_F32 && g->type == GGML_TYPE_F32 &&
+          ggml_is_contiguous_1(x) && ggml_is_contiguous_1(g))
+        return ggml_siglu_split(ctx, x, g);
+    }
+  }
   return ggml_mul(ctx, a, b);
 }
 
@@ -697,11 +708,12 @@ ggml_tensor *GraphInterpreter::build_fused_attention(ggml_context *ctx, const GI
   ggml_tensor *r = ggml_pet_attn(ctx, xt, bias, static_cast<int>(H), scale); // [D + H, L, N]
   if (backend_ && !ggml_backend_supports_op(backend_, r))
     return nullptr;
-  // the MATMUL's [N, H, L, d] = ggml [d, L, H, N]: the outputs viewed as
-  // [d, H, L, N] (increasing strides: the view's backward, a CUDA ACC, decodes
-  // indices assuming that), then permuted
-  ggml_tensor *o = ggml_view_4d(ctx, r, d, H, L, N, d * sizeof(float), r->nb[1], r->nb[2], 0);
-  return ggml_permute(ctx, o, 0, 2, 1, 3);
+  // the MATMUL's [N, H, L, d] = ggml [d, L, H, N]: the outputs [D, L, N] (a
+  // box of r, whose gradient is r's padded with zeros), made contiguous,
+  // viewed as [d, H, L, N] and permuted; the model's transpose back undoes the
+  // permute (permute_or_undo), and its reshape to [D, L, N] needs no copy
+  ggml_tensor *o = ggml_cont(ctx, ggml_view_3d(ctx, r, H * d, L, N, r->nb[1], r->nb[2], 0));
+  return ggml_permute(ctx, ggml_reshape_4d(ctx, o, d, H, L, N), 0, 2, 1, 3);
 }
 
 // ===================== Shape Operations =====================
@@ -944,6 +956,22 @@ ggml_tensor *GraphInterpreter::build_select(ggml_context *ctx,
                            std::to_string(ggml_dim));
 }
 
+namespace {
+// ggml_permute, or the tensor before `a` when `a` is a permute that this one
+// undoes (the fused attention's output, transposed back by the model): no
+// view chain, so no strided copies of it or of its gradient
+ggml_tensor *permute_or_undo(ggml_context *ctx, ggml_tensor *a, int p0, int p1, int p2, int p3) {
+  const int p[4] = {p0, p1, p2, p3};
+  if (a->op == GGML_OP_PERMUTE) {
+    const int32_t *q = reinterpret_cast<const int32_t *>(a->op_params);
+    bool identity = true;
+    for (int i = 0; i < 4; i++) identity = identity && p[q[i]] == i;
+    if (identity) return a->src[0];
+  }
+  return ggml_permute(ctx, a, p0, p1, p2, p3);
+}
+} // namespace
+
 ggml_tensor *GraphInterpreter::build_permute(ggml_context *ctx,
                                              const GIRNode &node) {
   if (node.inputs.empty()) {
@@ -969,8 +997,7 @@ ggml_tensor *GraphInterpreter::build_permute(ggml_context *ctx,
     ggml_axes[n_dims - 1 - i] = n_dims - 1 - static_cast<int>(axes[i]);
   }
 
-  return ggml_permute(ctx, a, ggml_axes[0], ggml_axes[1],
-                      ggml_axes[2], ggml_axes[3]);
+  return permute_or_undo(ctx, a, ggml_axes[0], ggml_axes[1], ggml_axes[2], ggml_axes[3]);
 }
 
 ggml_tensor *GraphInterpreter::build_transpose(ggml_context *ctx,
@@ -1010,7 +1037,7 @@ ggml_tensor *GraphInterpreter::build_transpose(ggml_context *ctx,
   // Swap the two dimensions
   std::swap(perm[ggml_dim0], perm[ggml_dim1]);
 
-  return ggml_permute(ctx, a, perm[0], perm[1], perm[2], perm[3]);
+  return permute_or_undo(ctx, a, perm[0], perm[1], perm[2], perm[3]);
 }
 
 ggml_tensor *GraphInterpreter::build_cont(ggml_context *ctx,

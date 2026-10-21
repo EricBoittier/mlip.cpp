@@ -109,6 +109,10 @@ public:
   /// Padded neighbour slots get an attention bias of -inf instead of PET's
   /// log(1e-15) = -34.5 (see build_clamp); for graphs built afterwards.
   void set_exact_padding_mask(bool on) { exact_padding_mask_ = on; }
+  /// x * sigmoid(y) as one GGML_GLU_OP_SIGLU node, whose gradient takes two
+  /// fused passes instead of five (needs a backend with SIGLU: CPU, CUDA; not
+  /// for the JVP graphs of training); for graphs built afterwards.
+  void set_fuse_glu(bool on) { fuse_glu_ = on; }
 
 private:
   // The IR graph
@@ -157,6 +161,7 @@ private:
   ggml_tensor *build_fused_attention(ggml_context *ctx, const GIRNode &node);
   bool input_gradients_ = false;
   bool exact_padding_mask_ = false;
+  bool fuse_glu_ = false;
   const GIRNode *find_node(const std::string &ref) const;
   std::vector<const GIRNode *> consumers(int id) const;
   ggml_tensor *build_chunk_linear(ggml_context *ctx, const GIRNode &node, int64_t index,

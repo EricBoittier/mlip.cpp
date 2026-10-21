@@ -1,0 +1,39 @@
+--- a/src/ggml.c
++++ b/src/ggml.c
+@@ -6539,8 +6539,34 @@
+     if (cgraph->grads[isrc]) {
+         cgraph->grads[isrc] = ggml_acc_impl(ctx, cgraph->grads[isrc], tensor, nb1, nb2, nb3, offset, cgraph->grad_accs[isrc]);
+     } else {
+-        struct ggml_tensor * a_zero = ggml_scale(ctx, src, 0.0f); // FIXME this is going to produce NaN if a contains inf/NaN
+-        cgraph->grads[isrc] = ggml_acc_impl(ctx, a_zero, tensor, nb1, nb2, nb3, offset, false);
++        // the first contribution of a view that is a box of a contiguous src
++        // (its rows, e.g. a split): tensor padded with zeros, one pass instead
++        // of zeroing a copy of src and accumulating into it (and no NaN from
++        // an inf in src). The CUDA PAD grid has ne2*ne3 blocks in z.
++        int64_t lo[4] = {0, 0, 0, 0};
++        bool box = src->type == GGML_TYPE_F32 && tensor->type == GGML_TYPE_F32 && ggml_is_contiguous(src) &&
++                   ggml_is_contiguous(tensor) && nb1 == src->nb[1] && nb2 == src->nb[2] && nb3 == src->nb[3] &&
++                   src->ne[2]*src->ne[3] <= 65535 && getenv("GGML_VIEW_GRAD_ACC") == NULL;
++        if (box) {
++            const size_t nb[4] = {src->nb[0], nb1, nb2, nb3};
++            size_t rem = offset;
++            for (int d = 3; d >= 0; d--) {
++                lo[d] = rem / nb[d];
++                rem %= nb[d];
++            }
++            box = rem == 0;
++            for (int d = 0; d < 4; d++) {
++                box = box && lo[d] + tensor->ne[d] <= src->ne[d];
++            }
++        }
++        if (box) {
++            cgraph->grads[isrc] = ggml_pad_ext(ctx, tensor,
++                (int) lo[0], (int) (src->ne[0] - tensor->ne[0] - lo[0]), (int) lo[1], (int) (src->ne[1] - tensor->ne[1] - lo[1]),
++                (int) lo[2], (int) (src->ne[2] - tensor->ne[2] - lo[2]), (int) lo[3], (int) (src->ne[3] - tensor->ne[3] - lo[3]));
++        } else {
++            struct ggml_tensor * a_zero = ggml_scale(ctx, src, 0.0f); // FIXME this is going to produce NaN if a contains inf/NaN
++            cgraph->grads[isrc] = ggml_acc_impl(ctx, a_zero, tensor, nb1, nb2, nb3, offset, false);
++        }
+     }
+     ggml_format_name(cgraph->grads[isrc], "grad for %s", cgraph->visited_hash_set.keys[isrc]->name);
+     ggml_build_forward_expand(cgraph, cgraph->grads[isrc]);

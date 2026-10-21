@@ -1,0 +1,202 @@
+--- a/include/ggml.h
++++ b/include/ggml.h
+@@ -622,6 +622,8 @@
+         GGML_GLU_OP_SWIGLU_OAI,
+         GGML_GLU_OP_GEGLU_ERF,
+         GGML_GLU_OP_GEGLU_QUICK,
++        GGML_GLU_OP_SIGLU,      // sigmoid(a) * b (PET's gated MLP)
++        GGML_GLU_OP_SIGLU_BACK, // sigmoid'(a) * b: the gradient of SIGLU w.r.t. a, given b = grad * g
+ 
+         GGML_GLU_OP_COUNT,
+     };
+@@ -1345,6 +1347,17 @@
+             struct ggml_context * ctx,
+             struct ggml_tensor  * a,
+             struct ggml_tensor  * b);
++
++    // sigmoid(a) * b, and its derivative sigmoid(a) (1 - sigmoid(a)) * b (split form only)
++    GGML_API struct ggml_tensor * ggml_siglu_split(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a,
++            struct ggml_tensor  * b);
++
++    GGML_API struct ggml_tensor * ggml_siglu_back_split(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a,
++            struct ggml_tensor  * b);
+ 
+     GGML_API struct ggml_tensor * ggml_geglu_quick_split(
+             struct ggml_context * ctx,
+--- a/src/ggml.c
++++ b/src/ggml.c
+@@ -1229,9 +1229,11 @@
+     "SWIGLU_OAI",
+     "GEGLU_ERF",
+     "GEGLU_QUICK",
++    "SIGLU",
++    "SIGLU_BACK",
+ };
+ 
+-static_assert(GGML_GLU_OP_COUNT == 6, "GGML_GLU_OP_COUNT != 6");
++static_assert(GGML_GLU_OP_COUNT == 8, "GGML_GLU_OP_COUNT != 8");
+ 
+ 
+ static_assert(sizeof(struct ggml_object)%GGML_MEM_ALIGN == 0, "ggml_object size must be a multiple of GGML_MEM_ALIGN");
+@@ -3069,6 +3071,22 @@
+     return ggml_glu_impl(ctx, a, b, GGML_GLU_OP_GEGLU_QUICK, false);
+ }
+ 
++// ggml_siglu
++
++struct ggml_tensor * ggml_siglu_split(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * a,
++        struct ggml_tensor  * b) {
++    return ggml_glu_impl(ctx, a, b, GGML_GLU_OP_SIGLU, false);
++}
++
++struct ggml_tensor * ggml_siglu_back_split(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * a,
++        struct ggml_tensor  * b) {
++    return ggml_glu_impl(ctx, a, b, GGML_GLU_OP_SIGLU_BACK, false);
++}
++
+ struct ggml_tensor * ggml_swiglu_oai(
+         struct ggml_context * ctx,
+         struct ggml_tensor  * a,
+@@ -7172,6 +7190,16 @@
+                         ggml_add_or_set(ctx, cgraph, isrc1, ggml_mul(ctx, ggml_silu(ctx, src0), grad));
+                     }
+                 } break;
++                case GGML_GLU_OP_SIGLU: {
++                    // y = sigmoid(a) * b: two fused passes, sigmoid recomputed from a
++                    GGML_ASSERT(src1 && "backward pass only implemented for split siglu");
++                    if (src0_needs_grads) {
++                        ggml_add_or_set(ctx, cgraph, isrc0, ggml_siglu_back_split(ctx, src0, ggml_mul(ctx, grad, src1)));
++                    }
++                    if (src1_needs_grads) {
++                        ggml_add_or_set(ctx, cgraph, isrc1, ggml_siglu_split(ctx, src0, grad));
++                    }
++                } break;
+                 default: {
+                     GGML_ABORT("unsupported glu op for backward pass: %s", ggml_glu_op_name(ggml_get_glu_op(tensor)));
+                 } //break;
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -2297,6 +2297,8 @@
+                 case GGML_GLU_OP_SWIGLU_OAI:
+                 case GGML_GLU_OP_GEGLU_ERF:
+                 case GGML_GLU_OP_GEGLU_QUICK:
++                case GGML_GLU_OP_SIGLU:
++                case GGML_GLU_OP_SIGLU_BACK:
+                     {
+                         n_tasks = n_threads;
+                     } break;
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -3128,6 +3128,31 @@
+ 
+ // ggml_compute_forward_swiglu
+ 
++// sigmoid(a) * b, or sigmoid'(a) * b (split form, f32)
++static void ggml_compute_forward_siglu_f32(
++        const ggml_compute_params * params,
++        ggml_tensor * dst, bool back) {
++    const ggml_tensor * src0 = dst->src[0];
++    const ggml_tensor * src1 = dst->src[1];
++    GGML_ASSERT(src1 && "siglu: split form only");
++    GGML_ASSERT(src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous_1(src0) && ggml_is_contiguous_1(src1) && ggml_is_contiguous_1(dst));
++    const int nc = src0->ne[0];
++    const int nr = ggml_nrows(src0);
++    GGML_ASSERT(dst->ne[0] == nc && src1->ne[0] == nc && ggml_nrows(dst) == nr);
++    const int dr = (nr + params->nth - 1)/params->nth;
++    const int ir0 = dr*params->ith, ir1 = MIN(ir0 + dr, nr);
++    for (int i1 = ir0; i1 < ir1; i1++) {
++        const float * a = (const float *) ((const char *) src0->data + i1*src0->nb[1]);
++        const float * b = (const float *) ((const char *) src1->data + i1*src1->nb[1]);
++        float * y = (float *) ((char *) dst->data + i1*dst->nb[1]);
++        for (int k = 0; k < nc; k++) {
++            const float s = 1.0f/(1.0f + expf(-a[k]));
++            y[k] = (back ? s*(1.0f - s) : s)*b[k];
++        }
++    }
++}
++
+ static void ggml_compute_forward_swiglu_f32(
+         const ggml_compute_params * params,
+         ggml_tensor * dst) {
+@@ -9806,6 +9831,11 @@
+             {
+                 ggml_compute_forward_geglu_quick(params, dst);
+             } break;
++        case GGML_GLU_OP_SIGLU:
++        case GGML_GLU_OP_SIGLU_BACK:
++            {
++                ggml_compute_forward_siglu_f32(params, dst, op == GGML_GLU_OP_SIGLU_BACK);
++            } break;
+         default:
+             {
+                 GGML_ABORT("fatal error");
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -2635,6 +2635,12 @@
+                 case GGML_GLU_OP_GEGLU_QUICK:
+                     ggml_cuda_op_geglu_quick(ctx, dst);
+                     break;
++                case GGML_GLU_OP_SIGLU:
++                    ggml_cuda_op_siglu(ctx, dst);
++                    break;
++                case GGML_GLU_OP_SIGLU_BACK:
++                    ggml_cuda_op_siglu_back(ctx, dst);
++                    break;
+                 default:
+                     return false;
+             }
+@@ -4670,6 +4676,10 @@
+                 case GGML_GLU_OP_GEGLU_ERF:
+                 case GGML_GLU_OP_GEGLU_QUICK:
+                     return ggml_is_contiguous_1(op->src[0]);
++                case GGML_GLU_OP_SIGLU:
++                case GGML_GLU_OP_SIGLU_BACK:
++                    return op->src[1] && op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous_1(op->src[0]) &&
++                           ggml_is_contiguous_1(op->src[1]);
+                 default:
+                     return false;
+             }
+--- a/src/ggml-cuda/unary.cu
++++ b/src/ggml-cuda/unary.cu
+@@ -346,6 +346,19 @@
+     ggml_cuda_op_unary_gated<op_gelu_quick>(ctx, dst);
+ }
+ 
++static __device__ __forceinline__ float op_sigmoid_back(float x) {
++    const float s = 1.0f / (1.0f + expf(-x));
++    return s * (1.0f - s);
++}
++
++void ggml_cuda_op_siglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    ggml_cuda_op_unary_gated<op_sigmoid>(ctx, dst);
++}
++
++void ggml_cuda_op_siglu_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    ggml_cuda_op_unary_gated<op_sigmoid_back>(ctx, dst);
++}
++
+ // swiglu_oai
+ 
+ template <typename T>
+--- a/src/ggml-cuda/unary.cuh
++++ b/src/ggml-cuda/unary.cuh
+@@ -87,6 +87,10 @@
+ 
+ void ggml_cuda_op_geglu_quick(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
++void ggml_cuda_op_siglu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
++void ggml_cuda_op_siglu_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
+ void ggml_cuda_op_xielu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node);
