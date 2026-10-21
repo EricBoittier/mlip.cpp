@@ -26,6 +26,7 @@ option(MLIPCPP_BUILD_EXAMPLES "Build examples" ON)
 option(MLIPCPP_BUILD_TESTS "Build tests" OFF)
 option(MLIPCPP_BUILD_FORTRAN "Build Fortran bindings" OFF)
 option(MLIPCPP_BUILD_PYTHON "Build Python bindings" OFF)
+option(MLIPCPP_BUILD_METATOMIC "Build the metatomic plugin (needs metatomic-core)" OFF)
 option(MLIPCPP_BUILD_TRAINING "Build the PET trainer (mlipcpp-train, POSIX only)" ON)
 option(MLIPCPP_INSTALL "Generate install target" OFF)
 option(MLIPCPP_USE_CUDA "Enable CUDA backend via ggml" OFF)
@@ -77,6 +78,12 @@ if(MLIPCPP_BUILD_PYTHON)
     find_package(Python 3.10 REQUIRED COMPONENTS Interpreter Development.Module
         OPTIONAL_COMPONENTS Development.SABIModule)
     message(STATUS "Python bindings enabled, setting CMAKE_POSITION_INDEPENDENT_CODE")
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
+
+if(MLIPCPP_BUILD_METATOMIC)
+    find_package(metatomic CONFIG REQUIRED)
+    # libmlipcpp and ggml are linked statically into the plugin
     set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 endif()
 
