@@ -1,0 +1,91 @@
+--- a/src/ggml-cuda/pet-attn.cu
++++ b/src/ggml-cuda/pet-attn.cu
+@@ -1170,6 +1170,65 @@
+     }
+ }
+ 
++// The same, one block per sequence n: per head, the sequence's q, k, v and
++// dO are staged in shared memory (coalesced rows, padded against bank
++// conflicts), and each thread owns up to PT entries (i, j) of the L x L map,
++// keeping their bias and gradient in registers across the heads. The kernel
++// above re-reads all of k and v once per query row, in strided loads.
++template <int d, int PT, typename T>
++static __global__ void __launch_bounds__(256) pet_attn_bwd_bias_seq(
++        const T * __restrict__ qkv, const float * __restrict__ bias, const float * __restrict__ res,
++        const float * __restrict__ grad, float * __restrict__ dbias, const int H, const int L, const float scale) {
++    extern __shared__ float sm[];
++    constexpr int S = d + 1;
++    const int D = H*d, LL = L*L, nt = blockDim.x, t = threadIdx.x;
++    const int64_t n = blockIdx.x;
++    float * q = sm, * k = q + L*S, * v = k + L*S, * g = v + L*S, * lse = g + L*S, * Di = lse + L;
++    const T     * x  = qkv  + n*L*3*D;
++    const float * r  = res  + n*L*(D + H);
++    const float * gr = grad + n*L*(D + H);
++    float acc[PT], bb[PT];
++#pragma unroll
++    for (int p = 0; p < PT; p++) {
++        const int e = t + p*nt;
++        acc[p] = 0.0f, bb[p] = e < LL ? bias[n*LL + e] : 0.0f;
++    }
++    for (int h = 0; h < H; h++) {
++        __syncthreads();
++        for (int e = t; e < L*d; e += nt) {
++            const int row = e / d, c = e % d;
++            const T * xr = x + (int64_t) row*3*D + h*d + c;
++            q[row*S + c] = ld_f(xr), k[row*S + c] = ld_f(xr + D), v[row*S + c] = ld_f(xr + 2*D);
++            g[row*S + c] = gr[(int64_t) row*(D + H) + h*d + c];
++        }
++        for (int row = t; row < L; row += nt) lse[row] = r[(int64_t) row*(D + H) + D + h];
++        __syncthreads();
++        for (int row = t; row < L; row += nt) {
++            const float * o = r + (int64_t) row*(D + H) + h*d;
++            float s = 0.0f;
++#pragma unroll
++            for (int c = 0; c < d; c++) s += g[row*S + c]*o[c];
++            Di[row] = s;
++        }
++        __syncthreads();
++#pragma unroll
++        for (int p = 0; p < PT; p++) {
++            const int e = t + p*nt;
++            if (e >= LL) break;
++            const int i = e / L, j = e % L;
++            float s = 0.0f, dp = 0.0f;
++#pragma unroll
++            for (int c = 0; c < d; c++) s += q[i*S + c]*k[j*S + c], dp += g[i*S + c]*v[j*S + c];
++            acc[p] += expf(scale*s + bb[p] - lse[i])*(dp - Di[i]);
++        }
++    }
++#pragma unroll
++    for (int p = 0; p < PT; p++) {
++        const int e = t + p*nt;
++        if (e < LL) dbias[n*LL + e] = acc[p];
++    }
++}
++
+ template <int d, typename T>
+ static void pet_attn_launch_bias(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * qkv = dst->src[0];
+@@ -1178,6 +1237,22 @@
+     const int   L     = (int) qkv->ne[2];
+     const int64_t N   = qkv->ne[3];
+     if (N == 0 || L == 0) return;
++    // one block per sequence while its tiles fit (GGML_PET_BIAS_ROWS=1: per row)
++    static const bool rows = getenv("GGML_PET_BIAS_ROWS") != nullptr;
++    const size_t smem_seq = (4*(size_t) L*(d + 1) + 2*(size_t) L)*sizeof(float);
++    const int64_t LL = (int64_t) L*L;
++    if (!rows && smem_seq <= MAX_SMEM && LL <= 16*256) {
++        auto launch = [&](auto kernel) {
++            kernel<<<(unsigned) N, 256, smem_seq, ctx.stream()>>>(
++                (const T *) qkv->data, (const float *) dst->src[1]->data, (const float *) dst->src[2]->data,
++                (const float *) dst->src[3]->data, (float *) dst->data, H, L, scale);
++        };
++        if      (LL <= 4*256) launch(pet_attn_bwd_bias_seq<d,  4, T>);
++        else if (LL <= 8*256) launch(pet_attn_bwd_bias_seq<d,  8, T>);
++        else                  launch(pet_attn_bwd_bias_seq<d, 16, T>);
++        CUDA_CHECK(cudaGetLastError());
++        return;
++    }
+     const size_t smem = (2*(size_t) H*d + 2*H)*sizeof(float);
+     GGML_ASSERT(smem <= MAX_SMEM && N <= 65535);
+     const int threads = std::min(128, (L + 31)/32*32);

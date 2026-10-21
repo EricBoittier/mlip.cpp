@@ -245,6 +245,9 @@ else()
         # (GGML_OP_PET_ATTN_JVP*, CPU + CUDA): conservative training without
         # storing any L x L matrix (runtime/graph_jvp.h)
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-pet-attention-jvp.patch"
+        # CUDA PET_ATTN_BACK_BIAS: one block per sequence with its q, k, v, dO
+        # tiles in shared memory (GGML_PET_BIAS_ROWS=1: the per-row kernel)
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-pet-attn-bias-seq.patch"
     )
     # the source cache is keyed by the ggml tag and the patches' contents:
     # CPM's default key hashes the arguments, i.e. the patch paths, so every
