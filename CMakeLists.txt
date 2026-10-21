@@ -290,6 +290,28 @@ CPMAddPackage(
     EXCLUDE_FROM_ALL YES
 )
 
+# vesin (neighbour lists: CPU cell lists, and CUDA through NVRTC at run time,
+# so building it needs no CUDA toolkit); its objects go into libmlipcpp
+option(MLIPCPP_USE_VESIN "Build neighbour lists with vesin" ON)
+if(EMSCRIPTEN)
+    set(MLIPCPP_USE_VESIN OFF)
+endif()
+if(MLIPCPP_USE_VESIN)
+    CPMAddPackage(
+        NAME vesin
+        GITHUB_REPOSITORY Luthaf/vesin
+        GIT_TAG v0.6.2
+        SOURCE_SUBDIR vesin
+        EXCLUDE_FROM_ALL YES
+    )
+endif()
+
+# OpenMP for the per-atom host work around the graph (neighbour list
+# post-processing, adaptive cutoffs, force gathering); optional
+if(NOT EMSCRIPTEN)
+    find_package(OpenMP COMPONENTS CXX)
+endif()
+
 # =============================================================================
 # Library
 # =============================================================================

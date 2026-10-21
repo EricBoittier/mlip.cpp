@@ -1,4 +1,5 @@
 #include "graph_model.h"
+#include "graph_cache.h"
 #include "core/adaptive_cutoff.h"
 #include "core/gguf_loader.h"
 #include "core/padding.h"
@@ -29,26 +30,6 @@ using json = nlohmann::json;
 namespace mlipcpp::runtime {
 
 namespace {
-
-// Optional wall-clock breakdown, including backend synchronization in compute.
-struct GraphProfile {
-  bool enabled = std::getenv("MLIPCPP_PROFILE_GRAPH") != nullptr;
-  std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now(), previous = start;
-  std::vector<std::pair<const char *, double>> stages;
-  void mark(const char *name) {
-    if (!enabled) return;
-    const auto now = std::chrono::steady_clock::now();
-    stages.emplace_back(name, std::chrono::duration<double, std::milli>(now - previous).count());
-    previous = now;
-  }
-  ~GraphProfile() {
-    if (!enabled) return;
-    mark("cleanup");
-    std::fprintf(stderr, "GRAPH_PROFILE");
-    for (auto [name, ms] : stages) std::fprintf(stderr, " %s=%.3f", name, ms);
-    std::fprintf(stderr, " total=%.3f ms\n", std::chrono::duration<double, std::milli>(previous - start).count());
-  }
-};
 
 // Bump cutoff function
 float cutoff_func_bump(float distance, float cutoff, float width) {
@@ -372,6 +353,8 @@ GraphModel::GraphModel()
     : neighbor_builder_(NeighborListOptions{cutoff_, true, false}) {}
 
 GraphModel::~GraphModel() {
+  cached_.reset();
+  release_cached_resources();
   if (weight_buffer_) {
     ggml_backend_buffer_free(weight_buffer_);
   }
@@ -619,7 +602,6 @@ ModelResult GraphModel::predict_single(
     const AtomicSystem &system, bool compute_forces,
     const std::function<void()> &post_compute_hook,
     std::vector<float> *parameter_gradients) {
-  GraphProfile profile;
   // Full FP32 on CUDA, as the MD engine: TF32 GEMMs (cuBLAS and ggml's mmf
   // kernels) put energies up to 14 meV/atom off the CPU / metatrain values on
   // MPtrj test structures, at no measurable speed gain here. MLIPCPP_TF32=1
@@ -630,6 +612,14 @@ ModelResult GraphModel::predict_single(
     return true;
   }();
   (void)full_fp32;
+  static const bool no_cache = [] {
+    const char *e = std::getenv("MLIPCPP_NO_GRAPH_CACHE");
+    return e && *e && *e != '0';
+  }();
+  if (!no_cache && !post_compute_hook && !parameter_gradients && cached_path_supported() &&
+      system.num_atoms() > 0)
+    return predict_cached(system, compute_forces);
+  GraphProfile profile;
   if (compute_forces && !forces_mode_) {
     throw std::runtime_error(
         "GraphModel: forces requested but model was exported with "

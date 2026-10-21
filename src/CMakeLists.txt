@@ -32,6 +32,7 @@ set(MLIPCPP_RUNTIME_SOURCES
     runtime/graph_ir.cpp
     runtime/graph_interpreter.cpp
     runtime/graph_model.cpp
+    runtime/graph_model_cached.cpp
 )
 
 # Utilities
@@ -86,9 +87,27 @@ target_link_libraries(mlipcpp
         $<$<NOT:$<BOOL:${EMSCRIPTEN}>>:fmt::fmt>
 )
 
+if(TARGET vesin_objects)
+    target_link_libraries(mlipcpp PRIVATE vesin_objects)
+    target_compile_definitions(mlipcpp PRIVATE MLIPCPP_HAVE_VESIN)
+endif()
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(mlipcpp PRIVATE OpenMP::OpenMP_CXX)
+endif()
+# CUDA: GraphModel::predict_cached builds the model inputs and gathers the
+# forces on the device, with the MD engine's kernels
+if(MLIPCPP_USE_CUDA)
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    target_sources(mlipcpp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/md/md_kernels.cu)
+    set_target_properties(mlipcpp PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+    target_link_libraries(mlipcpp PRIVATE CUDA::cudart)
+    target_compile_definitions(mlipcpp PRIVATE MLIPCPP_HAVE_CUDA_INPUTS)
+endif()
+
 target_compile_options(mlipcpp PRIVATE
-    $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra -Wpedantic>
-    $<$<CXX_COMPILER_ID:MSVC>:/W4>
+    $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:GNU,Clang,AppleClang>>:-Wall -Wextra -Wpedantic>
+    $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<CXX_COMPILER_ID:MSVC>>:/W4>
 )
 
 set_target_properties(mlipcpp PROPERTIES
@@ -206,7 +225,7 @@ if(MLIPCPP_BUILD_TRAINING AND UNIX AND NOT EMSCRIPTEN)
     if(MLIPCPP_USE_CUDA)
         enable_language(CUDA)
         find_package(CUDAToolkit REQUIRED)
-        add_library(mlipcpp_md STATIC md/md_engine.cpp md/md_kernels.cu)
+        add_library(mlipcpp_md STATIC md/md_engine.cpp) # md/md_kernels.cu: in mlipcpp
         target_include_directories(mlipcpp_md PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${ggml_SOURCE_DIR}/include
                                    ${ggml_SOURCE_DIR}/src) # ggml-impl.h: ggml_graph_view
         target_link_libraries(mlipcpp_md PUBLIC mlipcpp ggml CUDA::cudart)

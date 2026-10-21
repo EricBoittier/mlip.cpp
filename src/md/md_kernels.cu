@@ -52,7 +52,11 @@ __device__ inline void pair_vector(const double *x, const Cell &cell, int i, int
 }
 
 // periodic fractional coordinates into [0, 1); x = f . cell (rows), f = x . inv
-__global__ void wrap_kernel(int n, double *x, Cell cell, const double *inv) {
+struct Inverse {
+  double m[9];
+};
+__global__ void wrap_kernel(int n, double *x, Cell cell, Inverse inverse) {
+  const double *inv = inverse.m;
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
   double f[3];
@@ -63,25 +67,58 @@ __global__ void wrap_kernel(int n, double *x, Cell cell, const double *inv) {
   for (int c = 0; c < 3; c++) x[3 * i + c] = f[0] * cell.m[c] + f[1] * cell.m[3 + c] + f[2] * cell.m[6 + c];
 }
 
+// one warp per atom i, a lane per candidate j: each lane counts its hits
+// over the periodic images, a warp prefix sum gives its first slot, so the
+// candidates stay in (j, shift) order as with one thread per atom
 __global__ void build_kernel(int n, int K, const double *x, Cell cell, int3 img, double rc2,
                              int32_t *cand_j, Shift *cand_s, int32_t *count, int32_t *overflow) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= n) return;
-  int k = 0;
-  for (int j = 0; j < n; j++)
+  const int i = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x % 32;
+  if (i >= n) return; // whole warps
+  float cf[9];
+  for (int q = 0; q < 9; q++) cf[q] = float(cell.m[q]);
+  const float screen2 = float(rc2) * 1.001f + 1e-3f;
+  auto visit = [&](int j, auto &&hit) {
     for (int a = -img.x; a <= img.x; a++)
       for (int b = -img.y; b <= img.y; b++)
         for (int c = -img.z; c <= img.z; c++) {
           const Shift s{{int8_t(a), int8_t(b), int8_t(c)}};
           if (i == j && a == 0 && b == 0 && c == 0) continue;
+          // float screen with a margin (FP64 is slow on most GPUs); the
+          // decision stays the double test of pair_vector
+          float d2 = 0;
+          for (int q = 0; q < 3; q++) {
+            const float t = float(x[3 * j + q] - x[3 * i + q]) + a * cf[q] + b * cf[3 + q] + c * cf[6 + q];
+            d2 += t * t;
+          }
+          if (d2 > screen2) continue;
           double v[3];
           pair_vector(x, cell, i, j, s, v);
-          if (v[0] * v[0] + v[1] * v[1] + v[2] * v[2] >= rc2) continue;
-          if (k < K) cand_j[i * K + k] = j, cand_s[i * K + k] = s;
-          k++;
+          if (v[0] * v[0] + v[1] * v[1] + v[2] * v[2] < rc2) hit(s);
         }
-  count[i] = k;
-  if (k > K) atomicMax(overflow, k);
+  };
+  int base = 0;
+  for (int j0 = 0; j0 < n; j0 += 32) {
+    const int j = j0 + lane;
+    int hits = 0;
+    if (j < n) visit(j, [&](const Shift &) { hits++; });
+    int incl = hits;
+    for (int o = 1; o < 32; o <<= 1) {
+      const int y = __shfl_up_sync(0xffffffffu, incl, o);
+      if (lane >= o) incl += y;
+    }
+    if (hits) {
+      int k = base + incl - hits;
+      visit(j, [&](const Shift &s) {
+        if (k < K) cand_j[i * K + k] = j, cand_s[i * K + k] = s;
+        k++;
+      });
+    }
+    base += __shfl_sync(0xffffffffu, incl, 31);
+  }
+  if (lane == 0) {
+    count[i] = base;
+    if (base > K) atomicMax(overflow, base);
+  }
 }
 
 __global__ void reverse_kernel(int n, int K, const int32_t *cand_j, const Shift *cand_s,
@@ -232,6 +269,34 @@ __global__ void chain_gather_kernel(int n, int K, const int32_t *count, const in
   for (int c = 0; c < 3; c++) f[3 * i + c] += scale * F[c];
 }
 
+__device__ inline void add_virial(double w[6], const double r[3], const double g[3]) {
+  w[0] += r[0] * g[0], w[1] += r[1] * g[1], w[2] += r[2] * g[2];
+  w[3] += 0.5 * (r[1] * g[2] + r[2] * g[1]);
+  w[4] += 0.5 * (r[0] * g[2] + r[2] * g[0]);
+  w[5] += 0.5 * (r[0] * g[1] + r[1] * g[0]);
+}
+
+// atom k's edges: the slots with their input vectors and gradients, and the
+// adaptive chain term of every candidate within the cutoff
+__global__ void virial_kernel(int n, int K, int M, const int32_t *nkept, const float *ev, const float *G,
+                              const int32_t *count, const double *cv, const double *cd, double cutoff,
+                              const double *chain, double *out) {
+  const int k = blockIdx.x * blockDim.x + threadIdx.x;
+  if (k >= n) return;
+  double w[6] = {0, 0, 0, 0, 0, 0}, r[3], g[3];
+  for (int s = 0; s < nkept[k]; s++) {
+    const int a = k * M + s;
+    for (int c = 0; c < 3; c++) r[c] = ev[3 * a + c], g[c] = G[3 * a + c];
+    add_virial(w, r, g);
+  }
+  if (chain)
+    for (int q = 0; q < count[k]; q++) {
+      const int e = k * K + q;
+      if (cd[e] < cutoff) add_virial(w, cv + 3 * e, chain + 3 * e);
+    }
+  for (int c = 0; c < 6; c++) out[6 * k + c] = w[c];
+}
+
 __global__ void nc_kernel(int n, const float *nc, const float *scale, double *f) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
@@ -276,20 +341,16 @@ void build_list(State &s, const Cutoff &cut) {
     const double *m = s.cell;
     const double det = m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6]) +
                        m[2] * (m[3] * m[7] - m[4] * m[6]);
-    double inv[9] = {(m[4] * m[8] - m[5] * m[7]) / det, (m[2] * m[7] - m[1] * m[8]) / det,
+    const Inverse inv{{(m[4] * m[8] - m[5] * m[7]) / det, (m[2] * m[7] - m[1] * m[8]) / det,
                      (m[1] * m[5] - m[2] * m[4]) / det, (m[5] * m[6] - m[3] * m[8]) / det,
                      (m[0] * m[8] - m[2] * m[6]) / det, (m[2] * m[3] - m[0] * m[5]) / det,
                      (m[3] * m[7] - m[4] * m[6]) / det, (m[1] * m[6] - m[0] * m[7]) / det,
-                     (m[0] * m[4] - m[1] * m[3]) / det};
-    double *d_inv;
-    check(cudaMalloc(&d_inv, sizeof inv), "malloc");
-    check(cudaMemcpy(d_inv, inv, sizeof inv, cudaMemcpyHostToDevice), "copy");
-    LAUNCH(wrap_kernel, s.n, s.n, s.x, cell, d_inv);
-    check(cudaFree(d_inv), "free");
+                     (m[0] * m[4] - m[1] * m[3]) / det}};
+    LAUNCH(wrap_kernel, s.n, s.n, s.x, cell, inv);
   }
   check(cudaMemcpy(s.x_ref, s.x, sizeof(double) * 3 * s.n, cudaMemcpyDeviceToDevice), "x_ref");
   const double rc = cut.cutoff + cut.skin;
-  LAUNCH(build_kernel, s.n, s.n, s.K, s.x, cell, int3{s.images[0], s.images[1], s.images[2]}, rc * rc,
+  LAUNCH(build_kernel, 32 * s.n, s.n, s.K, s.x, cell, int3{s.images[0], s.images[1], s.images[2]}, rc * rc,
          s.cand_j, s.cand_s, s.count, s.scalars);
   LAUNCH(reverse_kernel, s.n * s.K, s.n, s.K, s.cand_j, s.cand_s, s.count, s.cand_rev);
 }
@@ -316,6 +377,12 @@ void conservative_forces(State &s, const Cutoff &c, const Graph &g, double energ
   LAUNCH(chain_kernel, s.n * s.K, s.n, s.K, s.count, s.cand_v, s.cand_d, c.cutoff, c.width, s.r, s.root,
          s.dn_root, s.clamped, s.dEdr, s.chain);
   LAUNCH(chain_gather_kernel, s.n, s.n, s.K, s.count, s.cand_rev, s.chain, energy_scale, s.f_cons);
+}
+
+void virial(State &s, const Cutoff &c, const Graph &g, double *w) {
+  const bool adaptive = c.n_target > 0 && g.grad_cv;
+  LAUNCH(virial_kernel, s.n, s.n, s.K, s.M, s.nkept, g.edge_vectors, g.grad_ev, s.count, s.cand_v, s.cand_d,
+         c.cutoff, adaptive ? s.chain : nullptr, w);
 }
 
 void nc_forces(State &s, const Graph &g) { LAUNCH(nc_kernel, s.n, s.n, g.nc, s.nc_scale, s.f_nc); }

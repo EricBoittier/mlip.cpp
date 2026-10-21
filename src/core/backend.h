@@ -94,6 +94,9 @@ public:
    */
   ggml_status compute(ggml_cgraph *graph);
 
+  // ggml CPU threads (MLIPCPP_NUM_THREADS, default GGML_DEFAULT_N_THREADS)
+  int n_threads() const { return n_threads_; }
+
   // Accelerator backends used next to the CPU (empty on GPU)
   const std::vector<ggml_backend_t> &accelerators() const { return accel_; }
 

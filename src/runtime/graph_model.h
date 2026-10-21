@@ -18,8 +18,11 @@ struct ggml_backend_buffer;
 
 typedef struct ggml_backend *ggml_backend_t;
 typedef struct ggml_backend_buffer *ggml_backend_buffer_t;
+typedef struct ggml_gallocr *ggml_gallocr_t;
 
 namespace mlipcpp::runtime {
+
+struct CachedGraph;
 
 /**
  * Model implementation using auto-exported computation graphs.
@@ -170,6 +173,31 @@ private:
 
   // Neighbor list builder
   NeighborListBuilder neighbor_builder_;
+
+  // Forces-mode models without long-range terms (fixed or "solver"
+  // adaptive cutoff) go through predict_cached: a graph built once per
+  // (n_atoms, neighbour slots) and reused, with the neighbour list (vesin when
+  // available), adaptive cutoffs and force gathering threaded over atoms.
+  // MLIPCPP_NO_GRAPH_CACHE=1 forces the general path below.
+  bool cached_path_supported() const;
+  ModelResult predict_cached(const AtomicSystem &system, bool compute_forces);
+  // the same on a CUDA backend, with the inputs built and the forces
+  // gathered on the device (MLIPCPP_HOST_INPUTS=1: on the host)
+  ModelResult predict_cached_device(const AtomicSystem &system, bool compute_forces,
+                                    const std::vector<int32_t> &species);
+  void build_cached_graph(int n_atoms, int M, bool exact_mask, bool backward);
+  // rebuilds cached_ unless it fits n_atoms with max_kept neighbours; true if rebuilt
+  bool fit_cached_graph(int n_atoms, int max_kept);
+  // energy and non-conservative forces of the last compute of cached_
+  void read_cached_outputs(const AtomicSystem &system, ModelResult &result) const;
+  struct CachedGraphDeleter {
+    void operator()(CachedGraph *graph) const;
+  };
+  std::unique_ptr<CachedGraph, CachedGraphDeleter> cached_;
+  ggml_gallocr_t galloc_ = nullptr;
+  void *vesin_ = nullptr;          // VesinNeighborList, reused between calls
+  void *device_inputs_ = nullptr;  // predict_cached_device's buffers
+  void release_cached_resources(); // galloc_, vesin_, device_inputs_
 
   // Predict a single system (all logic lives here).
   // post_compute_hook (if set) runs after a successful graph compute and

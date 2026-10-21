@@ -54,6 +54,9 @@ struct Cutoff {
 void build_list(State &s, const Cutoff &c);          // sets scalars[0] on overflow
 void prepare_inputs(State &s, const Cutoff &c, const Graph &g); // edges, radii, pack; scalars[1] = max kept
 void conservative_forces(State &s, const Cutoff &c, const Graph &g, double energy_scale);
+/// Per-atom virials sum over edges of v (x) dE/dv, symmetrised, [n, 6] as
+/// xx yy zz yz xz xy, unscaled; w is device memory. After conservative_forces.
+void virial(State &s, const Cutoff &c, const Graph &g, double *w);
 void nc_forces(State &s, const Graph &g);
 void kick(State &s, const double *f1, double a1, const double *f2, double a2, double dt); // v += dt (a1 f1 + a2 f2) / m
 void drift(State &s, double dt);                     // x += dt v; scalars[2] = max |x - x_ref|^2
