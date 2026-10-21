@@ -2,9 +2,11 @@
 
 #include <ggml-backend.h>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace mlipcpp {
 
@@ -83,11 +85,30 @@ public:
     return ggml_backend_get_default_buffer_type(cpu_);
   }
 
+  /**
+   * Compute a graph allocated on the primary backend.
+   *
+   * On CPU, accelerator backends compiled into ggml (e.g. BLAS, with
+   * MLIPCPP_USE_BLAS) take the operations they support through a scheduler,
+   * the CPU backend runs the rest. MLIPCPP_NO_ACCEL=1 disables them.
+   */
+  ggml_status compute(ggml_cgraph *graph);
+
+  // Accelerator backends used next to the CPU (empty on GPU)
+  const std::vector<ggml_backend_t> &accelerators() const { return accel_; }
+
 private:
   BackendProvider() = default;
+  void init_accelerators();
+  void release();
 
   ggml_backend_t primary_ = nullptr; // Primary backend (CPU or GPU)
   ggml_backend_t cpu_ = nullptr;     // CPU backend (always available)
+  int n_threads_ = GGML_DEFAULT_N_THREADS;
+  std::vector<ggml_backend_t> accel_;
+  ggml_backend_sched_t sched_ = nullptr;
+  int sched_graph_size_ = 0;
+  std::mutex sched_mutex_;
   std::string name_;
   BackendPreference preference_ = BackendPreference::Auto;
 };

@@ -92,6 +92,13 @@ cmake .. -DCMAKE_BUILD_TYPE=Release
 cmake --build . -j
 ```
 
+On CPU, `-DMLIPCPP_USE_BLAS=ON` (with `-DGGML_BLAS_VENDOR=OpenBLAS`,
+`Intel10_64_dyn` for MKL, ...) runs the matrix products of the graph models
+on BLAS and the rest on ggml's CPU backend, e.g. 1.6x faster energies and
+1.3x faster forces for a 64-atom PET with MKL on 12 Zen 3 cores. Set
+`MLIPCPP_NUM_THREADS` for the number of threads (default 4, shared by BLAS),
+and `MLIPCPP_NO_ACCEL=1` to run without BLAS.
+
 ### C++ CLI
 
 ```bash

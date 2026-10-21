@@ -87,32 +87,48 @@ void suppress_ggml_logging() { ggml_log_set(ggml_log_noop, nullptr); }
 } // namespace log
 #endif
 
-BackendProvider::~BackendProvider() {
+void BackendProvider::release() {
+  if (sched_) {
+    ggml_backend_sched_free(sched_);
+  }
+  for (auto *backend : accel_) {
+    ggml_backend_free(backend);
+  }
   if (primary_ && primary_ != cpu_) {
     ggml_backend_free(primary_);
   }
   if (cpu_) {
     ggml_backend_free(cpu_);
   }
+  sched_ = nullptr;
+  accel_.clear();
+  primary_ = cpu_ = nullptr;
 }
 
+BackendProvider::~BackendProvider() { release(); }
+
 BackendProvider::BackendProvider(BackendProvider &&other) noexcept
-    : primary_(other.primary_), cpu_(other.cpu_), name_(std::move(other.name_)),
+    : primary_(other.primary_), cpu_(other.cpu_), n_threads_(other.n_threads_),
+      accel_(std::move(other.accel_)), sched_(other.sched_),
+      sched_graph_size_(other.sched_graph_size_), name_(std::move(other.name_)),
       preference_(other.preference_) {
   other.primary_ = nullptr;
   other.cpu_ = nullptr;
+  other.accel_.clear();
+  other.sched_ = nullptr;
 }
 
 BackendProvider &BackendProvider::operator=(BackendProvider &&other) noexcept {
   if (this != &other) {
-    if (primary_ && primary_ != cpu_) {
-      ggml_backend_free(primary_);
-    }
-    if (cpu_) {
-      ggml_backend_free(cpu_);
-    }
+    release();
     primary_ = other.primary_;
     cpu_ = other.cpu_;
+    n_threads_ = other.n_threads_;
+    accel_ = std::move(other.accel_);
+    sched_ = other.sched_;
+    sched_graph_size_ = other.sched_graph_size_;
+    other.accel_.clear();
+    other.sched_ = nullptr;
     name_ = std::move(other.name_);
     preference_ = other.preference_;
     other.primary_ = nullptr;
@@ -174,7 +190,10 @@ BackendProvider::create(BackendPreference pref, int device) {
   // ggml defaults to GGML_DEFAULT_N_THREADS (4) CPU threads
   if (const char *threads = std::getenv("MLIPCPP_NUM_THREADS")) {
     int n = std::atoi(threads);
-    if (n > 0) ggml_backend_cpu_set_n_threads(provider->cpu_, n);
+    if (n > 0) {
+      provider->n_threads_ = n;
+      ggml_backend_cpu_set_n_threads(provider->cpu_, n);
+    }
   }
 #endif
 
@@ -182,6 +201,7 @@ BackendProvider::create(BackendPreference pref, int device) {
   if (pref == BackendPreference::CPU) {
     provider->primary_ = provider->cpu_;
     provider->name_ = ggml_backend_name(provider->primary_);
+    provider->init_accelerators();
     log::info("Backend: {}", provider->name_);
     return provider;
   }
@@ -258,9 +278,58 @@ BackendProvider::create(BackendPreference pref, int device) {
   // — users expecting GPU acceleration should see this.
   provider->primary_ = provider->cpu_;
   provider->name_ = ggml_backend_name(provider->primary_);
+  provider->init_accelerators();
   log::warn("Backend: {} (GPU not available; Auto fell back to CPU)",
             provider->name_);
   return provider;
+}
+
+void BackendProvider::init_accelerators() {
+  if (const char *off = std::getenv("MLIPCPP_NO_ACCEL"); off && *off && *off != '0') {
+    return;
+  }
+  for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+    auto *dev = ggml_backend_dev_get(i);
+    if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+      continue;
+    }
+    auto *backend = ggml_backend_dev_init(dev, nullptr);
+    if (!backend) {
+      continue;
+    }
+    // accelerators such as BLAS use the same number of threads as the CPU
+    auto *reg = ggml_backend_dev_backend_reg(dev);
+    auto set_n_threads = reinterpret_cast<ggml_backend_set_n_threads_t>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads"));
+    if (set_n_threads) {
+      set_n_threads(backend, n_threads_);
+    }
+    accel_.push_back(backend);
+    name_ += std::string("+") + ggml_backend_name(backend);
+  }
+}
+
+ggml_status BackendProvider::compute(ggml_cgraph *graph) {
+  if (accel_.empty()) {
+    return ggml_backend_graph_compute(primary_, graph);
+  }
+
+  std::lock_guard<std::mutex> lock(sched_mutex_);
+  // the scheduler sizes its tables for a maximum number of graph nodes
+  auto size = std::max(ggml_graph_size(graph), GGML_DEFAULT_GRAPH_SIZE);
+  if (sched_ == nullptr || size > sched_graph_size_) {
+    if (sched_) {
+      ggml_backend_sched_free(sched_);
+    }
+    auto backends = accel_;
+    backends.push_back(cpu_); // the last backend must be the CPU
+    sched_ = ggml_backend_sched_new(backends.data(), nullptr,
+                                    static_cast<int>(backends.size()),
+                                    static_cast<size_t>(size), false, true);
+    sched_graph_size_ = size;
+  }
+  ggml_backend_sched_reset(sched_);
+  return ggml_backend_sched_graph_compute(sched_, graph);
 }
 
 } // namespace mlipcpp

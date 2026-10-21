@@ -66,7 +66,9 @@ All optional, given as a JSON object of strings:
 The computation itself is float32 whatever `dtype` is.
 
 On CPU, ggml uses 4 threads unless `MLIPCPP_NUM_THREADS` is set in the
-environment (this applies to every mlipcpp entry point, not only the plugin).
+environment (this applies to every mlipcpp entry point, not only the plugin),
+and builds with `-DMLIPCPP_USE_BLAS=ON` run the matrix products on BLAS (see
+the README).
 
 ### Outputs
 
