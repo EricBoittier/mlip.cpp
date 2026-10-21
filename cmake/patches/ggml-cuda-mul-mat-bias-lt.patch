@@ -1,0 +1,136 @@
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -77,6 +77,8 @@
+ #include <initializer_list>
+ #include <limits>
+ #include <map>
++#include <tuple>
++#include <cublasLt.h>
+ #include <memory>
+ #include <mutex>
+ #include <cstdarg>
+@@ -3302,6 +3304,92 @@
+ }
+ 
+ 
++
++// MUL_MAT of a 2-D f32 weight followed (past no-op views) by the ADD of a
++// bias vector, the matmul's only use: one cuBLASLt GEMM with a bias epilogue
++// writing the ADD's output, instead of a GEMM and a broadcast add over the
++// whole result. Same compute type as the cuBLAS path (GGML_CUDA_NO_TF32);
++// GGML_CUDA_NO_MM_BIAS=1: off. Returns the index of the ADD, or -1.
++struct ggml_cuda_mm_bias_plan {
++    cublasLtMatmulDesc_t op = nullptr;
++    cublasLtMatrixLayout_t a = nullptr, b = nullptr, d = nullptr;
++    cublasLtMatmulAlgo_t algo{};
++    size_t ws = 0;
++    bool ok = false;
++};
++
++static int ggml_cuda_mul_mat_bias(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
++    static const bool off = getenv("GGML_CUDA_NO_MM_BIAS") != nullptr;
++    const ggml_tensor * mm = cgraph->nodes[i];
++    if (off || mm->op != GGML_OP_MUL_MAT || (mm->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, i) != 1) {
++        return -1;
++    }
++    int j = i + 1;
++    while (j < cgraph->n_nodes) {
++        const ggml_tensor * t = cgraph->nodes[j];
++        if (!(ggml_is_empty(t) || t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE ||
++              t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_NONE)) {
++            break;
++        }
++        j++;
++    }
++    if (j >= cgraph->n_nodes) {
++        return -1;
++    }
++    ggml_tensor * add = cgraph->nodes[j];
++    const ggml_tensor * A = mm->src[0], * B = mm->src[1], * bias = add->src[1];
++    if (add->op != GGML_OP_ADD || add->src[0] != mm || !bias || A->type != GGML_TYPE_F32 || B->type != GGML_TYPE_F32 ||
++        bias->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 || A->ne[2] != 1 || A->ne[3] != 1 ||
++        !ggml_is_contiguous(A) || !ggml_is_contiguous(B) || !ggml_is_contiguous(bias) || !ggml_is_contiguous(add) ||
++        ggml_nelements(bias) != mm->ne[0] || bias->ne[0] != mm->ne[0] || !ggml_are_same_shape(add, mm) ||
++        ggml_backend_buft_is_cuda_split(A->buffer->buft) || B->ne[0] != A->ne[0]) {
++        return -1;
++    }
++    const int64_t K = A->ne[0], M = A->ne[1], N = ggml_nrows(B);
++    const int device = ggml_cuda_get_device();
++    static cublasLtHandle_t lt[GGML_CUDA_MAX_DEVICES] = {};
++    if (!lt[device]) {
++        CUBLAS_CHECK(cublasLtCreate(&lt[device]));
++    }
++    static const bool no_tf32 = getenv("GGML_CUDA_NO_TF32") != nullptr;
++    static std::map<std::tuple<int, int64_t, int64_t, int64_t>, ggml_cuda_mm_bias_plan> plans;
++    ggml_cuda_mm_bias_plan & p = plans[{device, M, N, K}];
++    const size_t ws_max = 32u << 20;
++    if (!p.op) {
++        const cublasComputeType_t compute = no_tf32 ? CUBLAS_COMPUTE_32F : CUBLAS_COMPUTE_32F_FAST_TF32;
++        CUBLAS_CHECK(cublasLtMatmulDescCreate(&p.op, compute, CUDA_R_32F));
++        const cublasOperation_t ta = CUBLAS_OP_T, tb = CUBLAS_OP_N;
++        const cublasLtEpilogue_t epi = CUBLASLT_EPILOGUE_BIAS;
++        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof(ta)));
++        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof(tb)));
++        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_EPILOGUE, &epi, sizeof(epi)));
++        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&p.a, CUDA_R_32F, K, M, K));
++        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&p.b, CUDA_R_32F, K, N, K));
++        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&p.d, CUDA_R_32F, M, N, M));
++        cublasLtMatmulPreference_t pref;
++        CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&pref));
++        CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_max, sizeof(ws_max)));
++        cublasLtMatmulHeuristicResult_t res{};
++        int found = 0;
++        const void * bp = bias->data;
++        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bp, sizeof(bp)));
++        if (cublasLtMatmulAlgoGetHeuristic(lt[device], p.op, p.a, p.b, p.d, p.d, pref, 1, &res, &found) == CUBLAS_STATUS_SUCCESS && found > 0) {
++            p.algo = res.algo, p.ws = res.workspaceSize, p.ok = true;
++        }
++        cublasLtMatmulPreferenceDestroy(pref);
++    }
++    if (!p.ok) {
++        return -1;
++    }
++    const void * bp = bias->data;
++    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bp, sizeof(bp)));
++    ggml_cuda_pool_alloc<char> ws(ctx.pool(), p.ws > 0 ? p.ws : 1);
++    const float alpha = 1.0f, beta = 0.0f;
++    CUBLAS_CHECK(cublasLtMatmul(lt[device], p.op, &alpha, A->data, p.a, B->data, p.b, &beta, add->data, p.d, add->data, p.d,
++                                &p.algo, ws.get(), p.ws, ctx.stream()));
++    return j;
++}
++
+ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+                                int                                       node_idx,
+                                std::initializer_list<enum ggml_op>       ops,
+@@ -3734,6 +3822,11 @@
+                         }
+                     }
+ 
++                    if (const int j = ggml_cuda_mul_mat_bias(*cuda_ctx, cgraph, i); j >= 0) {
++                        i = j;
++                        continue;
++                    }
++
+                     bool fused_mul_mat_vec = false;
+                     int fused_node_count = 0;
+ 
+--- a/src/ggml-cuda/CMakeLists.txt
++++ b/src/ggml-cuda/CMakeLists.txt
+@@ -157,7 +157,7 @@
+     if (GGML_STATIC)
+         if (WIN32)
+             # As of 12.3.1 CUDA Toolkit for Windows does not offer a static cublas library
+-            target_link_libraries(ggml-cuda PRIVATE CUDA::cudart_static CUDA::cublas)
++            target_link_libraries(ggml-cuda PRIVATE CUDA::cudart_static CUDA::cublas CUDA::cublasLt)
+         else ()
+             if (GGML_CUDA_CUB_3DOT2)
+                 target_link_libraries(ggml-cuda PRIVATE  CCCL::CCCL)
+@@ -172,7 +172,7 @@
+         if (GGML_CUDA_CUB_3DOT2)
+             target_link_libraries(ggml-cuda PRIVATE  CCCL::CCCL)
+         endif()
+-        target_link_libraries(ggml-cuda PRIVATE CUDA::cudart CUDA::cublas)
++        target_link_libraries(ggml-cuda PRIVATE CUDA::cudart CUDA::cublas CUDA::cublasLt)
+     endif()
+ 
+     if (GGML_CUDA_NO_VMM)

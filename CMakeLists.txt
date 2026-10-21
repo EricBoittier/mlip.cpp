@@ -255,6 +255,9 @@ else()
         # fused attention's outputs) as one PAD instead of zeros + ACC
         # (GGML_VIEW_GRAD_ACC=1: zeros + ACC)
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-view-grad-pad.patch"
+        # CUDA MUL_MAT + bias ADD as one cuBLASLt GEMM with a bias epilogue
+        # (every linear layer; GGML_CUDA_NO_MM_BIAS=1: off)
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-mul-mat-bias-lt.patch"
     )
     # the source cache is keyed by the ggml tag and the patches' contents:
     # CPM's default key hashes the arguments, i.e. the patch paths, so every
