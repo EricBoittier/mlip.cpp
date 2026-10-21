@@ -328,13 +328,26 @@ public:
       converted.emplace_back(system, predictor_->cutoff());
     }
 
+    // the force head runs in the forward pass, which also gives the energy
+    auto forward = std::vector<mlipcpp::Result>();
+    for (const auto &output : requested_outputs) {
+      if (output.name() == NC_FORCE && predictor_->has_nc_forces() && forward.empty()) {
+        auto options = mlipcpp::PredictOptions();
+        options.compute_forces = true;
+        options.use_nc_forces = true;
+        for (const auto &system : converted) {
+          forward.push_back(predict(system, options));
+        }
+      }
+    }
+
     auto results = std::vector<metatensor::TensorMap>();
     for (const auto &output : requested_outputs) {
       if (output.name() == ENERGY && output.sample_kind() == SampleKind::System) {
         check_all_atoms_selected(converted, selected_atoms);
-        results.emplace_back(energy(converted, output));
+        results.emplace_back(energy(converted, output, forward));
       } else if (output.name() == NC_FORCE && predictor_->has_nc_forces()) {
-        results.emplace_back(nc_forces(converted, selected_atoms));
+        results.emplace_back(nc_forces(converted, selected_atoms, forward));
       } else {
         throw metatomic::Error("the mlipcpp plugin can not compute '" + output.name() + "'");
       }
@@ -393,7 +406,8 @@ private:
     return metatensor::TensorMap(metatensor::Labels({"_"}, {{0}}), std::move(blocks));
   }
 
-  metatensor::TensorMap energy(const std::vector<MlipSystem> &systems, const Quantity &request) {
+  metatensor::TensorMap energy(const std::vector<MlipSystem> &systems, const Quantity &request,
+                               const std::vector<mlipcpp::Result> &forward) {
     bool do_positions = false;
     bool do_strain = false;
     for (auto gradient : request.gradients()) {
@@ -413,7 +427,8 @@ private:
     for (size_t s = 0; s < systems.size(); s++) {
       const auto &system = systems[s];
       options.compute_stress = do_strain && system.periodic();
-      auto result = predict(system, options);
+      auto result = options.compute_forces || forward.empty() ? predict(system, options)
+                                                               : forward[s];
 
       energies.push_back(result.energy);
       system_samples.push_back(static_cast<int32_t>(s));
@@ -485,15 +500,12 @@ private:
   }
 
   metatensor::TensorMap nc_forces(const std::vector<MlipSystem> &systems,
-                                  const std::optional<metatensor::Labels> &selected_atoms) {
-    auto options = mlipcpp::PredictOptions();
-    options.compute_forces = true;
-    options.use_nc_forces = true;
-
+                                  const std::optional<metatensor::Labels> &selected_atoms,
+                                  const std::vector<mlipcpp::Result> &forward) {
     auto values = std::vector<double>();
     auto samples = std::vector<int32_t>();
     for (size_t s = 0; s < systems.size(); s++) {
-      auto result = predict(systems[s], options);
+      const auto &result = forward[s];
       for (size_t a = 0; a < systems[s].types.size(); a++) {
         auto sample = std::array<int32_t, 2>{static_cast<int32_t>(s), static_cast<int32_t>(a)};
         if (selected_atoms.has_value() && !selected_atoms->position({sample[0], sample[1]})) {
