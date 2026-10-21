@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdlib>
 #include <ggml.h>
 #include <ggml-cpu.h>
 #include <string>
@@ -169,6 +170,12 @@ BackendProvider::create(BackendPreference pref, int device) {
   // For WASM/Emscripten, set threads to 1 (no pthread support)
 #ifdef __EMSCRIPTEN__
   ggml_backend_cpu_set_n_threads(provider->cpu_, 1);
+#else
+  // ggml defaults to GGML_DEFAULT_N_THREADS (4) CPU threads
+  if (const char *threads = std::getenv("MLIPCPP_NUM_THREADS")) {
+    int n = std::atoi(threads);
+    if (n > 0) ggml_backend_cpu_set_n_threads(provider->cpu_, n);
+  }
 #endif
 
   // CPU-only mode
