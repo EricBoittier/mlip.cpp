@@ -681,9 +681,9 @@ ggml_tensor *GraphInterpreter::build_fused_attention(ggml_context *ctx, const GI
 
   ggml_tensor *q = resolve_input(ctx, qk->inputs[0]); // [d, L, H, N]
   ggml_tensor *xt = resolve_input(ctx, "node:" + std::to_string(x->id));
+  // a bias that depends on a parameter (the edge vectors, in force graphs)
+  // gets its gradient from GGML_OP_PET_ATTN_BACK_BIAS
   ggml_tensor *bias = resolve_input(ctx, add->inputs[1]);
-  if (depends_on_parameter(bias))
-    return nullptr;
   const int64_t d = q->ne[0], L = q->ne[1], H = q->ne[2], N = q->ne[3];
   if ((d != 8 && d != 16 && d != 32 && d != 64) || xt->ne[0] != H * d || xt->ne[1] != 3 ||
       xt->ne[2] != L || xt->ne[3] != N || bias->ne[0] != L || bias->ne[1] != L || bias->ne[2] != 1 ||
