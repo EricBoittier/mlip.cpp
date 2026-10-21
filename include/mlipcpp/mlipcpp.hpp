@@ -168,6 +168,18 @@ public:
   std::string_view model_type() const;
 
   /**
+   * @brief Atomic numbers the model was trained on (sorted, may be empty
+   * for models that do not record them)
+   */
+  const std::vector<int32_t> &atomic_types() const;
+
+  /**
+   * @brief Whether the model has a direct (non-conservative) force head,
+   * usable with PredictOptions::use_nc_forces
+   */
+  bool has_nc_forces() const;
+
+  /**
    * @brief Predict energy and optionally forces for a non-periodic system
    *
    * @param positions Flattened positions [n_atoms * 3]
