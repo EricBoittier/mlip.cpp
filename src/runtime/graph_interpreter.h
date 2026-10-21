@@ -109,6 +109,10 @@ public:
   /// Padded neighbour slots get an attention bias of -inf instead of PET's
   /// log(1e-15) = -34.5 (see build_clamp); for graphs built afterwards.
   void set_exact_padding_mask(bool on) { exact_padding_mask_ = on; }
+  /// Padded neighbour keys of every system get -inf (the exact mask) instead
+  /// of PET's finite log(1e-15) bias; for graphs built afterwards.
+  void set_pad_exact(bool on) { pad_exact_ = on; }
+  bool pad_exact() const { return pad_exact_; }
 
 private:
   // The IR graph
@@ -157,6 +161,7 @@ private:
   ggml_tensor *build_fused_attention(ggml_context *ctx, const GIRNode &node);
   bool input_gradients_ = false;
   bool exact_padding_mask_ = false;
+  bool pad_exact_ = false;
   const GIRNode *find_node(const std::string &ref) const;
   std::vector<const GIRNode *> consumers(int id) const;
   ggml_tensor *build_chunk_linear(ggml_context *ctx, const GIRNode &node, int64_t index,

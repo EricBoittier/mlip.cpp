@@ -20,6 +20,9 @@ struct TrainOptions {
   std::string init_gguf;  // PET exported with --nc-forces (forces mode)
   std::string output;     // trained GGUF; <output>.epoch<k> after each epoch
   std::string cache_dir;  // neighbour-list cache ("" = none)
+  // padded attention keys: "exact" (-inf), "finite" (metatrain's log(1e-15)) or
+  // "model" (as --init's pet.padding_mask); written to the output GGUF
+  std::string pad_mask = "exact";
   int epochs = 10;
   int batch_size = 64; // structures per GPU and step
   int n_gpus = 1;      // 0 = CPU

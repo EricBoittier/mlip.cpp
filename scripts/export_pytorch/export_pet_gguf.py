@@ -346,6 +346,11 @@ def main():
         help="Also output the direct non-conservative force head: [n_atoms, 4] = (energy | force)",
     )
     parser.add_argument(
+        "--pad-exact", action="store_true",
+        help="the model was trained with padded attention keys at -inf (pet.padding_mask = exact); "
+             "default: metatrain's finite log(1e-15) bias (finite)",
+    )
+    parser.add_argument(
         "--no-forces", action="store_true",
         help="Export without forces support (energy only, smaller graph)",
     )
@@ -466,6 +471,7 @@ def main():
     writer.add_string("pet.cutoff_function", cutoff_function)
     writer.add_int32("pet.forces_mode", 1 if not args.no_forces else 0)
     writer.add_int32("pet.nc_forces", 1 if args.nc_forces else 0)
+    writer.add_string("pet.padding_mask", "exact" if args.pad_exact else "finite")
     if wrapper.long_range:
         calculator = pet.long_range_featurizer.ewald_calculator
         writer.add_string("pet.long_range.solver", args.long_range_solver)

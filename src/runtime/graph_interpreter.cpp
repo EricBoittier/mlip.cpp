@@ -1059,12 +1059,13 @@ ggml_tensor *GraphInterpreter::build_log(ggml_context *ctx,
   }
   ggml_tensor *a = resolve_input(ctx, node.inputs[0]);
   ggml_tensor *t = ggml_log(ctx, a);
-  // MLIPCPP_PAD_EXACT=1: PET's attention bias log(clamp(cutoff factor, 1e-15))
-  // plus log(1 - padding mask), i.e. -inf on padded keys only, added after
-  // the log so its derivative stays finite; real edges with factor 0 keep
-  // -34.5. With the finite bias alone a trained model's output depends on the
-  // padded slots, i.e. on how structures are batched.
-  static const bool exact = std::getenv("MLIPCPP_PAD_EXACT") != nullptr;
+  // Exact padding mask (pad_exact_, from the GGUF's pet.padding_mask; see
+  // GraphModel::load_from_gguf): PET's attention bias log(clamp(cutoff factor,
+  // 1e-15)) plus log(1 - padding mask), i.e. -inf on padded keys only, added
+  // after the log so its derivative stays finite; real edges with factor 0 keep
+  // -34.5. With the finite bias alone a trained model's output and gradients
+  // depend on the padded slots, i.e. on how structures are batched.
+  const bool exact = pad_exact_;
   auto pm_it = inputs_.find("padding_mask");
   float floor = 0.0f;
   if (a->op == GGML_OP_CLAMP) std::memcpy(&floor, a->op_params, sizeof(floor));

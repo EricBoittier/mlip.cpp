@@ -447,6 +447,14 @@ bool GraphModel::load_from_gguf(const std::string &path) {
     throw std::runtime_error("No graph.json found in GGUF file");
   }
   interp_.load_graph(graph_json);
+  // Padding convention the model was trained with: "exact" (padded attention
+  // keys -inf; mlipcpp-train's default) or "finite" (metatrain's log(1e-15)
+  // bias; GGUFs without the key). MLIPCPP_PAD_EXACT=1 / =0 overrides.
+  {
+    bool exact = loader.get_string("pet.padding_mask", "finite") == "exact";
+    if (const char *e = std::getenv("MLIPCPP_PAD_EXACT")) exact = std::string(e) != "0";
+    interp_.set_pad_exact(exact);
+  }
   if ((interp_.graph().get_input("coulomb_matrix") != nullptr) != long_range_) {
     ggml_free(temp_ctx);
     throw std::runtime_error("PET-LR graph input and solver metadata disagree");

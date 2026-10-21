@@ -24,7 +24,7 @@ int main(int argc, char **argv) {
                "          [--muon-lr-scale {}] [--muon-ns-steps {}]\n"
                "          [--dump-errors PREFIX] [--log-errors FILE] [--log-errors-epochs {}] [--exclude DIR]\n"
                "          [--conservative] [--energy-weight {}] [--force-weight {}] [--nc-force-weight {}] [--model-baselines]\n"
-               "          [--allreduce {}]\n"
+               "          [--allreduce {}] [--pad-mask exact|finite|model]\n"
                "--dump-errors writes PREFIX.{{val,test}}.bin, --log-errors the training structures' errors\n"
                "before each update (24-byte records, see SystemError); --exclude DIR drops the split\n"
                "indices in DIR/{{train,val,test}}.npy;\n"
@@ -36,6 +36,8 @@ int main(int argc, char **argv) {
                "--model-baselines (fine-tuning) keeps --init's composition and scales;\n"
                "--allreduce 1 (NCCL builds, the default there) averages the gradients with one\n"
                "all-reduce and steps a replica of the optimizer on every GPU;\n"
+               "--pad-mask: padded attention keys get -inf (exact, the default) or metatrain's finite\n"
+               "log(1e-15) bias (finite), or as --init's pet.padding_mask (model); written to the output;\n"
                "--epochs 0 only evaluates --init on val/ and test/ (-o is ignored).\n",
                argv[0], o.epochs, o.batch_size, o.n_gpus, o.lr, o.warmup_fraction,
                o.grad_clip, o.seed, o.n_threads, o.log_every, o.mb_growth, o.mb_budget,
@@ -82,6 +84,7 @@ int main(int argc, char **argv) {
     else if (a == "--force-weight") o.force_weight = std::stod(val());
     else if (a == "--nc-force-weight") o.nc_force_weight = std::stod(val());
     else if (a == "--model-baselines") o.model_baselines = true;
+    else if (a == "--pad-mask") o.pad_mask = val();
     else if (a == "--allreduce") o.allreduce = std::stoi(val()) != 0;
     else usage();
   }

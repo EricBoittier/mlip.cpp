@@ -91,6 +91,7 @@ void write_gguf(const std::string &src, const std::string &dst, Worker &w,
   for (int64_t i = 0; i < gguf_get_n_tensors(in); i++)
     gguf_add_tensor(g, ggml_get_tensor(data_ctx, gguf_get_tensor_name(in, i)));
   gguf_set_val_f32(g, "pet.energy_scale", static_cast<float>(sc.energy_scale));
+  gguf_set_val_str(g, "pet.padding_mask", w.model().interpreter().pad_exact() ? "exact" : "finite");
   std::vector<int32_t> ck, fk;
   std::vector<float> cv, fv;
   for (auto [Z, c] : sc.composition) ck.push_back(Z), cv.push_back(static_cast<float>(c));
@@ -1541,6 +1542,12 @@ void train(const TrainOptions &o) {
         o.init_gguf, o.n_gpus == 0 ? -1 : w,
         o.tile_nb_ratio > 1 ? static_cast<size_t>(o.graph_cache) : 0));
   for (auto &w : workers) w->conservative = {o.conservative, o.energy_weight, o.force_weight, o.nc_force_weight};
+  if (o.pad_mask != "model") {
+    if (o.pad_mask != "exact" && o.pad_mask != "finite")
+      throw std::runtime_error("--pad-mask must be exact, finite or model");
+    for (auto &w : workers) w->model().interpreter().set_pad_exact(o.pad_mask == "exact");
+  }
+  fmt::print("padding mask: {}\n", workers[0]->model().interpreter().pad_exact() ? "exact" : "finite (metatrain)");
   if (o.conservative)
     fmt::print("conservative forces -dE/dx: loss weights energy {}, forces {}, direct forces {}\n", o.energy_weight,
                o.force_weight, o.nc_force_weight);

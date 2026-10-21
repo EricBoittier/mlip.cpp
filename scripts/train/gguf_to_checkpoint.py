@@ -196,6 +196,9 @@ def main():
     args = ap.parse_args()
 
     meta, tensors = read_gguf(args.gguf)
+    if meta.get("pet.padding_mask") == "exact":
+        print("note: trained with the exact padding mask (pet.padding_mask = exact); in metatrain set "
+              "METATRAIN_PET_PAD_EXACT=1 with pet_exact_mask.py to reproduce it")
     param_names = json.loads(meta["train.param_names"])
     model = load_local_model(args.init)
     n, untrained = load_weights(model, tensors, param_names)
