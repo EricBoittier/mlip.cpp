@@ -32,16 +32,24 @@ struct Radius {
   bool clamped = false;
 };
 
+/// No reduction: one thread visits all of an atom's edges.
+struct Serial {
+  MLIPCPP_HD void operator()(double &, double &) const {}
+};
+
 /// `dist(k)` for k in [0, n_edges): the distances of atom i's edges (any
-/// distance >= cutoff contributes exactly nothing).
-template <class Dist>
-MLIPCPP_HD inline Radius solve(int n_edges, Dist dist, double cutoff, double n_target, double width) {
+/// distance >= cutoff contributes exactly nothing). Cooperating threads (a GPU
+/// warp) each visit k = k0, k0 + stride, ...; `sum` reduces the partial counts
+/// to the same totals on every one of them.
+template <class Dist, class Sum = Serial>
+MLIPCPP_HD inline Radius solve(int n_edges, Dist dist, double cutoff, double n_target, double width,
+                               int k0 = 0, int stride = 1, Sum sum = {}) {
   const double N = n_target, w = width, inv = 1.0 / cutoff;
   // (n_total, dn/dr) at r; `loop`: the solver's exact 0/1 outside the taper,
   // else cutoff_func_bump (clamped) everywhere, as in the IFT residual
   auto count = [&](double r, bool loop, double &cnt, double &dcnt) {
     cnt = 0, dcnt = 0;
-    for (int k = 0; k < n_edges; k++) {
+    for (int k = k0; k < n_edges; k += stride) {
       const double sc = (dist(k) - (r - w)) / w;
       const double s = PI * fmin(fmax(sc, 1e-6), 1.0 - 1e-6);
       const double sn = sin(s), th = tanh(cos(s) / sn);
@@ -49,6 +57,7 @@ MLIPCPP_HD inline Radius solve(int n_edges, Dist dist, double cutoff, double n_t
       else if (sc > 0.0 && sc < 1.0) cnt += 0.5 * (1.0 + th), dcnt += 0.5 * PI / w * (1.0 - th * th) / (sn * sn);
       else if (sc <= 0.0) cnt += 1.0;
     }
+    sum(cnt, dcnt);
     const double x = r * inv;
     cnt += N * x * x * x;
     dcnt += 3.0 * N * x * x * inv;

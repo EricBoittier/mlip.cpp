@@ -151,19 +151,26 @@ __global__ void edge_kernel(int n, int K, const double *x, Cell cell, const int3
   cd[e] = sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) + 1e-15;
 }
 
+// a warp per atom: the lanes share the edge sums of each Newton step
 __global__ void radii_kernel(int n, int K, const int32_t *count, const double *cd, double cutoff,
                              double n_target, double width, double *r, double *root, double *dn,
                              int8_t *clamped) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= n) return;
+  const int i = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x % 32;
+  if (i >= n) return; // whole warps
   if (n_target <= 0) {
-    r[i] = cutoff, root[i] = cutoff, dn[i] = 1, clamped[i] = 1;
+    if (lane == 0) r[i] = cutoff, root[i] = cutoff, dn[i] = 1, clamped[i] = 1;
     return;
   }
   const double *d = cd + i * K;
+  auto warp_sum = [](double &a, double &b) {
+    for (int o = 16; o > 0; o >>= 1)
+      a += __shfl_xor_sync(0xffffffffu, a, o), b += __shfl_xor_sync(0xffffffffu, b, o);
+    // lane 0's totals everywhere, so all lanes take the same Newton steps
+    a = __shfl_sync(0xffffffffu, a, 0), b = __shfl_sync(0xffffffffu, b, 0);
+  };
   const auto a = adaptive::solve(
-      count[i], [&](int k) { return d[k] < cutoff ? d[k] : 1e30; }, cutoff, n_target, width);
-  r[i] = a.r, root[i] = a.root, dn[i] = a.dn_root, clamped[i] = a.clamped;
+      count[i], [&](int k) { return d[k] < cutoff ? d[k] : 1e30; }, cutoff, n_target, width, lane, 32, warp_sum);
+  if (lane == 0) r[i] = a.r, root[i] = a.root, dn[i] = a.dn_root, clamped[i] = a.clamped;
 }
 
 // atom i's kept edges, in candidate order, into slots [0, nkept); the rest padded
@@ -359,7 +366,7 @@ void prepare_inputs(State &s, const Cutoff &c, const Graph &g) {
   const Cell cell = make_cell(s);
   const int E = s.n * s.K;
   LAUNCH(edge_kernel, E, s.n, s.K, s.x, cell, s.cand_j, s.cand_s, s.count, s.cand_v, s.cand_d);
-  LAUNCH(radii_kernel, s.n, s.n, s.K, s.count, s.cand_d, c.cutoff, c.n_target, c.width, s.r, s.root,
+  LAUNCH(radii_kernel, 32 * s.n, s.n, s.K, s.count, s.cand_d, c.cutoff, c.n_target, c.width, s.r, s.root,
          s.dn_root, s.clamped);
   check(cudaMemset(s.scalars + 1, 0, sizeof(int32_t)), "memset");
   LAUNCH(pack_kernel, s.n, s.n, s.K, s.M, s.cand_j, s.count, s.cand_rev, s.cand_v, s.cand_d, s.r,
