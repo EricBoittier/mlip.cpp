@@ -27,6 +27,7 @@ option(MLIPCPP_BUILD_TESTS "Build tests" OFF)
 option(MLIPCPP_BUILD_FORTRAN "Build Fortran bindings" OFF)
 option(MLIPCPP_BUILD_PYTHON "Build Python bindings" OFF)
 option(MLIPCPP_BUILD_METATOMIC "Build the metatomic plugin (needs metatomic-core)" OFF)
+option(MLIPCPP_BUILD_LAMMPS "Build libmlipcpp_c.so, the shared C API that LAMMPS's pair_style mlipcpp links (lammps/)" OFF)
 option(MLIPCPP_BUILD_TRAINING "Build the PET trainer (mlipcpp-train, POSIX only)" ON)
 option(MLIPCPP_INSTALL "Generate install target" OFF)
 option(MLIPCPP_USE_CUDA "Enable CUDA backend via ggml" OFF)
@@ -84,6 +85,11 @@ endif()
 if(MLIPCPP_BUILD_METATOMIC)
     find_package(metatomic CONFIG REQUIRED)
     # libmlipcpp and ggml are linked statically into the plugin
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
+
+if(MLIPCPP_BUILD_LAMMPS)
+    # libmlipcpp and ggml are linked statically into libmlipcpp_c.so
     set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 endif()
 

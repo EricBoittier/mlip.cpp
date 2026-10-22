@@ -143,6 +143,31 @@ if(MLIPCPP_BUILD_METATOMIC)
 endif()
 
 # =============================================================================
+# Shared C API for LAMMPS (optional)
+# =============================================================================
+# pair_style mlipcpp (lammps/) is compiled into LAMMPS, with LAMMPS's compiler
+# and C++ standard (nvcc_wrapper, C++17 under KOKKOS), so it talks to mlip.cpp
+# through the C header only: one shared library with libmlipcpp and ggml inside
+# and only the mlipcpp_* C symbols exported. The C API source is compiled into
+# it directly, so the static library's copy is never pulled in.
+if(MLIPCPP_BUILD_LAMMPS)
+    add_library(mlipcpp_c SHARED api/c/mlipcpp_api.cpp)
+    target_include_directories(mlipcpp_c PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${ggml_SOURCE_DIR}/include)
+    target_link_libraries(mlipcpp_c PRIVATE mlipcpp ggml nlohmann_json::nlohmann_json fmt::fmt)
+    target_include_directories(mlipcpp_c PUBLIC $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>)
+    if(UNIX AND NOT APPLE)
+        target_link_options(mlipcpp_c PRIVATE
+            -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/api/c/mlipcpp_c.map)
+        set_target_properties(mlipcpp_c PROPERTIES LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/api/c/mlipcpp_c.map)
+    endif()
+    include(GNUInstallDirs)
+    install(TARGETS mlipcpp_c
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
+endif()
+
+# =============================================================================
 # Fortran bindings (optional)
 # =============================================================================
 if(MLIPCPP_BUILD_FORTRAN)

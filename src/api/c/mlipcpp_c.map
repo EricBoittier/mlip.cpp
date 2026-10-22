@@ -1,0 +1,8 @@
+/* libmlipcpp_c.so: the C API (include/mlipcpp/mlipcpp.h) and nothing else,
+   so its static libmlipcpp, ggml and fmt stay private to it */
+{
+  global:
+    mlipcpp_*;
+  local:
+    *;
+};
