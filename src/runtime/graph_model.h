@@ -195,6 +195,8 @@ private:
   int ragged_state_ = -1; // -1 unchecked, 0 no, 1 yes
   PetRaggedSpec ragged_spec_;
   std::map<std::string, ggml_tensor *> ragged_weights_;
+  ggml_context *ctx_ragged_fold_ = nullptr; // pet_ragged_fold_weights
+  ggml_backend_buffer_t ragged_fold_buffer_ = nullptr;
   bool use_ragged();
   void build_ragged_graph(int n_atoms, int64_t e_cap, int max_len, bool backward);
   // rebuilds cached_ unless it holds n_atoms, `edges` packed edges and sequences of

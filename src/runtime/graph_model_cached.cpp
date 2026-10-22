@@ -479,7 +479,15 @@ bool GraphModel::use_ragged() {
         break;
       }
     }
-    if (pet_ragged_spec(ragged_weights_, d_pet, heads, cutoff_width_, ragged_spec_, why)) ragged_state_ = 1;
+    if (pet_ragged_spec(ragged_weights_, d_pet, heads, cutoff_width_, ragged_spec_, why)) {
+      ragged_state_ = 1;
+      // MLIPCPP_RAGGED_GRAPH_FOLD=1: the folded weight products as matmuls in the graph
+      const char *f = std::getenv("MLIPCPP_RAGGED_GRAPH_FOLD");
+      if ((!f || !*f || *f == '0') && !ctx_ragged_fold_ &&
+          !pet_ragged_fold_weights(ggml_backend_buffer_get_type(weight_buffer_), ragged_spec_, ragged_weights_,
+                                   &ctx_ragged_fold_, &ragged_fold_buffer_))
+        std::fprintf(stderr, "mlipcpp: folded PET weights computed in the graph\n");
+    }
   }
   if (ragged_state_ != 1) std::fprintf(stderr, "mlipcpp: MLIPCPP_RAGGED ignored (%s)\n", why.c_str());
   return ragged_state_ == 1;

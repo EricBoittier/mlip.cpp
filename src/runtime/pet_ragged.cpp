@@ -1,14 +1,26 @@
 #include "pet_ragged.h"
 
+#include <ggml-backend.h>
 #include <ggml.h>
 
 #include <cmath>
 #include <cstdlib>
 #include <stdexcept>
+#include <vector>
 
 namespace mlipcpp::runtime {
 
 namespace {
+
+// A/B switches of this builder: set and not "0" (env_flag), or unset or not "0" (env_on, a default)
+bool env_flag(const char *name) {
+  const char *e = std::getenv(name);
+  return e && *e && *e != '0';
+}
+bool env_on(const char *name) {
+  const char *e = std::getenv(name);
+  return !e || !*e || *e != '0';
+}
 
 struct Builder {
   ggml_context *ctx;
@@ -26,20 +38,32 @@ struct Builder {
     return b == w.end() ? y : ggml_add(ctx, y, b->second);
   }
   ggml_tensor *rms_norm(ggml_tensor *x, const std::string &name, float eps) const {
+    // one op, whose gradient also sums the residual's (MLIPCPP_RAGGED_FUSE_RMS=0: RMS_NORM and MUL)
+    static const bool fuse = env_on("MLIPCPP_RAGGED_FUSE_RMS");
+    if (fuse) return ggml_pet_rms_norm(ctx, x, weight(name + "_weight"), eps);
     return ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), weight(name + "_weight"));
   }
   ggml_tensor *layer_norm(ggml_tensor *x, const std::string &name, float eps) const {
-    return ggml_pet_layer_norm(ctx, x, weight(name + "_weight"), weight(name + "_bias"), eps);
+    // MLIPCPP_RAGGED_LN_DECOMP=1: the LayerNorm of primitive ops (as GraphInterpreter::build_layer_norm)
+    static const bool decomp = env_flag("MLIPCPP_RAGGED_LN_DECOMP");
+    if (!decomp) return ggml_pet_layer_norm(ctx, x, weight(name + "_weight"), weight(name + "_bias"), eps);
+    const float inv_d = 1.0f / static_cast<float>(x->ne[0]);
+    ggml_tensor *centred = ggml_sub(ctx, x, ggml_repeat(ctx, ggml_scale(ctx, ggml_sum_rows(ctx, x), inv_d), x));
+    ggml_tensor *var = ggml_scale(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, centred)), inv_d);
+    ggml_tensor *sd = ggml_sqrt(ctx, ggml_scale_bias(ctx, var, 1.0f, eps));
+    ggml_tensor *y = ggml_div(ctx, centred, ggml_repeat(ctx, sd, x));
+    return ggml_add(ctx, ggml_mul(ctx, y, weight(name + "_weight")), weight(name + "_bias"));
   }
-  // FeedForward with SwiGLU: v, g = chunk(w_in(x)); w_out(v * sigmoid(g)). The two
+  // FeedForward with SwiGLU: v, g = chunk(w_in(x)); w_out(v * sigmoid(g)). Split form: the two
   // halves of w_in are blocks of its rows: two products instead of views of one
   // (the gradient of a second view of a tensor is a full-size ACC)
   ggml_tensor *gated_mlp(ggml_tensor *x, const std::string &name) const {
-    // MLIPCPP_RAGGED_GLU_VIEWS=1: one product and two views of it (the older form)
-    static const bool glu_views = [] {
-      const char *e = std::getenv("MLIPCPP_RAGGED_GLU_VIEWS");
-      return e && *e && *e != '0';
-    }();
+    // MLIPCPP_RAGGED_GLU_VIEWS=1 (with MLIPCPP_RAGGED_FUSE_GLU=0): one product and two views of it (the older form)
+    static const bool glu_views = env_flag("MLIPCPP_RAGGED_GLU_VIEWS");
+    // one product and one op over all of it, whose gradient is one [2f, rows]
+    // tensor: one gradient product, no ADD of two (MLIPCPP_RAGGED_FUSE_GLU=0: the split form below)
+    static const bool fuse_glu = env_on("MLIPCPP_RAGGED_FUSE_GLU");
+    if (fuse_glu) return linear(ggml_pet_glu(ctx, linear(x, name + "_w_in")), name + "_w_out");
     if (glu_views) {
       ggml_tensor *h = linear(x, name + "_w_in");
       const int64_t f = h->ne[0] / 2;
@@ -136,20 +160,45 @@ PetRaggedOutputs build_pet_ragged(ggml_context *ctx, const PetRaggedSpec &spec,
     //   = (W_a W_ee) [v, d] + (W_b Emb)[s] + W_c messages + (W_a b_ee + b)
     // the products of weights are small (d_pet x 4, d_pet x species) and replace the
     // concatenated [3 d_pet, E] input; in layer 0 the messages are an embedding too
+    // MLIPCPP_RAGGED_NO_FOLD=1: the concatenated input and the full compress_0 instead
+    static const bool no_fold = env_flag("MLIPCPP_RAGGED_NO_FOLD");
+    ggml_tensor *edge_tokens = nullptr;
+    if (no_fold) {
+      ggml_tensor *tokens_in = b.linear(edge_geometry, g + "edge_embedder");
+      if (l > 0)
+        tokens_in = ggml_concat(ctx, tokens_in, ggml_get_rows(ctx, b.weight(g + "neighbor_embedder_weight"), in.neighbor_species), 0);
+      tokens_in = ggml_concat(ctx, tokens_in, messages, 0);
+      edge_tokens = b.mlp2(tokens_in, g + "compress_0", g + "compress_2", false);
+    } else {
     ggml_tensor *w0 = b.weight(g + "compress_0_weight"); // [k d_pet, d_pet]
     auto block = [&](int k) { // columns [k d_pet, (k + 1) d_pet) of compress_0 as a [d_pet, d_pet] weight
       return ggml_cont(ctx, ggml_view_2d(ctx, w0, d_pet, d_pet, w0->nb[1], k * d_pet * ggml_element_size(w0)));
     };
-    ggml_tensor *w_a = block(0);
-    ggml_tensor *w_ee = b.weight(g + "edge_embedder_weight"); // [4, d_pet]
-    ggml_tensor *geometry_w = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, w_ee)), w_a); // [4, d_pet]
-    ggml_tensor *bias = ggml_add(ctx, ggml_mul_mat(ctx, w_a, ggml_reshape_2d(ctx, b.weight(g + "edge_embedder_bias"), d_pet, 1)),
-                                 ggml_reshape_2d(ctx, b.weight(g + "compress_0_bias"), d_pet, 1));
-    ggml_tensor *table = l > 0 ? ggml_mul_mat(ctx, block(1), b.weight(g + "neighbor_embedder_weight")) // [d_pet, species]
-                               : ggml_mul_mat(ctx, block(1), b.weight("neighbor_embedder_weight"));
-    ggml_tensor *pre = ggml_add(ctx, ggml_mul_mat(ctx, geometry_w, edge_geometry), ggml_get_rows(ctx, table, in.neighbor_species));
+    // the products, computed once in double by pet_ragged_fold_weights when the weights
+    // hold them (otherwise here, in the graph: in TF32 with MLIPCPP_TF32=1)
+    ggml_tensor *geometry_w, *bias, *table;
+    if (weights.count(g + "fold_geometry")) {
+      geometry_w = b.weight(g + "fold_geometry"), bias = b.weight(g + "fold_bias"), table = b.weight(g + "fold_table");
+    } else {
+      ggml_tensor *w_a = block(0);
+      ggml_tensor *w_ee = b.weight(g + "edge_embedder_weight"); // [4, d_pet]
+      geometry_w = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, w_ee)), w_a); // [4, d_pet]
+      bias = ggml_add(ctx, ggml_mul_mat(ctx, w_a, ggml_reshape_2d(ctx, b.weight(g + "edge_embedder_bias"), d_pet, 1)),
+                      ggml_reshape_2d(ctx, b.weight(g + "compress_0_bias"), d_pet, 1));
+      table = l > 0 ? ggml_mul_mat(ctx, block(1), b.weight(g + "neighbor_embedder_weight")) // [d_pet, species]
+                    : ggml_mul_mat(ctx, block(1), b.weight("neighbor_embedder_weight"));
+    }
+    // the K = 4 product of the raw edge vectors and distances in full FP32 even with
+    // MLIPCPP_TF32=1: in TF32 its inputs lose all but 10 mantissa bits, which put
+    // 0.6 meV/atom into PET-MAD-xs energies and most of the TF32 force error
+    // MLIPCPP_RAGGED_GEOM_TF32=1: in TF32 like the other products
+    static const bool geom_tf32 = env_flag("MLIPCPP_RAGGED_GEOM_TF32");
+    ggml_tensor *geo = ggml_mul_mat(ctx, geometry_w, edge_geometry);
+    if (!geom_tf32) ggml_mul_mat_set_prec(geo, GGML_PREC_F32);
+    ggml_tensor *pre = ggml_add(ctx, geo, ggml_get_rows(ctx, table, in.neighbor_species));
     if (l > 0) pre = ggml_add(ctx, pre, ggml_mul_mat(ctx, block(2), messages));
-    ggml_tensor *edge_tokens = b.linear(ggml_silu(ctx, ggml_add(ctx, pre, bias)), g + "compress_2"); // [d_pet, E]
+    edge_tokens = b.linear(ggml_silu(ctx, ggml_add(ctx, pre, bias)), g + "compress_2"); // [d_pet, E]
+    }
 
     // one PreLN transformer layer over [central token, its edges] per atom
     ggml_tensor *tokens = ggml_concat(ctx, b.linear(node, t + "center_contraction"), edge_tokens, 1); // [d_pet, n + E]
@@ -168,8 +217,12 @@ PetRaggedOutputs build_pet_ragged(ggml_context *ctx, const PetRaggedSpec &spec,
     const std::string c = std::to_string(l);
     // LayerNorm([edge; its reverse]) as one op: no gather and concatenation of [2 d_pet, E]
     // (the reverse of an edge's reverse is the edge, spare rows are their own reverse)
-    ggml_tensor *paired = ggml_pet_pair_norm(ctx, edges, in.reverse, b.weight("combination_norms_" + c + "_weight"),
-                                             b.weight("combination_norms_" + c + "_bias"), spec.ln_eps);
+    // MLIPCPP_RAGGED_PAIR_CONCAT=1: gather the reverse rows, concatenate, then LayerNorm
+    static const bool pair_concat = env_flag("MLIPCPP_RAGGED_PAIR_CONCAT");
+    ggml_tensor *paired = pair_concat
+        ? b.layer_norm(ggml_concat(ctx, edges, ggml_get_rows(ctx, edges, in.reverse), 0), "combination_norms_" + c, spec.ln_eps)
+        : ggml_pet_pair_norm(ctx, edges, in.reverse, b.weight("combination_norms_" + c + "_weight"),
+                             b.weight("combination_norms_" + c + "_bias"), spec.ln_eps);
     ggml_tensor *mixed = b.mlp2(paired, "combination_mlps_" + c + "_0", "combination_mlps_" + c + "_2", false);
     messages = ggml_add(ctx, ggml_add(ctx, messages, edges), mixed);
   }
@@ -189,4 +242,65 @@ PetRaggedOutputs build_pet_ragged(ggml_context *ctx, const PetRaggedSpec &spec,
   return out;
 }
 
+bool pet_ragged_fold_weights(ggml_backend_buffer_type *buft, const PetRaggedSpec &spec,
+                             std::map<std::string, ggml_tensor *> &w, ggml_context **ctx_out,
+                             ggml_backend_buffer **buffer_out) {
+  const int64_t d = spec.d_pet;
+  auto host = [&](const std::string &name, ggml_tensor *&t) {
+    t = w.at(name);
+    std::vector<float> v;
+    if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) return v;
+    v.resize(ggml_nelements(t));
+    ggml_backend_tensor_get(t, v.data(), 0, ggml_nbytes(t));
+    return v;
+  };
+  struct Fold {
+    std::string name;
+    int64_t ne0, ne1;
+    std::vector<float> v;
+    ggml_tensor *t = nullptr;
+  };
+  std::vector<Fold> folds;
+  for (int l = 0; l < spec.layers; l++) {
+    const std::string g = "gnn_layers_" + std::to_string(l) + "_";
+    ggml_tensor *t0, *tee, *tbee, *tb0, *temb;
+    const std::vector<float> w0 = host(g + "compress_0_weight", t0), wee = host(g + "edge_embedder_weight", tee),
+                             bee = host(g + "edge_embedder_bias", tbee), b0 = host(g + "compress_0_bias", tb0),
+                             emb = host(l > 0 ? g + "neighbor_embedder_weight" : "neighbor_embedder_weight", temb);
+    if (w0.empty() || wee.empty() || bee.empty() || b0.empty() || emb.empty()) return false;
+    const int64_t k_in = t0->ne[0], n_geo = tee->ne[0], n_species = temb->ne[1];
+    // compress_0 row o (an output), column c of block k: w0[o k_in + k d + c]
+    auto wa = [&](int64_t o, int64_t c) { return double(w0[o * k_in + c]); };
+    auto wb = [&](int64_t o, int64_t c) { return double(w0[o * k_in + d + c]); };
+    Fold geo{g + "fold_geometry", n_geo, d, std::vector<float>(n_geo * d)}; // W_a W_ee
+    Fold bias{g + "fold_bias", d, 1, std::vector<float>(d)};                 // W_a b_ee + b
+    Fold table{g + "fold_table", d, n_species, std::vector<float>(d * n_species)}; // W_b Emb
+    for (int64_t o = 0; o < d; o++) {
+      for (int64_t i = 0; i < n_geo; i++) {
+        double s = 0;
+        for (int64_t k = 0; k < d; k++) s += wa(o, k) * wee[k * n_geo + i];
+        geo.v[o * n_geo + i] = static_cast<float>(s);
+      }
+      double s = b0[o];
+      for (int64_t k = 0; k < d; k++) s += wa(o, k) * bee[k];
+      bias.v[o] = static_cast<float>(s);
+      for (int64_t sp = 0; sp < n_species; sp++) {
+        double t = 0;
+        for (int64_t k = 0; k < d; k++) t += wb(o, k) * emb[sp * d + k];
+        table.v[sp * d + o] = static_cast<float>(t);
+      }
+    }
+    folds.push_back(std::move(geo)), folds.push_back(std::move(bias)), folds.push_back(std::move(table));
+  }
+  ggml_context *ctx = ggml_init({ggml_tensor_overhead() * folds.size(), nullptr, /*no_alloc=*/true});
+  if (!ctx) return false;
+  for (Fold &f : folds) f.t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, f.ne0, f.ne1), ggml_set_name(f.t, f.name.c_str());
+  ggml_backend_buffer *buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+  if (!buffer) return ggml_free(ctx), false;
+  for (Fold &f : folds) ggml_backend_tensor_set(f.t, f.v.data(), 0, ggml_nbytes(f.t)), w[f.name] = f.t;
+  *ctx_out = ctx, *buffer_out = buffer;
+  return true;
+}
+
 } // namespace mlipcpp::runtime
+

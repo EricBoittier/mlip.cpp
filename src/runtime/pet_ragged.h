@@ -11,6 +11,8 @@
 #include <map>
 #include <string>
 
+struct ggml_backend_buffer;
+struct ggml_backend_buffer_type;
 struct ggml_context;
 struct ggml_tensor;
 
@@ -42,6 +44,15 @@ struct PetRaggedOutputs {
 /// reason, when they are not the feedforward-featurizer PET built here.
 bool pet_ragged_spec(const std::map<std::string, ggml_tensor *> &weights, int64_t d_pet, int heads,
                      float cutoff_width, PetRaggedSpec &spec, std::string &why);
+
+/// The products of weights that build_pet_ragged folds into compress_0 (per layer
+/// "gnn_layers_<l>_fold_geometry", "_fold_bias", "_fold_table"), computed once in
+/// double on the host and added to `weights`, in a buffer of `buft` the caller owns
+/// (ctx and buffer). As matmuls in the graph they would run in TF32 with
+/// MLIPCPP_TF32=1, which put 0.2-0.7 meV/atom into the energy. False if not done.
+bool pet_ragged_fold_weights(ggml_backend_buffer_type *buft, const PetRaggedSpec &spec,
+                             std::map<std::string, ggml_tensor *> &weights, ggml_context **ctx,
+                             ggml_backend_buffer **buffer);
 
 PetRaggedOutputs build_pet_ragged(ggml_context *ctx, const PetRaggedSpec &spec,
                                   const std::map<std::string, ggml_tensor *> &weights, const PetRaggedInputs &in,

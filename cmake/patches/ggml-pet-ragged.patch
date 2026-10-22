@@ -1,6 +1,6 @@
 --- a/include/ggml.h
 +++ b/include/ggml.h
-@@ -584,6 +584,14 @@
+@@ -584,6 +584,18 @@
          GGML_OP_PET_ATTN_JVP,
          GGML_OP_PET_ATTN_JVP_BACK,
          GGML_OP_PET_ATTN_JVP_BACK_BIAS,
@@ -12,10 +12,14 @@
 +        GGML_OP_PET_LAYER_NORM_BACK,
 +        GGML_OP_PET_PAIR_NORM,
 +        GGML_OP_PET_PAIR_NORM_BACK,
++        GGML_OP_PET_GLU,
++        GGML_OP_PET_GLU_BACK,
++        GGML_OP_PET_RMS_NORM,
++        GGML_OP_PET_RMS_NORM_BACK,
  
          GGML_OP_COUNT,
      };
-@@ -1781,6 +1789,55 @@
+@@ -1781,6 +1793,71 @@
      // result [D + n_head, L, N]: per row the D outputs, then the n_head
      // log-sum-exps (used by the backward pass); qkv may be F16 (storage only,
      // arithmetic in F32), the result and the gradient are F32
@@ -50,6 +54,22 @@
 +            struct ggml_tensor  * bias,
 +            float                 eps);
 +
++    // gated linear unit of h [2f, rows] = [v; g] (the two halves of each row):
++    // v * sigmoid(g), [f, rows]. Its gradient w.r.t. h is one [2f, rows] tensor,
++    // so the product that made h gets one gradient product instead of two
++    GGML_API struct ggml_tensor * ggml_pet_glu(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * h);
++
++    // RMSNorm over each row of x [d, rows] times weight [d], one pass; its
++    // gradient w.r.t. x (none w.r.t. weight) is one pass that also adds the
++    // gradient x already has from its other readers (a residual)
++    GGML_API struct ggml_tensor * ggml_pet_rms_norm(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * x,
++            struct ggml_tensor  * weight,
++            float                 eps);
++
 +    // fused PET attention over ragged sequences, without padding. qkv [3D, T]
 +    // holds one q | k | v row per token: the N central tokens first, then the
 +    // E = T - N edge tokens grouped by centre. Sequence i is token i followed by
@@ -73,7 +93,7 @@
              struct ggml_tensor  * qkv,
 --- a/src/ggml.c
 +++ b/src/ggml.c
-@@ -1071,9 +1071,17 @@
+@@ -1071,9 +1071,21 @@
      "PET_ATTN_JVP",
      "PET_ATTN_JVP_BACK",
      "PET_ATTN_JVP_BACK_BIAS",
@@ -85,14 +105,18 @@
 +    "PET_LAYER_NORM_BACK",
 +    "PET_PAIR_NORM",
 +    "PET_PAIR_NORM_BACK",
++    "PET_GLU",
++    "PET_GLU_BACK",
++    "PET_RMS_NORM",
++    "PET_RMS_NORM_BACK",
  };
  
 -static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
-+static_assert(GGML_OP_COUNT == 111, "GGML_OP_COUNT != 111");
++static_assert(GGML_OP_COUNT == 115, "GGML_OP_COUNT != 115");
  
  static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
      "none",
-@@ -1189,9 +1197,17 @@
+@@ -1189,9 +1201,21 @@
      "pet_attn_jvp(qkv,bias,dqkv,dbias)",
      "pet_attn_jvp_back(qkv,bias,g,dqkv,dbias)",
      "pet_attn_jvp_back_bias(qkv,bias,g,dqkv,dbias)",
@@ -104,14 +128,18 @@
 +    "pet_layer_norm_back(x,w,g)",
 +    "pet_pair_norm(x,rev,w,b)",
 +    "pet_pair_norm_back(x,rev,w,g)",
++    "pet_glu(h)",
++    "pet_glu_back(h,g)",
++    "pet_rms_norm(x,w)",
++    "pet_rms_norm_back(x,w,g,acc)",
  };
  
 -static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
-+static_assert(GGML_OP_COUNT == 111, "GGML_OP_COUNT != 111");
++static_assert(GGML_OP_COUNT == 115, "GGML_OP_COUNT != 115");
  
  static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
  
-@@ -4095,6 +4111,201 @@
+@@ -4095,6 +4119,276 @@
      a->src[2] = sinks;
  }
  
@@ -201,6 +229,81 @@
 +    result->src[0] = x;
 +    result->src[1] = weight;
 +    result->src[2] = grad;
++
++    return result;
++}
++
++// ggml_pet_glu
++
++struct ggml_tensor * ggml_pet_glu(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * h) {
++    GGML_ASSERT(h->type == GGML_TYPE_F32 && ggml_is_contiguous(h) && h->ne[0] % 2 == 0);
++
++    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, h->ne[0]/2, h->ne[1], h->ne[2], h->ne[3]);
++
++    result->op     = GGML_OP_PET_GLU;
++    result->src[0] = h;
++
++    return result;
++}
++
++static struct ggml_tensor * ggml_pet_glu_back(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * h,
++        struct ggml_tensor  * grad) {
++    GGML_ASSERT(ggml_is_contiguous(grad) && 2*grad->ne[0] == h->ne[0] && ggml_nrows(grad) == ggml_nrows(h));
++
++    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, h->ne);
++
++    result->op     = GGML_OP_PET_GLU_BACK;
++    result->src[0] = h;
++    result->src[1] = grad;
++
++    return result;
++}
++
++// ggml_pet_rms_norm
++
++struct ggml_tensor * ggml_pet_rms_norm(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * x,
++        struct ggml_tensor  * weight,
++        float                 eps) {
++    GGML_ASSERT(x->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(weight) && ggml_nelements(weight) == x->ne[0]);
++
++    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, x->ne);
++
++    ggml_set_op_params(result, &eps, sizeof(eps));
++
++    result->op     = GGML_OP_PET_RMS_NORM;
++    result->src[0] = x;
++    result->src[1] = weight;
++
++    return result;
++}
++
++// acc (or NULL): added to the gradient w.r.t. x
++static struct ggml_tensor * ggml_pet_rms_norm_back(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * x,
++        struct ggml_tensor  * weight,
++        struct ggml_tensor  * grad,
++        struct ggml_tensor  * acc,
++        float                 eps) {
++    GGML_ASSERT(ggml_is_contiguous(grad) && ggml_are_same_shape(x, grad));
++    GGML_ASSERT(!acc || (acc->type == GGML_TYPE_F32 && ggml_is_contiguous(acc) && ggml_are_same_shape(x, acc)));
++
++    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, x->ne);
++
++    ggml_set_op_params(result, &eps, sizeof(eps));
++
++    result->op     = GGML_OP_PET_RMS_NORM_BACK;
++    result->src[0] = x;
++    result->src[1] = weight;
++    result->src[2] = grad;
++    result->src[3] = acc;
 +
 +    return result;
 +}
@@ -313,7 +416,7 @@
  // ggml_pet_attn
  
  struct ggml_tensor * ggml_pet_attn(
-@@ -6537,7 +6748,12 @@
+@@ -6537,18 +6831,27 @@
      struct ggml_tensor * src = cgraph->visited_hash_set.keys[isrc];
      GGML_ASSERT(src);
      if (cgraph->grads[isrc]) {
@@ -327,7 +430,25 @@
      } else {
          // the first contribution of a view that is a box of a contiguous src
          // (its rows, e.g. a split): tensor padded with zeros, one pass instead
-@@ -7039,6 +7255,51 @@
+         // of zeroing a copy of src and accumulating into it (and no NaN from
+-        // an inf in src). The CUDA PAD grid has ne2*ne3 blocks in z.
++        // an inf in src). The CUDA PAD grid has ne2*ne3 blocks in z. The stride
++        // of a dimension the view has one element in is not used (a 2-D view's
++        // nb2 is its own size, not src's; GGML_VIEW_GRAD_PAD_STRICT=1: compared)
++        const bool strict = getenv("GGML_VIEW_GRAD_PAD_STRICT") != NULL;
+         int64_t lo[4] = {0, 0, 0, 0};
+         bool box = src->type == GGML_TYPE_F32 && tensor->type == GGML_TYPE_F32 && ggml_is_contiguous(src) &&
+-                   ggml_is_contiguous(tensor) && nb1 == src->nb[1] && nb2 == src->nb[2] && nb3 == src->nb[3] &&
++                   ggml_is_contiguous(tensor) && (nb1 == src->nb[1] || (!strict && tensor->ne[1] == 1)) &&
++                   (nb2 == src->nb[2] || (!strict && tensor->ne[2] == 1)) && (nb3 == src->nb[3] || (!strict && tensor->ne[3] == 1)) &&
+                    src->ne[2]*src->ne[3] <= 65535 && getenv("GGML_VIEW_GRAD_ACC") == NULL;
+         if (box) {
+-            const size_t nb[4] = {src->nb[0], nb1, nb2, nb3};
++            const size_t nb[4] = {src->nb[0], src->nb[1], src->nb[2], src->nb[3]};
+             size_t rem = offset;
+             for (int d = 3; d >= 0; d--) {
+                 lo[d] = rem / nb[d];
+@@ -7039,6 +7342,74 @@
              }
              GGML_ASSERT((!src1 || !src1_needs_grads) && "backward pass for softmax mask not implemented");
          } break;
@@ -351,6 +472,29 @@
 +                const float eps = ggml_get_op_params_f32(tensor, 0);
 +                ggml_add_or_set(ctx, cgraph, isrc0,
 +                    ggml_pet_pair_norm_back(ctx, src0, src1, src2, ggml_is_contiguous(grad) ? grad : ggml_cont(ctx, grad), eps));
++            }
++        } break;
++        case GGML_OP_PET_GLU: {
++            if (src0_needs_grads) {
++                ggml_add_or_set(ctx, cgraph, isrc0, ggml_pet_glu_back(ctx, src0, ggml_is_contiguous(grad) ? grad : ggml_cont(ctx, grad)));
++            }
++        } break;
++        case GGML_OP_PET_RMS_NORM: {
++            GGML_ASSERT(!src1_needs_grads && "pet_rms_norm: no gradient w.r.t. weight");
++            if (src0_needs_grads) {
++                const float eps = ggml_get_op_params_f32(tensor, 0);
++                struct ggml_tensor * g = ggml_is_contiguous(grad) ? grad : ggml_cont(ctx, grad);
++                // the gradient x has so far (from a residual) summed in the same pass
++                // (GGML_PET_RMS_BACK_NO_ACC=1: a separate ADD)
++                struct ggml_tensor * acc = cgraph->grads[isrc0];
++                if (acc && !cgraph->grad_accs[isrc0] && acc->type == GGML_TYPE_F32 && ggml_is_contiguous(acc) &&
++                    ggml_are_same_shape(acc, src0) && getenv("GGML_PET_RMS_BACK_NO_ACC") == NULL) {
++                    cgraph->grads[isrc0] = ggml_pet_rms_norm_back(ctx, src0, src1, g, acc, eps);
++                    ggml_format_name(cgraph->grads[isrc0], "grad for %s", src0->name);
++                    ggml_build_forward_expand(cgraph, cgraph->grads[isrc0]);
++                } else {
++                    ggml_add_or_set(ctx, cgraph, isrc0, ggml_pet_rms_norm_back(ctx, src0, src1, g, NULL, eps));
++                }
 +            }
 +        } break;
 +        case GGML_OP_PET_LAYER_NORM: {
@@ -381,7 +525,7 @@
                  const int32_t n_head = ggml_get_op_params_i32(tensor, 0);
 --- a/src/ggml-cpu/ggml-cpu.c
 +++ b/src/ggml-cpu/ggml-cpu.c
-@@ -1898,6 +1898,38 @@
+@@ -1898,6 +1898,54 @@
              {
                  ggml_compute_forward_pet_attn_jvp_back_bias(params, tensor);
              } break;
@@ -405,6 +549,22 @@
 +            {
 +                ggml_compute_forward_pet_layer_norm(params, tensor);
 +            } break;
++        case GGML_OP_PET_GLU:
++            {
++                ggml_compute_forward_pet_glu(params, tensor);
++            } break;
++        case GGML_OP_PET_GLU_BACK:
++            {
++                ggml_compute_forward_pet_glu_back(params, tensor);
++            } break;
++        case GGML_OP_PET_RMS_NORM:
++            {
++                ggml_compute_forward_pet_rms_norm(params, tensor);
++            } break;
++        case GGML_OP_PET_RMS_NORM_BACK:
++            {
++                ggml_compute_forward_pet_rms_norm_back(params, tensor);
++            } break;
 +        case GGML_OP_PET_LAYER_NORM_BACK:
 +            {
 +                ggml_compute_forward_pet_layer_norm_back(params, tensor);
@@ -420,7 +580,7 @@
          case GGML_OP_NEWTON_SCHULZ:
              {
                  ggml_compute_forward_newton_schulz(params, tensor);
-@@ -2349,6 +2381,14 @@
+@@ -2349,6 +2397,18 @@
          case GGML_OP_PET_ATTN_JVP:
          case GGML_OP_PET_ATTN_JVP_BACK:
          case GGML_OP_PET_ATTN_JVP_BACK_BIAS:
@@ -430,6 +590,10 @@
 +        case GGML_OP_PET_ATTN_RAGGED_BACK:
 +        case GGML_OP_PET_LAYER_NORM:
 +        case GGML_OP_PET_LAYER_NORM_BACK:
++        case GGML_OP_PET_GLU:
++        case GGML_OP_PET_GLU_BACK:
++        case GGML_OP_PET_RMS_NORM:
++        case GGML_OP_PET_RMS_NORM_BACK:
 +        case GGML_OP_PET_PAIR_NORM:
 +        case GGML_OP_PET_PAIR_NORM_BACK:
          case GGML_OP_NEWTON_SCHULZ:
@@ -437,7 +601,7 @@
          case GGML_OP_ROPE_BACK:
 --- a/src/ggml-cpu/ops.h
 +++ b/src/ggml-cpu/ops.h
-@@ -66,6 +66,14 @@
+@@ -66,6 +66,18 @@
  void ggml_compute_forward_pet_attn_jvp(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_pet_attn_jvp_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_pet_attn_jvp_back_bias(const struct ggml_compute_params * params, struct ggml_tensor * dst);
@@ -446,6 +610,10 @@
 +void ggml_compute_forward_pet_attn_ragged(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 +void ggml_compute_forward_pet_attn_ragged_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 +void ggml_compute_forward_pet_layer_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_pet_glu(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_pet_glu_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_pet_rms_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_pet_rms_norm_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 +void ggml_compute_forward_pet_layer_norm_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 +void ggml_compute_forward_pet_pair_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 +void ggml_compute_forward_pet_pair_norm_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
@@ -454,7 +622,7 @@
  void ggml_compute_forward_rope_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 --- a/src/ggml-cpu/ops.cpp
 +++ b/src/ggml-cpu/ops.cpp
-@@ -11581,3 +11581,275 @@
+@@ -11581,3 +11581,349 @@
          }
      }
  }
@@ -618,6 +786,80 @@
 +                    db[ru*H + h] += ds;
 +                }
 +            }
++        }
++    }
++}
++
++// ggml_compute_forward_pet_glu: row [v; g] -> v * sigmoid(g)
++
++void ggml_compute_forward_pet_glu(const ggml_compute_params * params, ggml_tensor * dst) {
++    const ggml_tensor * h = dst->src[0];
++    const int64_t f = dst->ne[0], rows = ggml_nrows(dst);
++    for (int64_t r = params->ith; r < rows; r += params->nth) {
++        const float * v = (const float *) h->data + r*2*f, * g = v + f;
++        float * y = (float *) dst->data + r*f;
++        for (int64_t c = 0; c < f; c++) y[c] = (1.0f/(1.0f + expf(-g[c])))*v[c];
++    }
++}
++
++// ggml_compute_forward_pet_glu_back: [dy sigmoid(g); dy v sigmoid(g) (1 - sigmoid(g))]
++
++void ggml_compute_forward_pet_glu_back(const ggml_compute_params * params, ggml_tensor * dst) {
++    const ggml_tensor * h = dst->src[0];
++    const float * dy = (const float *) dst->src[1]->data;
++    const int64_t f = dst->ne[0]/2, rows = ggml_nrows(dst);
++    for (int64_t r = params->ith; r < rows; r += params->nth) {
++        const float * v = (const float *) h->data + r*2*f, * g = v + f, * dyr = dy + r*f;
++        float * dv = (float *) dst->data + r*2*f, * dg = dv + f;
++        for (int64_t c = 0; c < f; c++) {
++            const float s = 1.0f/(1.0f + expf(-g[c]));
++            dv[c] = s*dyr[c];
++            dg[c] = (s*(1.0f - s))*(dyr[c]*v[c]);
++        }
++    }
++}
++
++// ggml_compute_forward_pet_rms_norm: x / sqrt(mean(x^2) + eps) * w, per row
++
++void ggml_compute_forward_pet_rms_norm(const ggml_compute_params * params, ggml_tensor * dst) {
++    const ggml_tensor * x = dst->src[0];
++    const float * w = (const float *) dst->src[1]->data;
++    const float eps = ggml_get_op_params_f32(dst, 0);
++    const int64_t d = x->ne[0], rows = ggml_nrows(x);
++    for (int64_t r = params->ith; r < rows; r += params->nth) {
++        const float * xr = (const float *) x->data + r*d;
++        float * y = (float *) dst->data + r*d;
++        ggml_float sum = 0.0;
++        for (int64_t c = 0; c < d; c++) sum += (ggml_float) (xr[c]*xr[c]);
++        const float scale = 1.0f/sqrtf((float) (sum/d) + eps);
++        for (int64_t c = 0; c < d; c++) y[c] = (xr[c]*scale)*w[c];
++    }
++}
++
++// ggml_compute_forward_pet_rms_norm_back: acc + (g w - x sum(g w x) / (sum(x^2) + d eps)) / sqrt(mean(x^2) + eps)
++
++void ggml_compute_forward_pet_rms_norm_back(const ggml_compute_params * params, ggml_tensor * dst) {
++    const ggml_tensor * x = dst->src[0], * acc = dst->src[3];
++    const float * w = (const float *) dst->src[1]->data, * g = (const float *) dst->src[2]->data;
++    const float eps = ggml_get_op_params_f32(dst, 0);
++    const int64_t d = x->ne[0], rows = ggml_nrows(x);
++    for (int64_t r = params->ith; r < rows; r += params->nth) {
++        const float * xr = (const float *) x->data + r*d, * gr = g + r*d;
++        float * dx = (float *) dst->data + r*d;
++        ggml_float sum_xx = 0.0, sum_xg = 0.0;
++        for (int64_t c = 0; c < d; c++) {
++            sum_xx += (ggml_float) (xr[c]*xr[c]);
++            sum_xg += (ggml_float) (xr[c]*(gr[c]*w[c]));
++        }
++        // as ggml_compute_forward_rms_norm_back_f32 of the product g w
++        const float mean_eps = (float) (sum_xx)/d + eps;
++        const float sum_eps = (float) (sum_xx) + eps*d;
++        const float rrms = 1.0f/sqrtf(mean_eps);
++        const float dx_x = (float) (-sum_xg)/sum_eps;
++        const float * ar = acc ? (const float *) acc->data + r*d : nullptr;
++        for (int64_t c = 0; c < d; c++) {
++            const float v = (gr[c]*w[c] + xr[c]*dx_x)*rrms;
++            dx[c] = ar ? ar[c] + v : v;
 +        }
 +    }
 +}
@@ -798,17 +1040,21 @@
  }
  
  template <float (*bin_op)(const float, const float),
-@@ -275,7 +277,8 @@
+@@ -275,7 +277,12 @@
          const uint3 ne12 = init_fastdiv_values((uint32_t) cne1[2]);
          const uint3 ne13 = init_fastdiv_values((uint32_t) cne1[3]);
  
 -        if (block_nums.z > 65535 || block_nums.y > 65535) {
-+        block_nums.y = std::min(block_nums.y, 65535u); // k_bin_bcast loops over the rows past it
-+        if (block_nums.z > 65535) {
++        // k_bin_bcast loops over the rows past gridDim.y = 65535 (GGML_BINBCAST_UNRAVEL=1: the
++        // index-unravelling kernel for them instead, as upstream)
++        static const bool unravel = getenv("GGML_BINBCAST_UNRAVEL") != nullptr;
++        const bool use_unravel = block_nums.z > 65535 || (unravel && block_nums.y > 65535);
++        block_nums.y = std::min(block_nums.y, 65535u);
++        if (use_unravel) {
              int         block_num  = (ne0 * ne1 * ne2 * ne3 + block_size - 1) / block_size;
              const uint3 prod_012    = init_fastdiv_values((uint32_t) (ne0 * ne1 * ne2));
              const uint3 prod_01     = init_fastdiv_values((uint32_t) (ne0 * ne1));
-@@ -333,17 +336,20 @@
+@@ -333,17 +340,20 @@
          return;
      }
  
@@ -831,7 +1077,7 @@
  }
  
  // repeat_back with the reduction split over blockIdx.y: k_repeat_back gives
-@@ -415,7 +421,7 @@
+@@ -415,7 +425,7 @@
      const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
  
      const dim3 block_dims(WARP_SIZE, 1, 1);
@@ -876,7 +1122,42 @@
  #include "ggml-cuda/newton-schulz.cuh"
  #include "ggml-cuda/pool2d.cuh"
  #include "ggml-cuda/quantize.cuh"
-@@ -2743,6 +2745,30 @@
+@@ -2243,7 +2245,24 @@
+     return use_mul_mat_vec_q;
+ }
+ 
++static void ggml_cuda_mul_mat_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
++
++// GGML_PREC_F32 (ggml_mul_mat_set_prec) on an F32 product: full FP32 even when the
++// GEMMs otherwise run on TF32 tensor cores (no GGML_CUDA_NO_TF32): no mmf kernels,
++// and cuBLAS in its default math mode for this product
+ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    static const bool no_tf32 = getenv("GGML_CUDA_NO_TF32") != nullptr;
++    const bool full = !no_tf32 && src0->type == GGML_TYPE_F32 && ggml_get_op_params_i32(dst, 0) == GGML_PREC_F32;
++    if (full) {
++        CUBLAS_CHECK(cublasSetMathMode(ctx.cublas_handle(), CUBLAS_DEFAULT_MATH));
++    }
++    ggml_cuda_mul_mat_impl(ctx, src0, src1, dst);
++    if (full) {
++        CUBLAS_CHECK(cublasSetMathMode(ctx.cublas_handle(), CUBLAS_TF32_TENSOR_OP_MATH));
++    }
++}
++
++static void ggml_cuda_mul_mat_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
+ 
+     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
+@@ -2255,7 +2274,8 @@
+     bool use_mul_mat_vec_f = (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16)
+         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
+     bool use_mul_mat_f     = !ggml_is_quantized(src0->type)
+-        && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
++        && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
++        && !(src0->type == GGML_TYPE_F32 && ggml_get_op_params_i32(dst, 0) == GGML_PREC_F32); // TF32 tensor cores
+     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear
+         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+         && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
+@@ -2743,6 +2763,42 @@
          case GGML_OP_PET_ATTN_BACK_BIAS:
              ggml_cuda_op_pet_attn_back_bias(ctx, dst);
              break;
@@ -901,13 +1182,214 @@
 +        case GGML_OP_PET_PAIR_NORM:
 +            ggml_cuda_op_pet_pair_norm(ctx, dst);
 +            break;
++        case GGML_OP_PET_GLU:
++            ggml_cuda_op_pet_glu(ctx, dst);
++            break;
++        case GGML_OP_PET_GLU_BACK:
++            ggml_cuda_op_pet_glu_back(ctx, dst);
++            break;
++        case GGML_OP_PET_RMS_NORM:
++            ggml_cuda_op_pet_rms_norm(ctx, dst);
++            break;
++        case GGML_OP_PET_RMS_NORM_BACK:
++            ggml_cuda_op_pet_rms_norm_back(ctx, dst);
++            break;
 +        case GGML_OP_PET_PAIR_NORM_BACK:
 +            ggml_cuda_op_pet_pair_norm_back(ctx, dst);
 +            break;
          case GGML_OP_PET_ATTN_JVP:
          case GGML_OP_PET_ATTN_JVP_BACK:
          case GGML_OP_PET_ATTN_JVP_BACK_BIAS:
-@@ -5027,6 +5053,18 @@
+@@ -3310,6 +3366,10 @@
+ // writing the ADD's output, instead of a GEMM and a broadcast add over the
+ // whole result. Same compute type as the cuBLAS path (GGML_CUDA_NO_TF32);
+ // GGML_CUDA_NO_MM_BIAS=1: off. Returns the index of the ADD, or -1.
++// GGML_CUDA_MM_RESIDUAL=1: when the next node (past views) is the ADD of that
++// sum and another tensor of its shape (a residual), the only use of the sum,
++// the GEMM also adds it (beta = 1, C = the residual) and writes that ADD's
++// output instead; the index returned is then that ADD's.
+ struct ggml_cuda_mm_bias_plan {
+     cublasLtMatmulDesc_t op = nullptr;
+     cublasLtMatrixLayout_t a = nullptr, b = nullptr, d = nullptr;
+@@ -3318,10 +3378,18 @@
+     bool ok = false;
+ };
+ 
++// whether the bytes of a and b overlap: the allocator may give an output the
++// memory of a tensor whose last reader was a node fused into the same GEMM
++static bool ggml_cuda_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b) {
++    const char * a0 = (const char *) a->data, * b0 = (const char *) b->data;
++    return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
++}
++
+ static int ggml_cuda_mul_mat_bias(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+     static const bool off = getenv("GGML_CUDA_NO_MM_BIAS") != nullptr;
+     const ggml_tensor * mm = cgraph->nodes[i];
+-    if (off || mm->op != GGML_OP_MUL_MAT || (mm->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, i) != 1) {
++    if (off || mm->op != GGML_OP_MUL_MAT || (mm->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, i) != 1 ||
++        ggml_get_op_params_i32(mm, 0) == GGML_PREC_F32) {
+         return -1;
+     }
+     int j = i + 1;
+@@ -3342,7 +3410,8 @@
+         bias->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 || A->ne[2] != 1 || A->ne[3] != 1 ||
+         !ggml_is_contiguous(A) || !ggml_is_contiguous(B) || !ggml_is_contiguous(bias) || !ggml_is_contiguous(add) ||
+         ggml_nelements(bias) != mm->ne[0] || bias->ne[0] != mm->ne[0] || !ggml_are_same_shape(add, mm) ||
+-        ggml_backend_buft_is_cuda_split(A->buffer->buft) || B->ne[0] != A->ne[0]) {
++        ggml_backend_buft_is_cuda_split(A->buffer->buft) || B->ne[0] != A->ne[0] || ggml_cuda_tensors_overlap(add, A) ||
++        ggml_cuda_tensors_overlap(add, B) || ggml_cuda_tensors_overlap(add, bias)) {
+         return -1;
+     }
+     const int64_t K = A->ne[0], M = A->ne[1], N = ggml_nrows(B);
+@@ -3381,11 +3450,133 @@
+     if (!p.ok) {
+         return -1;
+     }
++    static const bool residual = getenv("GGML_CUDA_MM_RESIDUAL") != nullptr;
++    int k = -1;
++    const ggml_tensor * R = nullptr;
++    if (residual && !(add->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_node_get_use_count(cgraph, j) == 1) {
++        k = j + 1;
++        while (k < cgraph->n_nodes && (ggml_is_empty(cgraph->nodes[k]) || cgraph->nodes[k]->op == GGML_OP_VIEW ||
++               cgraph->nodes[k]->op == GGML_OP_RESHAPE || cgraph->nodes[k]->op == GGML_OP_PERMUTE ||
++               cgraph->nodes[k]->op == GGML_OP_TRANSPOSE || cgraph->nodes[k]->op == GGML_OP_NONE)) {
++            k++;
++        }
++        const ggml_tensor * sum = k < cgraph->n_nodes ? cgraph->nodes[k] : nullptr;
++        if (sum && sum->op == GGML_OP_ADD && (sum->src[0] == add) != (sum->src[1] == add)) {
++            R = sum->src[0] == add ? sum->src[1] : sum->src[0];
++        }
++        if (!R || R->type != GGML_TYPE_F32 || sum->type != GGML_TYPE_F32 || !ggml_are_same_shape(R, add) ||
++            !ggml_are_same_shape(sum, add) || !ggml_is_contiguous(R) || !ggml_is_contiguous(sum) ||
++            ggml_cuda_tensors_overlap(sum, A) || ggml_cuda_tensors_overlap(sum, B) || ggml_cuda_tensors_overlap(sum, bias) ||
++            (ggml_cuda_tensors_overlap(sum, R) && sum->data != R->data)) {
++            k = -1, R = nullptr;
++        }
++    }
++    void * out = R ? cgraph->nodes[k]->data : add->data;
+     const void * bp = bias->data;
+     CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bp, sizeof(bp)));
+     ggml_cuda_pool_alloc<char> ws(ctx.pool(), p.ws > 0 ? p.ws : 1);
+-    const float alpha = 1.0f, beta = 0.0f;
+-    CUBLAS_CHECK(cublasLtMatmul(lt[device], p.op, &alpha, A->data, p.a, B->data, p.b, &beta, add->data, p.d, add->data, p.d,
++    const float alpha = 1.0f, beta = R ? 1.0f : 0.0f;
++    CUBLAS_CHECK(cublasLtMatmul(lt[device], p.op, &alpha, A->data, p.a, B->data, p.b, &beta, R ? R->data : out, p.d, out, p.d,
++                                &p.algo, ws.get(), p.ws, ctx.stream()));
++    return R ? k : j;
++}
++
++// OUT_PROD (a gradient product, 2-D f32) followed, past no-op views, by the
++// ADD of it (or of a RESHAPE of it) and another tensor of that size, the
++// product's only use (a sum of gradients): one cuBLASLt GEMM D = A B^T + C
++// with C the other tensor, writing the ADD's output. GGML_CUDA_NO_OUT_PROD_ACC=1:
++// off. Returns the index of the ADD, or -1.
++struct ggml_cuda_out_prod_plan {
++    cublasLtMatmulDesc_t op = nullptr;
++    cublasLtMatrixLayout_t a = nullptr, b = nullptr, d = nullptr;
++    cublasLtMatmulAlgo_t algo{};
++    size_t ws = 0;
++    bool ok = false;
++};
++
++static int ggml_cuda_out_prod_acc(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
++    static const bool on = getenv("GGML_CUDA_NO_OUT_PROD_ACC") == nullptr;
++    const ggml_tensor * op = cgraph->nodes[i];
++    if (!on || op->op != GGML_OP_OUT_PROD || (op->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, i) != 1) {
++        return -1;
++    }
++    const ggml_tensor * P = op;
++    int j = i + 1;
++    for (; j < cgraph->n_nodes; j++) {
++        const ggml_tensor * t = cgraph->nodes[j];
++        if (!(ggml_is_empty(t) || t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE ||
++              t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_NONE)) {
++            break;
++        }
++        if (t->op == GGML_OP_RESHAPE && t->src[0] == P) {
++            if ((t->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, j) != 1) {
++                return -1;
++            }
++            P = t;
++        }
++    }
++    if (j >= cgraph->n_nodes) {
++        return -1;
++    }
++    const ggml_tensor * sum = cgraph->nodes[j];
++    if (sum->op != GGML_OP_ADD || (sum->src[0] == P) == (sum->src[1] == P)) {
++        return -1;
++    }
++    const ggml_tensor * R = sum->src[0] == P ? sum->src[1] : sum->src[0];
++    const ggml_tensor * A = op->src[0], * B = op->src[1];
++    if (A->type != GGML_TYPE_F32 || B->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 || R->type != GGML_TYPE_F32 ||
++        sum->type != GGML_TYPE_F32 || !ggml_are_same_shape(R, sum) || !ggml_are_same_shape(P, sum) || !ggml_is_contiguous(R) ||
++        !ggml_is_contiguous(sum) || !ggml_is_contiguous(op) || A->ne[2] != 1 || A->ne[3] != 1 || B->ne[2] != 1 || B->ne[3] != 1 ||
++        A->nb[0] != sizeof(float) || A->ne[1] != B->ne[1] || op->ne[0] != A->ne[0] || op->ne[1] != B->ne[0] ||
++        ggml_cuda_tensors_overlap(sum, A) || ggml_cuda_tensors_overlap(sum, B) ||
++        (ggml_cuda_tensors_overlap(sum, R) && sum->data != R->data)) {
++        return -1;
++    }
++    // as ggml_cuda_out_prod: dst [m, n] = A [m, k] op(B), column-major
++    const bool B_T = ggml_is_transposed(B);
++    if ((B_T ? B->nb[1] : B->nb[0]) != sizeof(float)) {
++        return -1;
++    }
++    const int64_t m = op->ne[0], n = op->ne[1], kk = A->ne[1];
++    const int64_t lda = A->nb[1] / sizeof(float), ldb = (B_T ? B->nb[0] : B->nb[1]) / sizeof(float);
++    const int device = ggml_cuda_get_device();
++    static cublasLtHandle_t lt[GGML_CUDA_MAX_DEVICES] = {};
++    if (!lt[device]) {
++        CUBLAS_CHECK(cublasLtCreate(&lt[device]));
++    }
++    static const bool no_tf32 = getenv("GGML_CUDA_NO_TF32") != nullptr;
++    static std::map<std::tuple<int, int64_t, int64_t, int64_t, int64_t, int64_t, bool>, ggml_cuda_out_prod_plan> plans;
++    ggml_cuda_out_prod_plan & p = plans[{device, m, n, kk, lda, ldb, B_T}];
++    const size_t ws_max = 32u << 20;
++    if (!p.op) {
++        const cublasComputeType_t compute = no_tf32 ? CUBLAS_COMPUTE_32F : CUBLAS_COMPUTE_32F_FAST_TF32;
++        CUBLAS_CHECK(cublasLtMatmulDescCreate(&p.op, compute, CUDA_R_32F));
++        const cublasOperation_t ta = CUBLAS_OP_N, tb = B_T ? CUBLAS_OP_N : CUBLAS_OP_T;
++        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof(ta)));
++        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof(tb)));
++        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&p.a, CUDA_R_32F, m, kk, lda));
++        if (B_T) {
++            CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&p.b, CUDA_R_32F, kk, n, ldb));
++        } else {
++            CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&p.b, CUDA_R_32F, n, kk, ldb));
++        }
++        CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&p.d, CUDA_R_32F, m, n, m));
++        cublasLtMatmulPreference_t pref;
++        CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&pref));
++        CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_max, sizeof(ws_max)));
++        cublasLtMatmulHeuristicResult_t res{};
++        int found = 0;
++        if (cublasLtMatmulAlgoGetHeuristic(lt[device], p.op, p.a, p.b, p.d, p.d, pref, 1, &res, &found) == CUBLAS_STATUS_SUCCESS && found > 0) {
++            p.algo = res.algo, p.ws = res.workspaceSize, p.ok = true;
++        }
++        cublasLtMatmulPreferenceDestroy(pref);
++    }
++    if (!p.ok) {
++        return -1;
++    }
++    ggml_cuda_pool_alloc<char> ws(ctx.pool(), p.ws > 0 ? p.ws : 1);
++    const float alpha = 1.0f, beta = 1.0f;
++    CUBLAS_CHECK(cublasLtMatmul(lt[device], p.op, &alpha, A->data, p.a, B->data, p.b, &beta, R->data, p.d, sum->data, p.d,
+                                 &p.algo, ws.get(), p.ws, ctx.stream()));
+     return j;
+ }
+@@ -3827,6 +4018,11 @@
+                         continue;
+                     }
+ 
++                    if (const int j = ggml_cuda_out_prod_acc(*cuda_ctx, cgraph, i); j >= 0) {
++                        i = j;
++                        continue;
++                    }
++
+                     bool fused_mul_mat_vec = false;
+                     int fused_node_count = 0;
+ 
+@@ -5027,6 +5223,23 @@
          case GGML_OP_PET_ATTN_BACK:
          case GGML_OP_PET_ATTN_BACK_BIAS:
              return ggml_cuda_pet_attn_supported(op);
@@ -923,6 +1405,11 @@
 +        case GGML_OP_PET_PAIR_NORM:
 +        case GGML_OP_PET_PAIR_NORM_BACK:
 +            return op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[3]);
++        case GGML_OP_PET_GLU:
++        case GGML_OP_PET_GLU_BACK:
++        case GGML_OP_PET_RMS_NORM:
++        case GGML_OP_PET_RMS_NORM_BACK:
++            return op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]);
          case GGML_OP_PET_ATTN_JVP:
          case GGML_OP_PET_ATTN_JVP_BACK:
          case GGML_OP_PET_ATTN_JVP_BACK_BIAS:
@@ -2365,15 +2852,23 @@
 +}
 --- /dev/null
 +++ b/src/ggml-cuda/pet-fused.cuh
-@@ -0,0 +1,5 @@
+@@ -0,0 +1,13 @@
 +#include "common.cuh"
 +
 +// LayerNorm of each edge paired with its reverse (GGML_OP_PET_PAIR_NORM / _BACK): see ggml_pet_pair_norm
 +void ggml_cuda_op_pet_pair_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 +void ggml_cuda_op_pet_pair_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
++// gated linear unit of [v; g] rows (GGML_OP_PET_GLU / _BACK): see ggml_pet_glu
++void ggml_cuda_op_pet_glu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++void ggml_cuda_op_pet_glu_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
++// RMSNorm times weight, and its gradient plus a residual's (GGML_OP_PET_RMS_NORM / _BACK): see ggml_pet_rms_norm
++void ggml_cuda_op_pet_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++void ggml_cuda_op_pet_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 --- /dev/null
 +++ b/src/ggml-cuda/pet-fused.cu
-@@ -0,0 +1,105 @@
+@@ -0,0 +1,197 @@
 +#include "pet-fused.cuh"
 +
 +// ---- pair norm: one block per edge row ----
@@ -2477,5 +2972,97 @@
 +    pet_pair_norm_back_kernel<<<(unsigned) E, pet_pair_threads(d), 0, ctx.stream()>>>((const float *) x->data,
 +        (const int32_t *) dst->src[1]->data, (const float *) dst->src[2]->data, (const float *) dst->src[3]->data,
 +        (float *) dst->data, d, ggml_get_op_params_f32(dst, 0));
++    CUDA_CHECK(cudaGetLastError());
++}
++
++// ---- gated linear unit: one thread per output element ----
++// row r of h is [v; g] (f values each); y = sigmoid(g) v, and the gradient
++// w.r.t. h is [sigmoid(g) dy; sigmoid(g) (1 - sigmoid(g)) v dy] (the order of
++// ggml's SIGLU and SIGLU_BACK products)
++
++static __global__ void pet_glu_kernel(const float * __restrict__ h, float * __restrict__ y, const int64_t f, const int64_t n) {
++    for (int64_t i = blockIdx.x*(int64_t) blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x*blockDim.x) {
++        const int64_t r = i / f, c = i - r*f;
++        const float v = h[r*2*f + c], g = h[r*2*f + f + c];
++        y[i] = (1.0f / (1.0f + expf(-g)))*v;
++    }
++}
++
++static __global__ void pet_glu_back_kernel(const float * __restrict__ h, const float * __restrict__ dy, float * __restrict__ dh,
++        const int64_t f, const int64_t n) {
++    for (int64_t i = blockIdx.x*(int64_t) blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x*blockDim.x) {
++        const int64_t r = i / f, c = i - r*f;
++        const float v = h[r*2*f + c], g = h[r*2*f + f + c], d = dy[i];
++        const float s = 1.0f / (1.0f + expf(-g));
++        dh[r*2*f + c]     = s*d;
++        dh[r*2*f + f + c] = (s*(1.0f - s))*(d*v);
++    }
++}
++
++static unsigned pet_elementwise_blocks(int64_t n) {
++    return (unsigned) std::min<int64_t>((n + 255) / 256, 1 << 20);
++}
++
++void ggml_cuda_op_pet_glu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const int64_t n = ggml_nelements(dst);
++    if (n == 0) return;
++    pet_glu_kernel<<<pet_elementwise_blocks(n), 256, 0, ctx.stream()>>>((const float *) dst->src[0]->data, (float *) dst->data,
++        dst->ne[0], n);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++void ggml_cuda_op_pet_glu_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const int64_t n = ggml_nelements(dst->src[1]);
++    if (n == 0) return;
++    pet_glu_back_kernel<<<pet_elementwise_blocks(n), 256, 0, ctx.stream()>>>((const float *) dst->src[0]->data,
++        (const float *) dst->src[1]->data, (float *) dst->data, dst->src[1]->ne[0], n);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++// ---- RMSNorm: one block per row ----
++// y = x w / sqrt(mean(x^2) + eps); dx = acc + (g w - x sum(x g w) / (sum(x^2) + d eps)) / sqrt(mean(x^2) + eps)
++
++static __global__ void pet_rms_norm_kernel(const float * __restrict__ x, const float * __restrict__ w, float * __restrict__ y,
++        const int d, const float eps) {
++    const int64_t row = blockIdx.x;
++    const float * xr = x + row*d;
++    float s = 0.0f;
++    for (int c = threadIdx.x; c < d; c += blockDim.x) s += xr[c]*xr[c];
++    const float scale = rsqrtf(block_sum4(make_float4(s, 0.0f, 0.0f, 0.0f)).x / d + eps);
++    for (int c = threadIdx.x; c < d; c += blockDim.x) y[row*d + c] = (xr[c]*scale)*w[c];
++}
++
++static __global__ void pet_rms_norm_back_kernel(const float * __restrict__ x, const float * __restrict__ w, const float * __restrict__ g,
++        const float * __restrict__ acc, float * __restrict__ dx, const int d, const float eps) {
++    const int64_t row = blockIdx.x;
++    const float * xr = x + row*d, * gr = g + row*d;
++    float sxx = 0.0f, sxg = 0.0f;
++    for (int c = threadIdx.x; c < d; c += blockDim.x) sxx += xr[c]*xr[c], sxg += xr[c]*(gr[c]*w[c]);
++    const float4 t = block_sum4(make_float4(sxx, sxg, 0.0f, 0.0f));
++    const float rrms = rsqrtf(t.x / d + eps), sx = -t.y / (t.x + eps*d);
++    for (int c = threadIdx.x; c < d; c += blockDim.x) {
++        const float v = (gr[c]*w[c] + xr[c]*sx)*rrms;
++        dx[row*d + c] = acc ? acc[row*d + c] + v : v;
++    }
++}
++
++void ggml_cuda_op_pet_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * x = dst->src[0];
++    const int64_t rows = ggml_nrows(x);
++    if (rows == 0) return;
++    const int d = (int) x->ne[0];
++    pet_rms_norm_kernel<<<(unsigned) rows, pet_pair_threads(d), 0, ctx.stream()>>>((const float *) x->data,
++        (const float *) dst->src[1]->data, (float *) dst->data, d, ggml_get_op_params_f32(dst, 0));
++    CUDA_CHECK(cudaGetLastError());
++}
++
++void ggml_cuda_op_pet_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * x = dst->src[0];
++    const int64_t rows = ggml_nrows(x);
++    if (rows == 0) return;
++    const int d = (int) x->ne[0];
++    pet_rms_norm_back_kernel<<<(unsigned) rows, pet_pair_threads(d), 0, ctx.stream()>>>((const float *) x->data,
++        (const float *) dst->src[1]->data, (const float *) dst->src[2]->data,
++        dst->src[3] ? (const float *) dst->src[3]->data : nullptr, (float *) dst->data, d, ggml_get_op_params_f32(dst, 0));
 +    CUDA_CHECK(cudaGetLastError());
 +}

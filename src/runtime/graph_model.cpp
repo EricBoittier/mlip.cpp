@@ -355,6 +355,8 @@ GraphModel::GraphModel()
 GraphModel::~GraphModel() {
   cached_.reset();
   release_cached_resources();
+  if (ragged_fold_buffer_) ggml_backend_buffer_free(ragged_fold_buffer_);
+  if (ctx_ragged_fold_) ggml_free(ctx_ragged_fold_);
   if (weight_buffer_) {
     ggml_backend_buffer_free(weight_buffer_);
   }
