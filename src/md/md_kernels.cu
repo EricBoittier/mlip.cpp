@@ -376,15 +376,78 @@ __global__ void reverse_slot_kernel(int n, int K, int M, const int32_t *cand_j, 
   g_rev[i * M + slot] = rs >= 0 && rs < M ? j * M + rs : 0;
 }
 
+// ---- ragged layout: atom i's kept edges are rows [off[i], off[i + 1]) ----
+
+// the edges atom i keeps (as pack_kernel), and their largest count
+__global__ void count_kept_kernel(int n, int K, const int32_t *cand_j, const int32_t *count, const int32_t *cand_rev,
+                                  const double *cd, const double *r, double cutoff, bool adaptive, int32_t *nkept,
+                                  int32_t *max_kept) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  int nk = 0;
+  for (int k = 0; k < count[i]; k++) {
+    const int e = i * K + k;
+    const double d = cd[e], pc = adaptive ? 0.5 * (r[i] + r[cand_j[e]]) : cutoff;
+    nk += d < cutoff && (!adaptive || d <= pc) && cand_rev[e] >= 0;
+  }
+  nkept[i] = nk;
+  atomicMax(max_kept, nk);
+}
+
+// atom i's kept edges, in candidate order, into rows off[i] + slot; the row's centre atom too
+__global__ void pack_ragged_kernel(int n, int K, const int32_t *cand_j, const int32_t *count, const int32_t *cand_rev,
+                                   const double *cv, const double *cd, const double *r, double cutoff, bool adaptive,
+                                   const int32_t *species, const int32_t *off, int32_t *cand_slot, int32_t *g_ns,
+                                   float *g_ev, float *g_cv, int32_t *g_centers) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  int idx = 0;
+  for (int k = 0; k < count[i]; k++) {
+    const int e = i * K + k, j = cand_j[e];
+    const double d = cd[e], pc = adaptive ? 0.5 * (r[i] + r[j]) : cutoff;
+    if (!(d < cutoff && (!adaptive || d <= pc) && cand_rev[e] >= 0)) {
+      cand_slot[e] = -1;
+      continue;
+    }
+    cand_slot[e] = idx;
+    const int64_t f = off[i] + idx++;
+    g_ns[f] = species[j], g_centers[f] = i;
+    for (int c = 0; c < 3; c++) g_ev[3 * f + c] = static_cast<float>(cv[3 * e + c]);
+    g_cv[f] = static_cast<float>(pc);
+  }
+}
+
+__global__ void reverse_ragged_kernel(int n, int K, const int32_t *cand_j, const int32_t *count,
+                                      const int32_t *cand_rev, const int32_t *cand_slot, const int32_t *off,
+                                      int32_t *g_rev) {
+  const int e = blockIdx.x * blockDim.x + threadIdx.x;
+  const int i = e / K, k = e % K;
+  if (i >= n || k >= count[i]) return;
+  const int slot = cand_slot[e];
+  if (slot < 0) return;
+  const int rs = cand_slot[cand_rev[e]]; // kept as well: the pair cutoff is symmetric
+  g_rev[off[i] + slot] = rs >= 0 ? off[cand_j[e]] + rs : off[i] + slot;
+}
+
+// rows [off[n], e_cap): edges of no atom, at the cutoff (fc = 0), their own reverse
+__global__ void tail_ragged_kernel(int n, int64_t e_cap, const int32_t *off, float cutoff, int32_t *g_ns,
+                                   float *g_ev, float *g_cv, int32_t *g_rev, int32_t *g_centers) {
+  const int64_t f = off[n] + int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (f >= e_cap) return;
+  g_ns[f] = padding::kSpecies, g_cv[f] = cutoff, g_rev[f] = static_cast<int32_t>(f), g_centers[f] = 0;
+  padding::edge(cutoff, &g_ev[3 * f]);
+}
+
 // F_k = sum over k's slots of (G[k, s] - G[reverse]); dE/dr_k = sum of
 // (C[k, s] + C[reverse]) / 2 (each pair cutoff is the mean of two radii)
-__global__ void edge_force_kernel(int n, int M, const int32_t *nkept, const int32_t *g_rev,
+__global__ void edge_force_kernel(int n, int M, const int32_t *nkept, const int32_t *off, const int32_t *g_rev,
                                   const float *G, const float *C, double scale, double *f, double *dEdr) {
   const int k = blockIdx.x * blockDim.x + threadIdx.x;
   if (k >= n) return;
   double F[3] = {0, 0, 0}, S = 0;
+  const int64_t a0 = off ? off[k] : int64_t(k) * M;
   for (int s = 0; s < nkept[k]; s++) {
-    const int a = k * M + s, b = g_rev[a];
+    const int64_t a = a0 + s, b = g_rev[a];
     for (int c = 0; c < 3; c++) F[c] += double(G[3 * a + c]) - double(G[3 * b + c]);
     if (C) S += 0.5 * (double(C[a]) + double(C[b]));
   }
@@ -432,14 +495,15 @@ __device__ inline void add_virial(double w[6], const double r[3], const double g
 
 // atom k's edges: the slots with their input vectors and gradients, and the
 // adaptive chain term of every candidate within the cutoff
-__global__ void virial_kernel(int n, int K, int M, const int32_t *nkept, const float *ev, const float *G,
-                              const int32_t *count, const double *cv, const double *cd, double cutoff,
+__global__ void virial_kernel(int n, int K, int M, const int32_t *nkept, const int32_t *off, const float *ev,
+                              const float *G, const int32_t *count, const double *cv, const double *cd, double cutoff,
                               const double *chain, double *out) {
   const int k = blockIdx.x * blockDim.x + threadIdx.x;
   if (k >= n) return;
   double w[6] = {0, 0, 0, 0, 0, 0}, r[3], g[3];
+  const int64_t a0 = off ? off[k] : int64_t(k) * M;
   for (int s = 0; s < nkept[k]; s++) {
-    const int a = k * M + s;
+    const int64_t a = a0 + s;
     for (int c = 0; c < 3; c++) r[c] = ev[3 * a + c], g[c] = G[3 * a + c];
     add_virial(w, r, g);
   }
@@ -621,9 +685,39 @@ void prepare_inputs(State &s, const Cutoff &c, const Graph &g) {
   check(cudaMemcpy(g.species, s.species, sizeof(int32_t) * s.n, cudaMemcpyDeviceToDevice), "species");
 }
 
+void count_kept(State &s, const Cutoff &c) {
+  const Cell cell = make_cell(s);
+  const int E = s.n * s.K;
+  LAUNCH(edge_kernel, E, s.n, s.K, s.x, cell, s.cand_j, s.cand_s, s.count, s.cand_v, s.cand_d);
+  LAUNCH(radii_kernel, 32 * s.n, s.n, s.K, s.count, s.cand_d, c.cutoff, c.n_target, c.width, s.r, s.root,
+         s.dn_root, s.clamped);
+  check(cudaMemset(s.scalars + 1, 0, sizeof(int32_t)), "memset");
+  LAUNCH(count_kept_kernel, s.n, s.n, s.K, s.cand_j, s.count, s.cand_rev, s.cand_d, s.r, c.cutoff, c.n_target > 0,
+         s.nkept, s.scalars + 1);
+  scan_kernel<<<1, 1024>>>(s.n, s.nkept, s.offsets);
+  check(cudaGetLastError(), "scan_kernel");
+}
+
+void pack_ragged(State &s, const Cutoff &c, const Graph &g) {
+  const int E = s.n * s.K;
+  check(cudaMemcpy(g.offsets, s.offsets, sizeof(int32_t) * (s.n + 1), cudaMemcpyDeviceToDevice), "offsets");
+  LAUNCH(pack_ragged_kernel, s.n, s.n, s.K, s.cand_j, s.count, s.cand_rev, s.cand_v, s.cand_d, s.r, c.cutoff,
+         c.n_target > 0, s.species, s.offsets, s.cand_slot, g.neighbor_species, g.edge_vectors, g.cutoff_values,
+         g.centers);
+  LAUNCH(reverse_ragged_kernel, E, s.n, s.K, s.cand_j, s.count, s.cand_rev, s.cand_slot, s.offsets, g.reverse);
+  // the tail is at most e_cap rows (fewer: blocks past it return)
+  const int64_t tail_blocks = (g.e_cap + BLOCK - 1) / BLOCK;
+  if (tail_blocks > 0)
+    tail_ragged_kernel<<<(unsigned)tail_blocks, BLOCK>>>(s.n, g.e_cap, s.offsets, static_cast<float>(c.cutoff),
+                                                         g.neighbor_species, g.edge_vectors, g.cutoff_values,
+                                                         g.reverse, g.centers);
+  check(cudaGetLastError(), "tail_ragged_kernel");
+  check(cudaMemcpy(g.species, s.species, sizeof(int32_t) * s.n, cudaMemcpyDeviceToDevice), "species");
+}
+
 void conservative_forces(State &s, const Cutoff &c, const Graph &g, double energy_scale) {
   const bool adaptive = c.n_target > 0 && g.grad_cv;
-  LAUNCH(edge_force_kernel, s.n, s.n, s.M, s.nkept, g.reverse, g.grad_ev, adaptive ? g.grad_cv : nullptr,
+  LAUNCH(edge_force_kernel, s.n, s.n, s.M, s.nkept, g.offsets, g.reverse, g.grad_ev, adaptive ? g.grad_cv : nullptr,
          energy_scale, s.f_cons, s.dEdr);
   if (!adaptive) return;
   LAUNCH(chain_kernel, s.n * s.K, s.n, s.K, s.count, s.cand_v, s.cand_d, c.cutoff, c.width, s.r, s.root,
@@ -633,7 +727,7 @@ void conservative_forces(State &s, const Cutoff &c, const Graph &g, double energ
 
 void virial(State &s, const Cutoff &c, const Graph &g, double *w) {
   const bool adaptive = c.n_target > 0 && g.grad_cv;
-  LAUNCH(virial_kernel, s.n, s.n, s.K, s.M, s.nkept, g.edge_vectors, g.grad_ev, s.count, s.cand_v, s.cand_d,
+  LAUNCH(virial_kernel, s.n, s.n, s.K, s.M, s.nkept, g.offsets, g.edge_vectors, g.grad_ev, s.count, s.cand_v, s.cand_d,
          c.cutoff, adaptive ? s.chain : nullptr, w);
 }
 

@@ -32,6 +32,7 @@ struct State {
   // per step
   double *cand_v = nullptr, *cand_d = nullptr; // [n*K, 3], [n*K]
   int32_t *cand_slot = nullptr, *nkept = nullptr;
+  int32_t *offsets = nullptr; // [n + 1] ragged layout: exclusive scan of nkept (count_kept)
   double *r = nullptr, *root = nullptr, *dn_root = nullptr; // [n] adaptive radii
   int8_t *clamped = nullptr;
   double *dEdr = nullptr;  // [n] dE / d atomic cutoff
@@ -47,6 +48,10 @@ struct Graph {
   float *edge_vectors = nullptr, *padding_mask = nullptr, *cutoff_values = nullptr;
   const float *energy = nullptr, *nc = nullptr;        // [n], [n, 3] (unscaled)
   const float *grad_ev = nullptr, *grad_cv = nullptr;  // dE/d edge_vectors, dE/d cutoff_values
+  // ragged layout (offsets set): edge rows [offsets[i], offsets[i + 1]) of atom i, then
+  // padding rows up to e_cap; centers [e_cap] is each row's atom
+  int32_t *offsets = nullptr, *centers = nullptr;
+  int64_t e_cap = 0;
 };
 
 struct Cutoff {
@@ -63,6 +68,10 @@ struct Cutoff {
 void build_list(State &s, const Cutoff &c);
 void free_cells(State &s);
 void prepare_inputs(State &s, const Cutoff &c, const Graph &g); // edges, radii, pack; scalars[1] = max kept
+/// Ragged layout, in two steps around sizing the graph: count_kept sets nkept, s.offsets
+/// (offsets[n] = total kept edges) and scalars[1] = max kept; pack_ragged fills the graph.
+void count_kept(State &s, const Cutoff &c);
+void pack_ragged(State &s, const Cutoff &c, const Graph &g);
 void conservative_forces(State &s, const Cutoff &c, const Graph &g, double energy_scale);
 /// Per-atom virials sum over edges of v (x) dE/dv, symmetrised, [n, 6] as
 /// xx yy zz yz xz xy, unscaled; w is device memory. After conservative_forces.

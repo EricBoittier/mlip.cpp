@@ -3,6 +3,7 @@
 #include "core/backend.h"
 #include "core/coulomb.h"
 #include "graph_interpreter.h"
+#include "pet_ragged.h"
 #include "mlipcpp/model.h"
 #include "mlipcpp/neighbor_list.h"
 
@@ -186,6 +187,19 @@ private:
   ModelResult predict_cached_device(const AtomicSystem &system, bool compute_forces,
                                     const std::vector<int32_t> &species);
   void build_cached_graph(int n_atoms, int M, bool exact_mask, bool backward);
+
+  // Packed edges instead of n_atoms x M slots (pet_ragged.h): PET models of
+  // the architecture it builds, with MLIPCPP_RAGGED=1. num_heads_ is
+  // pet.num_heads, or the exported attention's scale gives it.
+  int num_heads_ = 0;
+  int ragged_state_ = -1; // -1 unchecked, 0 no, 1 yes
+  PetRaggedSpec ragged_spec_;
+  std::map<std::string, ggml_tensor *> ragged_weights_;
+  bool use_ragged();
+  void build_ragged_graph(int n_atoms, int64_t e_cap, int max_len, bool backward);
+  // rebuilds cached_ unless it holds n_atoms, `edges` packed edges and sequences of
+  // 1 + max_kept tokens; true if rebuilt
+  bool fit_ragged_graph(int n_atoms, int64_t edges, int max_kept);
   // rebuilds cached_ unless it fits n_atoms with max_kept neighbours; true if rebuilt
   bool fit_cached_graph(int n_atoms, int max_kept);
   // energy and non-conservative forces of the last compute of cached_
@@ -194,6 +208,10 @@ private:
     void operator()(CachedGraph *graph) const;
   };
   std::unique_ptr<CachedGraph, CachedGraphDeleter> cached_;
+  // allocates g's inputs, constants and compute buffer, then makes it cached_
+  void finish_cached_graph(std::unique_ptr<CachedGraph, CachedGraphDeleter> g,
+                           const std::vector<ggml_tensor *> &inputs,
+                           std::vector<std::pair<ggml_tensor *, float>> constants);
   ggml_gallocr_t galloc_ = nullptr;
   void *vesin_ = nullptr;          // VesinNeighborList, reused between calls
   void *device_inputs_ = nullptr;  // predict_cached_device's buffers

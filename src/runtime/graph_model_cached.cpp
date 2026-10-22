@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -39,6 +40,7 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <variant>
 #include <vector>
 
 namespace mlipcpp::runtime {
@@ -97,7 +99,7 @@ struct DeviceInputs {
       dalloc(st.x, 3 * n_cap), dalloc(st.x_ref, 3 * n_cap), dalloc(st.species, n_cap);
       dalloc(st.count, n_cap), dalloc(st.nkept, n_cap), dalloc(st.r, n_cap), dalloc(st.root, n_cap);
       dalloc(st.dn_root, n_cap), dalloc(st.clamped, n_cap), dalloc(st.dEdr, n_cap);
-      dalloc(st.f_cons, 3 * n_cap), dalloc(virial, 6 * n_cap);
+      dalloc(st.f_cons, 3 * n_cap), dalloc(virial, 6 * n_cap), dalloc(st.offsets, n_cap + 1);
     }
     if (!st.scalars) dalloc(st.scalars, 3);
     candidates(st.K ? st.K : 64);
@@ -114,7 +116,7 @@ struct DeviceInputs {
     md::gpu::free_cells(st);
     for (void *p : {(void *)st.x, (void *)st.x_ref, (void *)st.species, (void *)st.count, (void *)st.nkept,
                     (void *)st.r, (void *)st.root, (void *)st.dn_root, (void *)st.clamped, (void *)st.dEdr,
-                    (void *)st.f_cons, (void *)virial, (void *)st.scalars, (void *)st.cand_j, (void *)st.cand_rev,
+                    (void *)st.f_cons, (void *)virial, (void *)st.offsets, (void *)st.scalars, (void *)st.cand_j, (void *)st.cand_rev,
                     (void *)st.cand_s, (void *)st.cand_v, (void *)st.cand_d, (void *)st.cand_slot, (void *)st.chain})
       if (p) cudaFree(p);
   }
@@ -133,6 +135,9 @@ md::gpu::Graph device_graph(const CachedGraph &g) {
   d.nc = static_cast<const float *>(ptr(g.nc));
   d.grad_ev = static_cast<const float *>(ptr(g.grad_ev));
   d.grad_cv = static_cast<const float *>(ptr(g.grad_cv));
+  d.offsets = static_cast<int32_t *>(ptr(g.offsets));
+  d.centers = static_cast<int32_t *>(ptr(g.centers));
+  d.e_cap = g.e_cap;
   return d;
 }
 #endif
@@ -247,7 +252,7 @@ void GraphModel::build_cached_graph(int n, int M, bool exact_mask, bool backward
   if (g->nc) ggml_build_forward_expand(g->forward, g->nc);
   auto constants = std::vector<std::pair<ggml_tensor *, float>>();
   if (backward) {
-    ggml_tensor *total = ggml_sum(ctx, g->energy);
+    ggml_tensor *total = g->loss = ggml_sum(ctx, g->energy);
     ggml_set_loss(total);
     ggml_build_forward_expand(g->graph, total);
     ggml_build_backward_expand(ctx, g->graph, nullptr);
@@ -259,6 +264,13 @@ void GraphModel::build_cached_graph(int n, int M, bool exact_mask, bool backward
     constants.emplace_back(ggml_graph_get_grad_acc(g->graph, total), 1.0f);
   }
   for (auto &c : interp_.take_constants()) constants.push_back(c);
+  finish_cached_graph(std::move(g), inputs, std::move(constants));
+}
+
+void GraphModel::finish_cached_graph(std::unique_ptr<CachedGraph, CachedGraphDeleter> g,
+                                     const std::vector<ggml_tensor *> &inputs,
+                                     std::vector<std::pair<ggml_tensor *, float>> constants) {
+  const int n = g->n_atoms, M = g->ragged ? g->max_len : g->M;
   for (auto &c : constants) ggml_set_input(c.first);
 
   // inputs and constants in a buffer of their own (the allocator skips
@@ -282,6 +294,17 @@ void GraphModel::build_cached_graph(int n, int M, bool exact_mask, bool backward
     throw std::runtime_error("GraphModel: cannot allocate the graph (" + std::to_string(n) + " atoms x " +
                              std::to_string(M) + " neighbours)");
   ggml_backend_buffer_clear(g->inputs, 0);
+  if (std::getenv("MLIPCPP_PROFILE_GRAPH")) { // matrix-multiply work of the whole graph (2 K per output element)
+    double mm = 0, op = 0;
+    int n_mm = 0, n_op = 0;
+    for (int i = 0; i < ggml_graph_n_nodes(g->graph); i++) {
+      const ggml_tensor *t = ggml_graph_node(g->graph, i);
+      if (t->op == GGML_OP_MUL_MAT) mm += 2.0 * t->src[0]->ne[0] * ggml_nelements(t), n_mm++;
+      if (t->op == GGML_OP_OUT_PROD) op += 2.0 * t->src[0]->ne[1] * ggml_nelements(t), n_op++;
+    }
+    std::fprintf(stderr, "GRAPH_FLOPS n=%d M=%d nodes=%d mul_mat=%d (%.1f GFLOP) out_prod=%d (%.1f GFLOP)\n", n, M,
+                 ggml_graph_n_nodes(g->graph), n_mm, mm / 1e9, n_op, op / 1e9);
+  }
   std::vector<float> staging;
   for (auto &[t, value] : constants) {
     staging.assign(ggml_nelements(t), value);
@@ -418,6 +441,114 @@ bool GraphModel::fit_cached_graph(int n, int max_kept) {
   return true;
 }
 
+bool GraphModel::use_ragged() {
+  if (ragged_state_ >= 0) return ragged_state_ == 1;
+  ragged_state_ = 0;
+  const char *e = std::getenv("MLIPCPP_RAGGED");
+  if (!e || !*e || *e == '0') return false;
+  std::string why;
+  if (cutoff_function_ != "bump" || nc_forces_ || long_range_ || !forces_mode_) {
+    why = "needs a forces-mode model with the bump cutoff, no direct forces and no long range";
+  } else {
+    ragged_weights_.clear();
+    for (auto &[name, t] : weights()) ragged_weights_[name] = t;
+    int heads = num_heads_;
+    auto qkv = ragged_weights_.find("gnn_layers_0_trans_layers_0_attention_input_linear_weight");
+    const int64_t d_pet = qkv == ragged_weights_.end() ? 0 : qkv->second->ne[0];
+    if (heads <= 0 && d_pet > 0) {
+      // the exported attention: SOFT_MAX(ADD(DIV(scores, sqrt(head size) * temperature), bias)),
+      // temperature 1 (pet.num_heads in newer GGUFs)
+      const GIRGraph &graph = interp_.graph();
+      for (const GIRNode &node : graph.nodes) {
+        if (node.op != "SOFT_MAX" || node.inputs.empty() || node.inputs[0].rfind("node:", 0) != 0) continue;
+        const GIRNode *add = graph.get_node(std::stoi(node.inputs[0].substr(5)));
+        if (!add || add->op != "ADD" || add->inputs.empty() || add->inputs[0].rfind("node:", 0) != 0) continue;
+        const GIRNode *div = graph.get_node(std::stoi(add->inputs[0].substr(5)));
+        if (!div || div->op != "DIV") continue;
+        auto p = div->params.find("scalar");
+        if (p == div->params.end() || !std::holds_alternative<double>(p->second)) continue;
+        const double sd = std::get<double>(p->second);
+        const int64_t d = std::llround(sd * sd);
+        if (d > 0 && d_pet % d == 0 && std::abs(sd * sd - double(d)) < 1e-6 * double(d)) heads = int(d_pet / d);
+        break;
+      }
+    }
+    if (pet_ragged_spec(ragged_weights_, d_pet, heads, cutoff_width_, ragged_spec_, why)) ragged_state_ = 1;
+  }
+  if (ragged_state_ != 1) std::fprintf(stderr, "mlipcpp: MLIPCPP_RAGGED ignored (%s)\n", why.c_str());
+  return ragged_state_ == 1;
+}
+
+void GraphModel::build_ragged_graph(int n, int64_t e_cap, int max_len, bool backward) {
+  cached_.reset();
+  auto g = std::unique_ptr<CachedGraph, CachedGraphDeleter>(new CachedGraph());
+  g->n_atoms = n, g->M = 0, g->backward = backward;
+  g->ragged = true, g->e_cap = e_cap, g->max_len = max_len;
+  const bool adaptive = num_neighbors_adaptive_ > 0.0f;
+  g->ctx = ggml_init({ggml_tensor_overhead() * GRAPH_SIZE * 2 + ggml_graph_overhead_custom(GRAPH_SIZE, true) +
+                          ggml_graph_overhead_custom(GRAPH_SIZE, false),
+                      nullptr, /*no_alloc=*/true});
+  if (!g->ctx) throw std::runtime_error("GraphModel: cannot create the graph context");
+  ggml_context *ctx = g->ctx;
+
+  std::vector<ggml_tensor *> inputs;
+  auto input = [&](ggml_type type, int64_t ne0, int64_t ne1, const char *name) {
+    ggml_tensor *t = ne1 > 0 ? ggml_new_tensor_2d(ctx, type, ne0, ne1) : ggml_new_tensor_1d(ctx, type, ne0);
+    ggml_set_name(t, name);
+    ggml_set_input(t);
+    inputs.push_back(t);
+    return t;
+  };
+  PetRaggedInputs in;
+  in.species = g->species = input(GGML_TYPE_I32, n, 0, "species");
+  in.neighbor_species = g->neighbor_species = input(GGML_TYPE_I32, e_cap, 0, "neighbor_species");
+  in.edge_vectors = g->edge_vectors = input(GGML_TYPE_F32, 3, e_cap, "edge_vectors");
+  in.cutoff_values = g->cutoff_values = input(GGML_TYPE_F32, e_cap, 0, "cutoff_values");
+  in.reverse = g->reverse = input(GGML_TYPE_I32, e_cap, 0, "reverse_edge");
+  in.offsets = g->offsets = input(GGML_TYPE_I32, n + 1, 0, "offsets");
+  in.centers = g->centers = input(GGML_TYPE_I32, e_cap, 0, "centers");
+  if (backward) {
+    ggml_set_param(g->edge_vectors);
+    if (adaptive) ggml_set_param(g->cutoff_values);
+  }
+
+  const PetRaggedOutputs out = build_pet_ragged(ctx, ragged_spec_, ragged_weights_, in, n, e_cap, max_len);
+  g->energy = out.atom_energy;
+  g->loss = out.total;
+  ggml_set_output(g->energy);
+
+  g->graph = ggml_new_graph_custom(ctx, GRAPH_SIZE, backward);
+  ggml_build_forward_expand(g->graph, g->energy);
+  ggml_build_forward_expand(g->graph, g->loss);
+  g->forward = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
+  ggml_build_forward_expand(g->forward, g->energy);
+  ggml_build_forward_expand(g->forward, g->loss);
+  std::vector<std::pair<ggml_tensor *, float>> constants;
+  if (backward) {
+    ggml_set_loss(g->loss);
+    ggml_build_backward_expand(ctx, g->graph, nullptr);
+    g->grad_ev = ggml_graph_get_grad(g->graph, g->edge_vectors);
+    g->grad_cv = adaptive ? ggml_graph_get_grad(g->graph, g->cutoff_values) : nullptr;
+    if (!g->grad_ev) throw std::runtime_error("GraphModel: the energy does not depend on the edge vectors");
+    ggml_set_output(g->grad_ev);
+    if (g->grad_cv) ggml_set_output(g->grad_cv);
+    constants.emplace_back(ggml_graph_get_grad_acc(g->graph, g->loss), 1.0f);
+  }
+  finish_cached_graph(std::move(g), inputs, std::move(constants));
+}
+
+bool GraphModel::fit_ragged_graph(int n, int64_t edges, int max_kept) {
+  // spare rows and sequence length, so that the edge count of an MD step can
+  // move a little without a rebuild
+  const int64_t pad = std::max<int64_t>(64, edges / 32);
+  const int need_len = 1 + std::max(max_kept, 1);
+  if (cached_ && cached_->ragged && cached_->n_atoms == n && edges <= cached_->e_cap &&
+      cached_->e_cap <= edges + 2 * pad && need_len <= cached_->max_len)
+    return false;
+  build_ragged_graph(n, std::max<int64_t>(edges + pad, 1), need_len + 4, true);
+  return true;
+}
+
 void GraphModel::read_cached_outputs(const AtomicSystem &system, ModelResult &result) const {
   const CachedGraph &g = *cached_;
   const int n = g.n_atoms;
@@ -495,34 +626,53 @@ ModelResult GraphModel::predict_cached(const AtomicSystem &system, bool compute_
 
   const bool no_edges = max_kept == 0, forces_requested = compute_forces;
   if (no_edges) compute_forces = false;
-  if (fit_cached_graph(n, max_kept)) profile.mark("build_graph");
+  // the row of atom i's first edge: i * M slots, or packed (ragged) rows
+  const bool ragged = use_ragged();
+  std::vector<int64_t> first(n + 1, 0);
+  if (ragged) {
+    for (int i = 0; i < n; i++) first[i + 1] = first[i] + nkept[i];
+    if (fit_ragged_graph(n, first[n], max_kept)) profile.mark("build_graph");
+  } else if (fit_cached_graph(n, max_kept)) {
+    profile.mark("build_graph");
+  }
   CachedGraph &g = *cached_;
   const int M = g.M;
-  const size_t S = size_t(n) * M;
+  if (!ragged)
+    for (int i = 0; i <= n; i++) first[i] = int64_t(i) * M;
+  const size_t S = ragged ? size_t(g.e_cap) : size_t(n) * M;
 
-  // pack
-  std::vector<int32_t> ns(S, padding::kSpecies), rev(S, 0);
-  std::vector<float> ev(3 * S), pm(S, 1.0f), cv(S, static_cast<float>(cutoff));
+  // pack; rows that hold no kept edge are edges at the cutoff (padding.h)
+  std::vector<int32_t> ns(S, padding::kSpecies), rev(S, 0), centers(ragged ? S : 0, 0);
+  std::vector<float> ev(3 * S), pm(ragged ? 0 : S, 1.0f), cv(S, static_cast<float>(cutoff));
+  if (ragged)
+    for (size_t f = first[n]; f < S; f++) rev[f] = static_cast<int32_t>(f), padding::edge(static_cast<float>(cutoff), &ev[3 * f]);
 #pragma omp parallel for num_threads(nt) schedule(static)
   for (int i = 0; i < n; i++) {
-    for (int s = nkept[i]; s < M; s++) padding::edge(static_cast<float>(cutoff), &ev[3 * (size_t(i) * M + s)]);
+    if (!ragged)
+      for (int s = nkept[i]; s < M; s++) padding::edge(static_cast<float>(cutoff), &ev[3 * (size_t(i) * M + s)]);
     for (int64_t e = edges.start[i]; e < edges.start[i + 1]; e++) {
       if (slot[e] < 0) continue;
       const int j = edges.j[e];
-      const size_t f = size_t(i) * M + slot[e];
+      const size_t f = first[i] + slot[e];
       ns[f] = species[j];
       for (int c = 0; c < 3; c++) ev[3 * f + c] = static_cast<float>(edges.v[3 * e + c]);
-      pm[f] = 0.0f;
+      if (!ragged) pm[f] = 0.0f;
       cv[f] = static_cast<float>(pair_cutoff(i, j));
-      rev[f] = j * M + slot[edges.rev[e]];
+      rev[f] = static_cast<int32_t>(first[j] + slot[edges.rev[e]]);
+      if (ragged) centers[f] = i;
     }
   }
   ggml_backend_tensor_set(g.species, species.data(), 0, ggml_nbytes(g.species));
   ggml_backend_tensor_set(g.neighbor_species, ns.data(), 0, ggml_nbytes(g.neighbor_species));
   ggml_backend_tensor_set(g.edge_vectors, ev.data(), 0, ggml_nbytes(g.edge_vectors));
-  ggml_backend_tensor_set(g.padding_mask, pm.data(), 0, ggml_nbytes(g.padding_mask));
+  if (!ragged) ggml_backend_tensor_set(g.padding_mask, pm.data(), 0, ggml_nbytes(g.padding_mask));
   ggml_backend_tensor_set(g.reverse, rev.data(), 0, ggml_nbytes(g.reverse));
   ggml_backend_tensor_set(g.cutoff_values, cv.data(), 0, ggml_nbytes(g.cutoff_values));
+  if (ragged) {
+    std::vector<int32_t> off(first.begin(), first.end());
+    ggml_backend_tensor_set(g.offsets, off.data(), 0, ggml_nbytes(g.offsets));
+    ggml_backend_tensor_set(g.centers, centers.data(), 0, ggml_nbytes(g.centers));
+  }
   profile.mark("inputs");
 
   if (backend_provider_->compute(compute_forces ? g.graph : g.forward) != GGML_STATUS_SUCCESS)
@@ -558,7 +708,7 @@ ModelResult GraphModel::predict_cached(const AtomicSystem &system, bool compute_
     for (int k = 0; k < n; k++) {
       double dEdr = 0;
       for (int s = 0; s < nkept[k]; s++) {
-        const size_t a = size_t(k) * M + s, b = rev[a];
+        const size_t a = first[k] + s, b = rev[a];
         double ga[3], ra[3];
         for (int c = 0; c < 3; c++) {
           ga[c] = G[3 * a + c], ra[c] = ev[3 * a + c];
@@ -662,20 +812,39 @@ ModelResult GraphModel::predict_cached_device(const AtomicSystem &system, bool c
   }
   profile.mark("neighbor_list");
 
-  // pack into the current graph; rebuild it (and pack again) if the largest
-  // neighbour count does not fit
   int max_kept = 0;
-  if (!cached_ || cached_->n_atoms != n) build_cached_graph(n, cached_ ? cached_->M : 16, false, true);
   md::gpu::Graph gg;
-  for (;;) {
-    st.M = cached_->M;
-    gg = device_graph(*cached_);
-    md::gpu::prepare_inputs(st, cut, gg);
+  if (use_ragged()) {
+    // kept edges counted and scanned first; the graph sized to them, then packed
+    md::gpu::count_kept(st, cut);
+    int32_t total = 0;
+    download(&total, st.offsets + n, 1);
     download(&max_kept, st.scalars + 1, 1);
-    if (!fit_cached_graph(n, max_kept)) break;
+    fit_ragged_graph(n, total, max_kept);
+    gg = device_graph(*cached_);
+    md::gpu::pack_ragged(st, cut, gg);
+  } else {
+    // pack into the current graph; rebuild it (and pack again) if the largest
+    // neighbour count does not fit
+    if (!cached_ || cached_->n_atoms != n || cached_->ragged) build_cached_graph(n, cached_ && !cached_->ragged ? cached_->M : 16, false, true);
+    for (;;) {
+      st.M = cached_->M;
+      gg = device_graph(*cached_);
+      md::gpu::prepare_inputs(st, cut, gg);
+      download(&max_kept, st.scalars + 1, 1);
+      if (!fit_cached_graph(n, max_kept)) break;
+    }
   }
   md::gpu::synchronize();
   profile.mark("inputs");
+  if (profile.enabled && !cached_->ragged) { // how full the n x M neighbour slots are (padding_mask: 0 = kept edge)
+    std::vector<float> pm(ggml_nelements(cached_->padding_mask));
+    ggml_backend_tensor_get(cached_->padding_mask, pm.data(), 0, ggml_nbytes(cached_->padding_mask));
+    const size_t kept = std::count(pm.begin(), pm.end(), 0.0f);
+    std::fprintf(stderr, "GRAPH_SLOTS n=%d M=%d max_kept=%d kept=%zu mean_kept=%.1f fill=%.1f%%\n", n, cached_->M,
+                 max_kept, kept, double(kept) / n, 100.0 * kept / pm.size());
+    profile.mark("slots_debug");
+  }
 
   const bool no_edges = max_kept == 0, forces_requested = compute_forces;
   if (no_edges) compute_forces = false;

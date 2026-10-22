@@ -466,6 +466,10 @@ def main():
     writer.add_float32("pet.cutoff", cutoff)
     writer.add_float32("pet.cutoff_width", cutoff_width)
     writer.add_int32("pet.d_pet", d_pet)
+    try:  # attention heads (GraphModel's packed-edge PET; older GGUFs: from the attention scale)
+        writer.add_int32("pet.num_heads", int(pet.gnn_layers[0].trans.layers[0].attention.num_heads))
+    except (AttributeError, IndexError):
+        pass
     writer.add_float32("pet.energy_scale", energy_scale)
     writer.add_string("pet.cutoff_function", cutoff_function)
     writer.add_int32("pet.forces_mode", 1 if not args.no_forces else 0)

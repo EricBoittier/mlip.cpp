@@ -389,6 +389,7 @@ bool GraphModel::load_from_gguf(const std::string &path) {
   num_neighbors_adaptive_ = loader.get_float32("pet.num_neighbors_adaptive", 0.0f);
   cutoff_width_adaptive_ = loader.get_float32("pet.cutoff_width_adaptive", cutoff_width_);
   adaptive_cutoff_method_ = loader.get_string("pet.adaptive_cutoff_method", "grid");
+  num_heads_ = loader.get_int32("pet.num_heads", 0);
 
   const auto lr_solver = loader.get_string("pet.long_range.solver", "");
   if (!lr_solver.empty() && lr_solver != "direct-ewald" && lr_solver != "p3m") {

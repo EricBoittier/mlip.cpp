@@ -41,6 +41,12 @@ struct GraphProfile {
 struct CachedGraph {
   int n_atoms = 0, M = 0;
   bool exact_mask = false, backward = false;
+  // packed edges (pet_ragged.h): rows [offsets[i], offsets[i + 1]) of atom i,
+  // then padding rows up to e_cap; sequences of at most max_len tokens
+  bool ragged = false;
+  int64_t e_cap = 0;
+  int max_len = 0;
+  ggml_tensor *offsets = nullptr, *centers = nullptr;
   ggml_context *ctx = nullptr;
   ggml_cgraph *graph = nullptr; // forward (+ backward)
   ggml_cgraph *forward = nullptr; // the forward nodes of `graph`, in the same order
@@ -49,6 +55,7 @@ struct CachedGraph {
   ggml_tensor *species = nullptr, *neighbor_species = nullptr, *edge_vectors = nullptr,
               *padding_mask = nullptr, *reverse = nullptr, *cutoff_values = nullptr;
   ggml_tensor *energy = nullptr, *nc = nullptr;            // [1, n], [3, n] (unscaled)
+  ggml_tensor *loss = nullptr;                             // what the backward pass differentiates
   ggml_tensor *grad_ev = nullptr, *grad_cv = nullptr;      // dE / d edge_vectors, cutoff_values
 
   CachedGraph() = default;

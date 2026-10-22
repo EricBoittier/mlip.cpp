@@ -33,6 +33,7 @@ set(MLIPCPP_RUNTIME_SOURCES
     runtime/graph_interpreter.cpp
     runtime/graph_model.cpp
     runtime/graph_model_cached.cpp
+    runtime/pet_ragged.cpp
 )
 
 # Utilities
