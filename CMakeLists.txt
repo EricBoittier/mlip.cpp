@@ -258,6 +258,10 @@ else()
         # CUDA MUL_MAT + bias ADD as one cuBLASLt GEMM with a bias epilogue
         # (every linear layer; GGML_CUDA_NO_MM_BIAS=1: off)
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-mul-mat-bias-lt.patch"
+        # PET on packed edges (runtime/pet_ragged.h): GGML_OP_PET_BUMP (the bump
+        # cutoff) and GGML_OP_PET_ATTN_RAGGED (attention over sequences of
+        # different lengths, without padding), with their backward ops, CPU + CUDA
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-pet-ragged.patch"
     )
     # the source cache is keyed by the ggml tag and the patches' contents:
     # CPM's default key hashes the arguments, i.e. the patch paths, so every
