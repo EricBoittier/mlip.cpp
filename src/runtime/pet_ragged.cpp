@@ -166,9 +166,11 @@ PetRaggedOutputs build_pet_ragged(ggml_context *ctx, const PetRaggedSpec &spec,
 
     // messages of the next layer: the reversed edges mixed in
     const std::string c = std::to_string(l);
-    ggml_tensor *pair = ggml_concat(ctx, edges, ggml_get_rows(ctx, edges, in.reverse), 0); // [2 d_pet, E]
-    ggml_tensor *mixed = b.mlp2(b.layer_norm(pair, "combination_norms_" + c, spec.ln_eps),
-                                "combination_mlps_" + c + "_0", "combination_mlps_" + c + "_2", false);
+    // LayerNorm([edge; its reverse]) as one op: no gather and concatenation of [2 d_pet, E]
+    // (the reverse of an edge's reverse is the edge, spare rows are their own reverse)
+    ggml_tensor *paired = ggml_pet_pair_norm(ctx, edges, in.reverse, b.weight("combination_norms_" + c + "_weight"),
+                                             b.weight("combination_norms_" + c + "_bias"), spec.ln_eps);
+    ggml_tensor *mixed = b.mlp2(paired, "combination_mlps_" + c + "_0", "combination_mlps_" + c + "_2", false);
     messages = ggml_add(ctx, ggml_add(ctx, messages, edges), mixed);
   }
 
