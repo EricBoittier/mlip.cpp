@@ -91,6 +91,12 @@ struct DeviceInputs {
   md::gpu::State st;
   size_t n_cap = 0, e_cap = 0;
   double *virial = nullptr; // [n, 6]
+  // what the candidate list was built for: it is kept while these match and no
+  // atom moved more than half the skin (md::gpu::list_valid)
+  bool list_built = false;
+  std::vector<int32_t> list_species;
+  double list_cell[9] = {0};
+  int list_pbc[3] = {0, 0, 0};
 
   void atoms(int n) {
     st.n = n;
@@ -769,7 +775,13 @@ ModelResult GraphModel::predict_cached_device(const AtomicSystem &system, bool c
   auto &d = *static_cast<DeviceInputs *>(device_inputs_);
   md::gpu::State &st = d.st;
   d.atoms(n);
-  const md::gpu::Cutoff cut{cutoff_, 0.0, adaptive ? num_neighbors_adaptive_ : 0.0, cutoff_width_adaptive_};
+  // a Verlet skin: successive calls on the same atoms (MD steps) reuse the
+  // candidate list until an atom has moved half of it (MLIPCPP_NL_SKIN, Angstrom; 0: rebuild every call)
+  static const double skin = [] {
+    const char *e = std::getenv("MLIPCPP_NL_SKIN");
+    return e && *e ? std::max(0.0, std::atof(e)) : 0.5;
+  }();
+  const md::gpu::Cutoff cut{cutoff_, skin, adaptive ? num_neighbors_adaptive_ : 0.0, cutoff_width_adaptive_};
 
   // cell and periodic images within the cutoff (as md::Engine::set_system)
   std::fill(std::begin(st.cell), std::end(st.cell), 0.0);
@@ -795,22 +807,32 @@ ModelResult GraphModel::predict_cached_device(const AtomicSystem &system, bool c
       double w[3];
       cross((a + 1) % 3, (a + 2) % 3, w);
       const double height = volume / std::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
-      st.images[a] = static_cast<int>(std::ceil(cutoff_ / height));
+      st.images[a] = static_cast<int>(std::ceil((cutoff_ + skin) / height));
       if (st.images[a] > 127) throw std::runtime_error("GraphModel: cell too thin for the cutoff");
     }
   }
   std::vector<double> x(system.positions(), system.positions() + 3 * size_t(n));
   upload(st.x, x.data(), x.size());
   upload(st.species, species.data(), species.size());
-  for (;;) {
-    md::gpu::reset_scalars(st);
-    md::gpu::build_list(st, cut);
-    int32_t overflow = 0;
-    download(&overflow, st.scalars, 1);
-    if (overflow == 0) break;
-    d.candidates(overflow + overflow / 4 + 8);
+  const bool same_system = d.list_built && skin > 0 && d.list_species == species &&
+                           std::equal(std::begin(st.cell), std::end(st.cell), std::begin(d.list_cell)) &&
+                           std::equal(std::begin(st.pbc), std::end(st.pbc), std::begin(d.list_pbc));
+  if (!(same_system && md::gpu::list_valid(st, skin))) {
+    for (;;) {
+      md::gpu::reset_scalars(st);
+      md::gpu::build_list(st, cut);
+      int32_t overflow = 0;
+      download(&overflow, st.scalars, 1);
+      if (overflow == 0) break;
+      d.candidates(overflow + overflow / 4 + 8);
+    }
+    d.list_built = true, d.list_species = species;
+    std::copy(std::begin(st.cell), std::end(st.cell), std::begin(d.list_cell));
+    std::copy(std::begin(st.pbc), std::end(st.pbc), std::begin(d.list_pbc));
+    profile.mark("neighbor_list");
+  } else {
+    profile.mark("neighbor_list_reused");
   }
-  profile.mark("neighbor_list");
 
   int max_kept = 0;
   md::gpu::Graph gg;

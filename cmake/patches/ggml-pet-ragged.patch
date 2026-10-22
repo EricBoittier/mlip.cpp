@@ -734,8 +734,9 @@
 +void ggml_cuda_op_pet_attn_ragged_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 --- /dev/null
 +++ b/src/ggml-cuda/pet-ragged.cu
-@@ -0,0 +1,494 @@
+@@ -0,0 +1,813 @@
 +#include "pet-ragged.cuh"
++#include <cstring>
 +
 +// ---- bump cutoff ----
 +
@@ -1129,6 +1130,259 @@
 +    }
 +}
 +
++// ---- short sequences (max_len <= 64): one block per (sequence, head) ----
++// The whole sequence of one head is staged in shared memory once: q, k, v
++// (and dO), the L x L probabilities and their gradients. A thread owns a
++// query row (scores, softmax, output; dq), then a key row (dk, dv, the bias
++// gradient). Rows are padded to d + 1 floats: a thread's own row and the
++// rows read by all threads at once hit distinct banks.
++
++static constexpr int SHORT_L = 64;
++
++template <int d>
++static __device__ __forceinline__ void stage_head(float * __restrict__ dst, const float * __restrict__ src, const pet_seq & q,
++        const int L, const int64_t stride, const int col) {
++    for (int e = threadIdx.x; e < L*d; e += blockDim.x) {
++        const int r = e / d, c = e % d;
++        dst[r*(d + 1) + c] = src[q.row(r)*stride + col + c];
++    }
++}
++
++template <int d>
++static __global__ void pet_attn_ragged_fwd_short(
++        const float * __restrict__ qkv, const float * __restrict__ bias, const int32_t * __restrict__ off,
++        float * __restrict__ out, float * __restrict__ lse, const int N, const int H, const float scale) {
++    __shared__ float Qs[SHORT_L*(d + 1)], Ks[SHORT_L*(d + 1)], Vs[SHORT_L*(d + 1)], Bs[SHORT_L];
++    const pet_seq sq = pet_sequence(off, N);
++    const int L = sq.L, h = blockIdx.y, D = H*d, t = threadIdx.x;
++    stage_head<d>(Qs, qkv, sq, L, 3*D, h*d);
++    stage_head<d>(Ks, qkv, sq, L, 3*D, D + h*d);
++    stage_head<d>(Vs, qkv, sq, L, 3*D, 2*D + h*d);
++    for (int u = t; u < L; u += blockDim.x) Bs[u] = key_bias(bias, sq.row(u), N);
++    __syncthreads();
++    if (t >= L) return;
++    float q[d], acc[d], m = -INFINITY, l = 0.0f;
++#pragma unroll
++    for (int c = 0; c < d; c++) q[c] = scale*Qs[t*(d + 1) + c], acc[c] = 0.0f;
++    for (int u = 0; u < L; u++) {
++        const float * k = Ks + u*(d + 1);
++        float s = Bs[u];
++#pragma unroll
++        for (int c = 0; c < d; c++) s += q[c]*k[c];
++        if (s > m) {
++            const float corr = __expf(m - s);
++            l *= corr;
++#pragma unroll
++            for (int c = 0; c < d; c++) acc[c] *= corr;
++            m = s;
++        }
++        const float p = __expf(s - m);
++        l += p;
++        const float * v = Vs + u*(d + 1);
++#pragma unroll
++        for (int c = 0; c < d; c++) acc[c] += p*v[c];
++    }
++    const int64_t row = sq.row(t);
++    float * o = out + row*D + h*d;
++#pragma unroll
++    for (int c = 0; c < d; c++) o[c] = acc[c]/l;
++    lse[row*H + h] = m + logf(l);
++}
++
++template <int d>
++static __global__ void pet_attn_ragged_bwd_short(
++        const float * __restrict__ qkv, const float * __restrict__ bias, const int32_t * __restrict__ off,
++        const float * __restrict__ res, const float * __restrict__ lse, const float * __restrict__ grad,
++        float * __restrict__ dx, float * __restrict__ db, const int N, const int H, const float scale) {
++    extern __shared__ float sm[];
++    constexpr int P = d + 1, PL = SHORT_L + 1;
++    float * Qs = sm, * Ks = Qs + SHORT_L*P, * Vs = Ks + SHORT_L*P, * Gs = Vs + SHORT_L*P; // [L][d + 1]
++    float * Ps = Gs + SHORT_L*P, * Ss = Ps + SHORT_L*PL;                                 // [L][L + 1]
++    float * Bs = Ss + SHORT_L*PL;                                                       // [L]
++    const pet_seq sq = pet_sequence(off, N);
++    const int L = sq.L, h = blockIdx.y, D = H*d, t = threadIdx.x;
++    stage_head<d>(Qs, qkv, sq, L, 3*D, h*d);
++    stage_head<d>(Ks, qkv, sq, L, 3*D, D + h*d);
++    stage_head<d>(Vs, qkv, sq, L, 3*D, 2*D + h*d);
++    stage_head<d>(Gs, grad, sq, L, D, h*d);
++    for (int u = t; u < L; u += blockDim.x) Bs[u] = key_bias(bias, sq.row(u), N);
++    __syncthreads();
++    // query row t: probabilities, their gradients, dq
++    if (t < L) {
++        const int64_t row = sq.row(t);
++        const float * q = Qs + t*P, * g = Gs + t*P, * o = res + row*D + h*d;
++        float Di = 0.0f;
++#pragma unroll
++        for (int c = 0; c < d; c++) Di += g[c]*o[c];
++        const float l = lse[row*H + h];
++        float dq[d];
++#pragma unroll
++        for (int c = 0; c < d; c++) dq[c] = 0.0f;
++        for (int u = 0; u < L; u++) {
++            const float * k = Ks + u*P, * v = Vs + u*P;
++            float s = 0.0f, dp = 0.0f;
++#pragma unroll
++            for (int c = 0; c < d; c++) s += q[c]*k[c], dp += g[c]*v[c];
++            const float p = __expf(scale*s + Bs[u] - l), ds = p*(dp - Di);
++            Ps[t*PL + u] = p, Ss[t*PL + u] = ds;
++#pragma unroll
++            for (int c = 0; c < d; c++) dq[c] += ds*k[c];
++        }
++        float * o2 = dx + row*3*D + h*d;
++#pragma unroll
++        for (int c = 0; c < d; c++) o2[c] = scale*dq[c];
++    }
++    __syncthreads();
++    // key row t: dk, dv, the bias gradient
++    if (t < L) {
++        float dk[d], dv[d], dbt = 0.0f;
++#pragma unroll
++        for (int c = 0; c < d; c++) dk[c] = dv[c] = 0.0f;
++        for (int i = 0; i < L; i++) {
++            const float p = Ps[i*PL + t], ds = Ss[i*PL + t];
++            const float * q = Qs + i*P, * g = Gs + i*P;
++            dbt += ds;
++#pragma unroll
++            for (int c = 0; c < d; c++) dk[c] += ds*q[c], dv[c] += p*g[c];
++        }
++        const int64_t row = sq.row(t);
++        float * o2 = dx + row*3*D;
++#pragma unroll
++        for (int c = 0; c < d; c++) o2[D + h*d + c] = scale*dk[c], o2[2*D + h*d + c] = dv[c];
++        db[row*H + h] = dbt;
++    }
++}
++
++// ---- short sequences, low shared memory (GGML_PET_RAGGED_SHORT2=1) ----
++// As above, but only the side a thread reads from all rows is staged: K, V for
++// the forward and for dq; then Q, dO (over the same buffers) for dk, dv. A
++// thread keeps its own rows in registers, the probabilities are recomputed
++// in the second pass instead of stored, and the buffers are sized by max_len
++// instead of 64: ~11 KB instead of 25 / 67 KB at max_len 43, head size 32.
++
++template <int d>
++static __global__ void pet_attn_ragged_fwd_short2(
++        const float * __restrict__ qkv, const float * __restrict__ bias, const int32_t * __restrict__ off,
++        float * __restrict__ out, float * __restrict__ lse, const int N, const int H, const float scale, const int Lm) {
++    extern __shared__ float sm[];
++    constexpr int P = d + 1;
++    float * Ks = sm, * Vs = Ks + Lm*P, * Bs = Vs + Lm*P;
++    const pet_seq sq = pet_sequence(off, N);
++    const int L = sq.L, h = blockIdx.y, D = H*d, t = threadIdx.x;
++    stage_head<d>(Ks, qkv, sq, L, 3*D, D + h*d);
++    stage_head<d>(Vs, qkv, sq, L, 3*D, 2*D + h*d);
++    for (int u = t; u < L; u += blockDim.x) Bs[u] = key_bias(bias, sq.row(u), N);
++    __syncthreads();
++    if (t >= L) return;
++    const int64_t row = sq.row(t);
++    float q[d], acc[d], m = -INFINITY, l = 0.0f;
++    load_row<d>(qkv + row*3*D + h*d, q);
++#pragma unroll
++    for (int c = 0; c < d; c++) q[c] *= scale, acc[c] = 0.0f;
++    for (int u = 0; u < L; u++) {
++        const float * k = Ks + u*P;
++        float s = Bs[u];
++#pragma unroll
++        for (int c = 0; c < d; c++) s += q[c]*k[c];
++        if (s > m) {
++            const float corr = __expf(m - s);
++            l *= corr;
++#pragma unroll
++            for (int c = 0; c < d; c++) acc[c] *= corr;
++            m = s;
++        }
++        const float p = __expf(s - m);
++        l += p;
++        const float * v = Vs + u*P;
++#pragma unroll
++        for (int c = 0; c < d; c++) acc[c] += p*v[c];
++    }
++    float * o = out + row*D + h*d;
++#pragma unroll
++    for (int c = 0; c < d; c += 4) *reinterpret_cast<float4 *>(o + c) = make_float4(acc[c]/l, acc[c + 1]/l, acc[c + 2]/l, acc[c + 3]/l);
++    lse[row*H + h] = m + logf(l);
++}
++
++template <int d>
++static __global__ void pet_attn_ragged_bwd_short2(
++        const float * __restrict__ qkv, const float * __restrict__ bias, const int32_t * __restrict__ off,
++        const float * __restrict__ res, const float * __restrict__ lse, const float * __restrict__ grad,
++        float * __restrict__ dx, float * __restrict__ db, const int N, const int H, const float scale, const int Lm) {
++    extern __shared__ float sm[];
++    constexpr int P = d + 1;
++    float * As = sm, * Cs = As + Lm*P, * Bs = Cs + Lm*P, * Ls = Bs + Lm, * Ds = Ls + Lm;
++    const pet_seq sq = pet_sequence(off, N);
++    const int L = sq.L, h = blockIdx.y, D = H*d, t = threadIdx.x;
++    stage_head<d>(As, qkv, sq, L, 3*D, D + h*d);     // K
++    stage_head<d>(Cs, qkv, sq, L, 3*D, 2*D + h*d);   // V
++    for (int u = t; u < L; u += blockDim.x) Bs[u] = key_bias(bias, sq.row(u), N);
++    __syncthreads();
++    const int64_t row = t < L ? sq.row(t) : 0;
++    // query row t: dq
++    if (t < L) {
++        float q[d], g[d], dq[d], Di = 0.0f;
++        load_row<d>(qkv + row*3*D + h*d, q);
++        load_row<d>(grad + row*D + h*d, g);
++        {
++            float o[d];
++            load_row<d>(res + row*D + h*d, o);
++#pragma unroll
++            for (int c = 0; c < d; c++) Di += g[c]*o[c], dq[c] = 0.0f;
++        }
++        const float l = lse[row*H + h];
++        Ls[t] = l, Ds[t] = Di;
++        for (int u = 0; u < L; u++) {
++            const float * k = As + u*P, * v = Cs + u*P;
++            float s = 0.0f, dp = 0.0f;
++#pragma unroll
++            for (int c = 0; c < d; c++) s += q[c]*k[c], dp += g[c]*v[c];
++            const float ds = __expf(scale*s + Bs[u] - l)*(dp - Di);
++#pragma unroll
++            for (int c = 0; c < d; c++) dq[c] += ds*k[c];
++        }
++        float * o2 = dx + row*3*D + h*d;
++#pragma unroll
++        for (int c = 0; c < d; c += 4) *reinterpret_cast<float4 *>(o2 + c) = make_float4(scale*dq[c], scale*dq[c + 1], scale*dq[c + 2], scale*dq[c + 3]);
++    }
++    // key row t: its k, v into registers, then Q, dO over the K, V buffers
++    float k[d], v[d];
++    if (t < L) {
++#pragma unroll
++        for (int c = 0; c < d; c++) k[c] = As[t*P + c], v[c] = Cs[t*P + c];
++    }
++    __syncthreads();
++    stage_head<d>(As, qkv, sq, L, 3*D, h*d);         // Q
++    stage_head<d>(Cs, grad, sq, L, D, h*d);          // dO
++    __syncthreads();
++    if (t >= L) return;
++    float dk[d], dv[d], dbt = 0.0f;
++#pragma unroll
++    for (int c = 0; c < d; c++) dk[c] = dv[c] = 0.0f;
++    const float bt = Bs[t];
++    for (int i = 0; i < L; i++) {
++        const float * q = As + i*P, * g = Cs + i*P;
++        float s = 0.0f, dp = 0.0f;
++#pragma unroll
++        for (int c = 0; c < d; c++) s += q[c]*k[c], dp += g[c]*v[c];
++        const float p = __expf(scale*s + bt - Ls[i]), ds = p*(dp - Ds[i]);
++        dbt += ds;
++#pragma unroll
++        for (int c = 0; c < d; c++) dk[c] += ds*q[c], dv[c] += p*g[c];
++    }
++    float * o2 = dx + row*3*D;
++#pragma unroll
++    for (int c = 0; c < d; c += 4) {
++        *reinterpret_cast<float4 *>(o2 + D + h*d + c) = make_float4(scale*dk[c], scale*dk[c + 1], scale*dk[c + 2], scale*dk[c + 3]);
++        *reinterpret_cast<float4 *>(o2 + 2*D + h*d + c) = make_float4(dv[c], dv[c + 1], dv[c + 2], dv[c + 3]);
++    }
++    db[row*H + h] = dbt;
++}
++
++template <int d>
++static size_t pet_attn_short_bwd_smem() {
++    return (4*(size_t) SHORT_L*(d + 1) + 2*(size_t) SHORT_L*(SHORT_L + 1) + SHORT_L)*sizeof(float);
++}
++
 +// rows [N + off[N], T) belong to no sequence: zero their `w` floats of a and `h` floats of b
 +static __global__ void pet_ragged_zero_tail(const int32_t * __restrict__ off, const int N, const int64_t T,
 +        float * __restrict__ a, const int w, float * __restrict__ b, const int hb) {
@@ -1179,6 +1433,71 @@
 +    const pet_ragged_args a = pet_ragged_get(dst);
 +    cudaStream_t stream = ctx.stream();
 +    const int64_t tail = a.T - a.N; // an upper bound of the rows in no sequence
++    static const bool tiled = getenv("GGML_PET_RAGGED_TILED") != nullptr;
++    static const bool short2 = getenv("GGML_PET_RAGGED_SHORT1") == nullptr; // SHORT2 by default (SHORT1=1: the first short kernels)
++    // GGML_PET_RAGGED_SHORT=fwd / bwd: the short-sequence kernels for one direction only (unset: both)
++    static const int short_dirs = [] {
++        const char * e = getenv("GGML_PET_RAGGED_SHORT");
++        if (!e || !*e) return 3;
++        return (strcmp(e, "fwd") == 0 ? 1 : 0) | (strcmp(e, "bwd") == 0 ? 2 : 0);
++    }();
++    static const size_t smem_optin = [] {
++        int dev = 0, v = 0;
++        CUDA_CHECK(cudaGetDevice(&dev));
++        CUDA_CHECK(cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
++        return (size_t) v;
++    }();
++    // (head sizes up to 32: the forward's static shared memory stays within 48 KB)
++    if constexpr (d <= 32) {
++    const bool short_seq = !tiled && (short_dirs & (back ? 2 : 1)) && a.max_len <= SHORT_L && a.N > 0 && a.H <= 65535 &&
++                           pet_attn_short_bwd_smem<d>() <= smem_optin;
++    if (short_seq) {
++        const dim3 grid((unsigned) a.N, (unsigned) a.H);
++        if (short2) {
++            const int Lm = a.max_len, nt = (Lm + 31) / 32 * 32;
++            const size_t P = d + 1;
++            if (!back) {
++                float * out = (float *) dst->data, * lse = out + a.D*a.T;
++                if (tail > 0)
++                    pet_ragged_zero_tail<<<(unsigned) tail, 128, 0, stream>>>(a.off, a.N, a.T, out, (int) a.D, lse, a.H);
++                pet_attn_ragged_fwd_short2<d><<<grid, nt, (2*Lm*P + Lm)*sizeof(float), stream>>>(
++                    a.qkv, a.bias, a.off, out, lse, a.N, a.H, a.scale, Lm);
++            } else {
++                const float * res = (const float *) dst->src[3]->data, * lse = res + a.D*a.T;
++                const float * grad = (const float *) dst->src[4]->data;
++                float * dx = (float *) dst->data, * db = dx + 3*a.D*a.T;
++                if (tail > 0)
++                    pet_ragged_zero_tail<<<(unsigned) tail, 128, 0, stream>>>(a.off, a.N, a.T, dx, (int) (3*a.D), db, a.H);
++                pet_attn_ragged_bwd_short2<d><<<grid, nt, (2*Lm*P + 3*Lm)*sizeof(float), stream>>>(
++                    a.qkv, a.bias, a.off, res, lse, grad, dx, db, a.N, a.H, a.scale, Lm);
++            }
++            CUDA_CHECK(cudaGetLastError());
++            return;
++        }
++        if (!back) {
++            float * out = (float *) dst->data, * lse = out + a.D*a.T;
++            if (tail > 0)
++                pet_ragged_zero_tail<<<(unsigned) tail, 128, 0, stream>>>(a.off, a.N, a.T, out, (int) a.D, lse, a.H);
++            pet_attn_ragged_fwd_short<d><<<grid, SHORT_L, 0, stream>>>(a.qkv, a.bias, a.off, out, lse, a.N, a.H, a.scale);
++        } else {
++            const float * res = (const float *) dst->src[3]->data, * lse = res + a.D*a.T;
++            const float * grad = (const float *) dst->src[4]->data;
++            float * dx = (float *) dst->data, * db = dx + 3*a.D*a.T;
++            if (tail > 0)
++                pet_ragged_zero_tail<<<(unsigned) tail, 128, 0, stream>>>(a.off, a.N, a.T, dx, (int) (3*a.D), db, a.H);
++            const size_t smem = pet_attn_short_bwd_smem<d>();
++            static bool attr = false;
++            if (!attr) {
++                CUDA_CHECK(cudaFuncSetAttribute(pet_attn_ragged_bwd_short<d>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
++                attr = true;
++            }
++            pet_attn_ragged_bwd_short<d><<<grid, SHORT_L, smem, stream>>>(a.qkv, a.bias, a.off, res, lse, grad, dx, db,
++                                                                          a.N, a.H, a.scale);
++        }
++        CUDA_CHECK(cudaGetLastError());
++        return;
++    }
++    }
 +    if (!back) {
 +        float * out = (float *) dst->data, * lse = out + a.D*a.T;
 +        if (tail > 0)

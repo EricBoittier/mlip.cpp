@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdlib>
+#include <cstring>
 #include <cmath>
 #include <algorithm>
 #include <stdexcept>
@@ -631,21 +632,50 @@ bool make_grid(State &s, double rc, Grid &g) {
 }
 } // namespace
 
+namespace {
+
+Inverse make_inverse(const State &s) {
+  if (!(s.pbc[0] || s.pbc[1] || s.pbc[2])) return Inverse{{1, 0, 0, 0, 1, 0, 0, 0, 1}};
+  const double *m = s.cell;
+  const double det = m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6]) +
+                     m[2] * (m[3] * m[7] - m[4] * m[6]);
+  return Inverse{{(m[4] * m[8] - m[5] * m[7]) / det, (m[2] * m[7] - m[1] * m[8]) / det,
+                  (m[1] * m[5] - m[2] * m[4]) / det, (m[5] * m[6] - m[3] * m[8]) / det,
+                  (m[0] * m[8] - m[2] * m[6]) / det, (m[2] * m[3] - m[0] * m[5]) / det,
+                  (m[3] * m[7] - m[4] * m[6]) / det, (m[1] * m[6] - m[0] * m[7]) / det,
+                  (m[0] * m[4] - m[1] * m[3]) / det}};
+}
+
+__global__ void displacement_kernel(int n, const double *x, const double *x_ref, int32_t *max_disp) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  double d2 = 0;
+  for (int c = 0; c < 3; c++) {
+    const double u = x[3 * i + c] - x_ref[3 * i + c];
+    d2 += u * u;
+  }
+  atomicMax(max_disp, __float_as_int(static_cast<float>(d2))); // non-negative floats order as ints
+}
+
+} // namespace
+
+bool list_valid(State &s, double skin) {
+  const bool any_pbc = s.pbc[0] || s.pbc[1] || s.pbc[2];
+  if (any_pbc) LAUNCH(wrap_kernel, s.n, s.n, s.x, make_cell(s), make_inverse(s));
+  check(cudaMemset(s.scalars + 2, 0, sizeof(int32_t)), "memset");
+  LAUNCH(displacement_kernel, s.n, s.n, s.x, s.x_ref, s.scalars + 2);
+  int32_t bits = 0;
+  check(cudaMemcpy(&bits, s.scalars + 2, sizeof(int32_t), cudaMemcpyDeviceToHost), "max displacement");
+  float d2;
+  std::memcpy(&d2, &bits, sizeof d2);
+  return d2 <= 0.25 * skin * skin;
+}
+
 void build_list(State &s, const Cutoff &cut) {
   const Cell cell = make_cell(s);
   const bool any_pbc = s.pbc[0] || s.pbc[1] || s.pbc[2];
-  Inverse inv{{1, 0, 0, 0, 1, 0, 0, 0, 1}};
-  if (any_pbc) {
-    const double *m = s.cell;
-    const double det = m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6]) +
-                       m[2] * (m[3] * m[7] - m[4] * m[6]);
-    inv = Inverse{{(m[4] * m[8] - m[5] * m[7]) / det, (m[2] * m[7] - m[1] * m[8]) / det,
-                   (m[1] * m[5] - m[2] * m[4]) / det, (m[5] * m[6] - m[3] * m[8]) / det,
-                   (m[0] * m[8] - m[2] * m[6]) / det, (m[2] * m[3] - m[0] * m[5]) / det,
-                   (m[3] * m[7] - m[4] * m[6]) / det, (m[1] * m[6] - m[0] * m[7]) / det,
-                   (m[0] * m[4] - m[1] * m[3]) / det}};
-    LAUNCH(wrap_kernel, s.n, s.n, s.x, cell, inv);
-  }
+  const Inverse inv = make_inverse(s);
+  if (any_pbc) LAUNCH(wrap_kernel, s.n, s.n, s.x, cell, inv);
   check(cudaMemcpy(s.x_ref, s.x, sizeof(double) * 3 * s.n, cudaMemcpyDeviceToDevice), "x_ref");
   const double rc = cut.cutoff + cut.skin;
   Grid g{};

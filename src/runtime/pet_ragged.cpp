@@ -3,6 +3,7 @@
 #include <ggml.h>
 
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace mlipcpp::runtime {
@@ -30,13 +31,29 @@ struct Builder {
   ggml_tensor *layer_norm(ggml_tensor *x, const std::string &name, float eps) const {
     return ggml_pet_layer_norm(ctx, x, weight(name + "_weight"), weight(name + "_bias"), eps);
   }
-  // FeedForward with SwiGLU: v, g = chunk(w_in(x)); w_out(v * sigmoid(g))
+  // FeedForward with SwiGLU: v, g = chunk(w_in(x)); w_out(v * sigmoid(g)). The two
+  // halves of w_in are blocks of its rows: two products instead of views of one
+  // (the gradient of a second view of a tensor is a full-size ACC)
   ggml_tensor *gated_mlp(ggml_tensor *x, const std::string &name) const {
-    ggml_tensor *h = linear(x, name + "_w_in");
-    const int64_t f = h->ne[0] / 2;
-    ggml_tensor *v = ggml_view_2d(ctx, h, f, h->ne[1], h->nb[1], 0);
-    ggml_tensor *g = ggml_view_2d(ctx, h, f, h->ne[1], h->nb[1], f * ggml_element_size(h));
-    return linear(ggml_siglu_split(ctx, g, v), name + "_w_out");
+    // MLIPCPP_RAGGED_GLU_VIEWS=1: one product and two views of it (the older form)
+    static const bool glu_views = [] {
+      const char *e = std::getenv("MLIPCPP_RAGGED_GLU_VIEWS");
+      return e && *e && *e != '0';
+    }();
+    if (glu_views) {
+      ggml_tensor *h = linear(x, name + "_w_in");
+      const int64_t f = h->ne[0] / 2;
+      ggml_tensor *v = ggml_view_2d(ctx, h, f, h->ne[1], h->nb[1], 0);
+      ggml_tensor *g = ggml_view_2d(ctx, h, f, h->ne[1], h->nb[1], f * ggml_element_size(h));
+      return linear(ggml_siglu_split(ctx, g, v), name + "_w_out");
+    }
+    ggml_tensor *w_in = weight(name + "_w_in_weight"), *b_in = weight(name + "_w_in_bias"); // [in, 2f], [2f]
+    const int64_t f = w_in->ne[1] / 2;
+    auto half = [&](int k) {
+      ggml_tensor *w = ggml_view_2d(ctx, w_in, w_in->ne[0], f, w_in->nb[1], k * f * w_in->nb[1]);
+      return ggml_add(ctx, ggml_mul_mat(ctx, w, x), ggml_view_1d(ctx, b_in, f, k * f * ggml_element_size(b_in)));
+    };
+    return linear(ggml_siglu_split(ctx, half(1), half(0)), name + "_w_out");
   }
   // Linear, SiLU, Linear (, SiLU)
   ggml_tensor *mlp2(ggml_tensor *x, const std::string &a, const std::string &b, bool silu_out) const {

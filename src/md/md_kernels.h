@@ -66,6 +66,9 @@ struct Cutoff {
 /// tested. MLIPCPP_GPU_NL=cells|pairs forces one of the two (cells when
 /// possible).
 void build_list(State &s, const Cutoff &c);
+/// True when the list of the last build_list still holds for s.x: wraps s.x into the
+/// cell as build_list did, and no atom moved more than half the skin since.
+bool list_valid(State &s, double skin);
 void free_cells(State &s);
 void prepare_inputs(State &s, const Cutoff &c, const Graph &g); // edges, radii, pack; scalars[1] = max kept
 /// Ragged layout, in two steps around sizing the graph: count_kept sets nkept, s.offsets
