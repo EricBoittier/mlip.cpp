@@ -304,6 +304,10 @@ def metatrain_baselines(model):
     """Fitted composition (Z -> eV), energy scale and per-species
     non-conservative force scales of a metatrain >= 2026.5 PET (outer model,
     with `additive_models` and `scaler`). Empty dicts / None where absent."""
+    # wrappers (LLPRUncertaintyModel in the upet checkpoints) keep that PET as .model
+    while not hasattr(model, "additive_models") and isinstance(getattr(model, "model", None), torch.nn.Module):
+        model = model.model
+
     def by_type(block):
         Z = block.samples.values[:, 0].tolist()
         return {int(z): float(v) for z, v in zip(Z, block.values.reshape(len(Z), -1)[:, 0])}
