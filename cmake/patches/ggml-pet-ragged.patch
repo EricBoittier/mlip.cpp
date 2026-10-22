@@ -19,7 +19,20 @@
  
          GGML_OP_COUNT,
      };
-@@ -1781,6 +1793,71 @@
+@@ -1440,6 +1452,12 @@
+             struct ggml_tensor * a,
+             enum ggml_prec       prec);
+ 
++    // precision of the gradient products ggml_build_backward_expand makes for
++    // this matrix multiplication (GGML_PREC_F32: they get GGML_PREC_F32 too)
++    GGML_API void ggml_mul_mat_set_grad_prec(
++            struct ggml_tensor * a,
++            enum ggml_prec       prec);
++
+     // indirect matrix multiplication
+     GGML_API struct ggml_tensor * ggml_mul_mat_id(
+             struct ggml_context * ctx,
+@@ -1781,6 +1799,94 @@
      // result [D + n_head, L, N]: per row the D outputs, then the n_head
      // log-sum-exps (used by the backward pass); qkv may be F16 (storage only,
      // arithmetic in F32), the result and the gradient are F32
@@ -68,6 +81,29 @@
 +            struct ggml_context * ctx,
 +            struct ggml_tensor  * x,
 +            struct ggml_tensor  * weight,
++            float                 eps);
++
++    // ggml_pet_rms_norm of the sum x + y, which it returns as its src[0] (an
++    // ADD node): the CUDA backend computes the sum and its RMSNorm in one pass
++    // (both written); elsewhere, and when the two nodes are not consecutive,
++    // they run as an ADD and a PET_RMS_NORM. The gradients are theirs. x and y
++    // are also src[3] and src[4] of the result (its memory then overlaps neither)
++    GGML_API struct ggml_tensor * ggml_pet_add_rms_norm(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * x,
++            struct ggml_tensor  * y,
++            struct ggml_tensor  * weight,
++            float                 eps);
++
++    // ggml_pet_pair_norm whose gradient w.r.t. x also adds, in the same pass,
++    // the gradient x already has from its other readers (a residual), as
++    // ggml_pet_rms_norm's does
++    GGML_API struct ggml_tensor * ggml_pet_pair_norm_acc(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * x,
++            struct ggml_tensor  * rev,
++            struct ggml_tensor  * weight,
++            struct ggml_tensor  * bias,
 +            float                 eps);
 +
 +    // fused PET attention over ragged sequences, without padding. qkv [3D, T]
@@ -139,7 +175,22 @@
  
  static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
  
-@@ -4095,6 +4119,276 @@
+@@ -3283,6 +3307,14 @@
+     ggml_set_op_params_i32(a, 0, prec_i32);
+ }
+ 
++void ggml_mul_mat_set_grad_prec(
++        struct ggml_tensor * a,
++        enum ggml_prec       prec) {
++    GGML_ASSERT(a->op == GGML_OP_MUL_MAT);
++
++    ggml_set_op_params_i32(a, 1, (int32_t) prec);
++}
++
+ // ggml_mul_mat_id
+ 
+ /*
+@@ -4095,6 +4127,307 @@
      a->src[2] = sinks;
  }
  
@@ -284,6 +335,22 @@
 +    return result;
 +}
 +
++struct ggml_tensor * ggml_pet_add_rms_norm(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * x,
++        struct ggml_tensor  * y,
++        struct ggml_tensor  * weight,
++        float                 eps) {
++    struct ggml_tensor * result = ggml_pet_rms_norm(ctx, ggml_add(ctx, x, y), weight, eps);
++    ggml_set_op_params_i32(result, 1, 1); // the CUDA backend may run the ADD of src[0] and this in one kernel
++    // read by that kernel: sources here too (not used otherwise, no gradient), so the allocator keeps them
++    // until the result is allocated, which then cannot overlap them (not src[2]: ggml_compute_backward
++    // checks the gradients of src[0..2])
++    result->src[3] = x;
++    result->src[4] = y;
++    return result;
++}
++
 +// acc (or NULL): added to the gradient w.r.t. x
 +static struct ggml_tensor * ggml_pet_rms_norm_back(
 +        struct ggml_context * ctx,
@@ -341,8 +408,10 @@
 +        struct ggml_tensor  * rev,
 +        struct ggml_tensor  * weight,
 +        struct ggml_tensor  * grad,
++        struct ggml_tensor  * acc,
 +        float                 eps) {
 +    GGML_ASSERT(ggml_is_contiguous(grad) && grad->ne[0] == 2*x->ne[0] && grad->ne[1] == x->ne[1]);
++    GGML_ASSERT(!acc || (acc->type == GGML_TYPE_F32 && ggml_is_contiguous(acc) && ggml_are_same_shape(x, acc)));
 +
 +    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, x->ne);
 +
@@ -353,7 +422,20 @@
 +    result->src[1] = rev;
 +    result->src[2] = weight;
 +    result->src[3] = grad;
++    result->src[4] = acc;
 +
++    return result;
++}
++
++struct ggml_tensor * ggml_pet_pair_norm_acc(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * x,
++        struct ggml_tensor  * rev,
++        struct ggml_tensor  * weight,
++        struct ggml_tensor  * bias,
++        float                 eps) {
++    struct ggml_tensor * result = ggml_pet_pair_norm(ctx, x, rev, weight, bias, eps);
++    ggml_set_op_params_i32(result, 1, 1); // the backward sums the residual's gradient
 +    return result;
 +}
 +
@@ -416,7 +498,7 @@
  // ggml_pet_attn
  
  struct ggml_tensor * ggml_pet_attn(
-@@ -6537,18 +6831,27 @@
+@@ -6537,18 +6870,27 @@
      struct ggml_tensor * src = cgraph->visited_hash_set.keys[isrc];
      GGML_ASSERT(src);
      if (cgraph->grads[isrc]) {
@@ -448,7 +530,56 @@
              size_t rem = offset;
              for (int d = 3; d >= 0; d--) {
                  lo[d] = rem / nb[d];
-@@ -7039,6 +7342,74 @@
+@@ -6780,17 +7122,22 @@
+                     src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
+                 struct ggml_tensor * g = ggml_is_contiguous(grad) ? grad : ggml_cont(ctx, grad);
+                 g = ggml_reshape_2d(ctx, g, g->ne[0], ggml_nrows(g)); // [m, P]
++                // ggml_mul_mat_set_grad_prec: the precision of both gradient products (OUT_PROD op_params[0])
++                const int32_t grad_prec = ggml_get_op_params_i32(tensor, 1);
+                 if (src0_needs_grads) {
+                     // ds0[n, m] = sum_p src1[n, p] grad[m, p]
+-                    ggml_add_or_set(ctx, cgraph, isrc0,
+-                        ggml_out_prod(ctx, ggml_reshape_2d(ctx, src1, src1->ne[0], ggml_nrows(src1)), g));
++                    struct ggml_tensor * ds0 = ggml_out_prod(ctx, ggml_reshape_2d(ctx, src1, src1->ne[0], ggml_nrows(src1)), g);
++                    ggml_set_op_params_i32(ds0, 0, grad_prec);
++                    ggml_add_or_set(ctx, cgraph, isrc0, ds0);
+                 }
+                 if (src1_needs_grads) {
+                     // ds1[n, p] = sum_m src0[n, m] grad[m, p]; for m = 1 the transposed
+                     // view has equal strides and does not read as transposed (cuBLAS
+                     // would get ldb = 1): use the identical contiguous [P, 1]
+                     struct ggml_tensor * gt = g->ne[0] == 1 ? ggml_reshape_2d(ctx, g, g->ne[1], 1) : ggml_transpose(ctx, g);
+-                    ggml_add_or_set(ctx, cgraph, isrc1, ggml_reshape(ctx, ggml_out_prod(ctx, src0, gt), src1));
++                    struct ggml_tensor * ds1 = ggml_out_prod(ctx, src0, gt);
++                    ggml_set_op_params_i32(ds1, 0, grad_prec);
++                    ggml_add_or_set(ctx, cgraph, isrc1, ggml_reshape(ctx, ds1, src1));
+                 }
+                 break;
+             }
+@@ -6806,6 +7153,7 @@
+                     ggml_mul_mat(ctx, // [n,m,qq,rr]
+                         src1_t,       // [p,n,qq,rr]
+                         grad_t);      // [p,m,qq,rr]
++                ggml_set_op_params_i32(tmp, 0, ggml_get_op_params_i32(tensor, 1));
+                 if (!ggml_are_same_shape(tmp, src0)) {
+                     GGML_ASSERT(tmp->ne[0] == src0->ne[0]);
+                     GGML_ASSERT(tmp->ne[1] == src0->ne[1]);
+@@ -6827,10 +7175,11 @@
+                 //                                    = mul_mat(transpose(src0), grad)
+                 struct ggml_tensor * src0_t = ggml_cont(ctx, ggml_transpose(ctx, src0));
+                 struct ggml_tensor * grad_cont = ggml_is_contiguous(grad) ? grad : ggml_cont(ctx, grad);
+-                ggml_add_or_set(ctx, cgraph, isrc1,
+-                        ggml_mul_mat(ctx,   // [n,p,qq,rr]
++                struct ggml_tensor * ds1 = ggml_mul_mat(ctx, // [n,p,qq,rr]
+                             src0_t,         // [m,n,q1,r1]
+-                            grad_cont));    // [m,p,qq,rr]
++                            grad_cont);     // [m,p,qq,rr]
++                ggml_set_op_params_i32(ds1, 0, ggml_get_op_params_i32(tensor, 1));
++                ggml_add_or_set(ctx, cgraph, isrc1, ds1);
+             }
+         } break;
+         case GGML_OP_SCALE: {
+@@ -7039,6 +7388,83 @@
              }
              GGML_ASSERT((!src1 || !src1_needs_grads) && "backward pass for softmax mask not implemented");
          } break;
@@ -470,8 +601,17 @@
 +            GGML_ASSERT(!src2_needs_grads && "pet_pair_norm: no gradient w.r.t. weight and bias");
 +            if (src0_needs_grads) {
 +                const float eps = ggml_get_op_params_f32(tensor, 0);
-+                ggml_add_or_set(ctx, cgraph, isrc0,
-+                    ggml_pet_pair_norm_back(ctx, src0, src1, src2, ggml_is_contiguous(grad) ? grad : ggml_cont(ctx, grad), eps));
++                struct ggml_tensor * g = ggml_is_contiguous(grad) ? grad : ggml_cont(ctx, grad);
++                // ggml_pet_pair_norm_acc: the gradient x has so far (from a residual) summed in the same pass
++                struct ggml_tensor * acc = cgraph->grads[isrc0];
++                if (ggml_get_op_params_i32(tensor, 1) && acc && !cgraph->grad_accs[isrc0] && acc->type == GGML_TYPE_F32 &&
++                    ggml_is_contiguous(acc) && ggml_are_same_shape(acc, src0)) {
++                    cgraph->grads[isrc0] = ggml_pet_pair_norm_back(ctx, src0, src1, src2, g, acc, eps);
++                    ggml_format_name(cgraph->grads[isrc0], "grad for %s", src0->name);
++                    ggml_build_forward_expand(cgraph, cgraph->grads[isrc0]);
++                } else {
++                    ggml_add_or_set(ctx, cgraph, isrc0, ggml_pet_pair_norm_back(ctx, src0, src1, src2, g, NULL, eps));
++                }
 +            }
 +        } break;
 +        case GGML_OP_PET_GLU: {
@@ -622,7 +762,7 @@
  void ggml_compute_forward_rope_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 --- a/src/ggml-cpu/ops.cpp
 +++ b/src/ggml-cpu/ops.cpp
-@@ -11581,3 +11581,349 @@
+@@ -11581,3 +11581,351 @@
          }
      }
  }
@@ -945,6 +1085,7 @@
 +    const ggml_tensor * x = dst->src[0];
 +    const int32_t * rev = (const int32_t *) dst->src[1]->data;
 +    const float * w = (const float *) dst->src[2]->data, * g = (const float *) dst->src[3]->data;
++    const float * acc = dst->src[4] ? (const float *) dst->src[4]->data : nullptr; // a residual's gradient, or none
 +    const float eps = ggml_get_op_params_f32(dst, 0);
 +    const int64_t d = x->ne[0], E = x->ne[1];
 +    for (int64_t e = params->ith; e < E; e += params->nth) {
@@ -968,7 +1109,8 @@
 +            const double xa = (a[c] - mean)*rstd;
 +            const double first  = rstd*((double) ge[c]*w[c] - se - xa*sxe);         // pair e, first half
 +            const double second = rstd*((double) gr[d + c]*w[d + c] - sr - xa*sxr); // pair r, second half
-+            dx[c] = (float) (first + second);
++            const float v = (float) (first + second);
++            dx[c] = acc ? v + acc[e*d + c] : v;
 +        }
 +    }
 +}
@@ -1241,7 +1383,7 @@
          return -1;
      }
      const int64_t K = A->ne[0], M = A->ne[1], N = ggml_nrows(B);
-@@ -3381,11 +3450,133 @@
+@@ -3381,11 +3450,135 @@
      if (!p.ok) {
          return -1;
      }
@@ -1342,11 +1484,13 @@
 +        CUBLAS_CHECK(cublasLtCreate(&lt[device]));
 +    }
 +    static const bool no_tf32 = getenv("GGML_CUDA_NO_TF32") != nullptr;
-+    static std::map<std::tuple<int, int64_t, int64_t, int64_t, int64_t, int64_t, bool>, ggml_cuda_out_prod_plan> plans;
-+    ggml_cuda_out_prod_plan & p = plans[{device, m, n, kk, lda, ldb, B_T}];
++    // GGML_PREC_F32 (ggml_mul_mat_set_grad_prec): full FP32 for this product, a plan of its own
++    const bool f32 = no_tf32 || ggml_get_op_params_i32(op, 0) == GGML_PREC_F32;
++    static std::map<std::tuple<int, int64_t, int64_t, int64_t, int64_t, int64_t, bool, bool>, ggml_cuda_out_prod_plan> plans;
++    ggml_cuda_out_prod_plan & p = plans[{device, m, n, kk, lda, ldb, B_T, f32}];
 +    const size_t ws_max = 32u << 20;
 +    if (!p.op) {
-+        const cublasComputeType_t compute = no_tf32 ? CUBLAS_COMPUTE_32F : CUBLAS_COMPUTE_32F_FAST_TF32;
++        const cublasComputeType_t compute = f32 ? CUBLAS_COMPUTE_32F : CUBLAS_COMPUTE_32F_FAST_TF32;
 +        CUBLAS_CHECK(cublasLtMatmulDescCreate(&p.op, compute, CUDA_R_32F));
 +        const cublasOperation_t ta = CUBLAS_OP_N, tb = B_T ? CUBLAS_OP_N : CUBLAS_OP_T;
 +        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof(ta)));
@@ -1377,7 +1521,27 @@
                                  &p.algo, ws.get(), p.ws, ctx.stream()));
      return j;
  }
-@@ -3827,6 +4018,11 @@
+@@ -3822,11 +4015,31 @@
+                         }
+                     }
+ 
++                    // ggml_pet_add_rms_norm: the sum and its RMSNorm in one kernel (GGML_PET_ADD_RMS_DEBUG=1: report each)
++                    if (node->op == GGML_OP_ADD && i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_PET_RMS_NORM &&
++                        cgraph->nodes[i + 1]->src[0] == node && ggml_get_op_params_i32(cgraph->nodes[i + 1], 1) == 1) {
++                        static const bool dbg = getenv("GGML_PET_ADD_RMS_DEBUG") != nullptr;
++                        const bool fused = ggml_cuda_op_pet_add_rms_norm(*cuda_ctx, node, cgraph->nodes[i + 1]);
++                        if (dbg) {
++                            fprintf(stderr, "pet_add_rms_norm: node %d [%lld, %lld] %s\n", i, (long long) node->ne[0],
++                                    (long long) ggml_nrows(node), fused ? "fused" : "not fused");
++                        }
++                        if (fused) {
++                            i++;
++                            continue;
++                        }
++                    }
++
+                     if (const int j = ggml_cuda_mul_mat_bias(*cuda_ctx, cgraph, i); j >= 0) {
+                         i = j;
                          continue;
                      }
  
@@ -1389,7 +1553,7 @@
                      bool fused_mul_mat_vec = false;
                      int fused_node_count = 0;
  
-@@ -5027,6 +5223,23 @@
+@@ -5027,6 +5240,23 @@
          case GGML_OP_PET_ATTN_BACK:
          case GGML_OP_PET_ATTN_BACK_BIAS:
              return ggml_cuda_pet_attn_supported(op);
@@ -1413,6 +1577,31 @@
          case GGML_OP_PET_ATTN_JVP:
          case GGML_OP_PET_ATTN_JVP_BACK:
          case GGML_OP_PET_ATTN_JVP_BACK_BIAS:
+--- a/src/ggml-cuda/out-prod.cu
++++ b/src/ggml-cuda/out-prod.cu
+@@ -34,6 +34,14 @@
+ 
+     CUBLAS_CHECK(cublasSetStream(handle, stream));
+ 
++    // GGML_PREC_F32 (from ggml_mul_mat_set_grad_prec): full FP32 even when the
++    // GEMMs otherwise run on TF32 tensor cores (no GGML_CUDA_NO_TF32)
++    static const bool no_tf32 = getenv("GGML_CUDA_NO_TF32") != nullptr;
++    const bool full = !no_tf32 && ggml_get_op_params_i32(dst, 0) == GGML_PREC_F32;
++    if (full) {
++        CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH));
++    }
++
+     const int64_t lda = nb01 / sizeof(float);
+     const int64_t ldc = nb1  / sizeof(float);
+ 
+@@ -65,4 +73,7 @@
+                         &beta,  dst_d  +  i3      *s3  +  i2      *s2,  ldc));
+         }
+     }
++    if (full) {
++        CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH));
++    }
+ }
 --- a/src/ggml-cuda/pad.cu
 +++ b/src/ggml-cuda/pad.cu
 @@ -16,16 +16,17 @@
@@ -1474,8 +1663,9 @@
 +bool ggml_cuda_pet_attn_ragged_bf16(ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool back);
 --- /dev/null
 +++ b/src/ggml-cuda/pet-ragged.cu
-@@ -0,0 +1,816 @@
+@@ -0,0 +1,1521 @@
 +#include "pet-ragged.cuh"
++#include <cstdio>
 +#include <cstring>
 +
 +// ---- bump cutoff ----
@@ -1993,7 +2183,7 @@
 +    }
 +}
 +
-+// ---- short sequences, low shared memory (the default for max_len <= 64) ----
++// ---- short sequences, low shared memory (SHORT2: GGML_PET_RAGGED_SPLIT=0) ----
 +// As above, but only the side a thread reads from all rows is staged: K, V for
 +// the forward and for dq; then Q, dO (over the same buffers) for dk, dv. A
 +// thread keeps its own rows in registers, the probabilities are recomputed
@@ -2123,13 +2313,686 @@
 +    return (4*(size_t) SHORT_L*(d + 1) + 2*(size_t) SHORT_L*(SHORT_L + 1) + SHORT_L)*sizeof(float);
 +}
 +
-+// rows [N + off[N], T) belong to no sequence: zero their `w` floats of a and `h` floats of b
++// rows [N + off[N], T) belong to no sequence: zero their `w` floats of a and `h` floats of b (grid-stride over
++// the rows: the host only knows the upper bound T - N of their number; pet_ragged_zero_tail_launch)
 +static __global__ void pet_ragged_zero_tail(const int32_t * __restrict__ off, const int N, const int64_t T,
 +        float * __restrict__ a, const int w, float * __restrict__ b, const int hb) {
-+    const int64_t r = (int64_t) N + off[N] + blockIdx.x;
-+    if (r >= T) return;
-+    for (int c = threadIdx.x; c < w; c += blockDim.x) a[r*w + c] = 0.0f;
-+    for (int c = threadIdx.x; c < hb; c += blockDim.x) b[r*hb + c] = 0.0f;
++    for (int64_t r = (int64_t) N + off[N] + blockIdx.x; r < T; r += gridDim.x) {
++        for (int c = threadIdx.x; c < w; c += blockDim.x) a[r*w + c] = 0.0f;
++        for (int c = threadIdx.x; c < hb; c += blockDim.x) b[r*hb + c] = 0.0f;
++    }
++}
++
++static void pet_ragged_zero_tail_launch(const int32_t * off, const int N, const int64_t T, const int64_t tail,
++        float * a, const int w, float * b, const int hb, cudaStream_t stream) {
++    if (tail <= 0) return;
++    pet_ragged_zero_tail<<<(unsigned) std::min<int64_t>(tail, 2048), 128, 0, stream>>>(off, N, T, a, w, b, hb);
++}
++
++// ---- short sequences, split rows (the default for max_len <= 64; GGML_PET_RAGGED_SPLIT=S[,R[,HB]]) ----
++// SHORT2's kernels with S threads sharing a row (C = d / S channels each, the
++// dot products reduced over the S lanes by shuffles) and R rows per thread.
++// The staged rows are unpadded: a thread reads its channels of the row that
++// all threads read at once as float4s, fewer shared-memory loads per FMA than
++// SHORT2's one scalar load per one or two FMAs. All rows are staged up front
++// with cp.async (one global latency per block), and the heads of an atom are
++// consecutive blocks (block n H + h), so that they read whole token rows
++// together. The backward stages Q, K, V and dO at once and runs its two
++// passes side by side: the first half of the block owns query rows (dq), the
++// second key rows (dk, dv, the bias gradient), ~22 KB of shared memory at
++// max_len 43, head size 32.
++
++static __device__ __forceinline__ void pet_cp_async16(float * dst, const float * src) {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
++    const unsigned s = (unsigned) __cvta_generic_to_shared(dst);
++    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(s), "l"(src));
++#else
++    *reinterpret_cast<float4 *>(dst) = *reinterpret_cast<const float4 *>(src);
++#endif
++}
++
++static __device__ __forceinline__ void pet_cp_async_wait() {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
++    asm volatile("cp.async.wait_all;\n" ::);
++#endif
++}
++
++// columns [col, col + d) of the L rows of sequence q into dst [L][d], asynchronously
++template <int d>
++static __device__ __forceinline__ void stage_head_async(float * __restrict__ dst, const float * __restrict__ src, const pet_seq & q,
++        const int L, const int64_t stride, const int col) {
++    constexpr int d4 = d / 4;
++    for (int e = threadIdx.x; e < L*d4; e += blockDim.x) {
++        const int r = e / d4, c = (e % d4)*4;
++        pet_cp_async16(dst + r*d + c, src + q.row(r)*stride + col + c);
++    }
++}
++
++template <int C>
++static __device__ __forceinline__ void load4(const float * __restrict__ s, float (&r)[C]) {
++#pragma unroll
++    for (int c = 0; c < C; c += 4) {
++        const float4 v = *reinterpret_cast<const float4 *>(s + c);
++        r[c] = v.x, r[c + 1] = v.y, r[c + 2] = v.z, r[c + 3] = v.w;
++    }
++}
++
++template <int C>
++static __device__ __forceinline__ void store4(float * __restrict__ s, const float (&r)[C], const float f) {
++#pragma unroll
++    for (int c = 0; c < C; c += 4) *reinterpret_cast<float4 *>(s + c) = make_float4(f*r[c], f*r[c + 1], f*r[c + 2], f*r[c + 3]);
++}
++
++// sum over the S lanes of a row (S consecutive lanes of a warp; the lanes of a row are active together)
++template <int S>
++static __device__ __forceinline__ float row_sum(float v) {
++    if constexpr (S > 1) {
++        const unsigned mask = ((1u << S) - 1u) << ((threadIdx.x % 32) & ~(S - 1));
++#pragma unroll
++        for (int o = S / 2; o > 0; o >>= 1) v += __shfl_xor_sync(mask, v, o);
++    }
++    return v;
++}
++
++// block n H / HB + b: sequence n, heads [b HB, (b + 1) HB)
++static __device__ __forceinline__ pet_seq pet_sequence_nh(const int32_t * __restrict__ off, const int N, const int H, int & h, const int HB = 1) {
++    const int nb = H / HB, n = blockIdx.x / nb;
++    h = (blockIdx.x % nb)*HB;
++    return {n, (int64_t) N + off[n], 1 + off[n + 1] - off[n]};
++}
++
++// row groups of a split block per head (G groups of S lanes, R rows each: rows g, g + G, ...; HB heads one
++// after the other) and its threads per pass
++static __host__ __device__ __forceinline__ int pet_split_groups(const int Lm, const int R) { return (Lm + R - 1) / R; }
++static int pet_split_half(const int Lm, const int S, const int R, const int HB) { return (HB*pet_split_groups(Lm, R)*S + 31) / 32 * 32; }
++
++template <int d, int S, int R, int HB>
++static __global__ void pet_attn_ragged_fwd_split(
++        const float * __restrict__ qkv, const float * __restrict__ bias, const int32_t * __restrict__ off,
++        float * __restrict__ out, float * __restrict__ lse, const int N, const int H, const float scale, const int Lm) {
++    extern __shared__ float4 sm4[];
++    float * sm = reinterpret_cast<float *>(sm4);
++    constexpr int C = d / S;
++    int h0;
++    const pet_seq sq = pet_sequence_nh(off, N, H, h0, HB);
++    const int L = sq.L, D = H*d, t = threadIdx.x, p = t % S, G = pet_split_groups(Lm, R), hb = t / S / G, g = t / S % G;
++    float * Bs = sm + 2*HB*Lm*d, * Ks = sm + 2*min(hb, HB - 1)*Lm*d, * Vs = Ks + Lm*d;
++    for (int b = 0; b < HB; b++) {
++        stage_head_async<d>(sm + 2*b*Lm*d, qkv, sq, L, 3*D, D + (h0 + b)*d);
++        stage_head_async<d>(sm + (2*b + 1)*Lm*d, qkv, sq, L, 3*D, 2*D + (h0 + b)*d);
++    }
++    for (int u = t; u < L; u += blockDim.x) Bs[u] = key_bias(bias, sq.row(u), N);
++    const bool active = hb < HB && g < min(G, L);
++    const int h = h0 + hb;
++    float q[R][C], acc[R][C], m[R], l[R];
++    if (active) {
++#pragma unroll
++        for (int r = 0; r < R; r++) {
++            load4<C>(qkv + sq.row(min(g + r*G, L - 1))*3*D + h*d + p*C, q[r]);
++            m[r] = -INFINITY, l[r] = 0.0f;
++#pragma unroll
++            for (int c = 0; c < C; c++) q[r][c] *= scale, acc[r][c] = 0.0f;
++        }
++    }
++    pet_cp_async_wait();
++    __syncthreads();
++    if (!active) return;
++    for (int u = 0; u < L; u++) {
++        float k[C], v[C];
++        load4<C>(Ks + u*d + p*C, k);
++        load4<C>(Vs + u*d + p*C, v);
++        const float b = Bs[u];
++#pragma unroll
++        for (int r = 0; r < R; r++) {
++            float s = 0.0f;
++#pragma unroll
++            for (int c = 0; c < C; c++) s += q[r][c]*k[c];
++            s = row_sum<S>(s) + b;
++            if (s > m[r]) {
++                const float corr = __expf(m[r] - s);
++                l[r] *= corr;
++#pragma unroll
++                for (int c = 0; c < C; c++) acc[r][c] *= corr;
++                m[r] = s;
++            }
++            const float e = __expf(s - m[r]);
++            l[r] += e;
++#pragma unroll
++            for (int c = 0; c < C; c++) acc[r][c] += e*v[c];
++        }
++    }
++#pragma unroll
++    for (int r = 0; r < R; r++) {
++        const int i = g + r*G;
++        if (i >= L) continue;
++        const int64_t row = sq.row(i);
++        store4<C>(out + row*D + h*d + p*C, acc[r], 1.0f/l[r]);
++        if (p == 0) lse[row*H + h] = m[r] + logf(l[r]);
++    }
++}
++
++template <int d, int S, int R, int HB>
++static __global__ void pet_attn_ragged_bwd_split(
++        const float * __restrict__ qkv, const float * __restrict__ bias, const int32_t * __restrict__ off,
++        const float * __restrict__ res, const float * __restrict__ lse, const float * __restrict__ grad,
++        float * __restrict__ dx, float * __restrict__ db, const int N, const int H, const float scale, const int Lm, const int half) {
++    extern __shared__ float4 sm4[];
++    float * sm = reinterpret_cast<float *>(sm4);
++    constexpr int C = d / S;
++    int h0;
++    const pet_seq sq = pet_sequence_nh(off, N, H, h0, HB);
++    const int L = sq.L, D = H*d, G = pet_split_groups(Lm, R);
++    const bool keys = threadIdx.x >= half;           // first half: query rows, second half: key rows
++    const int t = threadIdx.x - (keys ? half : 0), p = t % S, hb = t / S / G, g = t / S % G, h = h0 + min(hb, HB - 1);
++    const bool active = hb < HB && g < min(G, L);
++    for (int b = 0; b < HB; b++) {
++        float * base = sm + 4*b*Lm*d;
++        stage_head_async<d>(base, qkv, sq, L, 3*D, D + (h0 + b)*d);
++        stage_head_async<d>(base + Lm*d, qkv, sq, L, 3*D, 2*D + (h0 + b)*d);
++        stage_head_async<d>(base + 2*Lm*d, qkv, sq, L, 3*D, (h0 + b)*d);
++        stage_head_async<d>(base + 3*Lm*d, grad, sq, L, D, (h0 + b)*d);
++    }
++    float * Ks = sm + 4*min(hb, HB - 1)*Lm*d, * Vs = Ks + Lm*d, * Qs = Vs + Lm*d, * Gs = Qs + Lm*d;
++    float * Bs = sm + 4*HB*Lm*d, * Ls = Bs + Lm + min(hb, HB - 1)*2*Lm, * Ds = Ls + Lm;
++    for (int u = threadIdx.x; u < L; u += blockDim.x) Bs[u] = key_bias(bias, sq.row(u), N);
++    // query rows: O and the lse from global while the stage is in flight
++    float o[R][C], li[R];
++    if (!keys && active) {
++#pragma unroll
++        for (int r = 0; r < R; r++) {
++            const int64_t row = sq.row(min(g + r*G, L - 1));
++            load4<C>(res + row*D + h*d + p*C, o[r]);
++            li[r] = lse[row*H + h];
++        }
++    }
++    pet_cp_async_wait();
++    __syncthreads();
++    float a[R][C], b[R][C], acc[R][C], Di[R];   // query: q, dO, dq; key: k, v, dk (+ dv)
++    if (active) {
++#pragma unroll
++        for (int r = 0; r < R; r++) {
++            const int i = min(g + r*G, L - 1);
++            load4<C>((keys ? Ks : Qs) + i*d + p*C, a[r]);
++            load4<C>((keys ? Vs : Gs) + i*d + p*C, b[r]);
++#pragma unroll
++            for (int c = 0; c < C; c++) acc[r][c] = 0.0f;
++            if (!keys) {
++                float s = 0.0f;
++#pragma unroll
++                for (int c = 0; c < C; c++) s += b[r][c]*o[r][c];
++                Di[r] = row_sum<S>(s);
++                if (p == 0 && g + r*G < L) Ls[i] = li[r], Ds[i] = Di[r];
++            }
++        }
++    }
++    __syncthreads();
++    if (!active) return;
++    if (!keys) {
++        for (int u = 0; u < L; u++) {
++            float k[C], v[C];
++            load4<C>(Ks + u*d + p*C, k);
++            load4<C>(Vs + u*d + p*C, v);
++            const float bu = Bs[u];
++#pragma unroll
++            for (int r = 0; r < R; r++) {
++                float s = 0.0f, dp = 0.0f;
++#pragma unroll
++                for (int c = 0; c < C; c++) s += a[r][c]*k[c], dp += b[r][c]*v[c];
++                s = row_sum<S>(s), dp = row_sum<S>(dp);
++                const float ds = __expf(scale*s + bu - li[r])*(dp - Di[r]);
++#pragma unroll
++                for (int c = 0; c < C; c++) acc[r][c] += ds*k[c];
++            }
++        }
++#pragma unroll
++        for (int r = 0; r < R; r++) {
++            const int i = g + r*G;
++            if (i < L) store4<C>(dx + sq.row(i)*3*D + h*d + p*C, acc[r], scale);
++        }
++        return;
++    }
++    float dv[R][C], bj[R], dbj[R];
++#pragma unroll
++    for (int r = 0; r < R; r++) {
++        bj[r] = Bs[min(g + r*G, L - 1)], dbj[r] = 0.0f;
++#pragma unroll
++        for (int c = 0; c < C; c++) dv[r][c] = 0.0f;
++    }
++    for (int i = 0; i < L; i++) {
++        float q[C], gi[C];
++        load4<C>(Qs + i*d + p*C, q);
++        load4<C>(Gs + i*d + p*C, gi);
++        const float l = Ls[i], Dq = Ds[i];
++#pragma unroll
++        for (int r = 0; r < R; r++) {
++            float s = 0.0f, dp = 0.0f;
++#pragma unroll
++            for (int c = 0; c < C; c++) s += q[c]*a[r][c], dp += gi[c]*b[r][c];
++            s = row_sum<S>(s), dp = row_sum<S>(dp);
++            const float e = __expf(scale*s + bj[r] - l), ds = e*(dp - Dq);
++            dbj[r] += ds;
++#pragma unroll
++            for (int c = 0; c < C; c++) acc[r][c] += ds*q[c], dv[r][c] += e*gi[c];
++        }
++    }
++#pragma unroll
++    for (int r = 0; r < R; r++) {
++        const int j = g + r*G;
++        if (j >= L) continue;
++        const int64_t row = sq.row(j);
++        store4<C>(dx + row*3*D + D + h*d + p*C, acc[r], scale);
++        store4<C>(dx + row*3*D + 2*D + h*d + p*C, dv[r], 1.0f);
++        if (p == 0) db[row*H + h] = dbj[r];
++    }
++}
++
++// launch the split kernels (d / S >= 4, S <= 8, R <= 2); false if (S, R) is not instantiated for d
++template <int d, int S, int R, int HB>
++static void pet_split_launch_sr(const bool back, const float * qkv, const float * bias, const int32_t * off, const float * res,
++        const float * lse_in, const float * grad, float * out, float * aux, const int N, const int H, const float scale, const int Lm,
++        cudaStream_t stream) {
++    const unsigned grid = (unsigned) N*(unsigned) (H / HB);
++    const int half = pet_split_half(Lm, S, R, HB);
++    if (!back) {
++        pet_attn_ragged_fwd_split<d, S, R, HB><<<grid, half, (2*HB*(size_t) Lm*d + Lm)*sizeof(float), stream>>>(
++            qkv, bias, off, out, aux, N, H, scale, Lm);
++    } else {
++        pet_attn_ragged_bwd_split<d, S, R, HB><<<grid, 2*half, (4*HB*(size_t) Lm*d + (1 + 2*HB)*Lm)*sizeof(float), stream>>>(
++            qkv, bias, off, res, lse_in, grad, out, aux, N, H, scale, Lm, half);
++    }
++}
++
++template <int d, int S>
++static bool pet_split_launch_s(const int R, const int HB, const bool back, const float * qkv, const float * bias, const int32_t * off,
++        const float * res, const float * lse_in, const float * grad, float * out, float * aux, const int N, const int H,
++        const float scale, const int Lm, cudaStream_t stream) {
++    if constexpr (d / S >= 4) {
++#define PET_SPLIT_CASE(r, hb) if (R == r && HB == hb) { \
++            pet_split_launch_sr<d, S, r, hb>(back, qkv, bias, off, res, lse_in, grad, out, aux, N, H, scale, Lm, stream); return true; }
++        PET_SPLIT_CASE(1, 1)
++        PET_SPLIT_CASE(2, 1)
++        PET_SPLIT_CASE(1, 2)
++        PET_SPLIT_CASE(2, 2)
++#undef PET_SPLIT_CASE
++    }
++    return false;
++}
++
++// (the grid is N H blocks: false beyond 2^31 - 1)
++template <int d>
++static bool pet_split_launch(const int S, const int R, const int HB, const bool back, const float * qkv, const float * bias, const int32_t * off,
++        const float * res, const float * lse_in, const float * grad, float * out, float * aux, const int N, const int H,
++        const float scale, const int Lm, cudaStream_t stream) {
++    if ((int64_t) N*H > INT32_MAX || H % HB != 0) return false;
++    switch (S) {
++        case 1: return pet_split_launch_s<d, 1>(R, HB, back, qkv, bias, off, res, lse_in, grad, out, aux, N, H, scale, Lm, stream);
++        case 2: return pet_split_launch_s<d, 2>(R, HB, back, qkv, bias, off, res, lse_in, grad, out, aux, N, H, scale, Lm, stream);
++        case 4: return pet_split_launch_s<d, 4>(R, HB, back, qkv, bias, off, res, lse_in, grad, out, aux, N, H, scale, Lm, stream);
++        case 8: return pet_split_launch_s<d, 8>(R, HB, back, qkv, bias, off, res, lse_in, grad, out, aux, N, H, scale, Lm, stream);
++        default: return false;
++    }
++}
++
++// ---- short sequences on TF32 tensor cores (GGML_PET_RAGGED_MMA=1 / 3; only when the GEMMs run in TF32;
++// by default 3xTF32 for head size 32) ----
++// One block per (sequence, head) as in SHORT2, the sequence padded to
++// Lp = 16 NW rows (zeros; padded keys get probability 0), Q, K, V (and dO)
++// staged in shared memory. Forward: warp w owns the 16 query rows 16 w ..:
++// S = Q K^T with mma.m16n8k8 (fp32 accumulation), the softmax on the
++// accumulators, O = P V. Backward (2 NW warps, FlashAttention-2 style, P
++// and dS never stored): warp w < NW owns query rows (S, dP -> dS, dQ = dS K),
++// warp NW + w key rows (S^T = K Q^T, dP^T = V dO^T -> P^T, dS^T, dV = P^T dO,
++// dK = dS^T Q, the bias gradient as row sums of dS^T). An accumulator tile
++// is used as the A operand of the next product as it is, with the k slots
++// q, q + 4 of a lane taken as the columns 2 q, 2 q + 1 it holds (the B
++// operand loaded in the same order). X3 (GGML_PET_RAGGED_MMA=3): 3xTF32
++// (a = a_hi + a_lo, products a_hi b_hi + a_hi b_lo + a_lo b_hi), close to fp32.
++
++static __device__ __forceinline__ uint32_t pet_tf32(const float x) {
++    uint32_t r;
++    asm("cvt.rna.tf32.f32 %0, %1;\n" : "=r"(r) : "f"(x));
++    return r;
++}
++
++template <bool X3>
++struct pet_frag_a { uint32_t hi[4], lo[X3 ? 4 : 1]; };
++template <bool X3>
++struct pet_frag_b { uint32_t hi[2], lo[X3 ? 2 : 1]; };
++
++template <bool X3, int NR>
++static __device__ __forceinline__ void pet_split_tf32(const float (&x)[NR], uint32_t (&hi)[NR], uint32_t (&lo)[X3 ? NR : 1]) {
++#pragma unroll
++    for (int i = 0; i < NR; i++) {
++        hi[i] = pet_tf32(x[i]);
++        if constexpr (X3) lo[i] = pet_tf32(x[i] - __uint_as_float(hi[i]));
++    }
++}
++
++static __device__ __forceinline__ void pet_mma_tf32(float (&c)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
++    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
++        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
++        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
++#else
++    (void) c; (void) a; (void) b;
++#endif
++}
++
++template <bool X3>
++static __device__ __forceinline__ void pet_mma(float (&c)[4], const pet_frag_a<X3> & a, const pet_frag_b<X3> & b) {
++    if constexpr (X3) {
++        uint32_t al[4] = {a.lo[0], a.lo[1], a.lo[2], a.lo[3]}, bl[2] = {b.lo[0], b.lo[1]};
++        pet_mma_tf32(c, al, b.hi);
++        pet_mma_tf32(c, a.hi, bl);
++    }
++    pet_mma_tf32(c, a.hi, b.hi);
++}
++
++// A (16 x 8) at (m0, k0) of X [m][k] (leading dimension ld), or of X^T when TR (X [k][m])
++template <bool X3, bool TR>
++static __device__ __forceinline__ pet_frag_a<X3> pet_load_a(const float * __restrict__ X, const int ld, const int m0, const int k0) {
++    const int lane = threadIdx.x % 32, g = lane / 4, q = lane % 4;
++    float x[4];
++    if constexpr (!TR) {
++        x[0] = X[(m0 + g)*ld + k0 + q], x[1] = X[(m0 + g + 8)*ld + k0 + q];
++        x[2] = X[(m0 + g)*ld + k0 + q + 4], x[3] = X[(m0 + g + 8)*ld + k0 + q + 4];
++    } else {
++        x[0] = X[(k0 + q)*ld + m0 + g], x[1] = X[(k0 + q)*ld + m0 + g + 8];
++        x[2] = X[(k0 + q + 4)*ld + m0 + g], x[3] = X[(k0 + q + 4)*ld + m0 + g + 8];
++    }
++    pet_frag_a<X3> f;
++    pet_split_tf32<X3, 4>(x, f.hi, f.lo);
++    return f;
++}
++
++// B (8 x 8) at (k0, n0) with B(k, n) = X [n][k] (NK, "col"), or X [k][n] (!NK)
++template <bool X3, bool NK>
++static __device__ __forceinline__ pet_frag_b<X3> pet_load_b(const float * __restrict__ X, const int ld, const int k0, const int n0) {
++    const int lane = threadIdx.x % 32, g = lane / 4, q = lane % 4;
++    float x[2];
++    if constexpr (NK) x[0] = X[(n0 + g)*ld + k0 + q], x[1] = X[(n0 + g)*ld + k0 + q + 4];
++    else              x[0] = X[(k0 + q)*ld + n0 + g], x[1] = X[(k0 + q + 4)*ld + n0 + g];
++    pet_frag_b<X3> f;
++    pet_split_tf32<X3, 2>(x, f.hi, f.lo);
++    return f;
++}
++
++// B for the k-tile k0 of an accumulator used as A (pet_acc_a): slots q, q + 4 <- rows k0 + 2 q, k0 + 2 q + 1 of X [k][n]
++template <bool X3>
++static __device__ __forceinline__ pet_frag_b<X3> pet_load_b_acc(const float * __restrict__ X, const int ld, const int k0, const int n0) {
++    const int lane = threadIdx.x % 32, g = lane / 4, q = lane % 4;
++    const float x[2] = {X[(k0 + 2*q)*ld + n0 + g], X[(k0 + 2*q + 1)*ld + n0 + g]};
++    pet_frag_b<X3> f;
++    pet_split_tf32<X3, 2>(x, f.hi, f.lo);
++    return f;
++}
++
++// an accumulator tile (rows g, g + 8, columns 2 q, 2 q + 1) as the A operand of a product over its columns
++template <bool X3>
++static __device__ __forceinline__ pet_frag_a<X3> pet_acc_a(const float (&c)[4]) {
++    const float x[4] = {c[0], c[2], c[1], c[3]};
++    pet_frag_a<X3> f;
++    pet_split_tf32<X3, 4>(x, f.hi, f.lo);
++    return f;
++}
++
++// rows [0, L) of columns [col, col + d) into dst [Lp][d + 4] asynchronously, rows [L, Lp) zeroed
++template <int d>
++static __device__ __forceinline__ void stage_head_pad(float * __restrict__ dst, const float * __restrict__ src, const pet_seq & q,
++        const int L, const int Lp, const int64_t stride, const int col) {
++    constexpr int d4 = d / 4, ld = d + 4;
++    for (int e = threadIdx.x; e < Lp*d4; e += blockDim.x) {
++        const int r = e / d4, c = (e % d4)*4;
++        if (r < L) pet_cp_async16(dst + r*ld + c, src + q.row(r)*stride + col + c);
++        else *reinterpret_cast<float4 *>(dst + r*ld + c) = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++    }
++}
++
++// acc[n] += A B[n] over k in [0, K): A (16 x K) at row m0 of X [m][k], B[n] (K x 8) = columns 8 n of Y^T, Y [n][k]
++template <bool X3, int K, int NN>
++static __device__ __forceinline__ void pet_mma_abt(float (&acc)[NN][4], const float * __restrict__ X, const float * __restrict__ Y,
++        const int ld, const int m0) {
++#pragma unroll
++    for (int k0 = 0; k0 < K; k0 += 8) {
++        const pet_frag_a<X3> a = pet_load_a<X3, false>(X, ld, m0, k0);
++#pragma unroll
++        for (int n = 0; n < NN; n++) pet_mma<X3>(acc[n], a, pet_load_b<X3, true>(Y, ld, k0, 8*n));
++    }
++}
++
++// acc[n] += P Y[:, 8 n ..] with P (16 x 8 NK) the accumulator tiles p, Y [k][n]
++template <bool X3, int NK, int NN>
++static __device__ __forceinline__ void pet_mma_acc(float (&acc)[NN][4], const float (&p)[NK][4], const float * __restrict__ Y, const int ld) {
++#pragma unroll
++    for (int kk = 0; kk < NK; kk++) {
++        const pet_frag_a<X3> a = pet_acc_a<X3>(p[kk]);
++#pragma unroll
++        for (int n = 0; n < NN; n++) pet_mma<X3>(acc[n], a, pet_load_b_acc<X3>(Y, ld, 8*kk, 8*n));
++    }
++}
++
++template <int NN>
++static __device__ __forceinline__ void pet_zero(float (&acc)[NN][4]) {
++#pragma unroll
++    for (int n = 0; n < NN; n++) acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.0f;
++}
++
++template <int d, int NW, bool X3>
++static __global__ void __launch_bounds__(32*NW) pet_attn_ragged_fwd_mma(
++        const float * __restrict__ qkv, const float * __restrict__ bias, const int32_t * __restrict__ off,
++        float * __restrict__ out, float * __restrict__ lse, const int N, const int H, const float scale) {
++    constexpr int Lp = 16*NW, ld = d + 4, NT = Lp / 8;
++    extern __shared__ float4 sm4[];
++    float * sm = reinterpret_cast<float *>(sm4);
++    float * Qs = sm, * Ks = Qs + Lp*ld, * Vs = Ks + Lp*ld, * Bs = Vs + Lp*ld;
++    int h;
++    const pet_seq sq = pet_sequence_nh(off, N, H, h);
++    const int L = sq.L, D = H*d;
++    stage_head_pad<d>(Qs, qkv, sq, L, Lp, 3*D, h*d);
++    stage_head_pad<d>(Ks, qkv, sq, L, Lp, 3*D, D + h*d);
++    stage_head_pad<d>(Vs, qkv, sq, L, Lp, 3*D, 2*D + h*d);
++    for (int u = threadIdx.x; u < Lp; u += blockDim.x) Bs[u] = u < L ? key_bias(bias, sq.row(u), N) : -INFINITY;
++    pet_cp_async_wait();
++    __syncthreads();
++    const int w = threadIdx.x / 32, lane = threadIdx.x % 32, g = lane / 4, q = lane % 4, m0 = 16*w;
++    if (m0 >= L) return;
++    float s[NT][4];
++    pet_zero(s);
++    pet_mma_abt<X3, d>(s, Qs, Ks, ld, m0);
++    // c0, c1 in row g, c2, c3 in row g + 8, columns 8 n + 2 q (+1)
++    float mx[2] = {-INFINITY, -INFINITY}, l[2] = {0.0f, 0.0f};
++#pragma unroll
++    for (int n = 0; n < NT; n++) {
++#pragma unroll
++        for (int e = 0; e < 4; e++) {
++            s[n][e] = scale*s[n][e] + Bs[8*n + 2*q + e % 2];
++            mx[e / 2] = fmaxf(mx[e / 2], s[n][e]);
++        }
++    }
++#pragma unroll
++    for (int r = 0; r < 2; r++) mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffffu, mx[r], 1)), mx[r] = fmaxf(mx[r], __shfl_xor_sync(0xffffffffu, mx[r], 2));
++#pragma unroll
++    for (int n = 0; n < NT; n++) {
++#pragma unroll
++        for (int e = 0; e < 4; e++) s[n][e] = __expf(s[n][e] - mx[e / 2]), l[e / 2] += s[n][e];
++    }
++#pragma unroll
++    for (int r = 0; r < 2; r++) l[r] += __shfl_xor_sync(0xffffffffu, l[r], 1), l[r] += __shfl_xor_sync(0xffffffffu, l[r], 2);
++    float o[d / 8][4];
++    pet_zero(o);
++    pet_mma_acc<X3>(o, s, Vs, ld);
++#pragma unroll
++    for (int r = 0; r < 2; r++) {
++        const int i = m0 + g + 8*r;
++        if (i >= L) continue;
++        const int64_t row = sq.row(i);
++        float * dst = out + row*D + h*d;
++#pragma unroll
++        for (int n = 0; n < d / 8; n++) *reinterpret_cast<float2 *>(dst + 8*n + 2*q) = make_float2(o[n][2*r]/l[r], o[n][2*r + 1]/l[r]);
++        if (q == 0) lse[row*H + h] = mx[r] + logf(l[r]);
++    }
++}
++
++template <int d, int NW, bool X3>
++static __global__ void __launch_bounds__(64*NW) pet_attn_ragged_bwd_mma(
++        const float * __restrict__ qkv, const float * __restrict__ bias, const int32_t * __restrict__ off,
++        const float * __restrict__ res, const float * __restrict__ lse, const float * __restrict__ grad,
++        float * __restrict__ dx, float * __restrict__ db, const int N, const int H, const float scale) {
++    constexpr int Lp = 16*NW, ld = d + 4, NT = Lp / 8;
++    extern __shared__ float4 sm4[];
++    float * sm = reinterpret_cast<float *>(sm4);
++    float * Qs = sm, * Ks = Qs + Lp*ld, * Vs = Ks + Lp*ld, * Gs = Vs + Lp*ld, * Bs = Gs + Lp*ld, * Ls = Bs + Lp, * Ds = Ls + Lp;
++    int h;
++    const pet_seq sq = pet_sequence_nh(off, N, H, h);
++    const int L = sq.L, D = H*d, t = threadIdx.x;
++    stage_head_pad<d>(Qs, qkv, sq, L, Lp, 3*D, h*d);
++    stage_head_pad<d>(Ks, qkv, sq, L, Lp, 3*D, D + h*d);
++    stage_head_pad<d>(Vs, qkv, sq, L, Lp, 3*D, 2*D + h*d);
++    stage_head_pad<d>(Gs, grad, sq, L, Lp, D, h*d);
++    for (int u = t; u < Lp; u += blockDim.x) {
++        Bs[u] = u < L ? key_bias(bias, sq.row(u), N) : 0.0f;
++        Ls[u] = u < L ? lse[sq.row(u)*H + h] : INFINITY; // padded queries: p = 0
++    }
++    // Di = dO_i . O_i, 4 threads per row (blockDim = 4 Lp): O from global while the stage is in flight
++    const int r4 = t / 4, c4 = (t % 4)*(d / 4);
++    float o4[d / 4];
++    if (r4 < L) {
++#pragma unroll
++        for (int c = 0; c < d / 4; c += 4) {
++            const float4 v = *reinterpret_cast<const float4 *>(res + sq.row(r4)*D + h*d + c4 + c);
++            o4[c] = v.x, o4[c + 1] = v.y, o4[c + 2] = v.z, o4[c + 3] = v.w;
++        }
++    }
++    pet_cp_async_wait();
++    __syncthreads();
++    {
++        float s = 0.0f;
++        if (r4 < L) {
++#pragma unroll
++            for (int c = 0; c < d / 4; c++) s += o4[c]*Gs[r4*ld + c4 + c];
++        }
++        s += __shfl_xor_sync(0xffffffffu, s, 1);
++        s += __shfl_xor_sync(0xffffffffu, s, 2);
++        if (t % 4 == 0) Ds[r4] = s;
++    }
++    __syncthreads();
++    const int w = t / 32, lane = t % 32, g = lane / 4, q = lane % 4;
++    if (w < NW) {
++        // query rows m0 ..: dS = P (dP - D), dQ = dS K
++        const int m0 = 16*w;
++        if (m0 >= L) return;
++        float s[NT][4], dp[NT][4];
++        pet_zero(s), pet_zero(dp);
++        pet_mma_abt<X3, d>(s, Qs, Ks, ld, m0);
++        pet_mma_abt<X3, d>(dp, Gs, Vs, ld, m0);
++        const float li[2] = {Ls[m0 + g], Ls[m0 + g + 8]}, Di[2] = {Ds[m0 + g], Ds[m0 + g + 8]};
++#pragma unroll
++        for (int n = 0; n < NT; n++) {
++#pragma unroll
++            for (int e = 0; e < 4; e++) {
++                const float p = __expf(scale*s[n][e] + Bs[8*n + 2*q + e % 2] - li[e / 2]);
++                dp[n][e] = 8*n + 2*q + e % 2 < L ? p*(dp[n][e] - Di[e / 2]) : 0.0f;
++            }
++        }
++        float dq[d / 8][4];
++        pet_zero(dq);
++        pet_mma_acc<X3>(dq, dp, Ks, ld);
++#pragma unroll
++        for (int r = 0; r < 2; r++) {
++            const int i = m0 + g + 8*r;
++            if (i >= L) continue;
++            float * dst = dx + sq.row(i)*3*D + h*d;
++#pragma unroll
++            for (int n = 0; n < d / 8; n++) *reinterpret_cast<float2 *>(dst + 8*n + 2*q) = make_float2(scale*dq[n][2*r], scale*dq[n][2*r + 1]);
++        }
++        return;
++    }
++    // key rows j0 ..: P^T, dS^T = P^T (dP^T - D), dV = P^T dO, dK = dS^T Q, the bias gradient
++    const int j0 = 16*(w - NW);
++    if (j0 >= L) return;
++    float s[NT][4], dp[NT][4];
++    pet_zero(s), pet_zero(dp);
++    pet_mma_abt<X3, d>(s, Ks, Qs, ld, j0);
++    pet_mma_abt<X3, d>(dp, Vs, Gs, ld, j0);
++    const float bj[2] = {Bs[j0 + g], Bs[j0 + g + 8]};
++    float dbj[2] = {0.0f, 0.0f};
++#pragma unroll
++    for (int n = 0; n < NT; n++) {
++#pragma unroll
++        for (int e = 0; e < 4; e++) {
++            const int i = 8*n + 2*q + e % 2;
++            s[n][e] = __expf(scale*s[n][e] + bj[e / 2] - Ls[i]);
++            dp[n][e] = s[n][e]*(dp[n][e] - Ds[i]);
++            dbj[e / 2] += dp[n][e];
++        }
++    }
++#pragma unroll
++    for (int r = 0; r < 2; r++) dbj[r] += __shfl_xor_sync(0xffffffffu, dbj[r], 1), dbj[r] += __shfl_xor_sync(0xffffffffu, dbj[r], 2);
++    float dk[d / 8][4], dv[d / 8][4];
++    pet_zero(dk), pet_zero(dv);
++    pet_mma_acc<X3>(dv, s, Gs, ld);
++    pet_mma_acc<X3>(dk, dp, Qs, ld);
++#pragma unroll
++    for (int r = 0; r < 2; r++) {
++        const int j = j0 + g + 8*r;
++        if (j >= L) continue;
++        const int64_t row = sq.row(j);
++        float * dst = dx + row*3*D;
++#pragma unroll
++        for (int n = 0; n < d / 8; n++) {
++            *reinterpret_cast<float2 *>(dst + D + h*d + 8*n + 2*q) = make_float2(scale*dk[n][2*r], scale*dk[n][2*r + 1]);
++            *reinterpret_cast<float2 *>(dst + 2*D + h*d + 8*n + 2*q) = make_float2(dv[n][2*r], dv[n][2*r + 1]);
++        }
++        if (q == 0) db[row*H + h] = dbj[r];
++    }
++}
++
++template <int d, int NW, bool X3>
++static void pet_mma_launch_nw(const bool back, const float * qkv, const float * bias, const int32_t * off, const float * res,
++        const float * lse_in, const float * grad, float * out, float * aux, const int N, const int H, const float scale,
++        cudaStream_t stream) {
++    constexpr int Lp = 16*NW, ld = d + 4;
++    const unsigned grid = (unsigned) N*(unsigned) H;
++    if (!back) {
++        const size_t smem = (3*(size_t) Lp*ld + Lp)*sizeof(float);
++        static bool attr = false;
++        if (!attr) {
++            CUDA_CHECK(cudaFuncSetAttribute(pet_attn_ragged_fwd_mma<d, NW, X3>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
++            attr = true;
++        }
++        pet_attn_ragged_fwd_mma<d, NW, X3><<<grid, 32*NW, smem, stream>>>(qkv, bias, off, out, aux, N, H, scale);
++    } else {
++        const size_t smem = (4*(size_t) Lp*ld + 3*Lp)*sizeof(float);
++        static bool attr = false;
++        if (!attr) {
++            CUDA_CHECK(cudaFuncSetAttribute(pet_attn_ragged_bwd_mma<d, NW, X3>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
++            attr = true;
++        }
++        pet_attn_ragged_bwd_mma<d, NW, X3><<<grid, 64*NW, smem, stream>>>(qkv, bias, off, res, lse_in, grad, out, aux, N, H, scale);
++    }
++}
++
++// TF32 tensor-core kernels for max_len <= 64, head sizes 16 and 32 (compute capability >= 8.0, checked by the
++// caller): false if not available
++template <int d>
++static bool pet_mma_launch(const bool x3, const bool back, const float * qkv, const float * bias, const int32_t * off,
++        const float * res, const float * lse_in, const float * grad, float * out, float * aux, const int N, const int H,
++        const float scale, const int Lm, cudaStream_t stream) {
++    if constexpr (d == 16 || d == 32) {
++        if ((int64_t) N*H > INT32_MAX || Lm > 64) return false;
++        const int NW = (Lm + 15) / 16;
++#define PET_MMA_CASE(nw) case nw: (x3 ? pet_mma_launch_nw<d, nw, true> : pet_mma_launch_nw<d, nw, false>)( \
++            back, qkv, bias, off, res, lse_in, grad, out, aux, N, H, scale, stream); return true;
++        switch (NW) {
++            PET_MMA_CASE(1)
++            PET_MMA_CASE(2)
++            PET_MMA_CASE(3)
++            PET_MMA_CASE(4)
++            default: return false;
++        }
++#undef PET_MMA_CASE
++    }
++    return false;
 +}
 +
 +struct pet_ragged_shape { int TP, TS; size_t smem; };
@@ -2166,6 +3029,22 @@
 +    return a;
 +}
 +
++// S[,R[,HB]] (lanes per row, rows per thread, heads per block)
++static int3 pet_split_env(const char * name, const int3 def) {
++    const char * e = getenv(name);
++    if (!e || !*e) return def;
++    int S = 0, R = 1, HB = 1;
++    if (sscanf(e, "%d,%d,%d", &S, &R, &HB) < 1) return def;
++    return make_int3(S, R, HB);
++}
++
++// 0 (off), 1 (TF32) or 3 (3xTF32) from `name`, else def; 0 unless the GEMMs run in TF32
++static int pet_mma_env(const char * name, const bool tf32, const int def) {
++    const char * e = getenv(name);
++    const int v = e && *e ? atoi(e) : def;
++    return tf32 && (v == 1 || v == 3) ? v : 0;
++}
++
 +template <int d>
 +static void pet_ragged_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool back) {
 +    constexpr int RF = 64 / d > 1 ? 64 / d : 1; // forward: q, acc in registers
@@ -2174,7 +3053,7 @@
 +    cudaStream_t stream = ctx.stream();
 +    const int64_t tail = a.T - a.N; // an upper bound of the rows in no sequence
 +    static const bool tiled = getenv("GGML_PET_RAGGED_TILED") != nullptr;
-+    // short sequences: the low-shared-memory kernels by default (GGML_PET_RAGGED_SHORT1=1: the
++    // short sequences: the split-row / tensor-core kernels by default (below; GGML_PET_RAGGED_SHORT1=1: the
 +    // first whole-sequence kernels, GGML_PET_RAGGED_TILED=1: the tiled ones)
 +    static const bool short2 = getenv("GGML_PET_RAGGED_SHORT1") == nullptr;
 +    // GGML_PET_RAGGED_SHORT=fwd / bwd: the short-sequence kernels for one direction only (unset: both)
@@ -2183,6 +3062,17 @@
 +        if (!e || !*e) return 3;
 +        return (strcmp(e, "fwd") == 0 ? 1 : 0) | (strcmp(e, "bwd") == 0 ? 2 : 0);
 +    }();
++    // short sequences, by default: the split-row kernels with one lane per row (S = R = HB = 1); while the GEMMs
++    // run in TF32 (GGML_CUDA_NO_TF32 unset) and for head size 32, the 3xTF32 tensor-core ones instead.
++    // GGML_PET_RAGGED_SPLIT=S[,R[,HB]]: the split-row kernels with S lanes per row, R rows per thread, HB heads
++    // per block (0: SHORT2); GGML_PET_RAGGED_MMA=0 / 1 (TF32) / 3 (3xTF32): the tensor-core kernels off / on for
++    // head sizes 16 and 32 (TF32 mode only); GGML_PET_RAGGED_SPLIT_FWD / _MMA_FWD: the same for the forward alone
++    static const int3 split_bwd = pet_split_env("GGML_PET_RAGGED_SPLIT", make_int3(1, 1, 1));
++    static const int3 split_fwd = pet_split_env("GGML_PET_RAGGED_SPLIT_FWD", split_bwd);
++    static const bool tf32 = getenv("GGML_CUDA_NO_TF32") == nullptr &&
++                             ggml_cuda_info().devices[ggml_cuda_get_device()].cc >= GGML_CUDA_CC_AMPERE;
++    static const int mma_bwd = pet_mma_env("GGML_PET_RAGGED_MMA", tf32, d == 32 ? 3 : 0);
++    static const int mma_fwd = pet_mma_env("GGML_PET_RAGGED_MMA_FWD", tf32, mma_bwd);
 +    static const size_t smem_optin = [] {
 +        int dev = 0, v = 0;
 +        CUDA_CHECK(cudaGetDevice(&dev));
@@ -2198,35 +3088,41 @@
 +        if (short2) {
 +            const int Lm = a.max_len, nt = (Lm + 31) / 32 * 32;
 +            const size_t P = d + 1;
++            const int3 sp = back ? split_bwd : split_fwd;
++            const int mm = back ? mma_bwd : mma_fwd;
 +            if (!back) {
 +                float * out = (float *) dst->data, * lse = out + a.D*a.T;
-+                if (tail > 0)
-+                    pet_ragged_zero_tail<<<(unsigned) tail, 128, 0, stream>>>(a.off, a.N, a.T, out, (int) a.D, lse, a.H);
-+                pet_attn_ragged_fwd_short2<d><<<grid, nt, (2*Lm*P + Lm)*sizeof(float), stream>>>(
-+                    a.qkv, a.bias, a.off, out, lse, a.N, a.H, a.scale, Lm);
++                pet_ragged_zero_tail_launch(a.off, a.N, a.T, tail, out, (int) a.D, lse, a.H, stream);
++                if ((mm == 0 || !pet_mma_launch<d>(mm == 3, false, a.qkv, a.bias, a.off, nullptr, nullptr, nullptr, out, lse,
++                                                   a.N, a.H, a.scale, Lm, stream)) &&
++                    (sp.x == 0 || !pet_split_launch<d>(sp.x, sp.y, sp.z, false, a.qkv, a.bias, a.off, nullptr, nullptr, nullptr, out, lse,
++                                                       a.N, a.H, a.scale, Lm, stream)))
++                    pet_attn_ragged_fwd_short2<d><<<grid, nt, (2*Lm*P + Lm)*sizeof(float), stream>>>(
++                        a.qkv, a.bias, a.off, out, lse, a.N, a.H, a.scale, Lm);
 +            } else {
 +                const float * res = (const float *) dst->src[3]->data, * lse = res + a.D*a.T;
 +                const float * grad = (const float *) dst->src[4]->data;
 +                float * dx = (float *) dst->data, * db = dx + 3*a.D*a.T;
-+                if (tail > 0)
-+                    pet_ragged_zero_tail<<<(unsigned) tail, 128, 0, stream>>>(a.off, a.N, a.T, dx, (int) (3*a.D), db, a.H);
-+                pet_attn_ragged_bwd_short2<d><<<grid, nt, (2*Lm*P + 3*Lm)*sizeof(float), stream>>>(
-+                    a.qkv, a.bias, a.off, res, lse, grad, dx, db, a.N, a.H, a.scale, Lm);
++                pet_ragged_zero_tail_launch(a.off, a.N, a.T, tail, dx, (int) (3*a.D), db, a.H, stream);
++                if ((mm == 0 || !pet_mma_launch<d>(mm == 3, true, a.qkv, a.bias, a.off, res, lse, grad, dx, db,
++                                                   a.N, a.H, a.scale, Lm, stream)) &&
++                    (sp.x == 0 || !pet_split_launch<d>(sp.x, sp.y, sp.z, true, a.qkv, a.bias, a.off, res, lse, grad, dx, db,
++                                                       a.N, a.H, a.scale, Lm, stream)))
++                    pet_attn_ragged_bwd_short2<d><<<grid, nt, (2*Lm*P + 3*Lm)*sizeof(float), stream>>>(
++                        a.qkv, a.bias, a.off, res, lse, grad, dx, db, a.N, a.H, a.scale, Lm);
 +            }
 +            CUDA_CHECK(cudaGetLastError());
 +            return;
 +        }
 +        if (!back) {
 +            float * out = (float *) dst->data, * lse = out + a.D*a.T;
-+            if (tail > 0)
-+                pet_ragged_zero_tail<<<(unsigned) tail, 128, 0, stream>>>(a.off, a.N, a.T, out, (int) a.D, lse, a.H);
++            pet_ragged_zero_tail_launch(a.off, a.N, a.T, tail, out, (int) a.D, lse, a.H, stream);
 +            pet_attn_ragged_fwd_short<d><<<grid, SHORT_L, 0, stream>>>(a.qkv, a.bias, a.off, out, lse, a.N, a.H, a.scale);
 +        } else {
 +            const float * res = (const float *) dst->src[3]->data, * lse = res + a.D*a.T;
 +            const float * grad = (const float *) dst->src[4]->data;
 +            float * dx = (float *) dst->data, * db = dx + 3*a.D*a.T;
-+            if (tail > 0)
-+                pet_ragged_zero_tail<<<(unsigned) tail, 128, 0, stream>>>(a.off, a.N, a.T, dx, (int) (3*a.D), db, a.H);
++            pet_ragged_zero_tail_launch(a.off, a.N, a.T, tail, dx, (int) (3*a.D), db, a.H, stream);
 +            const size_t smem = pet_attn_short_bwd_smem<d>();
 +            static bool attr = false;
 +            if (!attr) {
@@ -2242,8 +3138,7 @@
 +    }
 +    if (!back) {
 +        float * out = (float *) dst->data, * lse = out + a.D*a.T;
-+        if (tail > 0)
-+            pet_ragged_zero_tail<<<(unsigned) tail, 128, 0, stream>>>(a.off, a.N, a.T, out, (int) a.D, lse, a.H);
++        pet_ragged_zero_tail_launch(a.off, a.N, a.T, tail, out, (int) a.D, lse, a.H, stream);
 +        if (a.N > 0) {
 +            const pet_ragged_shape s = pet_ragged_shape_for(a.H, d, RF, a.max_len, false);
 +            const dim3 grid((unsigned) a.N, (a.max_len + s.TP - 1) / s.TP), block(s.TP / RF * a.H);
@@ -2253,8 +3148,7 @@
 +        const float * res = (const float *) dst->src[3]->data, * lse = res + a.D*a.T;
 +        const float * grad = (const float *) dst->src[4]->data;
 +        float * dx = (float *) dst->data, * db = dx + 3*a.D*a.T;
-+        if (tail > 0)
-+            pet_ragged_zero_tail<<<(unsigned) tail, 128, 0, stream>>>(a.off, a.N, a.T, dx, (int) (3*a.D), db, a.H);
++        pet_ragged_zero_tail_launch(a.off, a.N, a.T, tail, dx, (int) (3*a.D), db, a.H, stream);
 +        if (a.N > 0) {
 +            const pet_ragged_shape sq = pet_ragged_shape_for(a.H, d, RB, a.max_len, false);
 +            const pet_ragged_shape sk = pet_ragged_shape_for(a.H, d, RB, a.max_len, true);
@@ -2852,7 +3746,7 @@
 +}
 --- /dev/null
 +++ b/src/ggml-cuda/pet-fused.cuh
-@@ -0,0 +1,13 @@
+@@ -0,0 +1,15 @@
 +#include "common.cuh"
 +
 +// LayerNorm of each edge paired with its reverse (GGML_OP_PET_PAIR_NORM / _BACK): see ggml_pet_pair_norm
@@ -2866,9 +3760,11 @@
 +// RMSNorm times weight, and its gradient plus a residual's (GGML_OP_PET_RMS_NORM / _BACK): see ggml_pet_rms_norm
 +void ggml_cuda_op_pet_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 +void ggml_cuda_op_pet_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++// the ADD add and the PET_RMS_NORM norm of it (ggml_pet_add_rms_norm) in one kernel; false: not fusable, nothing run
++bool ggml_cuda_op_pet_add_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * norm);
 --- /dev/null
 +++ b/src/ggml-cuda/pet-fused.cu
-@@ -0,0 +1,197 @@
+@@ -0,0 +1,259 @@
 +#include "pet-fused.cuh"
 +
 +// ---- pair norm: one block per edge row ----
@@ -2923,7 +3819,8 @@
 +}
 +
 +static __global__ void pet_pair_norm_back_kernel(const float * __restrict__ x, const int32_t * __restrict__ rev,
-+        const float * __restrict__ w, const float * __restrict__ g, float * __restrict__ dx, const int d, const float eps) {
++        const float * __restrict__ w, const float * __restrict__ g, const float * __restrict__ acc, float * __restrict__ dx,
++        const int d, const float eps) {
 +    const int64_t e = blockIdx.x, r = rev[e];
 +    const float * a = x + e*d, * b = x + r*d;
 +    float mean, rstd;
@@ -2943,7 +3840,8 @@
 +    float * dxe = dx + e*d;
 +    for (int c = threadIdx.x; c < d; c += blockDim.x) {
 +        const float xa = (a[c] - mean)*rstd;
-+        dxe[c] = rstd*(ge[c]*w[c] - me - xa*mxe) + rstd*(gr[d + c]*w[d + c] - mr - xa*mxr);
++        const float v = rstd*(ge[c]*w[c] - me - xa*mxe) + rstd*(gr[d + c]*w[d + c] - mr - xa*mxr);
++        dxe[c] = acc ? v + acc[e*d + c] : v;
 +    }
 +}
 +
@@ -2971,7 +3869,7 @@
 +    const int d = (int) x->ne[0];
 +    pet_pair_norm_back_kernel<<<(unsigned) E, pet_pair_threads(d), 0, ctx.stream()>>>((const float *) x->data,
 +        (const int32_t *) dst->src[1]->data, (const float *) dst->src[2]->data, (const float *) dst->src[3]->data,
-+        (float *) dst->data, d, ggml_get_op_params_f32(dst, 0));
++        dst->src[4] ? (const float *) dst->src[4]->data : nullptr, (float *) dst->data, d, ggml_get_op_params_f32(dst, 0));
 +    CUDA_CHECK(cudaGetLastError());
 +}
 +
@@ -3032,6 +3930,29 @@
 +    for (int c = threadIdx.x; c < d; c += blockDim.x) y[row*d + c] = (xr[c]*scale)*w[c];
 +}
 +
++// s = x + y and y_out = RMSNorm(s) w in one pass (an ADD and the PET_RMS_NORM of it): each block reads its
++// rows of x and y once, before it writes the same rows of s and of the norm (either may be x or y itself)
++static __global__ void pet_add_rms_norm_kernel(const float * x, const float * y, const float * __restrict__ w,
++        float * s, float * n, const int d, const float eps) {
++    const int64_t row = blockIdx.x;
++    const float * xr = x + row*d, * yr = y + row*d;
++    float * sr = s + row*d;
++    float q = 0.0f;
++    float v[4]; // d <= 4 blockDim.x (pet_pair_threads: up to 256 threads, d <= 1024)
++#pragma unroll
++    for (int k = 0; k < 4; k++) {
++        const int c = threadIdx.x + k*blockDim.x;
++        v[k] = c < d ? xr[c] + yr[c] : 0.0f;
++        q += v[k]*v[k];
++    }
++    const float scale = rsqrtf(block_sum4(make_float4(q, 0.0f, 0.0f, 0.0f)).x / d + eps); // syncs: all reads are done
++#pragma unroll
++    for (int k = 0; k < 4; k++) {
++        const int c = threadIdx.x + k*blockDim.x;
++        if (c < d) sr[c] = v[k], n[row*d + c] = (v[k]*scale)*w[c];
++    }
++}
++
 +static __global__ void pet_rms_norm_back_kernel(const float * __restrict__ x, const float * __restrict__ w, const float * __restrict__ g,
 +        const float * __restrict__ acc, float * __restrict__ dx, const int d, const float eps) {
 +    const int64_t row = blockIdx.x;
@@ -3054,6 +3975,43 @@
 +    pet_rms_norm_kernel<<<(unsigned) rows, pet_pair_threads(d), 0, ctx.stream()>>>((const float *) x->data,
 +        (const float *) dst->src[1]->data, (float *) dst->data, d, ggml_get_op_params_f32(dst, 0));
 +    CUDA_CHECK(cudaGetLastError());
++}
++
++// the ADD before a PET_RMS_NORM of ggml_pet_add_rms_norm, both in one kernel: false (nothing run) unless
++// add is the norm's src[0], f32, contiguous, of one shape (no broadcast), d <= 1024, and the memory of
++// each output either is that of an input exactly or overlaps neither
++bool ggml_cuda_op_pet_add_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * norm) {
++    const ggml_tensor * x = add->src[0], * y = add->src[1], * w = norm->src[1];
++    if (norm->op != GGML_OP_PET_RMS_NORM || ggml_get_op_params_i32(norm, 1) != 1 || norm->src[0] != add || add->op != GGML_OP_ADD ||
++        norm->src[3] != x || norm->src[4] != y ||
++        x->type != GGML_TYPE_F32 || y->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 || norm->type != GGML_TYPE_F32 ||
++        !ggml_are_same_shape(x, add) || !ggml_are_same_shape(y, add) || !ggml_is_contiguous(x) || !ggml_is_contiguous(y) ||
++        !ggml_is_contiguous(add) || !ggml_is_contiguous(norm) || add->ne[0] > 1024) {
++        return false;
++    }
++    auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
++        const char * a0 = (const char *) a->data, * b0 = (const char *) b->data;
++        return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
++    };
++    for (const ggml_tensor * o : {(const ggml_tensor *) add, (const ggml_tensor *) norm}) {
++        for (const ggml_tensor * i : {x, y, w}) {
++            if (overlap(o, i) && (o->data != i->data || i == w)) {
++                return false;
++            }
++        }
++    }
++    if (overlap(add, norm)) {
++        return false;
++    }
++    const int64_t rows = ggml_nrows(add);
++    if (rows > 0) {
++        const int d = (int) add->ne[0];
++        pet_add_rms_norm_kernel<<<(unsigned) rows, pet_pair_threads(d), 0, ctx.stream()>>>((const float *) x->data,
++            (const float *) y->data, (const float *) w->data, (float *) add->data, (float *) norm->data, d,
++            ggml_get_op_params_f32(norm, 0));
++        CUDA_CHECK(cudaGetLastError());
++    }
++    return true;
 +}
 +
 +void ggml_cuda_op_pet_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

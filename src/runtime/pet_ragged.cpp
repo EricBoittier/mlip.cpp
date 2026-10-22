@@ -43,6 +43,18 @@ struct Builder {
     if (fuse) return ggml_pet_rms_norm(ctx, x, weight(name + "_weight"), eps);
     return ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), weight(name + "_weight"));
   }
+  // the residual sum s = x + y and rms_norm(s): with the fused RMSNorm, one kernel on CUDA writing both
+  // (ggml_pet_add_rms_norm; MLIPCPP_RAGGED_FUSE_ADD_RMS=0: an ADD and rms_norm)
+  ggml_tensor *add_rms_norm(ggml_tensor *x, ggml_tensor *y, ggml_tensor *&s, const std::string &name, float eps) const {
+    static const bool fuse = env_on("MLIPCPP_RAGGED_FUSE_ADD_RMS") && env_on("MLIPCPP_RAGGED_FUSE_RMS");
+    if (fuse && ggml_is_contiguous(x) && ggml_is_contiguous(y)) {
+      ggml_tensor *n = ggml_pet_add_rms_norm(ctx, x, y, weight(name + "_weight"), eps);
+      s = n->src[0];
+      return n;
+    }
+    s = ggml_add(ctx, x, y);
+    return rms_norm(s, name, eps);
+  }
   ggml_tensor *layer_norm(ggml_tensor *x, const std::string &name, float eps) const {
     // MLIPCPP_RAGGED_LN_DECOMP=1: the LayerNorm of primitive ops (as GraphInterpreter::build_layer_norm)
     static const bool decomp = env_flag("MLIPCPP_RAGGED_LN_DECOMP");
@@ -193,8 +205,13 @@ PetRaggedOutputs build_pet_ragged(ggml_context *ctx, const PetRaggedSpec &spec,
     // 0.6 meV/atom into PET-MAD-xs energies and most of the TF32 force error
     // MLIPCPP_RAGGED_GEOM_TF32=1: in TF32 like the other products
     static const bool geom_tf32 = env_flag("MLIPCPP_RAGGED_GEOM_TF32");
+    // and its gradient products (that w.r.t. edge_geometry gives the forces) likewise
+    // MLIPCPP_RAGGED_GEOM_BACK_FP32=1: in full FP32 too (otherwise in TF32; a small gain in the TF32 force
+    // error of PET-MAD-xs, none for -s, and 0.1-0.2% slower at 10k atoms)
+    static const bool geom_back_fp32 = env_flag("MLIPCPP_RAGGED_GEOM_BACK_FP32");
     ggml_tensor *geo = ggml_mul_mat(ctx, geometry_w, edge_geometry);
     if (!geom_tf32) ggml_mul_mat_set_prec(geo, GGML_PREC_F32);
+    if (!geom_tf32 && geom_back_fp32) ggml_mul_mat_set_grad_prec(geo, GGML_PREC_F32);
     ggml_tensor *pre = ggml_add(ctx, geo, ggml_get_rows(ctx, table, in.neighbor_species));
     if (l > 0) pre = ggml_add(ctx, pre, ggml_mul_mat(ctx, block(2), messages));
     edge_tokens = b.linear(ggml_silu(ctx, ggml_add(ctx, pre, bias)), g + "compress_2"); // [d_pet, E]
@@ -207,11 +224,13 @@ PetRaggedOutputs build_pet_ragged(ggml_context *ctx, const PetRaggedSpec &spec,
     ggml_tensor *o = ggml_view_2d(ctx, attn, d_pet, n + e_cap, attn->nb[1], 0);
     o = b.linear(o, t + "attention_output_linear");
 
-    node = ggml_add(ctx, node, b.linear(b.columns(o, 0, n), t + "center_expansion"));
-    node = ggml_add(ctx, node, b.gated_mlp(b.rms_norm(node, t + "norm_center_features", spec.rms_eps), t + "center_mlp"));
+    ggml_tensor *normed = b.add_rms_norm(node, b.linear(b.columns(o, 0, n), t + "center_expansion"), node,
+                                         t + "norm_center_features", spec.rms_eps);
+    node = ggml_add(ctx, node, b.gated_mlp(normed, t + "center_mlp"));
 
-    ggml_tensor *edges = ggml_add(ctx, edge_tokens, b.columns(o, n, e_cap));
-    edges = ggml_add(ctx, edges, b.gated_mlp(b.rms_norm(edges, t + "norm_mlp", spec.rms_eps), t + "mlp"));
+    ggml_tensor *edges = nullptr;
+    normed = b.add_rms_norm(edge_tokens, b.columns(o, n, e_cap), edges, t + "norm_mlp", spec.rms_eps);
+    edges = ggml_add(ctx, edges, b.gated_mlp(normed, t + "mlp"));
 
     // messages of the next layer: the reversed edges mixed in
     const std::string c = std::to_string(l);
@@ -219,12 +238,18 @@ PetRaggedOutputs build_pet_ragged(ggml_context *ctx, const PetRaggedSpec &spec,
     // (the reverse of an edge's reverse is the edge, spare rows are their own reverse)
     // MLIPCPP_RAGGED_PAIR_CONCAT=1: gather the reverse rows, concatenate, then LayerNorm
     static const bool pair_concat = env_flag("MLIPCPP_RAGGED_PAIR_CONCAT");
+    // its gradient also sums the edges' other one (from the messages residual) in the same pass
+    // (MLIPCPP_RAGGED_PAIR_BACK_ACC=0: an ADD of the two)
+    static const bool pair_back_acc = env_on("MLIPCPP_RAGGED_PAIR_BACK_ACC");
     ggml_tensor *paired = pair_concat
         ? b.layer_norm(ggml_concat(ctx, edges, ggml_get_rows(ctx, edges, in.reverse), 0), "combination_norms_" + c, spec.ln_eps)
-        : ggml_pet_pair_norm(ctx, edges, in.reverse, b.weight("combination_norms_" + c + "_weight"),
-                             b.weight("combination_norms_" + c + "_bias"), spec.ln_eps);
+        : (pair_back_acc ? ggml_pet_pair_norm_acc : ggml_pet_pair_norm)(ctx, edges, in.reverse,
+              b.weight("combination_norms_" + c + "_weight"), b.weight("combination_norms_" + c + "_bias"), spec.ln_eps);
     ggml_tensor *mixed = b.mlp2(paired, "combination_mlps_" + c + "_0", "combination_mlps_" + c + "_2", false);
-    messages = ggml_add(ctx, ggml_add(ctx, messages, edges), mixed);
+    // (with pair_back_acc mixed first, the same sum: the backward then reaches the pair
+    // norm after the residual, whose gradient it sums)
+    messages = pair_back_acc ? ggml_add(ctx, mixed, ggml_add(ctx, messages, edges))
+                             : ggml_add(ctx, ggml_add(ctx, messages, edges), mixed);
   }
 
   // readout: node head, and edge head weighted by the cutoff and summed per atom
