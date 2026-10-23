@@ -30,19 +30,14 @@ namespace {
 
 constexpr size_t GRAPH_SIZE = 32768;
 
-struct Edges {
-  std::vector<int64_t> start;            // [n + 1]
-  std::vector<int32_t> j, rev;           // rev: the edge j -> i with the opposite shift
-  std::vector<std::array<int32_t, 3>> shift;
-  std::vector<float> v;                  // [E, 3]
-};
-
 bool primary(int i, int j, const std::array<int32_t, 3> &s) {
   if (i != j) return i < j;
   for (int c = 0; c < 3; c++)
     if (s[c] != 0) return s[c] > 0;
   return false;
 }
+
+} // namespace
 
 // full list, grouped by centre and sorted, with reverse edges (as GraphModel's host_edges)
 Edges neighbor_edges(const AtomicSystem &system, double cutoff, void *&vesin_state) {
@@ -135,6 +130,19 @@ Edges neighbor_edges(const AtomicSystem &system, double cutoff, void *&vesin_sta
   return out;
 }
 
+void free_vesin(void *&vesin_state) {
+#ifdef MLIPCPP_HAVE_VESIN
+  if (vesin_state) {
+    auto *l = static_cast<VesinNeighborList *>(vesin_state);
+    vesin_free(l);
+    delete l;
+  }
+#endif
+  vesin_state = nullptr;
+}
+
+namespace {
+
 void inverse3(const double A[3][3], double I[3][3], double &det) {
   det = A[0][0] * (A[1][1] * A[2][2] - A[1][2] * A[2][1]) - A[0][1] * (A[1][0] * A[2][2] - A[1][2] * A[2][0]) +
         A[0][2] * (A[1][0] * A[2][1] - A[1][1] * A[2][0]);
@@ -156,6 +164,9 @@ void inverse3(const double A[3][3], double I[3][3], double &det) {
 double row_norm(const float *a) {
   return std::sqrt(double(a[0]) * a[0] + double(a[1]) * a[1] + double(a[2]) * a[2]);
 }
+} // namespace
+int mesh_points(const float *a, double spacing) { return std::max(8, static_cast<int>(std::ceil(row_norm(a) / spacing))); }
+namespace {
 
 int env_mesh(int out[3]) {
   const char *e = std::getenv("MLIPCPP_PLATO_MESH");
@@ -189,7 +200,8 @@ struct PlatoModel::Graph {
 };
 
 PlatoModel::PlatoModel(PlatoOptions options) : options_(options) {
-  if (const char *e = std::getenv("MLIPCPP_PLATO_FOLD_IN_GRAPH")) options_.fold_in_graph = *e && *e != '0';
+  if (const char *e = std::getenv("MLIPCPP_PLATO_FOLD_IN_GRAPH")) options_.fold_in_graph = options_.fold_in_graph || (*e && *e != '0');
+  if (const char *e = std::getenv("MLIPCPP_PLATO_DECOMPOSED_LN")) options_.decomposed_layer_norm = options_.decomposed_layer_norm || (*e && *e != '0');
   if (!options_.fixed_mesh[0]) env_mesh(options_.fixed_mesh);
   // A/B of the parts (timing): MLIPCPP_PLATO_NO_MESH=1, MLIPCPP_PLATO_NO_LES=1
   if (const char *e = std::getenv("MLIPCPP_PLATO_NO_MESH")) options_.mesh = options_.mesh && !(*e && *e != '0');
@@ -201,13 +213,7 @@ PlatoModel::~PlatoModel() {
   if (galloc_) ggml_gallocr_free(galloc_);
   if (buf_w_) ggml_backend_buffer_free(buf_w_);
   if (ctx_w_) ggml_free(ctx_w_);
-#ifdef MLIPCPP_HAVE_VESIN
-  if (vesin_) {
-    auto *l = static_cast<VesinNeighborList *>(vesin_);
-    vesin_free(l);
-    delete l;
-  }
-#endif
+  free_vesin(vesin_);
 }
 
 const char *PlatoModel::backend_name() const { return backend_ ? ggml_backend_name(backend_->primary()) : "none"; }
@@ -243,6 +249,7 @@ bool PlatoModel::load_from_gguf(const std::string &path) {
   spec_.les = hy["les"].get<bool>() && options_.les;
   spec_.n_types = idx;
   spec_.fold_in_graph = options_.fold_in_graph;
+  spec_.decomposed_layer_norm = options_.decomposed_layer_norm;
   mesh_spacing_ = hy["mesh_spacing"];
   if (!hy["rope"].get<bool>()) throw std::runtime_error("Plato: needs rope");
   if (!hy["num_framed_layers"].is_null() && hy["num_framed_layers"].get<int>() != spec_.layers)
@@ -360,7 +367,7 @@ ModelResult PlatoModel::predict(const AtomicSystem &system, bool compute_forces)
     for (int a = 0; a < 3; a++)
       mesh[a] = options_.fixed_mesh[0] > 0
                     ? options_.fixed_mesh[a]
-                    : std::max(8, static_cast<int>(std::ceil(row_norm(cell->matrix[a]) / mesh_spacing_)));
+                    : mesh_points(cell->matrix[a], mesh_spacing_);
   CellConsts &K = consts_;
   bool same_cell = K.valid && K.periodic == periodic && K.mesh[0] == mesh[0] && K.mesh[1] == mesh[1] && K.mesh[2] == mesh[2];
   if (same_cell && periodic) same_cell = std::memcmp(K.cell, &cell->matrix[0][0], sizeof(K.cell)) == 0;
@@ -459,8 +466,9 @@ ModelResult PlatoModel::predict(const AtomicSystem &system, bool compute_forces)
     in.rel_identity = input(GGML_TYPE_F32, 9, 0, "rel_identity");
     in.positions = input(GGML_TYPE_F32, 3, n, "positions");
     in.strain = input(GGML_TYPE_F32, 3, 3, "strain");
-    in.inv_cell_t = input(GGML_TYPE_F32, 3, 3, "inv_cell_t");
-    in.volume = static_cast<float>(V);
+    in.atom_inv_cell_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, 3, n);
+    ggml_set_name(in.atom_inv_cell_t, "atom_inv_cell_t"), ggml_set_input(in.atom_inv_cell_t), g->inputs.push_back(in.atom_inv_cell_t);
+    in.inv_volume = input(GGML_TYPE_F32, 1, 1, "inv_volume");
     for (int a = 0; a < 3; a++) in.mesh_size[a] = mesh[a];
     if (mesh_on) {
       const int64_t Mh = int64_t(mesh[0]) * mesh[1] * (mesh[2] / 2 + 1);
@@ -493,8 +501,8 @@ ModelResult PlatoModel::predict(const AtomicSystem &system, bool compute_forces)
       g->grad_ev = ggml_graph_get_grad(g->graph, in.edge_vectors);
       g->grad_pos = ggml_graph_get_grad(g->graph, in.positions);
       g->grad_eps = ggml_graph_get_grad(g->graph, in.strain);
-      for (ggml_tensor *t : {g->grad_ev, g->grad_pos, g->grad_eps})
-        if (t) ggml_set_output(t);
+      for (ggml_tensor *t : {g->grad_ev, g->grad_pos, g->grad_eps}) // views: their sources too
+        for (; t; t = t->view_src) ggml_set_output(t);
       g->loss_grad = ggml_graph_get_grad_acc(g->graph, g->out.total);
       if (g->loss_grad) {
         ggml_set_input(g->loss_grad);
@@ -542,10 +550,13 @@ ModelResult PlatoModel::predict(const AtomicSystem &system, bool compute_forces)
     set(in.rbf0, rbf0.data());
     const float I9[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1}, Z9[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
     set(in.rel_identity, I9), set(in.strain, Z9);
-    float ict[9];
-    for (int j = 0; j < 3; j++)
-      for (int k = 0; k < 3; k++) ict[j * 3 + k] = static_cast<float>(Ci[k][j]);
-    set(in.inv_cell_t, ict);
+    std::vector<float> ict(9 * size_t(n));
+    for (int i = 0; i < n; i++)
+      for (int j = 0; j < 3; j++)
+        for (int k = 0; k < 3; k++) ict[9 * i + j * 3 + k] = static_cast<float>(Ci[k][j]);
+    set(in.atom_inv_cell_t, ict.data());
+    const float iv = V > 0 ? static_cast<float>(1.0 / V) : 0.0f;
+    set(in.inv_volume, &iv);
     set(in.positions, system.positions());
     if (!consts_uploaded_) {
       if (in.mesh_k) set(in.mesh_k, K.mesh_k.data()), set(in.mesh_k0_pad, K.mesh_pad.data()), set(in.mesh_deconv, K.mesh_deconv.data());
@@ -569,7 +580,7 @@ ModelResult PlatoModel::predict(const AtomicSystem &system, bool compute_forces)
   parts_.nl_ms = ms(t0, t1), parts_.prep_ms = ms(t1, t2), parts_.compute_ms = ms(t2, t3);
 
   ModelResult r;
-  float total = 0, sr = 0, les = 0;
+  float total = 0, sr = 0, les = 0; // one structure: [1, 1]
   ggml_backend_tensor_get(G->out.total, &total, 0, sizeof(float));
   ggml_backend_tensor_get(G->out.short_range, &sr, 0, sizeof(float));
   if (G->out.les) ggml_backend_tensor_get(G->out.les, &les, 0, sizeof(float));

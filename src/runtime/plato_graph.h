@@ -49,26 +49,36 @@ struct PlatoInputs {
   ggml_tensor *zero_ang = nullptr;         // F32 [d/h/2 F, n], zeros (the centres' RoPE angles)
   ggml_tensor *rbf0 = nullptr;             // F32 [n_rbf], the radial basis of the centre token (d = 1e-6)
   ggml_tensor *rel_identity = nullptr;     // F32 [9] (fold_in_graph)
-  // long range
+  // structures of the batch: atoms of structure g are consecutive
+  int n_struct = 1;
+  ggml_tensor *struct_index = nullptr;     // I32 [n], structure of each atom
+  ggml_tensor *energy_weights = nullptr;   // F32 [1, G]: total = sum_g w_g E_g
+  // long range (periodic batches: every structure on the same mesh and the same
+  // integer k set; open systems: one structure)
   ggml_tensor *positions = nullptr;        // F32 [3, n] (param)
-  ggml_tensor *strain = nullptr;           // F32 [3, 3], row-major eps (param, zeros)
-  ggml_tensor *inv_cell_t = nullptr;       // F32 [3, 3]: frac = mul_mat(inv_cell_t, positions)
-  float volume = 0;                        // periodic: |det cell|
+  ggml_tensor *strain = nullptr;           // F32 [3, 3, G], row-major eps per structure (param, zeros)
+  ggml_tensor *atom_inv_cell_t = nullptr;  // F32 [3, 3, n]: frac_i = mul_mat(inv_cell_t of its structure, x_i)
+  ggml_tensor *inv_volume = nullptr;       // F32 [1, G], 1 / |det cell|
+  ggml_tensor *onehot = nullptr;           // F32 [n, G], atom in structure
+  ggml_tensor *onehot_t = nullptr;         // F32 [G, n]
+  ggml_tensor *inv_count = nullptr;        // F32 [1, G], 1 / atoms
   int mesh_size[3] = {0, 0, 0};            // periodic mesh coupling
-  ggml_tensor *mesh_k = nullptr;           // F32 [3, M0 M1 (M2/2+1)], 2 pi m inv(cell)^T
+  ggml_tensor *mesh_k = nullptr;           // F32 [3, M0 M1 (M2/2+1), G], 2 pi m inv(cell)^T
   ggml_tensor *mesh_k0_pad = nullptr;      // F32 [1, ...], 1 at k = 0, else 0
   ggml_tensor *mesh_deconv = nullptr;      // F32 [1, ...], (k != 0) / prod_a ((4 + 2 cos(2 pi m_a / M_a)) / 6)^2
-  ggml_tensor *les_k = nullptr;            // F32 [3, nk], half-space k vectors with |k| < kcut / sigma
+  ggml_tensor *les_k = nullptr;            // F32 [3, nk, G], half-space k vectors with |k| < kcut / sigma
   ggml_tensor *les_n = nullptr;            // F32 [3, nk], 2 pi n (phases 2 pi n . frac)
   ggml_tensor *les_taper = nullptr;        // F32 [1, nk], 1 where the cosine window is not 1
-  ggml_tensor *offdiag = nullptr;          // F32 [n, n], open-system LES: 1 - I
+  ggml_tensor *offdiag = nullptr;          // F32 [n, n], open-system LES (one structure): 1 - I
 };
 
 struct PlatoOutputs {
-  ggml_tensor *total = nullptr;     // [1] unscaled energy: differentiate this
-  ggml_tensor *short_range = nullptr; // [1] energy head part
-  ggml_tensor *les = nullptr;       // [1] LES part (or nullptr)
-  ggml_tensor *charges = nullptr;   // [n, Q] centred latent charges (or nullptr)
+  ggml_tensor *energies = nullptr;    // [1, G] unscaled energy per structure
+  ggml_tensor *total = nullptr;       // [1] sum_g w_g E_g: differentiate this
+  ggml_tensor *short_range = nullptr; // [1, G] energy head part
+  ggml_tensor *les = nullptr;         // [1, G] LES part (or nullptr)
+  ggml_tensor *charges = nullptr;     // [n, Q] centred latent charges (or nullptr): an
+                                      // electronegativity term sum_i chi_i q_i adds here
 };
 
 /// weights by checkpoint (state dict) name, plus "fold.<prefix>" for the host folds

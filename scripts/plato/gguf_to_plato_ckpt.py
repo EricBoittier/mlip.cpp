@@ -4,9 +4,9 @@
     python scripts/plato/gguf_to_plato_ckpt.py model.gguf -o model.ckpt [--check orig.ckpt]
 
 The model is rebuilt from the stored hypers and dataset info and every state-dict
-tensor is loaded from the GGUF bits. The checkpoint has no optimizer state (as
-``ModelInterface.get_checkpoint``); ``mtt train`` can start from it with
-``restart`` only as a fine-tune. ``--check`` compares every tensor with the one in
+tensor is loaded from the GGUF bits. The checkpoint has no optimizer or scheduler state
+and no epoch: ``mtt train options.yaml --restart model.ckpt`` trains from these
+weights with a fresh Adam and schedule (a fine-tune). ``--check`` compares every tensor with the one in
 the original checkpoint's best state dict, bit for bit.
 """
 
@@ -76,7 +76,13 @@ def main():
     # the GGUF's tensors as they are (load_state_dict casts float64 buffers into the
     # fresh model's float32 ones); load_checkpoint reads the best state dict
     ckpt["model_state_dict"] = ckpt["best_model_state_dict"] = state
-    ckpt["epoch"] = ckpt["best_epoch"] = json.loads(meta.get("plato.source", "{}")).get("best_epoch")
+    ckpt["epoch"] = ckpt["best_epoch"] = None
+    # trainer state for `mtt train --restart`: none, so the restart starts at epoch 0 with a
+    # fresh optimizer and schedule from these weights
+    from metatrain.experimental.plato_pet_lr.trainer import Trainer
+
+    ckpt.update(trainer_ckpt_version=Trainer.__checkpoint_version__, train_hypers=None, optimizer_state_dict=None,
+                scheduler_state_dict=None, best_metric=None, best_optimizer_state_dict=None)
     ckpt["model_ckpt_version"] = int(meta.get("plato.checkpoint_version", ckpt["model_ckpt_version"]))
     torch.save(ckpt, args.output)
     print(f"{args.output}: {len(state)} tensors")

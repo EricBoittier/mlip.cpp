@@ -7,6 +7,7 @@
 #include "mlipcpp/model.h"
 #include "runtime/plato_graph.h"
 
+#include <array>
 #include <map>
 #include <memory>
 #include <string>
@@ -29,7 +30,20 @@ struct PlatoOptions {
   int fixed_mesh[3] = {0, 0, 0};
   bool mesh = true, les = true; // the model's own switches (parity of the parts)
   bool fold_in_graph = false;   // training layout (MLIPCPP_PLATO_FOLD_IN_GRAPH=1)
+  bool decomposed_layer_norm = false; // LayerNorms of primitive ops (weight gradients)
 };
+
+/// full neighbour list grouped by centre and sorted, with reverse edges
+struct Edges {
+  std::vector<int64_t> start;            // [n + 1]
+  std::vector<int32_t> j, rev;           // rev: the edge j -> i with the opposite shift
+  std::vector<std::array<int32_t, 3>> shift;
+  std::vector<float> v;                  // [E, 3], x_j - x_i + shift . cell
+};
+Edges neighbor_edges(const AtomicSystem &system, double cutoff, void *&vesin_state);
+void free_vesin(void *&vesin_state);
+/// mesh size by PyTorch's rule from a cell row (|a| in double)
+int mesh_points(const float *cell_row, double spacing);
 
 class PlatoModel : public Model {
 public:
@@ -55,6 +69,14 @@ public:
   };
   const Parts &last_parts() const { return parts_; }
   const char *backend_name() const;
+
+  // training access (src/train/plato_train.cpp)
+  const std::map<std::string, ggml_tensor *> &weights() const { return weights_; }
+  std::shared_ptr<BackendProvider> backend() const { return backend_; }
+  double energy_scale() const { return energy_scale_; }
+  double mesh_spacing() const { return mesh_spacing_; }
+  const std::map<int, double> &composition() const { return composition_; }
+  const std::map<int, int> &species_index() const { return species_index_; }
 
 private:
   struct Graph;

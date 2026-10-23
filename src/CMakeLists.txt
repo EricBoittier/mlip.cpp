@@ -245,6 +245,8 @@ if(MLIPCPP_BUILD_TRAINING AND UNIX AND NOT EMSCRIPTEN)
     # Plato-PET-LR parity against PyTorch references and timing
     add_executable(mlipcpp-plato bin/mlipcpp_plato.cpp)
     target_link_libraries(mlipcpp-plato PRIVATE mlipcpp_train)
+    add_executable(mlipcpp-train-plato bin/mlipcpp_train_plato.cpp)
+    target_link_libraries(mlipcpp-train-plato PRIVATE mlipcpp_train)
 
     add_executable(mlipcpp-predict bin/mlipcpp_predict.cpp)
     target_link_libraries(mlipcpp-predict PRIVATE mlipcpp_train)

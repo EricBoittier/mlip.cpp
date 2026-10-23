@@ -67,13 +67,14 @@ struct B {
   ggml_tensor *cols(ggml_tensor *x, int64_t first, int64_t count) const {
     return ggml_view_2d(ctx, x, x->ne[0], count, x->nb[1], first * x->nb[1]);
   }
-  // k (I + eps)^-T to first order: k_b - sum_a eps_ba k_a; and |k|^2
+  // k (I + eps)^-T to first order: k_b - sum_a eps_ba k_a, per structure (k [3, m, G])
   ggml_tensor *strained(ggml_tensor *k) const { return ggml_sub(ctx, k, mm_f32(ctx, in.strain, k)); }
-  // 1 / V(eps) to first order: (1 - tr eps) / V
+  // 1 / V(eps) to first order per structure: (1 - tr eps) / V, [1, G]
   ggml_tensor *inv_volume() const {
-    auto e = [&](int k) { return ggml_view_1d(ctx, in.strain, 1, k * sizeof(float)); }; // contiguous views (CUDA SUM)
-    ggml_tensor *tr = ggml_add(ctx, ggml_add(ctx, e(0), e(4)), e(8));
-    return ggml_scale_bias(ctx, tr, -1.0f / in.volume, 1.0f / in.volume);
+    const int64_t G = in.strain->ne[2];
+    auto e = [&](int k) { return ggml_cont(ctx, ggml_view_2d(ctx, in.strain, 1, G, in.strain->nb[2], k * sizeof(float))); };
+    ggml_tensor *tr = ggml_add(ctx, ggml_add(ctx, e(0), e(4)), e(8)); // [1, G]
+    return ggml_mul(ctx, ggml_scale_bias(ctx, tr, -1.0f, 1.0f), in.inv_volume);
   }
 };
 
@@ -90,9 +91,12 @@ PlatoOutputs build_plato(ggml_context *ctx, const PlatoSpec &spec, const std::ma
   ggml_tensor *ev = in.edge_vectors;                                     // [3, E]
   ggml_tensor *dist = ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, ev))); // [1, E]
   ggml_tensor *x2 = ggml_sqr(ctx, ggml_scale(ctx, dist, 1.0f / rc));
-  ggml_tensor *one_m = ggml_scale_bias(ctx, x2, -1.0f, 1.0f);            // 1 - (d / rc)^2 > 0 (d < rc)
+  // 1 - (d / rc)^2, > 0 for the listed edges; clamped at 0 (+ 1e-30 inside the log, a
+  // softmax weight of 1e-90) for geometries moved past the list's cutoff (the training
+  // step's displaced evaluations), where f_c and its first two derivatives vanish
+  ggml_tensor *one_m = ggml_relu(ctx, ggml_scale_bias(ctx, x2, -1.0f, 1.0f));
   ggml_tensor *fc = ggml_mul(ctx, ggml_sqr(ctx, one_m), one_m);          // [1, E]
-  ggml_tensor *log_fc = ggml_reshape_1d(ctx, ggml_scale(ctx, ggml_log(ctx, one_m), 3.0f), E);
+  ggml_tensor *log_fc = ggml_reshape_1d(ctx, ggml_scale(ctx, ggml_log(ctx, ggml_scale_bias(ctx, one_m, 1.0f, 1e-30f)), 3.0f), E);
 
   // RoPE angles r . R_f omega_j: [hd F, T], the centres' (r = 0) zero
   ggml_tensor *ang_e = mm_f32(ctx, b.weight("rope.angles"), ev);   // [F hd, E]
@@ -120,7 +124,9 @@ PlatoOutputs build_plato(ggml_context *ctx, const PlatoSpec &spec, const std::ma
   ggml_tensor *tok = ggml_concat(ctx, center_tok, edge_tok, 1); // [d, T]
 
   ggml_tensor *frac = nullptr;
-  if (periodic && (spec.mesh || spec.les)) frac = mm_f32(ctx, in.inv_cell_t, in.positions); // [3, n]
+  if (periodic && (spec.mesh || spec.les)) // [3, n]: each atom with the inverse cell of its structure
+    frac = ggml_reshape_2d(ctx, mm_f32(ctx, in.atom_inv_cell_t, ggml_reshape_3d(ctx, in.positions, 3, 1, n)), 3, n);
+  const int64_t G = in.n_struct;
 
   const float scale = 1.0f / std::sqrt(static_cast<float>(ch));
   for (int l = 0; l < spec.layers; l++) {
@@ -139,56 +145,83 @@ PlatoOutputs build_plato(ggml_context *ctx, const PlatoSpec &spec, const std::ma
       const int64_t Mh = int64_t(M0) * M1 * (M2 / 2 + 1), C = spec.mesh_channels;
       ggml_tensor *xc = b.cols(tok, 0, n);
       ggml_tensor *v = b.frame_linear(b.layer_norm(xc, "coupling.norm"), "coupling.down"); // [C, n]
-      ggml_tensor *rho = ggml_plato_spread(ctx, v, frac, M0, M1, M2);                     // [M2, M1, M0, C]
-      ggml_tensor *rk = ggml_plato_fft3(ctx, rho, 0, M0, M1, M2);                         // [2 Mh2, M1, M0, C]
-      // the filter 4 pi / V exp(-sigma^2 k^2 / 2) / k^2 (1 + filt(|k|)) / deconv, under strain
-      ggml_tensor *k = b.strained(in.mesh_k);                                    // [3, Mh]
-      ggml_tensor *k2 = ggml_sum_rows(ctx, ggml_sqr(ctx, k));                    // [1, Mh]
+      if (G > 1) // the channels of structure g at [g C, (g + 1) C): [C G, n]
+        v = ggml_reshape_2d(ctx, ggml_mul(ctx, ggml_repeat(ctx, ggml_reshape_3d(ctx, v, C, 1, n), ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, G, n)),
+                                          ggml_reshape_3d(ctx, in.onehot_t, 1, G, n)), C * G, n);
+      ggml_tensor *rho = ggml_plato_spread(ctx, v, frac, M0, M1, M2);                     // [M2, M1, M0, C G]
+      ggml_tensor *rk = ggml_plato_fft3(ctx, rho, 0, M0, M1, M2);                         // [2 Mh2, M1, M0, C G]
+      // the filter 4 pi / V exp(-sigma^2 k^2 / 2) / k^2 (1 + filt(|k|)) / deconv, under strain, per structure
+      ggml_tensor *k = b.strained(in.mesh_k);                                    // [3, Mh, G]
+      ggml_tensor *k2 = ggml_sum_rows(ctx, ggml_sqr(ctx, k));                    // [1, Mh, G]
       ggml_tensor *k2s = ggml_add(ctx, k2, in.mesh_k0_pad);                      // 1 at k = 0
       const float s2 = spec.mesh_sigma * spec.mesh_sigma;
       ggml_tensor *base = ggml_div(ctx, ggml_exp(ctx, ggml_scale(ctx, k2, -0.5f * s2)), k2s);
-      base = ggml_mul(ctx, ggml_mul(ctx, base, in.mesh_deconv), ggml_scale(ctx, b.inv_volume(), 4.0f * M_PI));
-      ggml_tensor *filt = b.linear(ggml_silu(ctx, b.linear(ggml_sqrt(ctx, k2s), "coupling.filt.0")), "coupling.filt.2"); // [C, Mh]
-      ggml_tensor *g = ggml_mul(ctx, ggml_scale_bias(ctx, filt, 1.0f, 1.0f), base);                                     // [C, Mh]
-      g = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_transpose(ctx, g)), 1, Mh, C);                                       // [1, Mh, C]
-      rk = ggml_reshape_4d(ctx, ggml_mul(ctx, ggml_reshape_3d(ctx, rk, 2, Mh, C), g), rk->ne[0], M1, M0, C);
-      ggml_tensor *phi = ggml_plato_fft3(ctx, rk, 1, M0, M1, M2);                  // [M2, M1, M0, C]
-      ggml_tensor *m = ggml_plato_gather(ctx, phi, frac, false);                    // [C, n]
+      base = ggml_mul(ctx, ggml_mul(ctx, base, in.mesh_deconv),
+                      ggml_reshape_3d(ctx, ggml_scale(ctx, b.inv_volume(), 4.0f * M_PI), 1, 1, G));
+      ggml_tensor *filt = b.linear(ggml_silu(ctx, b.linear(ggml_sqrt(ctx, k2s), "coupling.filt.0")), "coupling.filt.2"); // [C, Mh, G]
+      ggml_tensor *g = ggml_mul(ctx, ggml_scale_bias(ctx, filt, 1.0f, 1.0f), base);                                     // [C, Mh, G]
+      g = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_permute(ctx, g, 1, 0, 2, 3)), 1, Mh, C * G);                         // [1, Mh, C G]
+      rk = ggml_reshape_4d(ctx, ggml_mul(ctx, ggml_reshape_3d(ctx, rk, 2, Mh, C * G), g), rk->ne[0], M1, M0, C * G);
+      ggml_tensor *phi = ggml_plato_fft3(ctx, rk, 1, M0, M1, M2);                  // [M2, M1, M0, C G]
+      ggml_tensor *m = ggml_plato_gather(ctx, phi, frac, false);                    // [C G, n]
+      if (G > 1) { // each atom's own structure: sum_g onehot[g, i] m[g C + c, i]
+        m = ggml_mul(ctx, ggml_reshape_3d(ctx, m, C, G, n), ggml_reshape_3d(ctx, in.onehot_t, 1, G, n));
+        m = ggml_reshape_2d(ctx, ggml_sum_rows(ctx, ggml_cont(ctx, ggml_permute(ctx, m, 1, 0, 2, 3))), C, n);
+      }
       ggml_tensor *delta = b.frame_linear(m, "coupling.up");                        // [d, n]
       tok = ggml_concat(ctx, ggml_add(ctx, xc, delta), b.cols(tok, n, E), 1);
     }
   }
 
-  // readout: h = tok_i + sum_e fc_e tok_e
+  // readout: h = tok_i + sum_e fc_e tok_e; energies per structure
   ggml_tensor *edges = ggml_mul(ctx, b.cols(tok, n, E), fc);
   ggml_tensor *h = ggml_add(ctx, b.cols(tok, 0, n), ggml_get_rows_back(ctx, edges, in.centers, b.cols(tok, 0, n)));
-  out.short_range = ggml_sum(ctx, b.frame_mlp(h, "energy_head")); // [1]
-  out.total = out.short_range;
+  ggml_tensor *shape_g = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, G);
+  auto per_structure = [&](ggml_tensor *atom_values) { // [1, n] -> [1, G]
+    return G == 1 ? ggml_reshape_2d(ctx, ggml_sum(ctx, atom_values), 1, 1)
+                  : ggml_get_rows_back(ctx, ggml_reshape_2d(ctx, atom_values, 1, n), in.struct_index, shape_g);
+  };
+  out.short_range = per_structure(b.frame_mlp(h, "energy_head")); // [1, G]
+  out.energies = out.short_range;
   if (spec.les) {
     const int64_t Q = spec.n_charges;
+    if (G > 1 && Q != 1) throw std::runtime_error("Plato: batched LES needs one charge channel");
     ggml_tensor *q = b.frame_mlp(h, "charge_head");                 // [Q, n]
     q = Q == 1 ? ggml_reshape_2d(ctx, q, n, 1) : ggml_cont(ctx, ggml_transpose(ctx, q)); // [n, Q]
-    q = ggml_sub(ctx, q, ggml_repeat(ctx, ggml_scale(ctx, ggml_sum_rows(ctx, q), 1.0f / n), q));
+    if (G == 1) {
+      q = ggml_sub(ctx, q, ggml_repeat(ctx, ggml_scale(ctx, ggml_sum_rows(ctx, q), 1.0f / n), q));
+    } else { // the mean of each structure
+      ggml_tensor *mean = ggml_mul(ctx, ggml_reshape_2d(ctx, mm_f32(ctx, in.onehot, q), 1, G), in.inv_count); // [1, G]
+      q = ggml_sub(ctx, q, ggml_reshape_2d(ctx, ggml_get_rows(ctx, mean, in.struct_index), n, 1));
+    }
     out.charges = q;
     const float sigma = spec.les_sigma;
     ggml_tensor *e = nullptr;
     if (periodic) {
-      ggml_tensor *ph = mm_f32(ctx, frac, in.les_n);           // [n, nk]
-      ggml_tensor *Cq = mm_f32(ctx, ggml_cos(ctx, ph), q);     // [nk, Q]
-      ggml_tensor *Sq = mm_f32(ctx, ggml_sin(ctx, ph), q);
-      ggml_tensor *k = b.strained(in.les_k);
-      ggml_tensor *k2 = ggml_sum_rows(ctx, ggml_sqr(ctx, k));        // [1, nk]
+      ggml_tensor *qb = G == 1 ? q : ggml_mul(ctx, in.onehot, q);    // [n, G Q]: each structure's charges
+      ggml_tensor *ph = mm_f32(ctx, frac, in.les_n);                 // [n, nk]
+      ggml_tensor *Cq = mm_f32(ctx, ggml_cos(ctx, ph), qb);          // [nk, G Q]
+      ggml_tensor *Sq = mm_f32(ctx, ggml_sin(ctx, ph), qb);
+      const int64_t nk = in.les_n->ne[1];
+      ggml_tensor *k = b.strained(in.les_k);                         // [3, nk, G]
+      ggml_tensor *k2 = ggml_reshape_2d(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, k)), nk, G); // [nk, G]
       const float kc = spec.les_kcut / sigma, wd = 1.0f / sigma;
       // cosine window over |k| in (kc - wd, kc): x = (|k| - (kc - wd)) / wd where tapered, else 0
-      ggml_tensor *xw = ggml_mul(ctx, ggml_scale_bias(ctx, ggml_sqrt(ctx, k2), 1.0f / wd, -(kc - wd) / wd), in.les_taper);
+      ggml_tensor *taper = ggml_reshape_2d(ctx, in.les_taper, nk, 1);
+      ggml_tensor *xw = ggml_mul(ctx, ggml_scale_bias(ctx, ggml_sqrt(ctx, k2), 1.0f / wd, -(kc - wd) / wd), taper);
       ggml_tensor *win = ggml_scale_bias(ctx, ggml_cos(ctx, ggml_scale(ctx, xw, static_cast<float>(M_PI))), 0.5f, 0.5f);
       ggml_tensor *gk = ggml_div(ctx, ggml_mul(ctx, win, ggml_exp(ctx, ggml_scale(ctx, k2, -0.5f * sigma * sigma))), k2);
-      ggml_tensor *s = ggml_add(ctx, ggml_sqr(ctx, Cq), ggml_sqr(ctx, Sq));        // [nk, Q]
-      ggml_tensor *rec = ggml_sum(ctx, ggml_mul(ctx, s, ggml_reshape_2d(ctx, gk, k2->ne[1], 1)));
+      ggml_tensor *sk = ggml_add(ctx, ggml_sqr(ctx, Cq), ggml_sqr(ctx, Sq));        // [nk, G Q]
+      ggml_tensor *rec;
+      if (G == 1) rec = ggml_reshape_2d(ctx, ggml_sum(ctx, ggml_mul(ctx, sk, gk)), 1, 1);
+      else rec = ggml_sum_rows(ctx, ggml_mul(ctx, sk, gk));                       // [1, G]
       rec = ggml_mul(ctx, rec, ggml_scale(ctx, b.inv_volume(), 4.0f * M_PI));
-      ggml_tensor *self = ggml_scale(ctx, ggml_sum(ctx, ggml_sqr(ctx, q)), 1.0f / (std::sqrt(2.0f * M_PI) * sigma));
+      ggml_tensor *self = G == 1 ? ggml_reshape_2d(ctx, ggml_sum(ctx, ggml_sqr(ctx, q)), 1, 1)
+                                 : ggml_sum_rows(ctx, ggml_sqr(ctx, qb));          // [1, G]
+      self = ggml_scale(ctx, self, 1.0f / (std::sqrt(2.0f * M_PI) * sigma));
       e = ggml_scale(ctx, ggml_sub(ctx, rec, self), KE);
     } else {
+      if (G != 1) throw std::runtime_error("Plato: open-system LES for one structure at a time");
       ggml_tensor *pos = in.positions;                                          // [3, n]
       ggml_tensor *shape = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, n, n);
       ggml_tensor *rij = ggml_sub(ctx, ggml_repeat(ctx, ggml_reshape_3d(ctx, pos, 3, n, 1), shape),
@@ -198,11 +231,12 @@ PlatoOutputs build_plato(ggml_context *ctx, const PlatoSpec &spec, const std::ma
       ggml_tensor *dij = ggml_sqrt(ctx, ggml_add(ctx, d2, ggml_scale_bias(ctx, in.offdiag, -1.0f, 1.0f)));
       ggml_tensor *pair = ggml_mul(ctx, ggml_div(ctx, ggml_plato_erf(ctx, ggml_scale(ctx, dij, 1.0f / (std::sqrt(2.0f) * sigma))), dij),
                                    in.offdiag);
-      e = ggml_scale(ctx, ggml_sum(ctx, ggml_mul(ctx, q, mm_f32(ctx, pair, q))), 0.5f * KE);
+      e = ggml_reshape_2d(ctx, ggml_scale(ctx, ggml_sum(ctx, ggml_mul(ctx, q, mm_f32(ctx, pair, q))), 0.5f * KE), 1, 1);
     }
     out.les = e;
-    out.total = ggml_add(ctx, out.total, e);
+    out.energies = ggml_add(ctx, out.energies, e);
   }
+  out.total = in.energy_weights ? ggml_sum(ctx, ggml_mul(ctx, out.energies, in.energy_weights)) : ggml_sum(ctx, out.energies);
   return out;
 }
 
