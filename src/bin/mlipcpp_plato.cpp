@@ -185,6 +185,26 @@ int bench(int argc, char **argv) {
   return 0;
 }
 
+// any GGUF through load_model (e.g. a PET GraphModel): ms per energy + forces call
+int bench_any(int argc, char **argv) {
+  const int K = std::stoi(arg(argc, argv, "--tile", "1")), N = std::stoi(arg(argc, argv, "--repeat", "20")),
+            W = std::stoi(arg(argc, argv, "--warmup", "3"));
+  auto m = load_model(argv[2]);
+  const AtomicSystem s = tile(read_all(argv[3]).at(0), K);
+  for (int i = 0; i < W; i++) m->predict(s, true);
+  std::vector<double> tot;
+  double E = 0;
+  for (int i = 0; i < N; i++) {
+    const auto t0 = std::chrono::steady_clock::now();
+    E = m->predict(s, true).energy;
+    tot.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+  }
+  std::sort(tot.begin(), tot.end());
+  std::printf("{\"model\": \"%s\", \"atoms\": %d, \"energy\": %.6f, \"ms_total\": %.3f, \"ms_min\": %.3f, \"repeat\": %d}\n",
+              m->model_type().c_str(), s.num_atoms(), E, tot[tot.size() / 2], tot[0], N);
+  return 0;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -196,6 +216,7 @@ int main(int argc, char **argv) {
   try {
     if (!std::strcmp(argv[1], "check")) return check(argc, argv);
     if (!std::strcmp(argv[1], "bench")) return bench(argc, argv);
+    if (!std::strcmp(argv[1], "bench-any")) return bench_any(argc, argv);
   } catch (const std::exception &e) {
     std::fprintf(stderr, "error: %s\n", e.what());
     return 1;

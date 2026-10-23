@@ -1,5 +1,5 @@
 """PyTorch reference energies, forces and stress of a plato_pet_lr checkpoint for the
-mlip.cpp parity tests (tests/plato_parity.py, mlipcpp-plato-check).
+mlip.cpp parity check (mlipcpp-plato check MODEL.gguf OUTDIR).
 
     python scripts/plato/plato_reference.py model.ckpt test.xyz OUTDIR [--rt model-rt.ckpt]
 

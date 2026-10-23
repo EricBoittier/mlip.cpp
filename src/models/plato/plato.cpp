@@ -350,62 +350,74 @@ ModelResult PlatoModel::predict(const AtomicSystem &system, bool compute_forces)
   int max_len = 1;
   for (int i = 0; i < n; i++) max_len = std::max<int>(max_len, 1 + static_cast<int>(ed.start[i + 1] - ed.start[i]));
 
-  // cell-dependent long-range constants
-  double C[3][3] = {}, Ci[3][3] = {}, det = 0, V = 0;
-  int mesh[3] = {0, 0, 0};
-  std::vector<float> mesh_k, mesh_pad, mesh_deconv, les_k, les_n, les_taper;
-  int64_t nk = 0;
+  // cell-dependent long-range constants (cached on the cell)
   const bool mesh_on = periodic && spec_.mesh, les_on = spec_.les;
-  if (periodic) {
-    for (int a = 0; a < 3; a++)
-      for (int b = 0; b < 3; b++) C[a][b] = cell->matrix[a][b];
-    inverse3(C, Ci, det);
-    V = std::abs(det);
-  }
-  if (mesh_on) {
+  int mesh[3] = {0, 0, 0};
+  if (mesh_on)
     for (int a = 0; a < 3; a++)
       mesh[a] = options_.fixed_mesh[0] > 0
                     ? options_.fixed_mesh[a]
                     : std::max(8, static_cast<int>(std::ceil(row_norm(cell->matrix[a]) / mesh_spacing_)));
-    const int M0 = mesh[0], M1 = mesh[1], M2 = mesh[2], Mh2 = M2 / 2 + 1;
-    const int64_t Mh = int64_t(M0) * M1 * Mh2;
-    mesh_k.resize(3 * Mh), mesh_pad.assign(Mh, 0.0f), mesh_deconv.resize(Mh);
-    auto freq = [](int i, int M) { return i <= (M - 1) / 2 ? i : i - M; };
-    for (int i0 = 0; i0 < M0; i0++)
-      for (int i1 = 0; i1 < M1; i1++)
-        for (int i2 = 0; i2 < Mh2; i2++) {
-          const int64_t e = (int64_t(i0) * M1 + i1) * Mh2 + i2;
-          const double m[3] = {double(freq(i0, M0)), double(freq(i1, M1)), double(i2)};
-          for (int b = 0; b < 3; b++)
-            mesh_k[3 * e + b] = static_cast<float>(2 * M_PI * (m[0] * Ci[b][0] + m[1] * Ci[b][1] + m[2] * Ci[b][2]));
-          double dc = 1;
-          for (int a = 0; a < 3; a++) {
-            const double f = (4 + 2 * std::cos(2 * M_PI * m[a] / mesh[a])) / 6;
-            dc *= f * f;
+  CellConsts &K = consts_;
+  bool same_cell = K.valid && K.periodic == periodic && K.mesh[0] == mesh[0] && K.mesh[1] == mesh[1] && K.mesh[2] == mesh[2];
+  if (same_cell && periodic) same_cell = std::memcmp(K.cell, &cell->matrix[0][0], sizeof(K.cell)) == 0;
+  if (!same_cell) {
+    K = CellConsts{};
+    K.valid = true, K.periodic = periodic;
+    for (int a = 0; a < 3; a++) K.mesh[a] = mesh[a];
+    if (periodic) {
+      std::memcpy(K.cell, &cell->matrix[0][0], sizeof(K.cell));
+      double C[3][3], det = 0;
+      for (int a = 0; a < 3; a++)
+        for (int b = 0; b < 3; b++) C[a][b] = cell->matrix[a][b];
+      inverse3(C, K.inv, det);
+      K.volume = std::abs(det);
+    }
+    const auto &Ci = K.inv;
+    if (mesh_on) {
+      const int M0 = mesh[0], M1 = mesh[1], M2 = mesh[2], Mh2 = M2 / 2 + 1;
+      const int64_t Mh = int64_t(M0) * M1 * Mh2;
+      K.mesh_k.resize(3 * Mh), K.mesh_pad.assign(Mh, 0.0f), K.mesh_deconv.resize(Mh);
+      auto freq = [](int i, int M) { return i <= (M - 1) / 2 ? i : i - M; };
+      for (int i0 = 0; i0 < M0; i0++)
+        for (int i1 = 0; i1 < M1; i1++)
+          for (int i2 = 0; i2 < Mh2; i2++) {
+            const int64_t e = (int64_t(i0) * M1 + i1) * Mh2 + i2;
+            const double m[3] = {double(freq(i0, M0)), double(freq(i1, M1)), double(i2)};
+            for (int b = 0; b < 3; b++)
+              K.mesh_k[3 * e + b] = static_cast<float>(2 * M_PI * (m[0] * Ci[b][0] + m[1] * Ci[b][1] + m[2] * Ci[b][2]));
+            double dc = 1;
+            for (int a = 0; a < 3; a++) {
+              const double f = (4 + 2 * std::cos(2 * M_PI * m[a] / mesh[a])) / 6;
+              dc *= f * f;
+            }
+            const bool zero = i0 == 0 && i1 == 0 && i2 == 0;
+            K.mesh_pad[e] = zero ? 1.0f : 0.0f;
+            K.mesh_deconv[e] = zero ? 0.0f : static_cast<float>(1.0 / dc);
           }
-          const bool zero = i0 == 0 && i1 == 0 && i2 == 0;
-          mesh_pad[e] = zero ? 1.0f : 0.0f;
-          mesh_deconv[e] = zero ? 0.0f : static_cast<float>(1.0 / dc);
-        }
+    }
+    if (les_on && periodic) {
+      const double kc = spec_.les_kcut / spec_.les_sigma, wd = 1.0 / spec_.les_sigma;
+      int nmax[3];
+      for (int a = 0; a < 3; a++) nmax[a] = static_cast<int>(std::floor(kc * row_norm(cell->matrix[a]) / (2 * M_PI)));
+      for (int a = -nmax[0]; a <= nmax[0]; a++)
+        for (int b = -nmax[1]; b <= nmax[1]; b++)
+          for (int c = -nmax[2]; c <= nmax[2]; c++) {
+            if (!(a > 0 || (a == 0 && b > 0) || (a == 0 && b == 0 && c > 0))) continue;
+            double k[3], k2 = 0;
+            for (int q = 0; q < 3; q++) k[q] = 2 * M_PI * (a * Ci[q][0] + b * Ci[q][1] + c * Ci[q][2]), k2 += k[q] * k[q];
+            if (!(k2 < kc * kc)) continue;
+            for (int q = 0; q < 3; q++) K.les_k.push_back(static_cast<float>(k[q]));
+            K.les_n.push_back(static_cast<float>(2 * M_PI * a)), K.les_n.push_back(static_cast<float>(2 * M_PI * b));
+            K.les_n.push_back(static_cast<float>(2 * M_PI * c));
+            K.les_taper.push_back(std::sqrt(k2) >= kc - wd ? 1.0f : 0.0f);
+          }
+    }
+    consts_uploaded_ = false;
   }
-  if (les_on && periodic) {
-    const double kc = spec_.les_kcut / spec_.les_sigma, wd = 1.0 / spec_.les_sigma;
-    int nmax[3];
-    for (int a = 0; a < 3; a++) nmax[a] = static_cast<int>(std::floor(kc * row_norm(cell->matrix[a]) / (2 * M_PI)));
-    for (int a = -nmax[0]; a <= nmax[0]; a++)
-      for (int b = -nmax[1]; b <= nmax[1]; b++)
-        for (int c = -nmax[2]; c <= nmax[2]; c++) {
-          if (!(a > 0 || (a == 0 && b > 0) || (a == 0 && b == 0 && c > 0))) continue;
-          double k[3], k2 = 0;
-          for (int q = 0; q < 3; q++) k[q] = 2 * M_PI * (a * Ci[q][0] + b * Ci[q][1] + c * Ci[q][2]), k2 += k[q] * k[q];
-          if (!(k2 < kc * kc)) continue;
-          for (int q = 0; q < 3; q++) les_k.push_back(static_cast<float>(k[q]));
-          les_n.push_back(static_cast<float>(2 * M_PI * a)), les_n.push_back(static_cast<float>(2 * M_PI * b));
-          les_n.push_back(static_cast<float>(2 * M_PI * c));
-          les_taper.push_back(std::sqrt(k2) >= kc - wd ? 1.0f : 0.0f);
-        }
-    nk = static_cast<int64_t>(les_taper.size());
-  }
+  const double V = K.volume;
+  const auto &Ci = K.inv;
+  const int64_t nk = static_cast<int64_t>(K.les_taper.size());
 
   // the graph for this shape
   const bool backward = true;
@@ -415,6 +427,7 @@ ModelResult PlatoModel::predict(const AtomicSystem &system, bool compute_forces)
                     G->mesh[1] == mesh[1] && G->mesh[2] == mesh[2];
   parts_.rebuilt = !same;
   if (!same) {
+    consts_uploaded_ = false;
     graph_.reset();
     auto g = std::make_unique<Graph>();
     g->n = n, g->E = E, g->max_len = max_len, g->periodic = periodic, g->mesh_on = mesh_on, g->les_on = les_on, g->nk = nk;
@@ -531,8 +544,11 @@ ModelResult PlatoModel::predict(const AtomicSystem &system, bool compute_forces)
       for (int k = 0; k < 3; k++) ict[j * 3 + k] = static_cast<float>(Ci[k][j]);
     set(in.inv_cell_t, ict);
     set(in.positions, system.positions());
-    if (in.mesh_k) set(in.mesh_k, mesh_k.data()), set(in.mesh_k0_pad, mesh_pad.data()), set(in.mesh_deconv, mesh_deconv.data());
-    if (in.les_k) set(in.les_k, les_k.data()), set(in.les_n, les_n.data()), set(in.les_taper, les_taper.data());
+    if (!consts_uploaded_) {
+      if (in.mesh_k) set(in.mesh_k, K.mesh_k.data()), set(in.mesh_k0_pad, K.mesh_pad.data()), set(in.mesh_deconv, K.mesh_deconv.data());
+      if (in.les_k) set(in.les_k, K.les_k.data()), set(in.les_n, K.les_n.data()), set(in.les_taper, K.les_taper.data());
+      consts_uploaded_ = true;
+    }
     if (in.offdiag) {
       std::vector<float> od(size_t(n) * n, 1.0f);
       for (int i = 0; i < n; i++) od[size_t(i) * n + i] = 0.0f;

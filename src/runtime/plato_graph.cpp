@@ -11,6 +11,16 @@ namespace {
 
 constexpr double KE = 14.399645; // eV A / e^2, as modules/ewald.py
 
+// a product in full FP32 (and its gradient products) even with TF32 GEMMs: the
+// geometry (RoPE angles, frames, fractional coordinates) and the long-range phases
+// and structure factors, where TF32's 10-bit mantissa costs meV
+ggml_tensor *mm_f32(ggml_context *ctx, ggml_tensor *a, ggml_tensor *b) {
+  ggml_tensor *y = ggml_mul_mat(ctx, a, b);
+  ggml_mul_mat_set_prec(y, GGML_PREC_F32);
+  ggml_mul_mat_set_grad_prec(y, GGML_PREC_F32);
+  return y;
+}
+
 struct B {
   ggml_context *ctx;
   const PlatoSpec &spec;
@@ -58,11 +68,12 @@ struct B {
     return ggml_view_2d(ctx, x, x->ne[0], count, x->nb[1], first * x->nb[1]);
   }
   // k (I + eps)^-T to first order: k_b - sum_a eps_ba k_a; and |k|^2
-  ggml_tensor *strained(ggml_tensor *k) const { return ggml_sub(ctx, k, ggml_mul_mat(ctx, in.strain, k)); }
+  ggml_tensor *strained(ggml_tensor *k) const { return ggml_sub(ctx, k, mm_f32(ctx, in.strain, k)); }
   // 1 / V(eps) to first order: (1 - tr eps) / V
   ggml_tensor *inv_volume() const {
-    ggml_tensor *diag = ggml_view_2d(ctx, in.strain, 1, 3, 4 * sizeof(float), 0);
-    return ggml_scale_bias(ctx, ggml_sum(ctx, diag), -1.0f / in.volume, 1.0f / in.volume);
+    auto e = [&](int k) { return ggml_view_1d(ctx, in.strain, 1, k * sizeof(float)); }; // contiguous views (CUDA SUM)
+    ggml_tensor *tr = ggml_add(ctx, ggml_add(ctx, e(0), e(4)), e(8));
+    return ggml_scale_bias(ctx, tr, -1.0f / in.volume, 1.0f / in.volume);
   }
 };
 
@@ -84,13 +95,13 @@ PlatoOutputs build_plato(ggml_context *ctx, const PlatoSpec &spec, const std::ma
   ggml_tensor *log_fc = ggml_reshape_1d(ctx, ggml_scale(ctx, ggml_log(ctx, one_m), 3.0f), E);
 
   // RoPE angles r . R_f omega_j: [hd F, T], the centres' (r = 0) zero
-  ggml_tensor *ang_e = ggml_mul_mat(ctx, b.weight("rope.angles"), ev);   // [F hd, E]
+  ggml_tensor *ang_e = mm_f32(ctx, b.weight("rope.angles"), ev);   // [F hd, E]
   ggml_tensor *ang = ggml_concat(ctx, in.zero_ang, ang_e, 1);            // [F hd, T]
 
   // edge embedding: sum_f w_f SiLU(W R_f^T r) + rad(rbf(d)) + sp_nbr[s_j] + sp_center[s_i]
   ggml_tensor *vec = nullptr;
   for (int64_t f = 0; f < F; f++) {
-    ggml_tensor *rf = ggml_mul_mat(ctx, b.weight("rope.frame_t." + std::to_string(f)), ev); // R_f^T r [3, E]
+    ggml_tensor *rf = mm_f32(ctx, b.weight("rope.frame_t." + std::to_string(f)), ev); // R_f^T r [3, E]
     ggml_tensor *t = ggml_scale(ctx, ggml_silu(ctx, b.linear(rf, "embed.vec", false)), spec.frame_w[f]);
     vec = vec ? ggml_add(ctx, vec, t) : t;
   }
@@ -109,7 +120,7 @@ PlatoOutputs build_plato(ggml_context *ctx, const PlatoSpec &spec, const std::ma
   ggml_tensor *tok = ggml_concat(ctx, center_tok, edge_tok, 1); // [d, T]
 
   ggml_tensor *frac = nullptr;
-  if (periodic && (spec.mesh || spec.les)) frac = ggml_mul_mat(ctx, in.inv_cell_t, in.positions); // [3, n]
+  if (periodic && (spec.mesh || spec.les)) frac = mm_f32(ctx, in.inv_cell_t, in.positions); // [3, n]
 
   const float scale = 1.0f / std::sqrt(static_cast<float>(ch));
   for (int l = 0; l < spec.layers; l++) {
@@ -162,9 +173,9 @@ PlatoOutputs build_plato(ggml_context *ctx, const PlatoSpec &spec, const std::ma
     const float sigma = spec.les_sigma;
     ggml_tensor *e = nullptr;
     if (periodic) {
-      ggml_tensor *ph = ggml_mul_mat(ctx, frac, in.les_n);           // [n, nk]
-      ggml_tensor *Cq = ggml_mul_mat(ctx, ggml_cos(ctx, ph), q);     // [nk, Q]
-      ggml_tensor *Sq = ggml_mul_mat(ctx, ggml_sin(ctx, ph), q);
+      ggml_tensor *ph = mm_f32(ctx, frac, in.les_n);           // [n, nk]
+      ggml_tensor *Cq = mm_f32(ctx, ggml_cos(ctx, ph), q);     // [nk, Q]
+      ggml_tensor *Sq = mm_f32(ctx, ggml_sin(ctx, ph), q);
       ggml_tensor *k = b.strained(in.les_k);
       ggml_tensor *k2 = ggml_sum_rows(ctx, ggml_sqr(ctx, k));        // [1, nk]
       const float kc = spec.les_kcut / sigma, wd = 1.0f / sigma;
@@ -187,7 +198,7 @@ PlatoOutputs build_plato(ggml_context *ctx, const PlatoSpec &spec, const std::ma
       ggml_tensor *dij = ggml_sqrt(ctx, ggml_add(ctx, d2, ggml_scale_bias(ctx, in.offdiag, -1.0f, 1.0f)));
       ggml_tensor *pair = ggml_mul(ctx, ggml_div(ctx, ggml_plato_erf(ctx, ggml_scale(ctx, dij, 1.0f / (std::sqrt(2.0f) * sigma))), dij),
                                    in.offdiag);
-      e = ggml_scale(ctx, ggml_sum(ctx, ggml_mul(ctx, q, ggml_mul_mat(ctx, pair, q))), 0.5f * KE);
+      e = ggml_scale(ctx, ggml_sum(ctx, ggml_mul(ctx, q, mm_f32(ctx, pair, q))), 0.5f * KE);
     }
     out.les = e;
     out.total = ggml_add(ctx, out.total, e);

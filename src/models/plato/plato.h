@@ -71,6 +71,16 @@ private:
   ggml_gallocr *galloc_ = nullptr;
   void *vesin_ = nullptr;
   Parts parts_;
+  // the cell-dependent long-range constants of the last cell (k vectors of the
+  // mesh and of LES, deconvolution); rebuilt and uploaded only when the cell changes
+  struct CellConsts {
+    float cell[9] = {};
+    bool valid = false, periodic = false;
+    int mesh[3] = {0, 0, 0};
+    double inv[3][3] = {}, volume = 0;
+    std::vector<float> mesh_k, mesh_pad, mesh_deconv, les_k, les_n, les_taper;
+  } consts_;
+  bool consts_uploaded_ = false;
 };
 
 } // namespace mlipcpp::plato
