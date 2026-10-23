@@ -191,6 +191,9 @@ struct PlatoModel::Graph {
 PlatoModel::PlatoModel(PlatoOptions options) : options_(options) {
   if (const char *e = std::getenv("MLIPCPP_PLATO_FOLD_IN_GRAPH")) options_.fold_in_graph = *e && *e != '0';
   if (!options_.fixed_mesh[0]) env_mesh(options_.fixed_mesh);
+  // A/B of the parts (timing): MLIPCPP_PLATO_NO_MESH=1, MLIPCPP_PLATO_NO_LES=1
+  if (const char *e = std::getenv("MLIPCPP_PLATO_NO_MESH")) options_.mesh = options_.mesh && !(*e && *e != '0');
+  if (const char *e = std::getenv("MLIPCPP_PLATO_NO_LES")) options_.les = options_.les && !(*e && *e != '0');
 }
 
 PlatoModel::~PlatoModel() {
