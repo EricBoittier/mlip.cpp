@@ -88,6 +88,36 @@ public:
   /// GPU index among those matching the backend preference; set before load.
   void set_device(int device) { device_ = device; }
 
+  /// One MD step on arrays that live on the GPU (mlipcpp_compute_device, for
+  /// LAMMPS's KOKKOS package): positions and types read and forces added on the
+  /// device, on the caller's stream; one synchronisation per call (the totals),
+  /// more only when the neighbour list is rebuilt. CUDA builds, forces-mode
+  /// models of the cached path (predict_cached).
+  struct DeviceStep {
+    int n_atoms = 0;
+    const double *positions = nullptr;    // device; (i, c) at positions[i * s0 + c * s1]
+    int64_t position_strides[2] = {3, 1};
+    const int32_t *types = nullptr;       // device [n_atoms], in [0, n_types]
+    int n_types = 0;
+    const int32_t *type_atomic_numbers = nullptr; // host [n_types + 1]; 0: no element
+    const double *cell = nullptr;         // host [9], lattice vectors as rows; nullptr: none
+    bool pbc[3] = {false, false, false};
+    double *forces = nullptr;             // device, added into; (i, c) at forces[i * s0 + c * s1]
+    int64_t force_strides[2] = {3, 1};
+    void *stream = nullptr;               // cudaStream_t; nullptr: the legacy default stream
+    bool rebuild = false;                 // the atoms may have been reordered or remapped
+    double skin = -1;                     // Verlet skin (A); < 0: MLIPCPP_NL_SKIN or 0.5
+    bool virial = false;
+  };
+  struct DeviceTotals {
+    double energy = 0;
+    double virial[6] = {0, 0, 0, 0, 0, 0}; // -sum over edges v (x) dE/dv: xx yy zz yz xz xy (eV)
+    bool rebuilt = false;                  // the neighbour list was built in this call
+    int attempts = 1;                      // > 1: computed again (graph too small, list stale)
+  };
+  bool device_step_supported() const;
+  DeviceTotals predict_device_step(const DeviceStep &step);
+
   GraphInterpreter &interpreter() { return interp_; }
   ggml_backend_t backend() const { return compute_backend_; }
 

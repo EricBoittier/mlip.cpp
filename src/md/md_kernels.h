@@ -40,6 +40,10 @@ struct State {
   double *f_cons = nullptr, *f_nc = nullptr; // [n, 3]
   int32_t *scalars = nullptr; // [0] overflow (list), [1] max kept, [2] max displacement^2 (float bits)
   CellList *cells = nullptr;  // made by build_list when it bins the atoms; free_cells
+  // the CUDA stream (cudaStream_t) every function below runs on; nullptr: the
+  // legacy default stream. Downloads (overflow, bounding box, list_valid)
+  // synchronise this stream only.
+  void *stream = nullptr;
 };
 
 /// Model inputs and outputs: device pointers into the ggml tensors.
@@ -75,10 +79,40 @@ void prepare_inputs(State &s, const Cutoff &c, const Graph &g); // edges, radii,
 /// (offsets[n] = total kept edges) and scalars[1] = max kept; pack_ragged fills the graph.
 void count_kept(State &s, const Cutoff &c);
 void pack_ragged(State &s, const Cutoff &c, const Graph &g);
-void conservative_forces(State &s, const Cutoff &c, const Graph &g, double energy_scale);
+/// pack_ragged without knowing on the host whether the graph is large enough:
+/// flags[0] = 1 when the kept edges (s.offsets[n]) pass g.e_cap or a sequence
+/// (1 + scalars[1]) passes max_len; the graph then gets empty sequences (g.offsets
+/// all 0) and the packing is skipped, so nothing is written out of bounds.
+void pack_ragged_guarded(State &s, const Cutoff &c, const Graph &g, int max_len, int32_t *flags);
+/// after prepare_inputs: flags[0] = 1 when an atom keeps more than s.M edges
+void slots_guard(State &s, int32_t *flags);
+/// skip (device, may be null): when *skip is set, the kernels that would read
+/// past the graph's rows return at once (their outputs are then garbage)
+void conservative_forces(State &s, const Cutoff &c, const Graph &g, double energy_scale,
+                         const int32_t *skip = nullptr);
 /// Per-atom virials sum over edges of v (x) dE/dv, symmetrised, [n, 6] as
 /// xx yy zz yz xz xy, unscaled; w is device memory. After conservative_forces.
-void virial(State &s, const Cutoff &c, const Graph &g, double *w);
+void virial(State &s, const Cutoff &c, const Graph &g, double *w, const int32_t *skip = nullptr);
+
+// ---- an engine's own device arrays (LAMMPS's KOKKOS package) ----
+/// s.x[i] = x(i) (+ shift[i], if given), with x(i, c) at x[i * xs0 + c * xs1];
+/// s.species[i] = type_species[types[i]], and *bad = 1 for a type outside
+/// [0, n_types] or without a species (type_species -1).
+void load_positions(State &s, const double *x, int64_t xs0, int64_t xs1, const double *shift,
+                    const int32_t *types, const int32_t *type_species, int n_types, int32_t *bad);
+/// shift[i] = s.x[i] - x(i): what build_list's wrap added to each atom
+void store_shift(State &s, const double *x, int64_t xs0, int64_t xs1, double *shift);
+/// scalars[2] = max |x - x_ref|^2 (float bits), on the device only
+void displacement(State &s);
+/// Totals in one block: out[0] = energy_scale sum e + sum type_energy[types],
+/// out[1..6] = -energy_scale sum w (if w), out[7] = flags[0], out[8] = total
+/// (*total, or -1), out[9] = scalars[1], out[10] = scalars[2] as a float,
+/// out[11] = flags[1]; flags[2] = 1 when flags[0] and flags[1] are 0 and
+/// scalars[2] <= max_d2 (the step is good).
+void totals(State &s, const float *e, const int32_t *types, const double *type_energy, int n_types,
+            double energy_scale, const double *w, const int32_t *total, double max_d2, int32_t *flags, double *out);
+/// f(i) += s.f_cons[i] when *ok, with f(i, c) at f[i * fs0 + c * fs1]
+void add_forces(State &s, double *f, int64_t fs0, int64_t fs1, const int32_t *ok);
 void nc_forces(State &s, const Graph &g);
 void kick(State &s, const double *f1, double a1, const double *f2, double a2, double dt); // v += dt (a1 f1 + a2 f2) / m
 void drift(State &s, double dt);                     // x += dt v; scalars[2] = max |x - x_ref|^2

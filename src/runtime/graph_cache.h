@@ -57,6 +57,9 @@ struct CachedGraph {
   ggml_tensor *energy = nullptr, *nc = nullptr;            // [1, n], [3, n] (unscaled)
   ggml_tensor *loss = nullptr;                             // what the backward pass differentiates
   ggml_tensor *grad_ev = nullptr, *grad_cv = nullptr;      // dE / d edge_vectors, cutoff_values
+  // predict_device_step: 1 when every node runs on the compute backend, so the
+  // graph goes to it directly and asynchronously (-1: not checked yet)
+  int direct = -1;
 
   CachedGraph() = default;
   CachedGraph(const CachedGraph &) = delete;

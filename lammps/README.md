@@ -39,6 +39,26 @@ reused between steps with a Verlet skin, `MLIPCPP_NL_SKIN`), so the pair style
 requests no LAMMPS list. Energy, forces and the global virial (from mlip.cpp's
 stress for a periodic box, `sum x (x) F` otherwise) come back; per-atom energy
 and virial are not available. mlip.cpp's switches (`MLIPCPP_RAGGED=1`,
-`MLIPCPP_TF32=1`, ...) are read from the environment. Under the KOKKOS package
-(`-k on g 1 -sf kk`) it runs as a host pair style: positions go to the host and
-forces back each step.
+`MLIPCPP_TF32=1`, ...) are read from the environment.
+
+## pair_style mlipcpp/kk (KOKKOS package, CUDA)
+
+With LAMMPS's KOKKOS package on, `patch_lammps.sh` also installs
+`src/KOKKOS/pair_mlipcpp_kokkos.*`, and `-k on g 1 -sf kk` (or `pair_style
+mlipcpp/kk ...`) runs the device-resident style: mlip.cpp reads the positions
+and types from, and adds the forces to, LAMMPS's device arrays
+(`mlipcpp_compute_device` in the C API), on the Kokkos CUDA stream, so LAMMPS
+never syncs `x` or `f` to the host. One synchronisation per step returns the
+energy and virial. mlip.cpp's device neighbour list is rebuilt at LAMMPS's own
+rebuilds (`neighbor->ago == 0`) with LAMMPS's skin (`neighbor` command), not
+`MLIPCPP_NL_SKIN`. Needs a CUDA build of mlip.cpp and a `pet-graph` GGUF; one
+MPI rank; no per-atom energy or virial.
+
+To run the host style under KOKKOS (positions to the host and forces back each
+step), keep the suffix off for it:
+
+```
+suffix      off
+pair_style  mlipcpp MODEL.gguf
+suffix      on
+```

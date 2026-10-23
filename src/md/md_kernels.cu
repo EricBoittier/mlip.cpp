@@ -23,11 +23,19 @@ constexpr int BLOCK = 128;
 void check(cudaError_t e, const char *what) {
   if (e != cudaSuccess) throw std::runtime_error(std::string("md: ") + what + ": " + cudaGetErrorString(e));
 }
-#define LAUNCH(kernel, n, ...)                                                   \
-  do {                                                                           \
-    if ((n) > 0) kernel<<<((n) + BLOCK - 1) / BLOCK, BLOCK>>>(__VA_ARGS__);      \
-    check(cudaGetLastError(), #kernel);                                          \
+// on s.stream: every launch site has its State as `s`
+#define LAUNCH(kernel, n, ...)                                                                \
+  do {                                                                                        \
+    if ((n) > 0) kernel<<<((n) + BLOCK - 1) / BLOCK, BLOCK, 0, stream_of(s)>>>(__VA_ARGS__);  \
+    check(cudaGetLastError(), #kernel);                                                       \
   } while (0)
+
+inline cudaStream_t stream_of(const State &s) { return static_cast<cudaStream_t>(s.stream); }
+// a download: this stream's work, then the copy
+template <class T> void download(const State &s, T *host, const T *device, size_t count, const char *what) {
+  check(cudaMemcpyAsync(host, device, count * sizeof(T), cudaMemcpyDeviceToHost, stream_of(s)), what);
+  check(cudaStreamSynchronize(stream_of(s)), what);
+}
 
 struct Cell {
   double m[9];
@@ -379,51 +387,77 @@ __global__ void reverse_slot_kernel(int n, int K, int M, const int32_t *cand_j, 
 
 // ---- ragged layout: atom i's kept edges are rows [off[i], off[i + 1]) ----
 
-// the edges atom i keeps (as pack_kernel), and their largest count
+// the edges atom i keeps (as pack_kernel), and their largest count; a warp per
+// atom, a lane per candidate
 __global__ void count_kept_kernel(int n, int K, const int32_t *cand_j, const int32_t *count, const int32_t *cand_rev,
                                   const double *cd, const double *r, double cutoff, bool adaptive, int32_t *nkept,
                                   int32_t *max_kept) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= n) return;
+  const int i = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x % 32;
+  if (i >= n) return; // whole warps
+  const int c = count[i];
   int nk = 0;
-  for (int k = 0; k < count[i]; k++) {
-    const int e = i * K + k;
-    const double d = cd[e], pc = adaptive ? 0.5 * (r[i] + r[cand_j[e]]) : cutoff;
-    nk += d < cutoff && (!adaptive || d <= pc) && cand_rev[e] >= 0;
+  for (int k0 = 0; k0 < c; k0 += 32) {
+    const int k = k0 + lane;
+    bool keep = false;
+    if (k < c) {
+      const int e = i * K + k;
+      const double d = cd[e], pc = adaptive ? 0.5 * (r[i] + r[cand_j[e]]) : cutoff;
+      keep = d < cutoff && (!adaptive || d <= pc) && cand_rev[e] >= 0;
+    }
+    nk += __popc(__ballot_sync(0xffffffffu, keep));
   }
-  nkept[i] = nk;
-  atomicMax(max_kept, nk);
+  if (lane == 0) {
+    nkept[i] = nk;
+    atomicMax(max_kept, nk);
+  }
 }
 
-// atom i's kept edges, in candidate order, into rows off[i] + slot; the row's centre atom too
+// atom i's kept edges, in candidate order, into rows off[i] + slot; the row's
+// centre atom too. A warp per atom: each lane tests a candidate, the ballot's
+// prefix gives its slot (the order of a serial loop over the candidates)
 __global__ void pack_ragged_kernel(int n, int K, const int32_t *cand_j, const int32_t *count, const int32_t *cand_rev,
                                    const double *cv, const double *cd, const double *r, double cutoff, bool adaptive,
                                    const int32_t *species, const int32_t *off, int32_t *cand_slot, int32_t *g_ns,
-                                   float *g_ev, float *g_cv, int32_t *g_centers) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= n) return;
-  int idx = 0;
-  for (int k = 0; k < count[i]; k++) {
-    const int e = i * K + k, j = cand_j[e];
-    const double d = cd[e], pc = adaptive ? 0.5 * (r[i] + r[j]) : cutoff;
-    if (!(d < cutoff && (!adaptive || d <= pc) && cand_rev[e] >= 0)) {
-      cand_slot[e] = -1;
-      continue;
+                                   float *g_ev, float *g_cv, int32_t *g_centers, const int32_t *skip) {
+  const int i = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x % 32;
+  if (i >= n || (skip && *skip)) return; // whole warps
+  const int c = count[i];
+  const int64_t o = off[i];
+  int base = 0;
+  for (int k0 = 0; k0 < c; k0 += 32) {
+    const int k = k0 + lane, e = i * K + k;
+    bool keep = false;
+    int j = 0;
+    double pc = cutoff;
+    if (k < c) {
+      j = cand_j[e];
+      const double d = cd[e];
+      pc = adaptive ? 0.5 * (r[i] + r[j]) : cutoff;
+      keep = d < cutoff && (!adaptive || d <= pc) && cand_rev[e] >= 0;
     }
-    cand_slot[e] = idx;
-    const int64_t f = off[i] + idx++;
-    g_ns[f] = species[j], g_centers[f] = i;
-    for (int c = 0; c < 3; c++) g_ev[3 * f + c] = static_cast<float>(cv[3 * e + c]);
-    g_cv[f] = static_cast<float>(pc);
+    const unsigned b = __ballot_sync(0xffffffffu, keep);
+    if (k < c) {
+      if (!keep) {
+        cand_slot[e] = -1;
+      } else {
+        const int idx = base + __popc(b & ((1u << lane) - 1u));
+        cand_slot[e] = idx;
+        const int64_t f = o + idx;
+        g_ns[f] = species[j], g_centers[f] = i;
+        for (int q = 0; q < 3; q++) g_ev[3 * f + q] = static_cast<float>(cv[3 * e + q]);
+        g_cv[f] = static_cast<float>(pc);
+      }
+    }
+    base += __popc(b);
   }
 }
 
 __global__ void reverse_ragged_kernel(int n, int K, const int32_t *cand_j, const int32_t *count,
                                       const int32_t *cand_rev, const int32_t *cand_slot, const int32_t *off,
-                                      int32_t *g_rev) {
+                                      int32_t *g_rev, const int32_t *skip) {
   const int e = blockIdx.x * blockDim.x + threadIdx.x;
   const int i = e / K, k = e % K;
-  if (i >= n || k >= count[i]) return;
+  if (i >= n || k >= count[i] || (skip && *skip)) return;
   const int slot = cand_slot[e];
   if (slot < 0) return;
   const int rs = cand_slot[cand_rev[e]]; // kept as well: the pair cutoff is symmetric
@@ -442,12 +476,14 @@ __global__ void tail_ragged_kernel(int n, int64_t e_cap, const int32_t *off, flo
 // F_k = sum over k's slots of (G[k, s] - G[reverse]); dE/dr_k = sum of
 // (C[k, s] + C[reverse]) / 2 (each pair cutoff is the mean of two radii)
 __global__ void edge_force_kernel(int n, int M, const int32_t *nkept, const int32_t *off, const int32_t *g_rev,
-                                  const float *G, const float *C, double scale, double *f, double *dEdr) {
+                                  const float *G, const float *C, double scale, double *f, double *dEdr,
+                                  const int32_t *skip) {
   const int k = blockIdx.x * blockDim.x + threadIdx.x;
-  if (k >= n) return;
+  if (k >= n || (skip && *skip)) return;
   double F[3] = {0, 0, 0}, S = 0;
   const int64_t a0 = off ? off[k] : int64_t(k) * M;
-  for (int s = 0; s < nkept[k]; s++) {
+  const int ns = off ? nkept[k] : min(nkept[k], M);
+  for (int s = 0; s < ns; s++) {
     const int64_t a = a0 + s, b = g_rev[a];
     for (int c = 0; c < 3; c++) F[c] += double(G[3 * a + c]) - double(G[3 * b + c]);
     if (C) S += 0.5 * (double(C[a]) + double(C[b]));
@@ -474,17 +510,21 @@ __global__ void chain_kernel(int n, int K, const int32_t *count, const double *c
   for (int c = 0; c < 3; c++) chain[3 * e + c] = coef * cv[3 * e + c];
 }
 
+// a warp per atom, the lanes over its candidates
 __global__ void chain_gather_kernel(int n, int K, const int32_t *count, const int32_t *cand_rev,
                                     const double *chain, double scale, double *f) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= n) return;
+  const int i = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x % 32;
+  if (i >= n) return; // whole warps
   double F[3] = {0, 0, 0};
-  for (int k = 0; k < count[i]; k++) {
+  for (int k = lane; k < count[i]; k += 32) {
     const int e = i * K + k, b = cand_rev[e];
     if (b < 0) continue; // (lists are symmetric: never)
     for (int c = 0; c < 3; c++) F[c] += chain[3 * e + c] - chain[3 * b + c];
   }
-  for (int c = 0; c < 3; c++) f[3 * i + c] += scale * F[c];
+  for (int o = 16; o > 0; o >>= 1)
+    for (int c = 0; c < 3; c++) F[c] += __shfl_xor_sync(0xffffffffu, F[c], o);
+  if (lane == 0)
+    for (int c = 0; c < 3; c++) f[3 * i + c] += scale * F[c];
 }
 
 __device__ inline void add_virial(double w[6], const double r[3], const double g[3]) {
@@ -498,12 +538,13 @@ __device__ inline void add_virial(double w[6], const double r[3], const double g
 // adaptive chain term of every candidate within the cutoff
 __global__ void virial_kernel(int n, int K, int M, const int32_t *nkept, const int32_t *off, const float *ev,
                               const float *G, const int32_t *count, const double *cv, const double *cd, double cutoff,
-                              const double *chain, double *out) {
+                              const double *chain, double *out, const int32_t *skip) {
   const int k = blockIdx.x * blockDim.x + threadIdx.x;
-  if (k >= n) return;
+  if (k >= n || (skip && *skip)) return;
   double w[6] = {0, 0, 0, 0, 0, 0}, r[3], g[3];
   const int64_t a0 = off ? off[k] : int64_t(k) * M;
-  for (int s = 0; s < nkept[k]; s++) {
+  const int ns = off ? nkept[k] : min(nkept[k], M);
+  for (int s = 0; s < ns; s++) {
     const int64_t a = a0 + s;
     for (int c = 0; c < 3; c++) r[c] = ev[3 * a + c], g[c] = G[3 * a + c];
     add_virial(w, r, g);
@@ -606,10 +647,10 @@ bool make_grid(State &s, double rc, Grid &g) {
     if (!s.cells) s.cells = new CellList();
     int one = 0;
     if (!s.cells->bbox) grow(s.cells->bbox, one, 6);
-    bbox_kernel<<<1, 256>>>(s.n, s.x, s.cells->bbox);
+    bbox_kernel<<<1, 256, 0, stream_of(s)>>>(s.n, s.x, s.cells->bbox);
     check(cudaGetLastError(), "bbox_kernel");
     double b[6];
-    check(cudaMemcpy(b, s.cells->bbox, sizeof b, cudaMemcpyDeviceToHost), "bbox");
+    download(s, b, s.cells->bbox, 6, "bbox");
     for (int d = 0; d < 3; d++) {
       const double extent = b[3 + d] - b[d];
       g.nc[d] = std::max(1, int(std::min(extent / rc, 1024.0)));
@@ -659,13 +700,17 @@ __global__ void displacement_kernel(int n, const double *x, const double *x_ref,
 
 } // namespace
 
+void displacement(State &s) {
+  check(cudaMemsetAsync(s.scalars + 2, 0, sizeof(int32_t), stream_of(s)), "memset");
+  LAUNCH(displacement_kernel, s.n, s.n, s.x, s.x_ref, s.scalars + 2);
+}
+
 bool list_valid(State &s, double skin) {
   const bool any_pbc = s.pbc[0] || s.pbc[1] || s.pbc[2];
   if (any_pbc) LAUNCH(wrap_kernel, s.n, s.n, s.x, make_cell(s), make_inverse(s));
-  check(cudaMemset(s.scalars + 2, 0, sizeof(int32_t)), "memset");
-  LAUNCH(displacement_kernel, s.n, s.n, s.x, s.x_ref, s.scalars + 2);
+  displacement(s);
   int32_t bits = 0;
-  check(cudaMemcpy(&bits, s.scalars + 2, sizeof(int32_t), cudaMemcpyDeviceToHost), "max displacement");
+  download(s, &bits, s.scalars + 2, 1, "max displacement");
   float d2;
   std::memcpy(&d2, &bits, sizeof d2);
   return d2 <= 0.25 * skin * skin;
@@ -676,7 +721,7 @@ void build_list(State &s, const Cutoff &cut) {
   const bool any_pbc = s.pbc[0] || s.pbc[1] || s.pbc[2];
   const Inverse inv = make_inverse(s);
   if (any_pbc) LAUNCH(wrap_kernel, s.n, s.n, s.x, cell, inv);
-  check(cudaMemcpy(s.x_ref, s.x, sizeof(double) * 3 * s.n, cudaMemcpyDeviceToDevice), "x_ref");
+  check(cudaMemcpyAsync(s.x_ref, s.x, sizeof(double) * 3 * s.n, cudaMemcpyDeviceToDevice, stream_of(s)), "x_ref");
   const double rc = cut.cutoff + cut.skin;
   Grid g{};
   if (make_grid(s, rc, g)) {
@@ -686,11 +731,11 @@ void build_list(State &s, const Cutoff &cut) {
     int n_cap = c.n_cap, cell_cap = c.cell_cap;
     grow(c.cell_of, c.n_cap, s.n), grow(c.atoms, n_cap, s.n);
     grow(c.count, c.cell_cap, ncell + 1), grow(c.start, cell_cap, ncell + 1);
-    check(cudaMemset(c.count, 0, sizeof(int32_t) * ncell), "memset");
+    check(cudaMemsetAsync(c.count, 0, sizeof(int32_t) * ncell, stream_of(s)), "memset");
     LAUNCH(bin_kernel, s.n, s.n, s.x, g, inv, c.cell_of, c.count);
-    scan_kernel<<<1, 1024>>>(ncell, c.count, c.start);
+    scan_kernel<<<1, 1024, 0, stream_of(s)>>>(ncell, c.count, c.start);
     check(cudaGetLastError(), "scan_kernel");
-    check(cudaMemset(c.count, 0, sizeof(int32_t) * ncell), "memset");
+    check(cudaMemsetAsync(c.count, 0, sizeof(int32_t) * ncell, stream_of(s)), "memset");
     LAUNCH(fill_kernel, s.n, s.n, c.cell_of, c.start, c.count, c.atoms);
     LAUNCH(gather_kernel, s.n, s.n, s.K, s.x, cell, g, inv, c.cell_of, c.start, c.atoms, rc * rc, s.cand_j, s.cand_s,
            s.count, s.scalars);
@@ -707,12 +752,12 @@ void prepare_inputs(State &s, const Cutoff &c, const Graph &g) {
   LAUNCH(edge_kernel, E, s.n, s.K, s.x, cell, s.cand_j, s.cand_s, s.count, s.cand_v, s.cand_d);
   LAUNCH(radii_kernel, 32 * s.n, s.n, s.K, s.count, s.cand_d, c.cutoff, c.n_target, c.width, s.r, s.root,
          s.dn_root, s.clamped);
-  check(cudaMemset(s.scalars + 1, 0, sizeof(int32_t)), "memset");
+  check(cudaMemsetAsync(s.scalars + 1, 0, sizeof(int32_t), stream_of(s)), "memset");
   LAUNCH(pack_kernel, s.n, s.n, s.K, s.M, s.cand_j, s.count, s.cand_rev, s.cand_v, s.cand_d, s.r,
          c.cutoff, c.n_target > 0, std::getenv("MLIPCPP_MD_REVERSE_SLOTS") != nullptr, s.species, s.cand_slot, s.nkept, s.scalars + 1, g.neighbor_species,
          g.edge_vectors, g.padding_mask, g.cutoff_values, g.reverse);
   LAUNCH(reverse_slot_kernel, E, s.n, s.K, s.M, s.cand_j, s.count, s.cand_rev, s.cand_slot, g.reverse);
-  check(cudaMemcpy(g.species, s.species, sizeof(int32_t) * s.n, cudaMemcpyDeviceToDevice), "species");
+  check(cudaMemcpyAsync(g.species, s.species, sizeof(int32_t) * s.n, cudaMemcpyDeviceToDevice, stream_of(s)), "species");
 }
 
 void count_kept(State &s, const Cutoff &c) {
@@ -721,44 +766,154 @@ void count_kept(State &s, const Cutoff &c) {
   LAUNCH(edge_kernel, E, s.n, s.K, s.x, cell, s.cand_j, s.cand_s, s.count, s.cand_v, s.cand_d);
   LAUNCH(radii_kernel, 32 * s.n, s.n, s.K, s.count, s.cand_d, c.cutoff, c.n_target, c.width, s.r, s.root,
          s.dn_root, s.clamped);
-  check(cudaMemset(s.scalars + 1, 0, sizeof(int32_t)), "memset");
-  LAUNCH(count_kept_kernel, s.n, s.n, s.K, s.cand_j, s.count, s.cand_rev, s.cand_d, s.r, c.cutoff, c.n_target > 0,
+  check(cudaMemsetAsync(s.scalars + 1, 0, sizeof(int32_t), stream_of(s)), "memset");
+  LAUNCH(count_kept_kernel, 32 * s.n, s.n, s.K, s.cand_j, s.count, s.cand_rev, s.cand_d, s.r, c.cutoff, c.n_target > 0,
          s.nkept, s.scalars + 1);
-  scan_kernel<<<1, 1024>>>(s.n, s.nkept, s.offsets);
+  scan_kernel<<<1, 1024, 0, stream_of(s)>>>(s.n, s.nkept, s.offsets);
   check(cudaGetLastError(), "scan_kernel");
 }
 
-void pack_ragged(State &s, const Cutoff &c, const Graph &g) {
+namespace {
+// g.offsets packed (or, past the graph's capacity, empty sequences), then the rows
+void pack_ragged_rows(State &s, const Cutoff &c, const Graph &g, const int32_t *skip) {
   const int E = s.n * s.K;
-  check(cudaMemcpy(g.offsets, s.offsets, sizeof(int32_t) * (s.n + 1), cudaMemcpyDeviceToDevice), "offsets");
-  LAUNCH(pack_ragged_kernel, s.n, s.n, s.K, s.cand_j, s.count, s.cand_rev, s.cand_v, s.cand_d, s.r, c.cutoff,
+  LAUNCH(pack_ragged_kernel, 32 * s.n, s.n, s.K, s.cand_j, s.count, s.cand_rev, s.cand_v, s.cand_d, s.r, c.cutoff,
          c.n_target > 0, s.species, s.offsets, s.cand_slot, g.neighbor_species, g.edge_vectors, g.cutoff_values,
-         g.centers);
-  LAUNCH(reverse_ragged_kernel, E, s.n, s.K, s.cand_j, s.count, s.cand_rev, s.cand_slot, s.offsets, g.reverse);
+         g.centers, skip);
+  LAUNCH(reverse_ragged_kernel, E, s.n, s.K, s.cand_j, s.count, s.cand_rev, s.cand_slot, s.offsets, g.reverse, skip);
   // the tail is at most e_cap rows (fewer: blocks past it return)
   const int64_t tail_blocks = (g.e_cap + BLOCK - 1) / BLOCK;
   if (tail_blocks > 0)
-    tail_ragged_kernel<<<(unsigned)tail_blocks, BLOCK>>>(s.n, g.e_cap, s.offsets, static_cast<float>(c.cutoff),
-                                                         g.neighbor_species, g.edge_vectors, g.cutoff_values,
-                                                         g.reverse, g.centers);
+    tail_ragged_kernel<<<(unsigned)tail_blocks, BLOCK, 0, stream_of(s)>>>(
+        s.n, g.e_cap, g.offsets, static_cast<float>(c.cutoff), g.neighbor_species, g.edge_vectors, g.cutoff_values,
+        g.reverse, g.centers);
   check(cudaGetLastError(), "tail_ragged_kernel");
-  check(cudaMemcpy(g.species, s.species, sizeof(int32_t) * s.n, cudaMemcpyDeviceToDevice), "species");
+  check(cudaMemcpyAsync(g.species, s.species, sizeof(int32_t) * s.n, cudaMemcpyDeviceToDevice, stream_of(s)), "species");
 }
 
-void conservative_forces(State &s, const Cutoff &c, const Graph &g, double energy_scale) {
+__global__ void ragged_guard_kernel(int n, const int32_t *off, const int32_t *max_kept, int64_t e_cap, int max_len,
+                                    int32_t *g_off, int32_t *flags) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i > n) return;
+  const bool over = off[n] > e_cap || 1 + *max_kept > max_len;
+  g_off[i] = over ? 0 : off[i];
+  if (i == 0 && over) flags[0] = 1;
+}
+
+__global__ void slots_guard_kernel(const int32_t *max_kept, int M, int32_t *flags) {
+  if (*max_kept > M) flags[0] = 1;
+}
+} // namespace
+
+void pack_ragged(State &s, const Cutoff &c, const Graph &g) {
+  check(cudaMemcpyAsync(g.offsets, s.offsets, sizeof(int32_t) * (s.n + 1), cudaMemcpyDeviceToDevice, stream_of(s)),
+        "offsets");
+  pack_ragged_rows(s, c, g, nullptr);
+}
+
+void pack_ragged_guarded(State &s, const Cutoff &c, const Graph &g, int max_len, int32_t *flags) {
+  LAUNCH(ragged_guard_kernel, s.n + 1, s.n, s.offsets, s.scalars + 1, g.e_cap, max_len, g.offsets, flags);
+  pack_ragged_rows(s, c, g, flags);
+}
+
+void slots_guard(State &s, int32_t *flags) {
+  slots_guard_kernel<<<1, 1, 0, stream_of(s)>>>(s.scalars + 1, s.M, flags);
+  check(cudaGetLastError(), "slots_guard_kernel");
+}
+
+void conservative_forces(State &s, const Cutoff &c, const Graph &g, double energy_scale, const int32_t *skip) {
   const bool adaptive = c.n_target > 0 && g.grad_cv;
   LAUNCH(edge_force_kernel, s.n, s.n, s.M, s.nkept, g.offsets, g.reverse, g.grad_ev, adaptive ? g.grad_cv : nullptr,
-         energy_scale, s.f_cons, s.dEdr);
+         energy_scale, s.f_cons, s.dEdr, skip);
   if (!adaptive) return;
   LAUNCH(chain_kernel, s.n * s.K, s.n, s.K, s.count, s.cand_v, s.cand_d, c.cutoff, c.width, s.r, s.root,
          s.dn_root, s.clamped, s.dEdr, s.chain);
-  LAUNCH(chain_gather_kernel, s.n, s.n, s.K, s.count, s.cand_rev, s.chain, energy_scale, s.f_cons);
+  LAUNCH(chain_gather_kernel, 32 * s.n, s.n, s.K, s.count, s.cand_rev, s.chain, energy_scale, s.f_cons);
 }
 
-void virial(State &s, const Cutoff &c, const Graph &g, double *w) {
+void virial(State &s, const Cutoff &c, const Graph &g, double *w, const int32_t *skip) {
   const bool adaptive = c.n_target > 0 && g.grad_cv;
   LAUNCH(virial_kernel, s.n, s.n, s.K, s.M, s.nkept, g.offsets, g.edge_vectors, g.grad_ev, s.count, s.cand_v, s.cand_d,
-         c.cutoff, adaptive ? s.chain : nullptr, w);
+         c.cutoff, adaptive ? s.chain : nullptr, w, skip);
+}
+
+// ---- an engine's own device arrays ----
+
+namespace {
+__global__ void load_kernel(int n, const double *x, int64_t xs0, int64_t xs1, const double *shift,
+                            const int32_t *types, const int32_t *type_species, int n_types, double *out,
+                            int32_t *species, int32_t *bad) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  for (int c = 0; c < 3; c++) out[3 * i + c] = x[i * xs0 + c * xs1] + (shift ? shift[3 * i + c] : 0.0);
+  const int t = types[i];
+  const int sp = t >= 0 && t <= n_types ? type_species[t] : -1;
+  species[i] = sp < 0 ? 0 : sp;
+  if (sp < 0) *bad = 1;
+}
+
+__global__ void shift_kernel(int n, const double *wrapped, const double *x, int64_t xs0, int64_t xs1, double *shift) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  for (int c = 0; c < 3; c++) shift[3 * i + c] = wrapped[3 * i + c] - x[i * xs0 + c * xs1];
+}
+
+constexpr int TOTALS_BLOCK = 256;
+__global__ void totals_kernel(int n, const float *e, const int32_t *types, const double *type_energy, int n_types,
+                              double scale,
+                              const double *w, const int32_t *total, const int32_t *scalars, double max_d2,
+                              int32_t *flags, double *out) {
+  __shared__ double part[7][TOTALS_BLOCK];
+  const int t = threadIdx.x;
+  double a = 0, b = 0, v[6] = {0, 0, 0, 0, 0, 0};
+  for (int i = t; i < n; i += TOTALS_BLOCK) {
+    const int ty = types[i];
+    a += double(e[i]), b += ty >= 0 && ty <= n_types ? type_energy[ty] : 0.0;
+    if (w)
+      for (int c = 0; c < 6; c++) v[c] += w[6 * i + c];
+  }
+  part[0][t] = scale * a + b;
+  for (int c = 0; c < 6; c++) part[1 + c][t] = v[c];
+  __syncthreads();
+  for (int o = TOTALS_BLOCK / 2; o > 0; o >>= 1) {
+    if (t < o)
+      for (int q = 0; q < 7; q++) part[q][t] += part[q][t + o];
+    __syncthreads();
+  }
+  if (t != 0) return;
+  out[0] = part[0][0];
+  for (int c = 0; c < 6; c++) out[1 + c] = w ? -scale * part[1 + c][0] : 0.0;
+  const float d2 = __int_as_float(scalars[2]);
+  out[7] = flags[0], out[8] = total ? *total : -1, out[9] = scalars[1], out[10] = d2, out[11] = flags[1];
+  flags[2] = flags[0] == 0 && flags[1] == 0 && double(d2) <= max_d2;
+}
+
+__global__ void add_forces_kernel(int n, const double *fc, double *f, int64_t fs0, int64_t fs1, const int32_t *ok) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n || !*ok) return;
+  for (int c = 0; c < 3; c++) f[i * fs0 + c * fs1] += fc[3 * i + c];
+}
+} // namespace
+
+void load_positions(State &s, const double *x, int64_t xs0, int64_t xs1, const double *shift, const int32_t *types,
+                    const int32_t *type_species, int n_types, int32_t *bad) {
+  LAUNCH(load_kernel, s.n, s.n, x, xs0, xs1, shift, types, type_species, n_types, s.x, s.species, bad);
+}
+
+void store_shift(State &s, const double *x, int64_t xs0, int64_t xs1, double *shift) {
+  LAUNCH(shift_kernel, s.n, s.n, s.x, x, xs0, xs1, shift);
+}
+
+void totals(State &s, const float *e, const int32_t *types, const double *type_energy, int n_types,
+            double energy_scale, const double *w, const int32_t *total, double max_d2, int32_t *flags, double *out) {
+  totals_kernel<<<1, TOTALS_BLOCK, 0, stream_of(s)>>>(s.n, e, types, type_energy, n_types, energy_scale, w, total,
+                                                      s.scalars,
+                                                      max_d2, flags, out);
+  check(cudaGetLastError(), "totals_kernel");
+}
+
+void add_forces(State &s, double *f, int64_t fs0, int64_t fs1, const int32_t *ok) {
+  LAUNCH(add_forces_kernel, s.n, s.n, s.f_cons, f, fs0, fs1, ok);
 }
 
 void nc_forces(State &s, const Graph &g) { LAUNCH(nc_kernel, s.n, s.n, g.nc, s.nc_scale, s.f_nc); }
@@ -769,7 +924,7 @@ void kick(State &s, const double *f1, double a1, const double *f2, double a2, do
 
 void drift(State &s, double dt) { LAUNCH(drift_kernel, s.n, s.n, s.x, s.v, s.x_ref, dt, s.scalars + 2); }
 
-void reset_scalars(State &s) { check(cudaMemset(s.scalars, 0, 3 * sizeof(int32_t)), "memset"); }
+void reset_scalars(State &s) { check(cudaMemsetAsync(s.scalars, 0, 3 * sizeof(int32_t), stream_of(s)), "memset"); }
 
 void synchronize() { check(cudaDeviceSynchronize(), "synchronize"); }
 

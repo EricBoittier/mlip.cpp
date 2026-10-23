@@ -1,5 +1,6 @@
 #!/bin/bash
-# Add pair_style mlipcpp (package ML-MLIPCPP) to a LAMMPS source tree, then
+# Add pair_style mlipcpp (package ML-MLIPCPP, and mlipcpp/kk for the KOKKOS
+# package) to a LAMMPS source tree, then
 # build LAMMPS with -D PKG_ML-MLIPCPP=ON (and -D MLIPCPP_LIBRARY=... unless
 # mlip.cpp was built in its build/ directory).
 #
@@ -21,6 +22,8 @@ put() {  # put SRC DST: copy, or symlink with --link
 }
 
 put "$here/ML-MLIPCPP" "$lammps/src/ML-MLIPCPP"
+# pair_style mlipcpp/kk, which LAMMPS's KOKKOS package builds when ML-MLIPCPP is on
+for f in pair_mlipcpp_kokkos.h pair_mlipcpp_kokkos.cpp; do put "$here/KOKKOS/$f" "$lammps/src/KOKKOS/$f"; done
 sed "s|@MLIPCPP_DIR@|$mlipcpp|" "$here/cmake/ML-MLIPCPP.cmake" > "$lammps/cmake/Modules/Packages/ML-MLIPCPP.cmake"
 
 # Register the package: its name, and its module with the other packages that

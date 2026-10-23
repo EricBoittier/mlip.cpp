@@ -104,6 +104,10 @@ if(MLIPCPP_USE_CUDA)
     set_target_properties(mlipcpp PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
     target_link_libraries(mlipcpp PRIVATE CUDA::cudart)
     target_compile_definitions(mlipcpp PRIVATE MLIPCPP_HAVE_CUDA_INPUTS)
+    # GraphModel::predict_device_step orders the backend's stream after the caller's
+    # through ggml backend events (their cudaEvent_t: ggml-backend-impl.h)
+    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/runtime/graph_model_cached.cpp
+                                PROPERTIES INCLUDE_DIRECTORIES ${ggml_SOURCE_DIR}/src)
 endif()
 
 target_compile_options(mlipcpp PRIVATE

@@ -782,3 +782,89 @@ void mlipcpp_result_free(mlipcpp_result_t result) {
     delete result;
   }
 }
+
+// ============================================================================
+// Device arrays
+// ============================================================================
+
+mlipcpp_error_t mlipcpp_device_system_default(mlipcpp_device_system_t *system) {
+  if (!system) {
+    set_error("NULL system pointer");
+    return MLIPCPP_ERROR_NULL_POINTER;
+  }
+  std::memset(system, 0, sizeof *system);
+  system->position_strides[0] = system->force_strides[0] = 3;
+  system->position_strides[1] = system->force_strides[1] = 1;
+  system->skin = -1.0;
+  clear_error();
+  return MLIPCPP_OK;
+}
+
+bool mlipcpp_model_supports_device(mlipcpp_model_t model) {
+  if (!model || !model->weights_loaded) return false;
+  auto *graph = dynamic_cast<mlipcpp::runtime::GraphModel *>(model->model.get());
+  return graph && graph->device_step_supported();
+}
+
+mlipcpp_error_t mlipcpp_compute_device(mlipcpp_model_t model, const mlipcpp_device_system_t *system,
+                                       mlipcpp_device_result_t *result) {
+  if (!model) {
+    set_error("Invalid model handle");
+    return MLIPCPP_ERROR_INVALID_HANDLE;
+  }
+  if (!system || !result) {
+    set_error("NULL system or result pointer");
+    return MLIPCPP_ERROR_NULL_POINTER;
+  }
+  if (!model->weights_loaded) {
+    set_error("Model weights not loaded");
+    return MLIPCPP_ERROR_MODEL_NOT_LOADED;
+  }
+  auto *graph = dynamic_cast<mlipcpp::runtime::GraphModel *>(model->model.get());
+  if (!graph || !graph->device_step_supported()) {
+    set_error("Device arrays need a CUDA build and a forces-mode graph model (pet-graph GGUF) on CUDA");
+    return MLIPCPP_ERROR_UNSUPPORTED;
+  }
+  if (system->n_atoms <= 0) {
+    set_error("Invalid number of atoms");
+    return MLIPCPP_ERROR_INVALID_PARAMETER;
+  }
+  if (!system->positions || !system->types || !system->forces || !system->type_atomic_numbers) {
+    set_error("NULL positions, types, forces or type_atomic_numbers");
+    return MLIPCPP_ERROR_NULL_POINTER;
+  }
+  try {
+    mlipcpp::runtime::GraphModel::DeviceStep step;
+    step.n_atoms = system->n_atoms;
+    step.positions = system->positions;
+    step.types = system->types;
+    step.n_types = system->n_types;
+    step.type_atomic_numbers = system->type_atomic_numbers;
+    step.cell = system->cell;
+    step.forces = system->forces;
+    for (int k = 0; k < 2; k++) {
+      step.position_strides[k] = system->position_strides[k];
+      step.force_strides[k] = system->force_strides[k];
+    }
+    if (!step.position_strides[0] && !step.position_strides[1]) step.position_strides[0] = 3, step.position_strides[1] = 1;
+    if (!step.force_strides[0] && !step.force_strides[1]) step.force_strides[0] = 3, step.force_strides[1] = 1;
+    for (int k = 0; k < 3; k++) step.pbc[k] = system->cell && system->pbc[k];
+    step.stream = system->stream;
+    step.rebuild = system->rebuild_neighbors;
+    step.skin = system->skin;
+    step.virial = system->compute_virial;
+    const auto totals = graph->predict_device_step(step);
+    result->energy = totals.energy;
+    for (int k = 0; k < 6; k++) result->virial[k] = totals.virial[k];
+    result->neighbor_list_rebuilt = totals.rebuilt;
+    result->attempts = totals.attempts;
+    clear_error();
+    return MLIPCPP_OK;
+  } catch (const std::exception &e) {
+    set_error(std::string("Device step failed: ") + e.what());
+    return MLIPCPP_ERROR_COMPUTATION;
+  } catch (...) {
+    set_error("Device step failed: unknown error");
+    return MLIPCPP_ERROR_INTERNAL;
+  }
+}
