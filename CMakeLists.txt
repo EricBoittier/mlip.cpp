@@ -268,6 +268,9 @@ else()
         # cutoff) and GGML_OP_PET_ATTN_RAGGED (attention over sequences of
         # different lengths, without padding), with their backward ops, CPU + CUDA
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-pet-ragged.patch"
+        # the gradient of a CONCAT w.r.t. a contiguous part as a view of the
+        # concatenation's gradient, not a copy (GGML_CONCAT_GRAD_CONT=1: a copy)
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-concat-grad-view.patch"
     )
     # the source cache is keyed by the ggml tag and the patches' contents:
     # CPM's default key hashes the arguments, i.e. the patch paths, so every

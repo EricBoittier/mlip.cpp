@@ -1,0 +1,46 @@
+--- a/src/ggml.c
++++ b/src/ggml.c
+@@ -6842,6 +6842,25 @@
+ // else if there is no gradient for tensor, set the corresponding value
+ // else, just add/subtract/etc. the gradients
+ 
++// a CONCAT's gradient w.r.t. one of its srcs, a view of its own gradient: read where it
++// is when that view is contiguous (e.g. one part of a concatenation along the last used
++// dimension) and the src does not accumulate its gradient in place, instead of a copy of
++// its bytes (GGML_CONCAT_GRAD_CONT=1: always the copy)
++static struct ggml_tensor * ggml_concat_grad_part(
++        struct ggml_context * ctx,
++        struct ggml_cgraph  * cgraph,
++        size_t                isrc,
++        struct ggml_tensor  * view) {
++    static int copy = -1;
++    if (copy < 0) {
++        copy = getenv("GGML_CONCAT_GRAD_CONT") != NULL;
++    }
++    if (!copy && ggml_is_contiguous(view) && !cgraph->grad_accs[isrc]) {
++        return view;
++    }
++    return ggml_cont(ctx, view);
++}
++
+ static void ggml_add_or_set(
+         struct ggml_context * ctx,
+         struct ggml_cgraph  * cgraph,
+@@ -7683,7 +7702,7 @@
+                         src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+                         grad->nb[1], grad->nb[2], grad->nb[3], offset);
+                 }
+-                ggml_add_or_set(ctx, cgraph, isrc0, ggml_reshape(ctx, ggml_cont(ctx, grad_src0), src0));
++                ggml_add_or_set(ctx, cgraph, isrc0, ggml_reshape(ctx, ggml_concat_grad_part(ctx, cgraph, isrc0, grad_src0), src0));
+             }
+             if (src1_needs_grads) {
+                 // grad_src1 = grad[:..., src0->ne[dim]:, ...]
+@@ -7692,7 +7711,7 @@
+                 struct ggml_tensor * grad_src1 = ggml_view_4d(ctx, grad,
+                     src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+                     grad->nb[1], grad->nb[2], grad->nb[3], offset);
+-                ggml_add_or_set(ctx, cgraph, isrc1, ggml_reshape(ctx, ggml_cont(ctx, grad_src1), src1));
++                ggml_add_or_set(ctx, cgraph, isrc1, ggml_reshape(ctx, ggml_concat_grad_part(ctx, cgraph, isrc1, grad_src1), src1));
+             }
+         } break;
+         case GGML_OP_NONE: {
