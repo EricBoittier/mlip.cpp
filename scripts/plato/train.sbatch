@@ -37,6 +37,13 @@ if has speed; then
     env $([[ $v != none ]] && echo $v=1) $T --init $D/models/D2-att.gguf --train $D/data/train.bin --val $D/data/val.bin --epochs ${SPEED_EPOCHS:-1} --max-steps ${SPEED_STEPS:-200} --batch-size $BS --backend cuda --fd-eps $EPS --no-val --gpus ${GPUS:-1} ${SPEED_ARGS:-} -o $OUT/speed.gguf 2>&1 | grep -v "^ggml_cuda\|Device \|warmup"
   done
 fi
+if has chicheck; then
+  echo "== electronegativity model: gradient check, parity, speed"
+  $T --init $D/models/chi-test.gguf --train $D/data/train.bin --check $D/data/grefC --backend cuda --fd-eps $EPS 2>&1 | grep -E "loss|gradient|largest"
+  $D/build-cuda/bin/mlipcpp-plato check $D/models/chi-test.gguf $D/ref-chi --backend cuda 2>&1 | grep -E "full|D2|d2_"
+  $T --init $D/models/init-chi.gguf --train $D/data/train.bin --val $D/data/val.bin --epochs 1 --max-steps 200 --batch-size 32 --backend cuda --fd-eps $EPS -o $OUT/chi-speed.gguf 2>&1 | grep -E "^epoch"
+  $T --init $D/models/init-nochi.gguf --train $D/data/train.bin --val $D/data/val.bin --epochs 1 --max-steps 200 --batch-size 32 --backend cuda --fd-eps $EPS -o $OUT/nochi-speed.gguf 2>&1 | grep -E "^epoch"
+fi
 if has prof; then
   rm -f $OUT/prof.*
   nsys profile --cuda-graph-trace=node -t cuda,nvtx -o $OUT/prof $T --init $D/models/D2-att.gguf --train $D/data/train.bin --val $D/data/val.bin --epochs 1 --max-steps ${SPEED_STEPS:-60} --batch-size $BS --backend cuda --fd-eps $EPS --no-val -o $OUT/prof.gguf > $OUT/prof.log 2>&1
