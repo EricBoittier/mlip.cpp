@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <vector>
 
 struct ggml_backend_buffer;
 struct ggml_backend_buffer_type;
@@ -38,6 +39,9 @@ struct PetRaggedInputs {
 struct PetRaggedOutputs {
   ggml_tensor *atom_energy = nullptr; // [1, n], unscaled (forward only)
   ggml_tensor *total = nullptr;       // [1], unscaled sum: differentiate this
+  // tensors to expand into the graph first, in this order (before atom_energy and
+  // total): places a few sums where the CUDA backend fuses them into GEMMs
+  std::vector<ggml_tensor *> order;
 };
 
 /// The architecture of a PET model's weights (by GGUF name). False, with the

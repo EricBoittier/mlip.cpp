@@ -147,6 +147,10 @@ PetRaggedOutputs build_pet_ragged(ggml_context *ctx, const PetRaggedSpec &spec,
                                   const std::map<std::string, ggml_tensor *> &weights, const PetRaggedInputs &in,
                                   int n, int64_t e_cap, int max_len) {
   const Builder b{ctx, weights};
+  PetRaggedOutputs out;
+  // sums placed for the CUDA backend's GEMM epilogues (a residual computed before the product
+  // it is added to); MLIPCPP_RAGGED_RESIDUAL_ORDER=0: the earlier order (same sums)
+  static const bool residual_order = env_on("MLIPCPP_RAGGED_RESIDUAL_ORDER");
   const int64_t d_pet = spec.d_pet;
   const float scale = 1.0f / std::sqrt(static_cast<float>(d_pet / spec.heads));
 
@@ -213,8 +217,16 @@ PetRaggedOutputs build_pet_ragged(ggml_context *ctx, const PetRaggedSpec &spec,
     if (!geom_tf32) ggml_mul_mat_set_prec(geo, GGML_PREC_F32);
     if (!geom_tf32 && geom_back_fp32) ggml_mul_mat_set_grad_prec(geo, GGML_PREC_F32);
     ggml_tensor *pre = ggml_add(ctx, geo, ggml_get_rows(ctx, table, in.neighbor_species));
-    if (l > 0) pre = ggml_add(ctx, pre, ggml_mul_mat(ctx, block(2), messages));
-    edge_tokens = b.linear(ggml_silu(ctx, ggml_add(ctx, pre, bias)), g + "compress_2"); // [d_pet, E]
+    if (residual_order && l > 0) {
+      // the messages product with the bias, then that sum: on CUDA one cuBLASLt GEMM (bias epilogue,
+      // beta = 1). The FP32 geometry product keeps cuBLAS's own path (cuBLASLt ran it slower, its
+      // epilogue as a separate pass), so layer 0 has its two ADDs as before
+      pre = ggml_add(ctx, pre, ggml_add(ctx, ggml_mul_mat(ctx, block(2), messages), bias));
+    } else {
+      if (l > 0) pre = ggml_add(ctx, pre, ggml_mul_mat(ctx, block(2), messages));
+      pre = ggml_add(ctx, pre, bias);
+    }
+    edge_tokens = b.linear(ggml_silu(ctx, pre), g + "compress_2"); // [d_pet, E]
     }
 
     // one PreLN transformer layer over [central token, its edges] per atom
@@ -227,6 +239,9 @@ PetRaggedOutputs build_pet_ragged(ggml_context *ctx, const PetRaggedSpec &spec,
     ggml_tensor *normed = b.add_rms_norm(node, b.linear(b.columns(o, 0, n), t + "center_expansion"), node,
                                          t + "norm_center_features", spec.rms_eps);
     node = ggml_add(ctx, node, b.gated_mlp(normed, t + "center_mlp"));
+    // the node update first, as without out.order: the backward then meets the attention output's
+    // edge rows before its node rows (the zero-padded gradient is the edges', the in-place ACC the nodes')
+    if (residual_order) out.order.push_back(node);
 
     ggml_tensor *edges = nullptr;
     normed = b.add_rms_norm(edge_tokens, b.columns(o, n, e_cap), edges, t + "norm_mlp", spec.rms_eps);
@@ -245,11 +260,22 @@ PetRaggedOutputs build_pet_ragged(ggml_context *ctx, const PetRaggedSpec &spec,
         ? b.layer_norm(ggml_concat(ctx, edges, ggml_get_rows(ctx, edges, in.reverse), 0), "combination_norms_" + c, spec.ln_eps)
         : (pair_back_acc ? ggml_pet_pair_norm_acc : ggml_pet_pair_norm)(ctx, edges, in.reverse,
               b.weight("combination_norms_" + c + "_weight"), b.weight("combination_norms_" + c + "_bias"), spec.ln_eps);
+    if (residual_order && pair_back_acc) {
+      // the residual messages + edges placed after the pair norm and the first combination
+      // layer, before the second's product (out.order): on CUDA that product, its bias and
+      // this residual are one cuBLASLt GEMM; the backward still reaches the pair norm after
+      // the residual, whose gradient it sums
+      ggml_tensor *h = ggml_silu(ctx, b.linear(paired, "combination_mlps_" + c + "_0"));
+      ggml_tensor *res = ggml_add(ctx, messages, edges);
+      out.order.push_back(h), out.order.push_back(res);
+      messages = ggml_add(ctx, b.linear(h, "combination_mlps_" + c + "_2"), res);
+    } else {
     ggml_tensor *mixed = b.mlp2(paired, "combination_mlps_" + c + "_0", "combination_mlps_" + c + "_2", false);
     // (with pair_back_acc mixed first, the same sum: the backward then reaches the pair
     // norm after the residual, whose gradient it sums)
     messages = pair_back_acc ? ggml_add(ctx, mixed, ggml_add(ctx, messages, edges))
                              : ggml_add(ctx, ggml_add(ctx, messages, edges), mixed);
+    }
   }
 
   // readout: node head, and edge head weighted by the cutoff and summed per atom
@@ -259,7 +285,6 @@ PetRaggedOutputs build_pet_ragged(ggml_context *ctx, const PetRaggedSpec &spec,
                                  "edge_final_layers_0"); // [1, E]
   edge_e = ggml_mul(ctx, edge_e, ggml_reshape_2d(ctx, fc, 1, e_cap));
 
-  PetRaggedOutputs out;
   out.total = ggml_add(ctx, ggml_sum(ctx, node_e), ggml_sum(ctx, edge_e));
   // per atom (no gradient needed): edge contributions scattered onto their centres
   ggml_tensor *per_atom_edges = ggml_get_rows_back(ctx, ggml_reshape_2d(ctx, edge_e, 1, e_cap), in.centers, node_e);

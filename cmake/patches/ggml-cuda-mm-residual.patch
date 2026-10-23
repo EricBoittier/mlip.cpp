@@ -1,0 +1,192 @@
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -3361,15 +3361,18 @@
+ 
+ 
+ 
+-// MUL_MAT of a 2-D f32 weight followed (past no-op views) by the ADD of a
+-// bias vector, the matmul's only use: one cuBLASLt GEMM with a bias epilogue
+-// writing the ADD's output, instead of a GEMM and a broadcast add over the
+-// whole result. Same compute type as the cuBLAS path (GGML_CUDA_NO_TF32);
+-// GGML_CUDA_NO_MM_BIAS=1: off. Returns the index of the ADD, or -1.
+-// GGML_CUDA_MM_RESIDUAL=1: when the next node (past views) is the ADD of that
+-// sum and another tensor of its shape (a residual), the only use of the sum,
+-// the GEMM also adds it (beta = 1, C = the residual) and writes that ADD's
+-// output instead; the index returned is then that ADD's.
++// MUL_MAT of a 2-D f32 weight followed (past no-op views) by an ADD of it, the
++// matmul's only use, as one cuBLASLt GEMM writing the ADD's output instead of
++// a GEMM and an element-wise pass over the whole result:
++//   - the ADD of a bias vector: a bias epilogue; when the next node (past
++//     views) is the ADD of that sum and another tensor of its shape (a
++//     residual), the sum's only use, the GEMM also adds it (beta = 1, C = the
++//     residual) and writes that ADD's output (the index returned);
++//   - the ADD of a tensor of its shape (a residual, no bias): beta = 1, C = it.
++// The residual is a src of an ADD after the GEMM's node, so it was computed
++// before (or is a view of something that was). Same compute type as the cuBLAS
++// path (GGML_CUDA_NO_TF32); not for a GGML_PREC_F32 matmul (cuBLAS's own path).
++// GGML_CUDA_NO_MM_BIAS=1: off; GGML_CUDA_NO_MM_RESIDUAL=1: the bias epilogue only.
+ struct ggml_cuda_mm_bias_plan {
+     cublasLtMatmulDesc_t op = nullptr;
+     cublasLtMatrixLayout_t a = nullptr, b = nullptr, d = nullptr;
+@@ -3385,14 +3388,7 @@
+     return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+ }
+ 
+-static int ggml_cuda_mul_mat_bias(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+-    static const bool off = getenv("GGML_CUDA_NO_MM_BIAS") != nullptr;
+-    const ggml_tensor * mm = cgraph->nodes[i];
+-    if (off || mm->op != GGML_OP_MUL_MAT || (mm->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, i) != 1 ||
+-        ggml_get_op_params_i32(mm, 0) == GGML_PREC_F32) {
+-        return -1;
+-    }
+-    int j = i + 1;
++static int ggml_cuda_next_op_node(const ggml_cgraph * cgraph, int j) {
+     while (j < cgraph->n_nodes) {
+         const ggml_tensor * t = cgraph->nodes[j];
+         if (!(ggml_is_empty(t) || t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE ||
+@@ -3401,17 +3397,63 @@
+         }
+         j++;
+     }
++    return j;
++}
++
++// the other src of an ADD of x, or nullptr if `add` is not an ADD of x and something else
++static const ggml_tensor * ggml_cuda_add_other(const ggml_tensor * add, const ggml_tensor * x) {
++    if (add->op != GGML_OP_ADD || (add->src[0] == x) == (add->src[1] == x)) {
++        return nullptr;
++    }
++    return add->src[0] == x ? add->src[1] : add->src[0];
++}
++
++// R a residual C for a GEMM writing `out` (of R's shape): f32, contiguous, `out` is R in place or apart from it
++static bool ggml_cuda_mm_residual_ok(const ggml_tensor * R, const ggml_tensor * out) {
++    return R && R->type == GGML_TYPE_F32 && out->type == GGML_TYPE_F32 && ggml_are_same_shape(R, out) &&
++           ggml_is_contiguous(R) && ggml_is_contiguous(out) && (!ggml_cuda_tensors_overlap(out, R) || out->data == R->data);
++}
++
++static int ggml_cuda_mul_mat_bias(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
++    static const bool off = getenv("GGML_CUDA_NO_MM_BIAS") != nullptr;
++    static const bool residual = getenv("GGML_CUDA_NO_MM_RESIDUAL") == nullptr;
++    const ggml_tensor * mm = cgraph->nodes[i];
++    if (off || mm->op != GGML_OP_MUL_MAT || (mm->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, i) != 1 ||
++        ggml_get_op_params_i32(mm, 0) == GGML_PREC_F32) {
++        return -1;
++    }
++    const int j = ggml_cuda_next_op_node(cgraph, i + 1);
+     if (j >= cgraph->n_nodes) {
+         return -1;
+     }
+     ggml_tensor * add = cgraph->nodes[j];
+-    const ggml_tensor * A = mm->src[0], * B = mm->src[1], * bias = add->src[1];
+-    if (add->op != GGML_OP_ADD || add->src[0] != mm || !bias || A->type != GGML_TYPE_F32 || B->type != GGML_TYPE_F32 ||
+-        bias->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 || A->ne[2] != 1 || A->ne[3] != 1 ||
+-        !ggml_is_contiguous(A) || !ggml_is_contiguous(B) || !ggml_is_contiguous(bias) || !ggml_is_contiguous(add) ||
+-        ggml_nelements(bias) != mm->ne[0] || bias->ne[0] != mm->ne[0] || !ggml_are_same_shape(add, mm) ||
+-        ggml_backend_buft_is_cuda_split(A->buffer->buft) || B->ne[0] != A->ne[0] || ggml_cuda_tensors_overlap(add, A) ||
+-        ggml_cuda_tensors_overlap(add, B) || ggml_cuda_tensors_overlap(add, bias)) {
++    const ggml_tensor * A = mm->src[0], * B = mm->src[1], * other = ggml_cuda_add_other(add, mm);
++    if (!other || A->type != GGML_TYPE_F32 || B->type != GGML_TYPE_F32 || other->type != GGML_TYPE_F32 ||
++        mm->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 || A->ne[2] != 1 || A->ne[3] != 1 ||
++        !ggml_is_contiguous(A) || !ggml_is_contiguous(B) || !ggml_is_contiguous(other) || !ggml_is_contiguous(add) ||
++        !ggml_are_same_shape(add, mm) || ggml_backend_buft_is_cuda_split(A->buffer->buft) || B->ne[0] != A->ne[0]) {
++        return -1;
++    }
++    const bool is_bias = ggml_nelements(other) == mm->ne[0] && other->ne[0] == mm->ne[0];
++    const ggml_tensor * bias = is_bias ? other : nullptr, * R = nullptr;
++    const ggml_tensor * out = add;
++    int last = j;
++    if (!is_bias) {
++        // a residual of the product's own shape
++        if (!residual || !ggml_cuda_mm_residual_ok(other, add)) {
++            return -1;
++        }
++        R = other;
++    } else if (residual && !(add->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_node_get_use_count(cgraph, j) == 1) {
++        const int k = ggml_cuda_next_op_node(cgraph, j + 1);
++        const ggml_tensor * sum = k < cgraph->n_nodes ? cgraph->nodes[k] : nullptr;
++        const ggml_tensor * r = sum ? ggml_cuda_add_other(sum, add) : nullptr;
++        if (r && ggml_are_same_shape(sum, add) && ggml_cuda_mm_residual_ok(r, sum) && !ggml_cuda_tensors_overlap(sum, A) &&
++            !ggml_cuda_tensors_overlap(sum, B) && !ggml_cuda_tensors_overlap(sum, bias)) {
++            R = r, out = sum, last = k;
++        }
++    }
++    if (ggml_cuda_tensors_overlap(out, A) || ggml_cuda_tensors_overlap(out, B) || (bias && ggml_cuda_tensors_overlap(out, bias))) {
+         return -1;
+     }
+     const int64_t K = A->ne[0], M = A->ne[1], N = ggml_nrows(B);
+@@ -3421,14 +3463,15 @@
+         CUBLAS_CHECK(cublasLtCreate(&lt[device]));
+     }
+     static const bool no_tf32 = getenv("GGML_CUDA_NO_TF32") != nullptr;
+-    static std::map<std::tuple<int, int64_t, int64_t, int64_t>, ggml_cuda_mm_bias_plan> plans;
+-    ggml_cuda_mm_bias_plan & p = plans[{device, M, N, K}];
++    const bool fp32 = no_tf32;
++    static std::map<std::tuple<int, int64_t, int64_t, int64_t, bool, bool>, ggml_cuda_mm_bias_plan> plans;
++    ggml_cuda_mm_bias_plan & p = plans[{device, M, N, K, fp32, bias != nullptr}];
+     const size_t ws_max = 32u << 20;
+     if (!p.op) {
+-        const cublasComputeType_t compute = no_tf32 ? CUBLAS_COMPUTE_32F : CUBLAS_COMPUTE_32F_FAST_TF32;
++        const cublasComputeType_t compute = fp32 ? CUBLAS_COMPUTE_32F : CUBLAS_COMPUTE_32F_FAST_TF32;
+         CUBLAS_CHECK(cublasLtMatmulDescCreate(&p.op, compute, CUDA_R_32F));
+         const cublasOperation_t ta = CUBLAS_OP_T, tb = CUBLAS_OP_N;
+-        const cublasLtEpilogue_t epi = CUBLASLT_EPILOGUE_BIAS;
++        const cublasLtEpilogue_t epi = bias ? CUBLASLT_EPILOGUE_BIAS : CUBLASLT_EPILOGUE_DEFAULT;
+         CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof(ta)));
+         CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof(tb)));
+         CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_EPILOGUE, &epi, sizeof(epi)));
+@@ -3440,8 +3483,10 @@
+         CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws_max, sizeof(ws_max)));
+         cublasLtMatmulHeuristicResult_t res{};
+         int found = 0;
+-        const void * bp = bias->data;
+-        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bp, sizeof(bp)));
++        if (bias) {
++            const void * bp = bias->data;
++            CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bp, sizeof(bp)));
++        }
+         if (cublasLtMatmulAlgoGetHeuristic(lt[device], p.op, p.a, p.b, p.d, p.d, pref, 1, &res, &found) == CUBLAS_STATUS_SUCCESS && found > 0) {
+             p.algo = res.algo, p.ws = res.workspaceSize, p.ok = true;
+         }
+@@ -3450,35 +3495,15 @@
+     if (!p.ok) {
+         return -1;
+     }
+-    static const bool residual = getenv("GGML_CUDA_MM_RESIDUAL") != nullptr;
+-    int k = -1;
+-    const ggml_tensor * R = nullptr;
+-    if (residual && !(add->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_node_get_use_count(cgraph, j) == 1) {
+-        k = j + 1;
+-        while (k < cgraph->n_nodes && (ggml_is_empty(cgraph->nodes[k]) || cgraph->nodes[k]->op == GGML_OP_VIEW ||
+-               cgraph->nodes[k]->op == GGML_OP_RESHAPE || cgraph->nodes[k]->op == GGML_OP_PERMUTE ||
+-               cgraph->nodes[k]->op == GGML_OP_TRANSPOSE || cgraph->nodes[k]->op == GGML_OP_NONE)) {
+-            k++;
+-        }
+-        const ggml_tensor * sum = k < cgraph->n_nodes ? cgraph->nodes[k] : nullptr;
+-        if (sum && sum->op == GGML_OP_ADD && (sum->src[0] == add) != (sum->src[1] == add)) {
+-            R = sum->src[0] == add ? sum->src[1] : sum->src[0];
+-        }
+-        if (!R || R->type != GGML_TYPE_F32 || sum->type != GGML_TYPE_F32 || !ggml_are_same_shape(R, add) ||
+-            !ggml_are_same_shape(sum, add) || !ggml_is_contiguous(R) || !ggml_is_contiguous(sum) ||
+-            ggml_cuda_tensors_overlap(sum, A) || ggml_cuda_tensors_overlap(sum, B) || ggml_cuda_tensors_overlap(sum, bias) ||
+-            (ggml_cuda_tensors_overlap(sum, R) && sum->data != R->data)) {
+-            k = -1, R = nullptr;
+-        }
++    if (bias) {
++        const void * bp = bias->data;
++        CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bp, sizeof(bp)));
+     }
+-    void * out = R ? cgraph->nodes[k]->data : add->data;
+-    const void * bp = bias->data;
+-    CUBLAS_CHECK(cublasLtMatmulDescSetAttribute(p.op, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bp, sizeof(bp)));
+     ggml_cuda_pool_alloc<char> ws(ctx.pool(), p.ws > 0 ? p.ws : 1);
+     const float alpha = 1.0f, beta = R ? 1.0f : 0.0f;
+-    CUBLAS_CHECK(cublasLtMatmul(lt[device], p.op, &alpha, A->data, p.a, B->data, p.b, &beta, R ? R->data : out, p.d, out, p.d,
+-                                &p.algo, ws.get(), p.ws, ctx.stream()));
+-    return R ? k : j;
++    CUBLAS_CHECK(cublasLtMatmul(lt[device], p.op, &alpha, A->data, p.a, B->data, p.b, &beta, R ? R->data : out->data, p.d,
++                                out->data, p.d, &p.algo, ws.get(), p.ws, ctx.stream()));
++    return last;
+ }
+ 
+ // OUT_PROD (a gradient product, 2-D f32) followed, past no-op views, by the

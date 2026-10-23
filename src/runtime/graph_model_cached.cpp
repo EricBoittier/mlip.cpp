@@ -582,9 +582,11 @@ void GraphModel::build_ragged_graph(int n, int64_t e_cap, int max_len, bool back
   ggml_set_output(g->energy);
 
   g->graph = ggml_new_graph_custom(ctx, GRAPH_SIZE, backward);
+  for (ggml_tensor *t : out.order) ggml_build_forward_expand(g->graph, t);
   ggml_build_forward_expand(g->graph, g->energy);
   ggml_build_forward_expand(g->graph, g->loss);
   g->forward = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
+  for (ggml_tensor *t : out.order) ggml_build_forward_expand(g->forward, t);
   ggml_build_forward_expand(g->forward, g->energy);
   ggml_build_forward_expand(g->forward, g->loss);
   std::vector<std::pair<ggml_tensor *, float>> constants;

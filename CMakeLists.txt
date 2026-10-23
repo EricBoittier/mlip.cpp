@@ -271,6 +271,9 @@ else()
         # the gradient of a CONCAT w.r.t. a contiguous part as a view of the
         # concatenation's gradient, not a copy (GGML_CONCAT_GRAD_CONT=1: a copy)
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-concat-grad-view.patch"
+        # CUDA MUL_MAT (+ bias) + residual ADD as one cuBLASLt GEMM with beta = 1
+        # (GGML_CUDA_NO_MM_RESIDUAL=1: off)
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-mm-residual.patch"
         # CUDA PET norms (RMSNorm, add + RMSNorm, pair LayerNorm, their backward)
         # one warp per row with the row in registers (GGML_PET_NORM_BLOCK=1: a block per row)
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-pet-norm-warp.patch"
