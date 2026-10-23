@@ -1,0 +1,87 @@
+--- a/src/ggml-cuda/pet-fused.cu
++++ b/src/ggml-cuda/pet-fused.cu
+@@ -410,6 +410,46 @@
+     }
+ }
+ 
++// float4 forms (f a multiple of 4, 16-byte aligned rows; GGML_PET_GLU_SCALAR=1: the kernels above):
++// one thread per four outputs, with 32-bit row / column arithmetic when the indices fit
++template <typename I>
++static __global__ void pet_glu_kernel4(const float4 * __restrict__ h, float4 * __restrict__ y, const I f4, const I n4) {
++    for (I i = blockIdx.x*(I) blockDim.x + threadIdx.x; i < n4; i += (I) gridDim.x*blockDim.x) {
++        const I r = i / f4, c = i - r*f4;
++        const float4 v = h[r*2*f4 + c], g = h[r*2*f4 + f4 + c];
++        y[i] = make_float4((1.0f / (1.0f + expf(-g.x)))*v.x, (1.0f / (1.0f + expf(-g.y)))*v.y,
++                           (1.0f / (1.0f + expf(-g.z)))*v.z, (1.0f / (1.0f + expf(-g.w)))*v.w);
++    }
++}
++
++template <typename I>
++static __global__ void pet_glu_back_kernel4(const float4 * __restrict__ h, const float4 * __restrict__ dy,
++        float4 * __restrict__ dh, const I f4, const I n4) {
++    for (I i = blockIdx.x*(I) blockDim.x + threadIdx.x; i < n4; i += (I) gridDim.x*blockDim.x) {
++        const I r = i / f4, c = i - r*f4;
++        const float4 v = h[r*2*f4 + c], g = h[r*2*f4 + f4 + c], d = dy[i];
++        float4 a, b;
++#define PET_GLU_BACK1(k) { const float s = 1.0f / (1.0f + expf(-g.k)); a.k = s*d.k; b.k = (s*(1.0f - s))*(d.k*v.k); }
++        PET_GLU_BACK1(x) PET_GLU_BACK1(y) PET_GLU_BACK1(z) PET_GLU_BACK1(w)
++#undef PET_GLU_BACK1
++        dh[r*2*f4 + c] = a;
++        dh[r*2*f4 + f4 + c] = b;
++    }
++}
++
++static bool pet_glu_vec4(const int64_t f, std::initializer_list<const void *> ptrs) {
++    static const bool scalar = getenv("GGML_PET_GLU_SCALAR") != nullptr;
++    if (scalar || f % 4 != 0) {
++        return false;
++    }
++    for (const void * p : ptrs) {
++        if ((uintptr_t) p % 16 != 0) {
++            return false;
++        }
++    }
++    return true;
++}
++
+ static unsigned pet_elementwise_blocks(int64_t n) {
+     return (unsigned) std::min<int64_t>((n + 255) / 256, 1 << 20);
+ }
+@@ -417,6 +457,18 @@
+ void ggml_cuda_op_pet_glu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const int64_t n = ggml_nelements(dst);
+     if (n == 0) return;
++    if (pet_glu_vec4(dst->ne[0], {dst->src[0]->data, dst->data})) {
++        const int64_t f4 = dst->ne[0] / 4, n4 = n / 4;
++        if (2*n4 + 2*f4 < INT32_MAX) {
++            pet_glu_kernel4<uint32_t><<<pet_elementwise_blocks(n4), 256, 0, ctx.stream()>>>((const float4 *) dst->src[0]->data,
++                (float4 *) dst->data, (uint32_t) f4, (uint32_t) n4);
++        } else {
++            pet_glu_kernel4<int64_t><<<pet_elementwise_blocks(n4), 256, 0, ctx.stream()>>>((const float4 *) dst->src[0]->data,
++                (float4 *) dst->data, f4, n4);
++        }
++        CUDA_CHECK(cudaGetLastError());
++        return;
++    }
+     pet_glu_kernel<<<pet_elementwise_blocks(n), 256, 0, ctx.stream()>>>((const float *) dst->src[0]->data, (float *) dst->data,
+         dst->ne[0], n);
+     CUDA_CHECK(cudaGetLastError());
+@@ -425,6 +477,18 @@
+ void ggml_cuda_op_pet_glu_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const int64_t n = ggml_nelements(dst->src[1]);
+     if (n == 0) return;
++    if (pet_glu_vec4(dst->src[1]->ne[0], {dst->src[0]->data, dst->src[1]->data, dst->data})) {
++        const int64_t f4 = dst->src[1]->ne[0] / 4, n4 = n / 4;
++        if (2*n4 + 2*f4 < INT32_MAX) {
++            pet_glu_back_kernel4<uint32_t><<<pet_elementwise_blocks(n4), 256, 0, ctx.stream()>>>((const float4 *) dst->src[0]->data,
++                (const float4 *) dst->src[1]->data, (float4 *) dst->data, (uint32_t) f4, (uint32_t) n4);
++        } else {
++            pet_glu_back_kernel4<int64_t><<<pet_elementwise_blocks(n4), 256, 0, ctx.stream()>>>((const float4 *) dst->src[0]->data,
++                (const float4 *) dst->src[1]->data, (float4 *) dst->data, f4, n4);
++        }
++        CUDA_CHECK(cudaGetLastError());
++        return;
++    }
+     pet_glu_back_kernel<<<pet_elementwise_blocks(n), 256, 0, ctx.stream()>>>((const float *) dst->src[0]->data,
+         (const float *) dst->src[1]->data, (float *) dst->data, dst->src[1]->ne[0], n);
+     CUDA_CHECK(cudaGetLastError());

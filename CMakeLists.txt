@@ -274,6 +274,9 @@ else()
         # CUDA PET norms (RMSNorm, add + RMSNorm, pair LayerNorm, their backward)
         # one warp per row with the row in registers (GGML_PET_NORM_BLOCK=1: a block per row)
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-pet-norm-warp.patch"
+        # CUDA PET_GLU / _BACK on float4 with 32-bit index arithmetic
+        # (GGML_PET_GLU_SCALAR=1: one element per thread, 64-bit division)
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-pet-glu-vec4.patch"
     )
     # the source cache is keyed by the ggml tag and the patches' contents:
     # CPM's default key hashes the arguments, i.e. the patch paths, so every
