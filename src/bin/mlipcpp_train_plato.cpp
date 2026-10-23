@@ -4,7 +4,7 @@
 //       [--epochs 3] [--batch-size 16] [--lr 1e-4] [--schedule cosine|linear] [--warmup 0.01]
 //       [--decay-after 10] [--min-lr 1e-6] [--energy-weight 1] [--force-weight 1] [--grad-clip 1]
 //       [--seed 0] [--no-augment] [--fd-eps 5e-3] [--gpus 1] [--save-every 100] [--log FILE.jsonl]
-//       [--resume STATE] [--state STATE] [--max-epochs-this-run N] [--backend cuda]
+//       [--resume STATE] [--state STATE] [--state-every 10] [--max-epochs-this-run N] [--max-hours H] [--backend cuda]
 //   mlipcpp-train-plato --init model.gguf --train data.bin --check REF   (REF.json / REF.f64 of
 //       scripts/plato/plato_grad_reference.py: loss and parameter gradients vs PyTorch)
 //
@@ -882,6 +882,7 @@ int main(int argc, char **argv) {
     const std::string schedule = arg(argc, argv, "--schedule", "cosine");
     const int64_t max_steps = std::stoll(arg(argc, argv, "--max-steps", "-1"));
     const int save_every = std::stoi(arg(argc, argv, "--save-every", "100")), val_every = std::stoi(arg(argc, argv, "--val-every", "1"));
+    const int state_every = std::stoi(arg(argc, argv, "--state-every", "10"));
     const int max_epochs_run = std::stoi(arg(argc, argv, "--max-epochs-this-run", "1000000"));
     const double max_hours = std::stod(arg(argc, argv, "--max-hours", "1e9"));
     const bool augment = !flag(argc, argv, "--no-augment"), no_val = flag(argc, argv, "--no-val");
@@ -1030,7 +1031,7 @@ int main(int argc, char **argv) {
       log_line(line);
       const bool last = ep == epochs || epochs_this_run >= max_epochs_run || (max_steps > 0 && st.step >= max_steps) ||
                         std::chrono::duration<double>(clk::now() - run_start).count() / 3600.0 > max_hours;
-      if (ep % save_every == 0 || last) {
+      if (ep % save_every == 0 || ep % state_every == 0 || last) {
         const auto p = w0.get_params();
         const nlohmann::json info = {{"epoch", ep}, {"step", st.step}, {"init", init}, {"lr", lr0}, {"schedule", schedule},
                                      {"epochs", epochs}, {"batch_size", B}, {"fd_eps", w0.fd_eps}, {"gpus", W}};

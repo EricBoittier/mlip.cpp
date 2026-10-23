@@ -247,6 +247,8 @@ bool PlatoModel::load_from_gguf(const std::string &path) {
   spec_.les_sigma = hy["les_sigma"], spec_.les_kcut = hy["les_kcut"];
   spec_.mesh = hy["mesh_coupling"].get<bool>() && options_.mesh;
   spec_.les = hy["les"].get<bool>() && options_.les;
+  spec_.chi = spec_.les && hy.value("electronegativity", std::string("none")) == "linear";
+  spec_.chi_bound = hy.value("dchi_bound", 0.0f);
   spec_.n_types = idx;
   spec_.fold_in_graph = options_.fold_in_graph;
   spec_.decomposed_layer_norm = options_.decomposed_layer_norm;
@@ -489,6 +491,7 @@ ModelResult PlatoModel::predict(const AtomicSystem &system, bool compute_forces)
     ggml_set_output(g->out.total);
     ggml_set_output(g->out.short_range);
     if (g->out.les) ggml_set_output(g->out.les);
+    if (g->out.chi) ggml_set_output(g->out.chi);
     g->forward = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
     ggml_build_forward_expand(g->forward, g->out.short_range);
     ggml_build_forward_expand(g->forward, g->out.total);
@@ -584,6 +587,9 @@ ModelResult PlatoModel::predict(const AtomicSystem &system, bool compute_forces)
   ggml_backend_tensor_get(G->out.total, &total, 0, sizeof(float));
   ggml_backend_tensor_get(G->out.short_range, &sr, 0, sizeof(float));
   if (G->out.les) ggml_backend_tensor_get(G->out.les, &les, 0, sizeof(float));
+  float chi = 0;
+  if (G->out.chi) ggml_backend_tensor_get(G->out.chi, &chi, 0, sizeof(float));
+  parts_.chi = energy_scale_ * chi;
   r.energy = static_cast<float>(energy_scale_ * total + composition);
   parts_.short_range = energy_scale_ * sr, parts_.les = energy_scale_ * les, parts_.composition = composition;
   for (int a = 0; a < 3; a++) parts_.mesh[a] = mesh[a];

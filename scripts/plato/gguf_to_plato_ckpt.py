@@ -50,7 +50,11 @@ def build_model(meta):
         for n, t in info["targets"].items()
     }
     ds = DatasetInfo(length_unit=info["length_unit"], atomic_types=info["atomic_types"], targets=targets)
-    return PlatoPETLR(json.loads(meta["plato.hypers"]), ds)
+    # hypers of an older checkpoint version: the model's own upgrade path
+    ck = {"model_ckpt_version": int(meta.get("plato.checkpoint_version", PlatoPETLR.__checkpoint_version__)),
+          "model_data": {"model_hypers": json.loads(meta["plato.hypers"])}}
+    PlatoPETLR.upgrade_checkpoint(ck)
+    return PlatoPETLR(ck["model_data"]["model_hypers"], ds)
 
 
 def main():
@@ -83,7 +87,6 @@ def main():
 
     ckpt.update(trainer_ckpt_version=Trainer.__checkpoint_version__, train_hypers=None, optimizer_state_dict=None,
                 scheduler_state_dict=None, best_metric=None, best_optimizer_state_dict=None)
-    ckpt["model_ckpt_version"] = int(meta.get("plato.checkpoint_version", ckpt["model_ckpt_version"]))
     torch.save(ckpt, args.output)
     print(f"{args.output}: {len(state)} tensors")
 
@@ -91,8 +94,7 @@ def main():
         orig = torch.load(args.check, weights_only=False, map_location="cpu")
         osd = orig["best_model_state_dict"] or orig["model_state_dict"]
         bad = [n for n in osd if n not in state or osd[n].dtype != state[n].dtype or osd[n].shape != state[n].shape
-               or not torch.equal(osd[n].view(torch.uint8) if osd[n].dtype != torch.uint8 else osd[n],
-                                  state[n].view(torch.uint8) if state[n].dtype != torch.uint8 else state[n])]
+               or not torch.equal(osd[n].reshape(-1).view(torch.uint8), state[n].reshape(-1).view(torch.uint8))]
         extra = [n for n in state if n not in osd]
         print(f"bit-identical: {len(osd) - len(bad)}/{len(osd)} tensors; differ: {bad[:10]}; extra: {extra}")
         if bad or extra:

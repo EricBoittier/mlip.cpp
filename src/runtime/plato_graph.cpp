@@ -238,6 +238,18 @@ PlatoOutputs build_plato(ggml_context *ctx, const PlatoSpec &spec, const std::ma
     }
     out.les = e;
     out.energies = ggml_add(ctx, out.energies, e);
+    if (spec.chi) {
+      // in model units: sum_i chi_i q_m,i / charge_unit (q_m: the centred first channel)
+      ggml_tensor *dchi = b.frame_mlp(h, "electronegativity.0.head");               // [1, n]
+      if (spec.chi_bound > 0) dchi = ggml_scale(ctx, ggml_tanh(ctx, dchi), spec.chi_bound);
+      ggml_tensor *chi0 = b.weight("electronegativity.0.chi0");
+      ggml_tensor *chi = ggml_add(ctx, ggml_reshape_2d(ctx, ggml_get_rows(ctx, ggml_reshape_2d(ctx, chi0, 1, chi0->ne[0]), in.species), 1, n), dchi);
+      out.chi_atoms = chi;
+      ggml_tensor *q0 = ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_view_2d(ctx, q, n, 1, q->nb[1], 0)), 1, n);
+      ggml_tensor *ea = ggml_div(ctx, ggml_mul(ctx, chi, q0), b.weight("electronegativity.0.charge_unit"));
+      out.chi = per_structure(ea);
+      out.energies = ggml_add(ctx, out.energies, out.chi);
+    }
   }
   out.total = in.energy_weights ? ggml_sum(ctx, ggml_mul(ctx, out.energies, in.energy_weights)) : ggml_sum(ctx, out.energies);
   return out;

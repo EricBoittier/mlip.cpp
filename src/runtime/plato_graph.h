@@ -26,6 +26,10 @@ struct PlatoSpec {
   int couple_at = 1, mesh_channels = 8, n_types = 0;
   float cutoff = 5.0f, mesh_sigma = 1.5f, les_sigma = 1.0f, les_kcut = 6.0f, ln_eps = 1e-5f;
   bool mesh = true, les = true;
+  // electronegativity term E_chi = sum_i chi_i q_i on the first charge channel (metatrain
+  // feat/plato-chi-frozen): chi = chi0[Z] + dchi, dchi = b tanh(head(h)) when b > 0
+  bool chi = false;
+  float chi_bound = 0.0f;
   std::vector<float> frame_w;        // [F]
   std::vector<double> frame_R;       // [F][3][3], R_f
   std::vector<double> omega;         // [d/h/2][3]
@@ -81,6 +85,8 @@ struct PlatoOutputs {
   ggml_tensor *total = nullptr;       // [1] sum_g w_g E_g: differentiate this
   ggml_tensor *short_range = nullptr; // [1, G] energy head part
   ggml_tensor *les = nullptr;         // [1, G] LES part (or nullptr)
+  ggml_tensor *chi = nullptr;         // [1, G] electronegativity part (or nullptr)
+  ggml_tensor *chi_atoms = nullptr;   // [1, n] chi_i (eV / e)
   ggml_tensor *charges = nullptr;     // [n, Q] centred latent charges (or nullptr): an
                                       // electronegativity term sum_i chi_i q_i adds here
 };

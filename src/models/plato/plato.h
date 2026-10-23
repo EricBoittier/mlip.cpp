@@ -60,7 +60,7 @@ public:
   const runtime::PlatoSpec &spec() const { return spec_; }
   // parts of the last energy (eV, scaled): energy head, LES; and the mesh it used
   struct Parts {
-    double short_range = 0, les = 0, composition = 0;
+    double short_range = 0, les = 0, chi = 0, composition = 0; // les: Ewald part, chi: electronegativity part
     int mesh[3] = {0, 0, 0};
     int64_t n_k = 0, edges = 0;
     int max_len = 0;
