@@ -1,0 +1,76 @@
+#pragma once
+// Plato-PET-LR (metatrain experimental.plato_pet_lr, frame_mode: attention):
+// GGUFs from scripts/plato/export_plato_gguf.py. Energy, forces and stress from
+// one ggml graph and its backward pass (runtime/plato_graph.h).
+
+#include "core/backend.h"
+#include "mlipcpp/model.h"
+#include "runtime/plato_graph.h"
+
+#include <map>
+#include <memory>
+#include <string>
+#include <vector>
+
+struct ggml_context;
+struct ggml_backend_buffer;
+struct ggml_cgraph;
+struct ggml_gallocr;
+
+namespace mlipcpp::plato {
+
+struct PlatoOptions {
+  BackendPreference backend = BackendPreference::Auto;
+  int device = 0;
+  // the mesh coupling's mesh; 0: PyTorch's rule max(8, ceil(|a_i| / spacing)) per
+  // cell vector, which jumps under rotation or strain where |a_i| / spacing crosses
+  // an integer (an integer-length box rotated by a generic rotation: one more point).
+  // MLIPCPP_PLATO_MESH="M" or "M0,M1,M2" sets it too. Off by default (parity).
+  int fixed_mesh[3] = {0, 0, 0};
+  bool mesh = true, les = true; // the model's own switches (parity of the parts)
+  bool fold_in_graph = false;   // training layout (MLIPCPP_PLATO_FOLD_IN_GRAPH=1)
+};
+
+class PlatoModel : public Model {
+public:
+  explicit PlatoModel(PlatoOptions options = {});
+  ~PlatoModel() override;
+
+  bool load_from_gguf(const std::string &path);
+  ModelResult predict(const AtomicSystem &system) override { return predict(system, true); }
+  ModelResult predict(const AtomicSystem &system, bool compute_forces) override;
+  std::string model_type() const override { return "plato-pet-lr"; }
+  float cutoff() const override { return spec_.cutoff; }
+
+  PlatoOptions &options() { return options_; }
+  const runtime::PlatoSpec &spec() const { return spec_; }
+  // parts of the last energy (eV, scaled): energy head, LES; and the mesh it used
+  struct Parts {
+    double short_range = 0, les = 0, composition = 0;
+    int mesh[3] = {0, 0, 0};
+    int64_t n_k = 0, edges = 0;
+    int max_len = 0;
+    bool rebuilt = false;
+    double nl_ms = 0, prep_ms = 0, compute_ms = 0, read_ms = 0; // host neighbour list, inputs (+ graph build), graph, outputs
+  };
+  const Parts &last_parts() const { return parts_; }
+  const char *backend_name() const;
+
+private:
+  struct Graph;
+  PlatoOptions options_;
+  runtime::PlatoSpec spec_;
+  double energy_scale_ = 1.0, mesh_spacing_ = 1.0;
+  std::map<int, double> composition_;
+  std::map<int, int> species_index_;
+  std::shared_ptr<BackendProvider> backend_;
+  ggml_context *ctx_w_ = nullptr;
+  ggml_backend_buffer *buf_w_ = nullptr;
+  std::map<std::string, ggml_tensor *> weights_;
+  std::unique_ptr<Graph> graph_;
+  ggml_gallocr *galloc_ = nullptr;
+  void *vesin_ = nullptr;
+  Parts parts_;
+};
+
+} // namespace mlipcpp::plato

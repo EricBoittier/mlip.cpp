@@ -20,6 +20,7 @@ set(MLIPCPP_MODEL_SOURCES
     models/pet/pet.cpp
     models/pet/pet_batch.cpp
     models/pet/pet_layers.cpp
+    models/plato/plato.cpp
 )
 
 # I/O and utilities
@@ -34,6 +35,7 @@ set(MLIPCPP_RUNTIME_SOURCES
     runtime/graph_model.cpp
     runtime/graph_model_cached.cpp
     runtime/pet_ragged.cpp
+    runtime/plato_graph.cpp
 )
 
 # Utilities
@@ -239,6 +241,10 @@ if(MLIPCPP_BUILD_TRAINING AND UNIX AND NOT EMSCRIPTEN)
 
     add_executable(mlipcpp-wgrad-test bin/mlipcpp_wgrad_test.cpp)
     target_link_libraries(mlipcpp-wgrad-test PRIVATE mlipcpp_train)
+
+    # Plato-PET-LR parity against PyTorch references and timing
+    add_executable(mlipcpp-plato bin/mlipcpp_plato.cpp)
+    target_link_libraries(mlipcpp-plato PRIVATE mlipcpp_train)
 
     add_executable(mlipcpp-predict bin/mlipcpp_predict.cpp)
     target_link_libraries(mlipcpp-predict PRIVATE mlipcpp_train)

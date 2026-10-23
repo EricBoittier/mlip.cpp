@@ -283,6 +283,13 @@ else()
         # CUDA PET_GLU / _BACK on float4 with 32-bit index arithmetic
         # (GGML_PET_GLU_SCALAR=1: one element per thread, 64-bit division)
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-pet-glu-vec4.patch"
+        # Plato-PET-LR (runtime/plato_graph.h): frame-averaged RoPE attention over
+        # ragged sequences (GGML_OP_PLATO_ATTN / _BACK), 3-D real FFTs whose
+        # gradients are their adjoints (GGML_OP_PLATO_FFT3; cuFFT on CUDA, a
+        # mixed-radix FFT on the CPU), order-4 B-spline spread / gather with
+        # analytic position derivatives, erf, and the GET_ROWS_BACK gradient;
+        # CPU + CUDA
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-plato.patch"
     )
     # the source cache is keyed by the ggml tag and the patches' contents:
     # CPM's default key hashes the arguments, i.e. the patch paths, so every
