@@ -51,6 +51,10 @@ struct PlatoInputs {
   ggml_tensor *rel_identity = nullptr;     // F32 [9] (fold_in_graph)
   // structures of the batch: atoms of structure g are consecutive
   int n_struct = 1;
+  // every structure of the batch with the same |k| sets and no strain derivative
+  // (rotated copies of one cell, no stress loss): one mesh filter and one Ewald g(k)
+  // for all, from mesh_k / les_k / strain / inv_volume of one structure ([.., 1])
+  bool shared_filter = false;
   ggml_tensor *struct_index = nullptr;     // I32 [n], structure of each atom
   ggml_tensor *energy_weights = nullptr;   // F32 [1, G]: total = sum_g w_g E_g
   // long range (periodic batches: every structure on the same mesh and the same

@@ -13,7 +13,7 @@ set -euo pipefail
 D=/work/cosmo/boittier/lyra/mlipcpp/pd-bench/dev-plato
 C=/work/cosmo/boittier/cache
 export CCACHE_DIR=$C/ccache CPM_SOURCE_CACHE=$C/cpm XDG_CACHE_HOME=$C/xdg
-module purge; module load gcc/14.3.0 cuda/12.9.1 cmake/3.31.9
+module purge; module load gcc/14.3.0 cuda/12.9.1 cmake/3.31.9 nccl
 echo "node $(hostname) gpu $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | head -1)"
 B=$D/build-cuda
 STEPS=${STEPS:-build check speed}
@@ -28,11 +28,14 @@ if has build; then
   echo built
 fi
 if has check; then
-  for r in grefE gref; do echo "== gradient check $r (CUDA, fp32 GEMMs=$GGML_CUDA_NO_TF32)"; $T --init $D/models/D2-att.gguf --train $D/data/train.bin --check $D/data/$r --backend cuda --fd-eps $EPS 2>&1 | grep -v "^ggml_cuda\|Device 0"; done
+  for r in grefE gref; do echo "== gradient check $r (CUDA, fp32 GEMMs=$GGML_CUDA_NO_TF32)"; $T --init $D/models/D2-att.gguf --train $D/data/train.bin --check $D/data/$r --backend cuda --fd-eps $EPS 2>&1 | grep -E "loss|gradient|largest"; done
+  $D/build-cuda/bin/mlipcpp-plato check $D/models/D2-att.gguf $D/ref --backend cuda 2>&1 | grep -E "^cc0  |x8     full|open   full"
 fi
 if has speed; then
-  echo "== speed: 200 steps"
-  $T --init $D/models/D2-att.gguf --train $D/data/train.bin --val $D/data/val.bin --epochs 1 --max-steps ${SPEED_STEPS:-200} --backend cuda --fd-eps $EPS -o $OUT/speed.gguf 2>&1 | grep -v "^ggml_cuda\|Device 0\|warmup"
+  for v in ${SPEED_VARIANTS:-none}; do
+    echo "== speed: ${SPEED_STEPS:-200} steps, batch $BS, $v"
+    env $([[ $v != none ]] && echo $v=1) $T --init $D/models/D2-att.gguf --train $D/data/train.bin --val $D/data/val.bin --epochs ${SPEED_EPOCHS:-1} --max-steps ${SPEED_STEPS:-200} --batch-size $BS --backend cuda --fd-eps $EPS --no-val --gpus ${GPUS:-1} ${SPEED_ARGS:-} -o $OUT/speed.gguf 2>&1 | grep -v "^ggml_cuda\|Device \|warmup"
+  done
 fi
 if has train; then
   echo "== mlipcpp-train-plato $EPOCHS epochs, lr $LR, batch $BS"

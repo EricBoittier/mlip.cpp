@@ -145,10 +145,9 @@ PlatoOutputs build_plato(ggml_context *ctx, const PlatoSpec &spec, const std::ma
       const int64_t Mh = int64_t(M0) * M1 * (M2 / 2 + 1), C = spec.mesh_channels;
       ggml_tensor *xc = b.cols(tok, 0, n);
       ggml_tensor *v = b.frame_linear(b.layer_norm(xc, "coupling.norm"), "coupling.down"); // [C, n]
-      if (G > 1) // the channels of structure g at [g C, (g + 1) C): [C G, n]
-        v = ggml_reshape_2d(ctx, ggml_mul(ctx, ggml_repeat(ctx, ggml_reshape_3d(ctx, v, C, 1, n), ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, G, n)),
-                                          ggml_reshape_3d(ctx, in.onehot_t, 1, G, n)), C * G, n);
-      ggml_tensor *rho = ggml_plato_spread(ctx, v, frac, M0, M1, M2);                     // [M2, M1, M0, C G]
+      // structure g's channels at [g C, (g + 1) C) of one mesh
+      ggml_tensor *rho = G > 1 ? ggml_plato_spread_blocked(ctx, v, frac, in.struct_index, (int) G, M0, M1, M2)
+                               : ggml_plato_spread(ctx, v, frac, M0, M1, M2);           // [M2, M1, M0, C G]
       ggml_tensor *rk = ggml_plato_fft3(ctx, rho, 0, M0, M1, M2);                         // [2 Mh2, M1, M0, C G]
       // the filter 4 pi / V exp(-sigma^2 k^2 / 2) / k^2 (1 + filt(|k|)) / deconv, under strain, per structure
       ggml_tensor *k = b.strained(in.mesh_k);                                    // [3, Mh, G]
@@ -157,17 +156,15 @@ PlatoOutputs build_plato(ggml_context *ctx, const PlatoSpec &spec, const std::ma
       const float s2 = spec.mesh_sigma * spec.mesh_sigma;
       ggml_tensor *base = ggml_div(ctx, ggml_exp(ctx, ggml_scale(ctx, k2, -0.5f * s2)), k2s);
       base = ggml_mul(ctx, ggml_mul(ctx, base, in.mesh_deconv),
-                      ggml_reshape_3d(ctx, ggml_scale(ctx, b.inv_volume(), 4.0f * M_PI), 1, 1, G));
+                      ggml_reshape_3d(ctx, ggml_scale(ctx, b.inv_volume(), 4.0f * M_PI), 1, 1, in.strain->ne[2]));
       ggml_tensor *filt = b.linear(ggml_silu(ctx, b.linear(ggml_sqrt(ctx, k2s), "coupling.filt.0")), "coupling.filt.2"); // [C, Mh, G]
       ggml_tensor *g = ggml_mul(ctx, ggml_scale_bias(ctx, filt, 1.0f, 1.0f), base);                                     // [C, Mh, G]
-      g = ggml_reshape_3d(ctx, ggml_cont(ctx, ggml_permute(ctx, g, 1, 0, 2, 3)), 1, Mh, C * G);                         // [1, Mh, C G]
-      rk = ggml_reshape_4d(ctx, ggml_mul(ctx, ggml_reshape_3d(ctx, rk, 2, Mh, C * G), g), rk->ne[0], M1, M0, C * G);
+      const int64_t Gf = g->ne[2];                                                                                       // G, or 1 (shared)
+      g = ggml_reshape_4d(ctx, ggml_cont(ctx, ggml_permute(ctx, g, 1, 0, 2, 3)), 1, Mh, C, Gf);                         // [1, Mh, C, Gf]
+      rk = ggml_reshape_4d(ctx, ggml_mul(ctx, ggml_reshape_4d(ctx, rk, 2, Mh, C, G), g), rk->ne[0], M1, M0, C * G);
       ggml_tensor *phi = ggml_plato_fft3(ctx, rk, 1, M0, M1, M2);                  // [M2, M1, M0, C G]
-      ggml_tensor *m = ggml_plato_gather(ctx, phi, frac, false);                    // [C G, n]
-      if (G > 1) { // each atom's own structure: sum_g onehot[g, i] m[g C + c, i]
-        m = ggml_mul(ctx, ggml_reshape_3d(ctx, m, C, G, n), ggml_reshape_3d(ctx, in.onehot_t, 1, G, n));
-        m = ggml_reshape_2d(ctx, ggml_sum_rows(ctx, ggml_cont(ctx, ggml_permute(ctx, m, 1, 0, 2, 3))), C, n);
-      }
+      ggml_tensor *m = G > 1 ? ggml_plato_gather_blocked(ctx, phi, frac, in.struct_index, (int) C, false)
+                             : ggml_plato_gather(ctx, phi, frac, false);            // [C, n]
       ggml_tensor *delta = b.frame_linear(m, "coupling.up");                        // [d, n]
       tok = ggml_concat(ctx, ggml_add(ctx, xc, delta), b.cols(tok, n, E), 1);
     }
@@ -204,7 +201,7 @@ PlatoOutputs build_plato(ggml_context *ctx, const PlatoSpec &spec, const std::ma
       ggml_tensor *Sq = mm_f32(ctx, ggml_sin(ctx, ph), qb);
       const int64_t nk = in.les_n->ne[1];
       ggml_tensor *k = b.strained(in.les_k);                         // [3, nk, G]
-      ggml_tensor *k2 = ggml_reshape_2d(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, k)), nk, G); // [nk, G]
+      ggml_tensor *k2 = ggml_reshape_2d(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, k)), nk, in.les_k->ne[2]); // [nk, G or 1]
       const float kc = spec.les_kcut / sigma, wd = 1.0f / sigma;
       // cosine window over |k| in (kc - wd, kc): x = (|k| - (kc - wd)) / wd where tapered, else 0
       ggml_tensor *taper = ggml_reshape_2d(ctx, in.les_taper, nk, 1);

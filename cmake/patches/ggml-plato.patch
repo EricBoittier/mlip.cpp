@@ -1,5 +1,5 @@
 diff --git a/include/ggml.h b/include/ggml.h
-index 5f70de04..c2e43b7a 100644
+index 5f70de04..90375df7 100644
 --- a/include/ggml.h
 +++ b/include/ggml.h
 @@ -596,6 +596,12 @@ extern "C" {
@@ -15,7 +15,7 @@ index 5f70de04..c2e43b7a 100644
  
          GGML_OP_COUNT,
      };
-@@ -1887,6 +1893,68 @@ extern "C" {
+@@ -1887,6 +1893,87 @@ extern "C" {
              int                   max_len,
              float                 scale);
  
@@ -74,6 +74,25 @@ index 5f70de04..c2e43b7a 100644
 +            struct ggml_context * ctx,
 +            struct ggml_tensor  * mesh,
 +            struct ggml_tensor  * frac,
++            bool                  deriv);
++
++    // the same for a batch of structures on one mesh: atom i writes (reads) the channels
++    // [block[i] C, (block[i] + 1) C) of a mesh with C n_blocks channels (block: I32 [n])
++    GGML_API struct ggml_tensor * ggml_plato_spread_blocked(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * v,
++            struct ggml_tensor  * frac,
++            struct ggml_tensor  * block,
++            int                   n_blocks,
++            int                   M0,
++            int                   M1,
++            int                   M2);
++    GGML_API struct ggml_tensor * ggml_plato_gather_blocked(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * mesh,
++            struct ggml_tensor  * frac,
++            struct ggml_tensor  * block,
++            int                   C,
 +            bool                  deriv);
 +
 +    // the error function, elementwise
@@ -149,7 +168,7 @@ index 27a21253..172afd9d 100644
                      {
                          cur += sizeof(int32_t)*node->src[0]->ne[0]*n_tasks;
 diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
-index 561cde2f..99511140 100644
+index 561cde2f..99973760 100644
 --- a/src/ggml-cpu/ops.cpp
 +++ b/src/ggml-cpu/ops.cpp
 @@ -12,6 +12,7 @@
@@ -160,7 +179,7 @@ index 561cde2f..99511140 100644
  
  // ggml_compute_forward_dup
  
-@@ -11929,3 +11930,401 @@ void ggml_compute_forward_pet_pair_norm_back(const ggml_compute_params * params,
+@@ -11929,3 +11930,407 @@ void ggml_compute_forward_pet_pair_norm_back(const ggml_compute_params * params,
          }
      }
  }
@@ -512,14 +531,17 @@ index 561cde2f..99511140 100644
 +
 +void ggml_compute_forward_plato_spread(const ggml_compute_params * params, ggml_tensor * dst) {
 +    const float * v = (const float *) dst->src[0]->data, * frac = (const float *) dst->src[1]->data;
-+    const int64_t C = dst->src[0]->ne[0], n = ggml_nrows(dst->src[1]);
++    const int32_t * blk = dst->src[2] ? (const int32_t *) dst->src[2]->data : nullptr;
++    const int64_t C = dst->src[0]->ne[0], n = ggml_nrows(dst->src[1]), CT = dst->ne[3];
 +    const int64_t M2 = dst->ne[0], M1 = dst->ne[1], M0 = dst->ne[2], M = M0*M1*M2;
 +    float * rho = (float *) dst->data;
 +    plato_stencil st;
-+    for (int64_t c = params->ith; c < C; c += params->nth) { // a channel per thread: no races
-+        float * r = rho + c*M;
++    for (int64_t ct = params->ith; ct < CT; ct += params->nth) { // a channel per thread: no races
++        float * r = rho + ct*M;
 +        memset(r, 0, M*sizeof(float));
++        const int64_t b = ct / C, c = ct % C;
 +        for (int64_t a = 0; a < n; a++) {
++            if ((blk ? blk[a] : 0) != b) continue;
 +            st.make(frac + 3*a, M0, M1, M2, false);
 +            const float va = v[a*C + c];
 +            for (int s = 0; s < 64; s++) r[st.idx[s]] += st.w[s]*va;
@@ -530,15 +552,18 @@ index 561cde2f..99511140 100644
 +void ggml_compute_forward_plato_gather(const ggml_compute_params * params, ggml_tensor * dst) {
 +    const ggml_tensor * mesh = dst->src[0];
 +    const float * phi = (const float *) mesh->data, * frac = (const float *) dst->src[1]->data;
-+    const int64_t M2 = mesh->ne[0], M1 = mesh->ne[1], M0 = mesh->ne[2], C = mesh->ne[3], M = M0*M1*M2;
++    const int32_t * blk = dst->src[2] ? (const int32_t *) dst->src[2]->data : nullptr;
++    const int64_t M2 = mesh->ne[0], M1 = mesh->ne[1], M0 = mesh->ne[2], M = M0*M1*M2;
 +    const int64_t n = ggml_nrows(dst->src[1]);
 +    const bool deriv = ggml_get_op_params_i32(dst, 0) != 0;
++    const int64_t C = ggml_get_op_params_i32(dst, 1);
 +    float * out = (float *) dst->data;
 +    plato_stencil st;
 +    for (int64_t a = params->ith; a < n; a += params->nth) {
 +        st.make(frac + 3*a, M0, M1, M2, deriv);
++        const int64_t c0 = (blk ? blk[a] : 0)*C;
 +        for (int64_t c = 0; c < C; c++) {
-+            const float * m = phi + c*M;
++            const float * m = phi + (c0 + c)*M;
 +            if (!deriv) {
 +                float acc = 0.0f;
 +                for (int s = 0; s < 64; s++) acc += st.w[s]*m[st.idx[s]];
@@ -645,10 +670,10 @@ index d227271e..c29e09aa 100644
              return op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[2]);
 diff --git a/src/ggml-cuda/plato.cu b/src/ggml-cuda/plato.cu
 new file mode 100644
-index 00000000..5924fec2
+index 00000000..99bb41cc
 --- /dev/null
 +++ b/src/ggml-cuda/plato.cu
-@@ -0,0 +1,548 @@
+@@ -0,0 +1,549 @@
 +#include "plato.cuh"
 +
 +#include <cufft.h>
@@ -1054,8 +1079,8 @@ index 00000000..5924fec2
 +}
 +
 +// a thread per (atom, stencil point)
-+__global__ void plato_spread_k(const float * __restrict__ v, const float * __restrict__ frac, float * __restrict__ rho, int n, int C,
-+                               int M0, int M1, int M2) {
++__global__ void plato_spread_k(const float * __restrict__ v, const float * __restrict__ frac, const int * __restrict__ blk,
++                               float * __restrict__ rho, int n, int C, int M0, int M1, int M2) {
 +    const int64_t e = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
 +    if (e >= (int64_t) n * 64) return;
 +    const int a = (int) (e / 64), s = (int) (e % 64), x = s / 16, y = (s / 4) % 4, z = s % 4;
@@ -1066,12 +1091,13 @@ index 00000000..5924fec2
 +    plato_bspline_cu(frac[3 * a + 2] * (float) M2, M2, iz, wz, d);
 +    const float w = wx[x] * wy[y] * wz[z];
 +    const int64_t idx = ((int64_t) ix[x] * M1 + iy[y]) * M2 + iz[z], M = (int64_t) M0 * M1 * M2;
-+    for (int c = 0; c < C; c++) atomicAdd(rho + c * M + idx, w * v[(int64_t) a * C + c]);
++    const int64_t c0 = (int64_t) (blk ? blk[a] : 0) * C;
++    for (int c = 0; c < C; c++) atomicAdd(rho + (c0 + c) * M + idx, w * v[(int64_t) a * C + c]);
 +}
 +
 +// a thread per (atom, channel)
-+__global__ void plato_gather_k(const float * __restrict__ phi, const float * __restrict__ frac, float * __restrict__ out, int n, int C,
-+                               int M0, int M1, int M2, int deriv) {
++__global__ void plato_gather_k(const float * __restrict__ phi, const float * __restrict__ frac, const int * __restrict__ blk,
++                               float * __restrict__ out, int n, int C, int M0, int M1, int M2, int deriv) {
 +    const int64_t e = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
 +    if (e >= (int64_t) n * C) return;
 +    const int a = (int) (e / C), c = (int) (e % C);
@@ -1080,7 +1106,7 @@ index 00000000..5924fec2
 +    plato_bspline_cu(frac[3 * a + 0] * (float) M0, M0, ix, wx, dx);
 +    plato_bspline_cu(frac[3 * a + 1] * (float) M1, M1, iy, wy, dy);
 +    plato_bspline_cu(frac[3 * a + 2] * (float) M2, M2, iz, wz, dz);
-+    const float * m = phi + (int64_t) c * M0 * M1 * M2;
++    const float * m = phi + ((int64_t) (blk ? blk[a] : 0) * C + c) * M0 * M1 * M2;
 +    float acc = 0.0f, g0 = 0.0f, g1 = 0.0f, g2 = 0.0f;
 +    for (int x = 0; x < 4; x++)
 +        for (int y = 0; y < 4; y++) {
@@ -1175,20 +1201,20 @@ index 00000000..5924fec2
 +    cudaStream_t st = ctx.stream();
 +    CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), st));
 +    if (n == 0) return;
-+    plato_spread_k<<<plato_blocks((int64_t) n * 64, 256), 256, 0, st>>>((const float *) dst->src[0]->data,
-+                                                                         (const float *) dst->src[1]->data, (float *) dst->data, n, C,
-+                                                                         M0, M1, M2);
++    plato_spread_k<<<plato_blocks((int64_t) n * 64, 256), 256, 0, st>>>(
++        (const float *) dst->src[0]->data, (const float *) dst->src[1]->data,
++        dst->src[2] ? (const int *) dst->src[2]->data : nullptr, (float *) dst->data, n, C, M0, M1, M2);
 +    CUDA_CHECK(cudaGetLastError());
 +}
 +
 +void ggml_cuda_op_plato_gather(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 +    const ggml_tensor * mesh = dst->src[0];
-+    const int M2 = (int) mesh->ne[0], M1 = (int) mesh->ne[1], M0 = (int) mesh->ne[2], C = (int) mesh->ne[3];
++    const int M2 = (int) mesh->ne[0], M1 = (int) mesh->ne[1], M0 = (int) mesh->ne[2], C = ggml_get_op_params_i32(dst, 1);
 +    const int n = (int) ggml_nrows(dst->src[1]);
 +    if (n == 0) return;
 +    plato_gather_k<<<plato_blocks((int64_t) n * C, 128), 128, 0, ctx.stream()>>>(
-+        (const float *) mesh->data, (const float *) dst->src[1]->data, (float *) dst->data, n, C, M0, M1, M2,
-+        ggml_get_op_params_i32(dst, 0));
++        (const float *) mesh->data, (const float *) dst->src[1]->data, dst->src[2] ? (const int *) dst->src[2]->data : nullptr,
++        (float *) dst->data, n, C, M0, M1, M2, ggml_get_op_params_i32(dst, 0));
 +    CUDA_CHECK(cudaGetLastError());
 +}
 +
@@ -1215,7 +1241,7 @@ index 00000000..e2060651
 +void ggml_cuda_op_plato_gather(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 +void ggml_cuda_op_plato_erf(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/src/ggml.c b/src/ggml.c
-index 77a1e7b7..bd772504 100644
+index 77a1e7b7..9679412d 100644
 --- a/src/ggml.c
 +++ b/src/ggml.c
 @@ -1083,9 +1083,15 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
@@ -1252,7 +1278,7 @@ index 77a1e7b7..bd772504 100644
  
  static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
  
-@@ -4372,6 +4384,125 @@ struct ggml_tensor * ggml_pet_pair_norm_acc(
+@@ -4372,6 +4384,153 @@ struct ggml_tensor * ggml_pet_pair_norm_acc(
      return result;
  }
  
@@ -1331,6 +1357,28 @@ index 77a1e7b7..bd772504 100644
 +    return result;
 +}
 +
++struct ggml_tensor * ggml_plato_spread_blocked(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * v,
++        struct ggml_tensor  * frac,
++        struct ggml_tensor  * block,
++        int                   n_blocks,
++        int                   M0,
++        int                   M1,
++        int                   M2) {
++    GGML_ASSERT(v->type == GGML_TYPE_F32 && frac->type == GGML_TYPE_F32 && ggml_is_contiguous(v) && ggml_is_contiguous(frac));
++    GGML_ASSERT(frac->ne[0] == 3 && ggml_nrows(frac) == ggml_nrows(v) && M0 >= 4 && M1 >= 4 && M2 >= 4 && n_blocks >= 1);
++    GGML_ASSERT(!block || (block->type == GGML_TYPE_I32 && ggml_nelements(block) == ggml_nrows(v) && ggml_is_contiguous(block)));
++    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, M2, M1, M0, v->ne[0]*n_blocks);
++    int32_t params[4] = { M0, M1, M2, n_blocks };
++    ggml_set_op_params(result, params, sizeof(params));
++    result->op     = GGML_OP_PLATO_SPREAD;
++    result->src[0] = v;
++    result->src[1] = frac;
++    result->src[2] = block;
++    return result;
++}
++
 +struct ggml_tensor * ggml_plato_spread(
 +        struct ggml_context * ctx,
 +        struct ggml_tensor  * v,
@@ -1338,14 +1386,28 @@ index 77a1e7b7..bd772504 100644
 +        int                   M0,
 +        int                   M1,
 +        int                   M2) {
-+    GGML_ASSERT(v->type == GGML_TYPE_F32 && frac->type == GGML_TYPE_F32 && ggml_is_contiguous(v) && ggml_is_contiguous(frac));
-+    GGML_ASSERT(frac->ne[0] == 3 && ggml_nrows(frac) == ggml_nrows(v) && M0 >= 4 && M1 >= 4 && M2 >= 4);
-+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, M2, M1, M0, v->ne[0]);
-+    int32_t params[3] = { M0, M1, M2 };
++    return ggml_plato_spread_blocked(ctx, v, frac, NULL, 1, M0, M1, M2);
++}
++
++struct ggml_tensor * ggml_plato_gather_blocked(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * mesh,
++        struct ggml_tensor  * frac,
++        struct ggml_tensor  * block,
++        int                   C,
++        bool                  deriv) {
++    GGML_ASSERT(mesh->type == GGML_TYPE_F32 && frac->type == GGML_TYPE_F32 && ggml_is_contiguous(mesh) && ggml_is_contiguous(frac));
++    GGML_ASSERT(frac->ne[0] == 3 && mesh->ne[0] >= 4 && mesh->ne[1] >= 4 && mesh->ne[2] >= 4 && C >= 1 && mesh->ne[3] % C == 0);
++    GGML_ASSERT(!block || (block->type == GGML_TYPE_I32 && ggml_nelements(block) == ggml_nrows(frac) && ggml_is_contiguous(block)));
++    GGML_ASSERT(block || C == mesh->ne[3]);
++    const int64_t n = ggml_nrows(frac);
++    struct ggml_tensor * result = deriv ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, 3, n) : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, n);
++    int32_t params[2] = { deriv ? 1 : 0, C };
 +    ggml_set_op_params(result, params, sizeof(params));
-+    result->op     = GGML_OP_PLATO_SPREAD;
-+    result->src[0] = v;
++    result->op     = GGML_OP_PLATO_GATHER;
++    result->src[0] = mesh;
 +    result->src[1] = frac;
++    result->src[2] = block;
 +    return result;
 +}
 +
@@ -1354,15 +1416,7 @@ index 77a1e7b7..bd772504 100644
 +        struct ggml_tensor  * mesh,
 +        struct ggml_tensor  * frac,
 +        bool                  deriv) {
-+    GGML_ASSERT(mesh->type == GGML_TYPE_F32 && frac->type == GGML_TYPE_F32 && ggml_is_contiguous(mesh) && ggml_is_contiguous(frac));
-+    GGML_ASSERT(frac->ne[0] == 3 && mesh->ne[0] >= 4 && mesh->ne[1] >= 4 && mesh->ne[2] >= 4);
-+    const int64_t C = mesh->ne[3], n = ggml_nrows(frac);
-+    struct ggml_tensor * result = deriv ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, 3, n) : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, n);
-+    ggml_set_op_params_i32(result, 0, deriv ? 1 : 0);
-+    result->op     = GGML_OP_PLATO_GATHER;
-+    result->src[0] = mesh;
-+    result->src[1] = frac;
-+    return result;
++    return ggml_plato_gather_blocked(ctx, mesh, frac, NULL, (int) mesh->ne[3], deriv);
 +}
 +
 +struct ggml_tensor * ggml_plato_erf(
@@ -1378,7 +1432,7 @@ index 77a1e7b7..bd772504 100644
  // ggml_pet_attn_ragged
  
  struct ggml_tensor * ggml_pet_attn_ragged(
-@@ -7469,6 +7600,69 @@ static void ggml_compute_backward(
+@@ -7469,6 +7628,72 @@ static void ggml_compute_backward(
                      ggml_pet_layer_norm_back(ctx, src0, src1, ggml_is_contiguous(grad) ? grad : ggml_cont(ctx, grad), eps));
              }
          } break;
@@ -1408,14 +1462,15 @@ index 77a1e7b7..bd772504 100644
 +            }
 +        } break;
 +        case GGML_OP_PLATO_SPREAD: {
-+            // rho[c, idx_s(a)] += w_s(a) v[c, a]
++            // rho[block_a C + c, idx_s(a)] += w_s(a) v[c, a]
 +            struct ggml_tensor * g = ggml_is_contiguous(grad) ? grad : ggml_cont(ctx, grad);
++            struct ggml_tensor * blk = tensor->src[2];
++            const int64_t C = src0->ne[0], n = ggml_nrows(src1);
 +            if (src0_needs_grads) {
-+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_reshape(ctx, ggml_plato_gather(ctx, g, src1, false), src0));
++                ggml_add_or_set(ctx, cgraph, isrc0, ggml_reshape(ctx, ggml_plato_gather_blocked(ctx, g, src1, blk, (int) C, false), src0));
 +            }
 +            if (src1_needs_grads) {
-+                const int64_t C = src0->ne[0], n = ggml_nrows(src1);
-+                struct ggml_tensor * dg = ggml_plato_gather(ctx, g, src1, true); // [C, 3, n]
++                struct ggml_tensor * dg = ggml_plato_gather_blocked(ctx, g, src1, blk, (int) C, true); // [C, 3, n]
 +                struct ggml_tensor * t  = ggml_mul(ctx, dg, ggml_reshape_3d(ctx, src0, C, 1, n));
 +                ggml_add_or_set(ctx, cgraph, isrc1, ggml_reshape(ctx, ggml_sum_rows(ctx, t), src1));
 +            }
@@ -1423,12 +1478,14 @@ index 77a1e7b7..bd772504 100644
 +        case GGML_OP_PLATO_GATHER: {
 +            GGML_ASSERT(ggml_get_op_params_i32(tensor, 0) == 0 && "plato_gather: the derivatives are not differentiable");
 +            struct ggml_tensor * g = ggml_is_contiguous(grad) ? grad : ggml_cont(ctx, grad);
++            struct ggml_tensor * blk = tensor->src[2];
++            const int64_t C = ggml_get_op_params_i32(tensor, 1), n = ggml_nrows(src1);
 +            if (src0_needs_grads) {
-+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_plato_spread(ctx, g, src1, src0->ne[2], src0->ne[1], src0->ne[0]));
++                ggml_add_or_set(ctx, cgraph, isrc0, ggml_plato_spread_blocked(ctx, g, src1, blk, (int) (src0->ne[3]/C),
++                    src0->ne[2], src0->ne[1], src0->ne[0]));
 +            }
 +            if (src1_needs_grads) {
-+                const int64_t C = src0->ne[3], n = ggml_nrows(src1);
-+                struct ggml_tensor * dm = ggml_plato_gather(ctx, src0, src1, true); // [C, 3, n]
++                struct ggml_tensor * dm = ggml_plato_gather_blocked(ctx, src0, src1, blk, (int) C, true); // [C, 3, n]
 +                struct ggml_tensor * t  = ggml_mul(ctx, dm, ggml_reshape_3d(ctx, g, C, 1, n));
 +                ggml_add_or_set(ctx, cgraph, isrc1, ggml_reshape(ctx, ggml_sum_rows(ctx, t), src1));
 +            }
