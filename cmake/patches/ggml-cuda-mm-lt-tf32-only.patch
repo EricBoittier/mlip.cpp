@@ -1,0 +1,14 @@
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -3418,7 +3418,10 @@
+     static const bool off = getenv("GGML_CUDA_NO_MM_BIAS") != nullptr;
+     static const bool residual = getenv("GGML_CUDA_NO_MM_RESIDUAL") == nullptr;
+     const ggml_tensor * mm = cgraph->nodes[i];
+-    if (off || mm->op != GGML_OP_MUL_MAT || (mm->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, i) != 1 ||
++    // in full FP32 (GGML_CUDA_NO_TF32) cuBLASLt runs SIMT kernels and the bias as a separate epilogue
++    // pass, slower than cuBLAS's own GEMM and an ADD: only TF32 products (GGML_CUDA_MM_LT_FP32=1: both)
++    static const bool fp32_off = getenv("GGML_CUDA_NO_TF32") != nullptr && getenv("GGML_CUDA_MM_LT_FP32") == nullptr;
++    if (off || fp32_off || mm->op != GGML_OP_MUL_MAT || (mm->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, i) != 1 ||
+         ggml_get_op_params_i32(mm, 0) == GGML_PREC_F32) {
+         return -1;
+     }

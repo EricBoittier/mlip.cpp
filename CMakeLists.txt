@@ -274,6 +274,9 @@ else()
         # CUDA MUL_MAT (+ bias) + residual ADD as one cuBLASLt GEMM with beta = 1
         # (GGML_CUDA_NO_MM_RESIDUAL=1: off)
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-mm-residual.patch"
+        # the cuBLASLt epilogues for TF32 products only: in full FP32 cuBLAS's own
+        # GEMM and an ADD are faster (GGML_CUDA_MM_LT_FP32=1: cuBLASLt for both)
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-mm-lt-tf32-only.patch"
         # CUDA PET norms (RMSNorm, add + RMSNorm, pair LayerNorm, their backward)
         # one warp per row with the row in registers (GGML_PET_NORM_BLOCK=1: a block per row)
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-pet-norm-warp.patch"
