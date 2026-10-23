@@ -196,10 +196,17 @@ PlatoOutputs build_plato(ggml_context *ctx, const PlatoSpec &spec, const std::ma
     ggml_tensor *e = nullptr;
     if (periodic) {
       ggml_tensor *qb = G == 1 ? q : ggml_mul(ctx, in.onehot, q);    // [n, G Q]: each structure's charges
-      ggml_tensor *ph = mm_f32(ctx, frac, in.les_n);                 // [n, nk]
-      ggml_tensor *Cq = mm_f32(ctx, ggml_cos(ctx, ph), qb);          // [nk, G Q]
-      ggml_tensor *Sq = mm_f32(ctx, ggml_sin(ctx, ph), qb);
       const int64_t nk = in.les_n->ne[1];
+      ggml_tensor *sk;                                               // [nk, G Q]: |S(k)|^2
+      if (Q == 1) { // fused structure factors (no [n, nk] phase matrices)
+        ggml_tensor *r = ggml_plato_ewald(ctx, frac, ggml_reshape_1d(ctx, q, n), G == 1 ? nullptr : in.struct_index, in.les_n, (int) G);
+        sk = ggml_view_2d(ctx, r, nk, G, r->nb[1], 2 * r->nb[2]);
+      } else {
+        ggml_tensor *ph = mm_f32(ctx, frac, in.les_n);               // [n, nk]
+        ggml_tensor *Cq = mm_f32(ctx, ggml_cos(ctx, ph), qb);        // [nk, G Q]
+        ggml_tensor *Sq = mm_f32(ctx, ggml_sin(ctx, ph), qb);
+        sk = ggml_add(ctx, ggml_sqr(ctx, Cq), ggml_sqr(ctx, Sq));
+      }
       ggml_tensor *k = b.strained(in.les_k);                         // [3, nk, G]
       ggml_tensor *k2 = ggml_reshape_2d(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, k)), nk, in.les_k->ne[2]); // [nk, G or 1]
       const float kc = spec.les_kcut / sigma, wd = 1.0f / sigma;
@@ -208,7 +215,6 @@ PlatoOutputs build_plato(ggml_context *ctx, const PlatoSpec &spec, const std::ma
       ggml_tensor *xw = ggml_mul(ctx, ggml_scale_bias(ctx, ggml_sqrt(ctx, k2), 1.0f / wd, -(kc - wd) / wd), taper);
       ggml_tensor *win = ggml_scale_bias(ctx, ggml_cos(ctx, ggml_scale(ctx, xw, static_cast<float>(M_PI))), 0.5f, 0.5f);
       ggml_tensor *gk = ggml_div(ctx, ggml_mul(ctx, win, ggml_exp(ctx, ggml_scale(ctx, k2, -0.5f * sigma * sigma))), k2);
-      ggml_tensor *sk = ggml_add(ctx, ggml_sqr(ctx, Cq), ggml_sqr(ctx, Sq));        // [nk, G Q]
       ggml_tensor *rec;
       if (G == 1) rec = ggml_reshape_2d(ctx, ggml_sum(ctx, ggml_mul(ctx, sk, gk)), 1, 1);
       else rec = ggml_sum_rows(ctx, ggml_mul(ctx, sk, gk));                       // [1, G]

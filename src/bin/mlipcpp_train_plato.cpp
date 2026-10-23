@@ -323,7 +323,7 @@ struct BatchGraph {
   ggml_gallocr_t galloc = nullptr;
   PlatoInputs in;
   runtime::PlatoOutputs out;
-  ggml_tensor *g_ev = nullptr, *g_pos = nullptr, *loss_grad = nullptr, *acc_scale = nullptr;
+  ggml_tensor *g_ev = nullptr, *g_pos = nullptr, *loss_grad = nullptr;
   bool constants_set = false;
   ~BatchGraph() {
     if (galloc) ggml_gallocr_free(galloc);
@@ -487,7 +487,6 @@ struct Worker {
       in.les_n = input(GGML_TYPE_F32, 3, nk, 1, "les_n");
       in.les_taper = input(GGML_TYPE_F32, 1, nk, 1, "les_taper");
     }
-    bg->acc_scale = input(GGML_TYPE_F32, 1, 1, 1, "acc_scale");
     ggml_set_param(in.edge_vectors), ggml_set_param(in.positions);
     bg->out = runtime::build_plato(ctx, spec, model->weights(), in, n, E, P.L, true);
     ggml_set_output(bg->out.energies);
@@ -504,7 +503,8 @@ struct Worker {
     for (size_t k = 0; k < params.size(); k++) {
       ggml_tensor *g = ggml_graph_get_grad(bg->graph, params[k]);
       if (!g) continue;
-      ggml_build_forward_expand(bg->graph, ggml_add_inplace(ctx, acc[k], ggml_mul(ctx, ggml_reshape(ctx, g, acc[k]), bg->acc_scale)));
+      // the loss seed carries the scale (+-1 / 2 eps): acc_k += dT/dtheta_k
+      ggml_build_forward_expand(bg->graph, ggml_add_inplace(ctx, acc[k], ggml_reshape(ctx, g, acc[k])));
     }
     ggml_backend_buffer_type_t buft = model->backend()->buffer_type();
     const size_t al = ggml_backend_buft_get_alignment(buft);
@@ -562,7 +562,7 @@ struct Worker {
       bg.constants_set = true;
     }
     auto run = [&](const std::vector<float> &ev, const std::vector<float> &pos, const std::vector<float> &w, float s) {
-      set(in.edge_vectors, ev.data()), set(in.positions, pos.data()), set(in.energy_weights, w.data()), set(bg.acc_scale, &s);
+      set(in.edge_vectors, ev.data()), set(in.positions, pos.data()), set(in.energy_weights, w.data()), set(bg.loss_grad, &s);
       const auto a = clk::now();
       if (model->backend()->compute(bg.graph) != GGML_STATUS_SUCCESS) throw std::runtime_error("compute failed");
       t_compute += ms_since(a);
@@ -570,12 +570,13 @@ struct Worker {
     std::vector<float> w1(G, 1.0f);
     w1[Gr] = 0.0f;
     t_host += ms_since(t0);
-    run(P.ev0, P.pos0, w1, 0.0f);
+    run(P.ev0, P.pos0, w1, 1.0f);
     const auto t1 = clk::now();
     std::vector<float> Eraw(G), gev(3 * E), gpos(3 * size_t(n));
     ggml_backend_tensor_get(bg.out.energies, Eraw.data(), 0, 4 * G);
     ggml_backend_tensor_get(bg.g_ev, gev.data(), 0, gev.size() * 4);
     ggml_backend_tensor_get(bg.g_pos, gpos.data(), 0, gpos.size() * 4);
+    zero_acc(); // eval0 accumulated dT/dtheta with seed 1
     std::vector<double> dEdx(3 * size_t(P.n_real), 0.0);
     for (int A = 0; A < P.n_real; A++)
       for (int c = 0; c < 3; c++) dEdx[3 * A + c] = gpos[3 * A + c];

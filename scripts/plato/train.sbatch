@@ -37,6 +37,22 @@ if has speed; then
     env $([[ $v != none ]] && echo $v=1) $T --init $D/models/D2-att.gguf --train $D/data/train.bin --val $D/data/val.bin --epochs ${SPEED_EPOCHS:-1} --max-steps ${SPEED_STEPS:-200} --batch-size $BS --backend cuda --fd-eps $EPS --no-val --gpus ${GPUS:-1} ${SPEED_ARGS:-} -o $OUT/speed.gguf 2>&1 | grep -v "^ggml_cuda\|Device \|warmup"
   done
 fi
+if has prof; then
+  rm -f $OUT/prof.*
+  nsys profile --cuda-graph-trace=node -t cuda,nvtx -o $OUT/prof $T --init $D/models/D2-att.gguf --train $D/data/train.bin --val $D/data/val.bin --epochs 1 --max-steps ${SPEED_STEPS:-60} --batch-size $BS --backend cuda --fd-eps $EPS --no-val -o $OUT/prof.gguf > $OUT/prof.log 2>&1
+  grep "^epoch" $OUT/prof.log
+  nsys stats --report cuda_gpu_kern_sum --format csv -o $OUT/kern $OUT/prof.nsys-rep > /dev/null 2>&1
+  python3 - $OUT/kern_cuda_gpu_kern_sum.csv <<'PY'
+import csv, sys
+rows = list(csv.DictReader(open(sys.argv[1])))
+tot = sum(float(r["Total Time (ns)"]) for r in rows)
+print(f"GPU kernel time total {tot/1e6:.1f} ms, {sum(int(r['Instances']) for r in rows)} launches")
+for r in sorted(rows, key=lambda r: -float(r["Total Time (ns)"]))[:25]:
+    print(f"{float(r['Total Time (ns)'])/1e6:9.1f} ms {int(r['Instances']):8d}  {r['Name'][:110]}")
+PY
+  nsys stats --report cuda_api_sum --format csv -o $OUT/api $OUT/prof.nsys-rep > /dev/null 2>&1
+  head -8 $OUT/api_cuda_api_sum.csv | cut -c1-160
+fi
 if has train; then
   echo "== mlipcpp-train-plato $EPOCHS epochs, lr $LR, batch $BS"
   /usr/bin/time -v $T --init $D/models/D2-att.gguf --train $D/data/train.bin --val $D/data/val.bin --epochs $EPOCHS --batch-size $BS --lr $LR --backend cuda --fd-eps $EPS --seed 0 -o $OUT/trained.gguf 2>&1 | grep -v "^ggml_cuda\|Device 0\|warmup" | grep -v "^\s*\(Page\|Volun\|Invol\|Swaps\|File\|Socket\|Signals\|Average\|Minor\|Major\|Exit\|Percent\|System time\|User time\)"
