@@ -271,6 +271,9 @@ else()
         # the gradient of a CONCAT w.r.t. a contiguous part as a view of the
         # concatenation's gradient, not a copy (GGML_CONCAT_GRAD_CONT=1: a copy)
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-concat-grad-view.patch"
+        # CUDA PET norms (RMSNorm, add + RMSNorm, pair LayerNorm, their backward)
+        # one warp per row with the row in registers (GGML_PET_NORM_BLOCK=1: a block per row)
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-pet-norm-warp.patch"
     )
     # the source cache is keyed by the ggml tag and the patches' contents:
     # CPM's default key hashes the arguments, i.e. the patch paths, so every

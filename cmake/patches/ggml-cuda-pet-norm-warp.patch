@@ -1,0 +1,350 @@
+--- a/src/ggml-cuda/pet-fused.cu
++++ b/src/ggml-cuda/pet-fused.cu
+@@ -1,5 +1,9 @@
+ #include "pet-fused.cuh"
+ 
++#include <cstdint>
++#include <cstdlib>
++#include <initializer_list>
++
+ // ---- pair norm: one block per edge row ----
+ // Row e of the forward is LayerNorm([x[e]; x[rev[e]]]) * w + b. In the
+ // backward, x[e] is the first half of pair e and the second half of pair
+@@ -78,6 +82,266 @@
+     }
+ }
+ 
++// ---- warp-per-row norms (GGML_PET_NORM_BLOCK=1: the block-per-row kernels) ----
++// For rows of d = 128 V values (V = 1, 2, 4, 8; the pair norms V <= 4) and 16-byte aligned data: one
++// warp per row, 8 rows per 256-thread block, each lane holding V float4 of the row in registers.
++// Every input row is read once, reductions are warp shuffles (no shared memory, no __syncthreads),
++// and all of a row's reads come before its writes (an output may be its input in place, as before).
++#define PET_WARP_ROWS 8
++
++static __device__ __forceinline__ float pet_warp_sum(float v) {
++#pragma unroll
++    for (int o = 16; o > 0; o >>= 1) {
++        v += __shfl_xor_sync(0xffffffffu, v, o);
++    }
++    return v;
++}
++
++static __device__ __forceinline__ float4 pet_f4_sum(const float4 a, const float4 b) {
++    return make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
++}
++
++template <int V> static __device__ __forceinline__ void pet_load_row(const float * p, float4 (&v)[V]) {
++    const float4 * q = (const float4 *) p;
++    const int lane = threadIdx.x % 32;
++#pragma unroll
++    for (int k = 0; k < V; k++) {
++        v[k] = q[lane + 32*k];
++    }
++}
++
++template <int V> static __device__ __forceinline__ void pet_store_row(float * p, const float4 (&v)[V]) {
++    float4 * q = (float4 *) p;
++    const int lane = threadIdx.x % 32;
++#pragma unroll
++    for (int k = 0; k < V; k++) {
++        q[lane + 32*k] = v[k];
++    }
++}
++
++static __device__ __forceinline__ int64_t pet_warp_row() {
++    return (int64_t) blockIdx.x*PET_WARP_ROWS + threadIdx.x/32;
++}
++
++// a warp kernel for rows of d values: V (0: none), when GGML_PET_NORM_BLOCK is unset and every pointer is 16-byte aligned
++static int pet_norm_warp_v(const int d, const int v_max, std::initializer_list<const void *> ptrs) {
++    static const bool block = getenv("GGML_PET_NORM_BLOCK") != nullptr;
++    const int v = d / 128;
++    if (block || d % 128 != 0 || v > v_max || (v != 1 && v != 2 && v != 4 && v != 8)) {
++        return 0;
++    }
++    for (const void * p : ptrs) {
++        if (p && (uintptr_t) p % 16 != 0) {
++            return 0;
++        }
++    }
++    return v;
++}
++
++static unsigned pet_warp_blocks(const int64_t rows) {
++    return (unsigned) ((rows + PET_WARP_ROWS - 1) / PET_WARP_ROWS);
++}
++
++#define PET_WARP_DISPATCH(v, kernel, grid, ...)                                                     \
++    switch (v) {                                                                                    \
++        case 1: kernel<1><<<grid, 32*PET_WARP_ROWS, 0, ctx.stream()>>>(__VA_ARGS__); break;         \
++        case 2: kernel<2><<<grid, 32*PET_WARP_ROWS, 0, ctx.stream()>>>(__VA_ARGS__); break;         \
++        case 4: kernel<4><<<grid, 32*PET_WARP_ROWS, 0, ctx.stream()>>>(__VA_ARGS__); break;         \
++        default: kernel<8><<<grid, 32*PET_WARP_ROWS, 0, ctx.stream()>>>(__VA_ARGS__); break;        \
++    }
++
++template <int V>
++static __global__ void pet_rms_norm_warp(const float * __restrict__ x, const float * __restrict__ w, float * __restrict__ y,
++        const int64_t rows, const int d, const float eps) {
++    const int64_t row = pet_warp_row();
++    if (row >= rows) {
++        return;
++    }
++    float4 v[V], wv[V];
++    pet_load_row<V>(x + row*d, v);
++    float s = 0.0f;
++#pragma unroll
++    for (int k = 0; k < V; k++) {
++        s += v[k].x*v[k].x + v[k].y*v[k].y + v[k].z*v[k].z + v[k].w*v[k].w;
++    }
++    const float scale = rsqrtf(pet_warp_sum(s) / d + eps);
++    pet_load_row<V>(w, wv);
++#pragma unroll
++    for (int k = 0; k < V; k++) {
++        v[k] = make_float4((v[k].x*scale)*wv[k].x, (v[k].y*scale)*wv[k].y, (v[k].z*scale)*wv[k].z, (v[k].w*scale)*wv[k].w);
++    }
++    pet_store_row<V>(y + row*d, v);
++}
++
++template <int V>
++static __global__ void pet_add_rms_norm_warp(const float * x, const float * y, const float * __restrict__ w, float * s,
++        float * n, const int64_t rows, const int d, const float eps) {
++    const int64_t row = pet_warp_row();
++    if (row >= rows) {
++        return;
++    }
++    float4 v[V], b[V];
++    pet_load_row<V>(x + row*d, v);
++    pet_load_row<V>(y + row*d, b);
++    float q = 0.0f;
++#pragma unroll
++    for (int k = 0; k < V; k++) {
++        v[k] = pet_f4_sum(v[k], b[k]);
++        q += v[k].x*v[k].x + v[k].y*v[k].y + v[k].z*v[k].z + v[k].w*v[k].w;
++    }
++    const float scale = rsqrtf(pet_warp_sum(q) / d + eps);
++    pet_store_row<V>(s + row*d, v);
++    pet_load_row<V>(w, b);
++#pragma unroll
++    for (int k = 0; k < V; k++) {
++        b[k] = make_float4((v[k].x*scale)*b[k].x, (v[k].y*scale)*b[k].y, (v[k].z*scale)*b[k].z, (v[k].w*scale)*b[k].w);
++    }
++    pet_store_row<V>(n + row*d, b);
++}
++
++template <int V>
++static __global__ void pet_rms_norm_back_warp(const float * x, const float * __restrict__ w, const float * g,
++        const float * acc, float * dx, const int64_t rows, const int d, const float eps) {
++    const int64_t row = pet_warp_row();
++    if (row >= rows) {
++        return;
++    }
++    float4 xv[V], gv[V], wv[V];
++    pet_load_row<V>(x + row*d, xv);
++    pet_load_row<V>(g + row*d, gv);
++    pet_load_row<V>(w, wv);
++    float sxx = 0.0f, sxg = 0.0f;
++#pragma unroll
++    for (int k = 0; k < V; k++) {
++        gv[k] = make_float4(gv[k].x*wv[k].x, gv[k].y*wv[k].y, gv[k].z*wv[k].z, gv[k].w*wv[k].w);
++        sxx += xv[k].x*xv[k].x + xv[k].y*xv[k].y + xv[k].z*xv[k].z + xv[k].w*xv[k].w;
++        sxg += xv[k].x*gv[k].x + xv[k].y*gv[k].y + xv[k].z*gv[k].z + xv[k].w*gv[k].w;
++    }
++    sxx = pet_warp_sum(sxx), sxg = pet_warp_sum(sxg);
++    const float rrms = rsqrtf(sxx / d + eps), sx = -sxg / (sxx + eps*d);
++#pragma unroll
++    for (int k = 0; k < V; k++) {
++        gv[k] = make_float4((gv[k].x + xv[k].x*sx)*rrms, (gv[k].y + xv[k].y*sx)*rrms, (gv[k].z + xv[k].z*sx)*rrms,
++                            (gv[k].w + xv[k].w*sx)*rrms);
++    }
++    if (acc) {
++        pet_load_row<V>(acc + row*d, xv);
++#pragma unroll
++        for (int k = 0; k < V; k++) {
++            gv[k] = pet_f4_sum(xv[k], gv[k]);
++        }
++    }
++    pet_store_row<V>(dx + row*d, gv);
++}
++
++// mean and rstd of the 2d values of a and b (held by the warp)
++template <int V>
++static __device__ __forceinline__ void pet_pair_stats_warp(const float4 (&a)[V], const float4 (&b)[V], const int d,
++        const float eps, float & mean, float & rstd) {
++    float s = 0.0f;
++#pragma unroll
++    for (int k = 0; k < V; k++) {
++        s += (a[k].x + a[k].y) + (a[k].z + a[k].w) + (b[k].x + b[k].y) + (b[k].z + b[k].w);
++    }
++    mean = pet_warp_sum(s) / (2*d);
++    float v = 0.0f;
++#pragma unroll
++    for (int k = 0; k < V; k++) {
++        const float4 p = a[k], q = b[k];
++        v += (p.x - mean)*(p.x - mean) + (p.y - mean)*(p.y - mean) + (p.z - mean)*(p.z - mean) + (p.w - mean)*(p.w - mean);
++        v += (q.x - mean)*(q.x - mean) + (q.y - mean)*(q.y - mean) + (q.z - mean)*(q.z - mean) + (q.w - mean)*(q.w - mean);
++    }
++    rstd = rsqrtf(pet_warp_sum(v) / (2*d) + eps);
++}
++
++template <int V>
++static __global__ void pet_pair_norm_warp(const float * __restrict__ x, const int32_t * __restrict__ rev,
++        const float * __restrict__ w, const float * __restrict__ bias, float * __restrict__ y, const int64_t E, const int d,
++        const float eps) {
++    const int64_t e = pet_warp_row();
++    if (e >= E) {
++        return;
++    }
++    float4 a[V], b[V], wv[V], bv[V];
++    pet_load_row<V>(x + e*d, a);
++    pet_load_row<V>(x + (int64_t) rev[e]*d, b);
++    float mean, rstd;
++    pet_pair_stats_warp<V>(a, b, d, eps, mean, rstd);
++    float * ye = y + e*2*d;
++#define PET_LN4(o, p, ww, bb) o = make_float4((p.x - mean)*rstd*ww.x + bb.x, (p.y - mean)*rstd*ww.y + bb.y, \
++                                              (p.z - mean)*rstd*ww.z + bb.z, (p.w - mean)*rstd*ww.w + bb.w)
++    pet_load_row<V>(w, wv);
++    pet_load_row<V>(bias, bv);
++#pragma unroll
++    for (int k = 0; k < V; k++) {
++        PET_LN4(a[k], a[k], wv[k], bv[k]);
++    }
++    pet_store_row<V>(ye, a);
++    pet_load_row<V>(w + d, wv);
++    pet_load_row<V>(bias + d, bv);
++#pragma unroll
++    for (int k = 0; k < V; k++) {
++        PET_LN4(b[k], b[k], wv[k], bv[k]);
++    }
++    pet_store_row<V>(ye + d, b);
++#undef PET_LN4
++}
++
++template <int V>
++static __global__ void pet_pair_norm_back_warp(const float * __restrict__ x, const int32_t * __restrict__ rev,
++        const float * __restrict__ w, const float * __restrict__ g, const float * acc, float * dx, const int64_t E,
++        const int d, const float eps) {
++    const int64_t e = pet_warp_row();
++    if (e >= E) {
++        return;
++    }
++    const int64_t r = rev[e];
++    float4 a[V], b[V];
++    pet_load_row<V>(x + e*d, a);
++    pet_load_row<V>(x + r*d, b);
++    float mean, rstd;
++    pet_pair_stats_warp<V>(a, b, d, eps, mean, rstd);
++    // pair e = [a; b] with gradient ge, pair r = [b; a] with gradient gr (as pet_pair_norm_back_kernel)
++    float4 e0[V], e1[V], r0[V], r1[V], w0[V], w1[V];
++    pet_load_row<V>(g + e*2*d, e0);
++    pet_load_row<V>(g + e*2*d + d, e1);
++    pet_load_row<V>(g + r*2*d, r0);
++    pet_load_row<V>(g + r*2*d + d, r1);
++    pet_load_row<V>(w, w0);
++    pet_load_row<V>(w + d, w1);
++    float se = 0.0f, sxe = 0.0f, sr = 0.0f, sxr = 0.0f;
++#define PET_MUL4(p, q) p = make_float4(p.x*q.x, p.y*q.y, p.z*q.z, p.w*q.w)
++#define PET_DOT4(p, q) (p.x*q.x + p.y*q.y + p.z*q.z + p.w*q.w)
++#define PET_SUM4(p) ((p.x + p.y) + (p.z + p.w))
++#pragma unroll
++    for (int k = 0; k < V; k++) {
++        a[k] = make_float4((a[k].x - mean)*rstd, (a[k].y - mean)*rstd, (a[k].z - mean)*rstd, (a[k].w - mean)*rstd); // xa
++        b[k] = make_float4((b[k].x - mean)*rstd, (b[k].y - mean)*rstd, (b[k].z - mean)*rstd, (b[k].w - mean)*rstd); // xb
++        PET_MUL4(e0[k], w0[k]), PET_MUL4(e1[k], w1[k]), PET_MUL4(r0[k], w0[k]), PET_MUL4(r1[k], w1[k]);
++        se += PET_SUM4(e0[k]) + PET_SUM4(e1[k]), sxe += PET_DOT4(e0[k], a[k]) + PET_DOT4(e1[k], b[k]);
++        sr += PET_SUM4(r0[k]) + PET_SUM4(r1[k]), sxr += PET_DOT4(r0[k], b[k]) + PET_DOT4(r1[k], a[k]);
++    }
++#undef PET_MUL4
++#undef PET_DOT4
++#undef PET_SUM4
++    const float me = pet_warp_sum(se) / (2*d), mxe = pet_warp_sum(sxe) / (2*d);
++    const float mr = pet_warp_sum(sr) / (2*d), mxr = pet_warp_sum(sxr) / (2*d);
++#define PET_DX(c) (rstd*(e0[k].c - me - a[k].c*mxe) + rstd*(r1[k].c - mr - a[k].c*mxr))
++#pragma unroll
++    for (int k = 0; k < V; k++) {
++        e0[k] = make_float4(PET_DX(x), PET_DX(y), PET_DX(z), PET_DX(w));
++    }
++#undef PET_DX
++    if (acc) {
++        pet_load_row<V>(acc + e*d, b);
++#pragma unroll
++        for (int k = 0; k < V; k++) {
++            e0[k] = pet_f4_sum(e0[k], b[k]);
++        }
++    }
++    pet_store_row<V>(dx + e*d, e0);
++}
++
+ static int pet_pair_threads(int d) {
+     int t = 32;
+     while (t < 256 && t < d) t *= 2;
+@@ -89,6 +353,13 @@
+     const int64_t E = x->ne[1];
+     if (E == 0) return;
+     const int d = (int) x->ne[0];
++    const float eps = ggml_get_op_params_f32(dst, 0);
++    if (const int v = pet_norm_warp_v(d, 4, {x->data, dst->src[2]->data, dst->src[3]->data, dst->data})) {
++        PET_WARP_DISPATCH(v, pet_pair_norm_warp, pet_warp_blocks(E), (const float *) x->data, (const int32_t *) dst->src[1]->data,
++            (const float *) dst->src[2]->data, (const float *) dst->src[3]->data, (float *) dst->data, E, d, eps);
++        CUDA_CHECK(cudaGetLastError());
++        return;
++    }
+     pet_pair_norm_kernel<<<(unsigned) E, pet_pair_threads(d), 0, ctx.stream()>>>((const float *) x->data,
+         (const int32_t *) dst->src[1]->data, (const float *) dst->src[2]->data, (const float *) dst->src[3]->data,
+         (float *) dst->data, d, ggml_get_op_params_f32(dst, 0));
+@@ -100,6 +371,15 @@
+     const int64_t E = x->ne[1];
+     if (E == 0) return;
+     const int d = (int) x->ne[0];
++    const float eps = ggml_get_op_params_f32(dst, 0);
++    const float * acc = dst->src[4] ? (const float *) dst->src[4]->data : nullptr;
++    if (const int v = pet_norm_warp_v(d, 4, {x->data, dst->src[2]->data, dst->src[3]->data, acc, dst->data})) {
++        PET_WARP_DISPATCH(v, pet_pair_norm_back_warp, pet_warp_blocks(E), (const float *) x->data,
++            (const int32_t *) dst->src[1]->data, (const float *) dst->src[2]->data, (const float *) dst->src[3]->data, acc,
++            (float *) dst->data, E, d, eps);
++        CUDA_CHECK(cudaGetLastError());
++        return;
++    }
+     pet_pair_norm_back_kernel<<<(unsigned) E, pet_pair_threads(d), 0, ctx.stream()>>>((const float *) x->data,
+         (const int32_t *) dst->src[1]->data, (const float *) dst->src[2]->data, (const float *) dst->src[3]->data,
+         dst->src[4] ? (const float *) dst->src[4]->data : nullptr, (float *) dst->data, d, ggml_get_op_params_f32(dst, 0));
+@@ -205,6 +485,12 @@
+     const int64_t rows = ggml_nrows(x);
+     if (rows == 0) return;
+     const int d = (int) x->ne[0];
++    if (const int v = pet_norm_warp_v(d, 8, {x->data, dst->src[1]->data, dst->data})) {
++        PET_WARP_DISPATCH(v, pet_rms_norm_warp, pet_warp_blocks(rows), (const float *) x->data, (const float *) dst->src[1]->data,
++            (float *) dst->data, rows, d, ggml_get_op_params_f32(dst, 0));
++        CUDA_CHECK(cudaGetLastError());
++        return;
++    }
+     pet_rms_norm_kernel<<<(unsigned) rows, pet_pair_threads(d), 0, ctx.stream()>>>((const float *) x->data,
+         (const float *) dst->src[1]->data, (float *) dst->data, d, ggml_get_op_params_f32(dst, 0));
+     CUDA_CHECK(cudaGetLastError());
+@@ -239,6 +525,12 @@
+     const int64_t rows = ggml_nrows(add);
+     if (rows > 0) {
+         const int d = (int) add->ne[0];
++        if (const int v = pet_norm_warp_v(d, 8, {x->data, y->data, w->data, add->data, norm->data})) {
++            PET_WARP_DISPATCH(v, pet_add_rms_norm_warp, pet_warp_blocks(rows), (const float *) x->data, (const float *) y->data,
++                (const float *) w->data, (float *) add->data, (float *) norm->data, rows, d, ggml_get_op_params_f32(norm, 0));
++            CUDA_CHECK(cudaGetLastError());
++            return true;
++        }
+         pet_add_rms_norm_kernel<<<(unsigned) rows, pet_pair_threads(d), 0, ctx.stream()>>>((const float *) x->data,
+             (const float *) y->data, (const float *) w->data, (float *) add->data, (float *) norm->data, d,
+             ggml_get_op_params_f32(norm, 0));
+@@ -252,6 +544,14 @@
+     const int64_t rows = ggml_nrows(x);
+     if (rows == 0) return;
+     const int d = (int) x->ne[0];
++    const float * acc = dst->src[3] ? (const float *) dst->src[3]->data : nullptr;
++    if (const int v = pet_norm_warp_v(d, 8, {x->data, dst->src[1]->data, dst->src[2]->data, acc, dst->data})) {
++        PET_WARP_DISPATCH(v, pet_rms_norm_back_warp, pet_warp_blocks(rows), (const float *) x->data,
++            (const float *) dst->src[1]->data, (const float *) dst->src[2]->data, acc, (float *) dst->data, rows, d,
++            ggml_get_op_params_f32(dst, 0));
++        CUDA_CHECK(cudaGetLastError());
++        return;
++    }
+     pet_rms_norm_back_kernel<<<(unsigned) rows, pet_pair_threads(d), 0, ctx.stream()>>>((const float *) x->data,
+         (const float *) dst->src[1]->data, (const float *) dst->src[2]->data,
+         dst->src[3] ? (const float *) dst->src[3]->data : nullptr, (float *) dst->data, d, ggml_get_op_params_f32(dst, 0));
