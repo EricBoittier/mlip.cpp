@@ -6,7 +6,7 @@
 # FP32 GEMMs, validation on the full val split every epoch; OUT.best.gguf by R^2(E) + R^2(F),
 # a GGUF every 100 epochs. A chain of jobs that resume from the trainer state; each job
 # resubmits the next until the run is done.
-#   NAME=pet sbatch pet_long.sbatch        (GPUS=2 for two GPUs of one node, data parallel)
+#   NAME=pet sbatch pet_long.sbatch        (GPUS=2 for two GPUs of one node, data parallel; OPT=muon [MUON_SCALE=10])
 #SBATCH --job-name=pet-long
 #SBATCH --account=cosmo
 #SBATCH --partition=rtx6000
@@ -33,7 +33,7 @@ else
 fi
 $RUN/mlipcpp-train $FROM --data $P/data --gpus ${GPUS:-1} --batch-size $((32 / ${GPUS:-1})) \
   --conservative --energy-weight 1 --force-weight 1 --nc-force-weight 0 \
-  --optimizer adam --lr 1e-4 --schedule linear --decay-after 10 --min-lr 1e-6 --grad-clip 1e30 --seed ${SEED:-0} \
+  --optimizer ${OPT:-adam} --muon-lr-scale ${MUON_SCALE:-10} --lr 1e-4 --schedule linear --decay-after 10 --min-lr 1e-6 --grad-clip 1e30 --seed ${SEED:-0} \
   --epochs ${EPOCHS:-4000} --save-every 100 --state-every 10 --max-hours ${HOURS:-23.3} \
   --threads 12 --cache-dir $P/nl-cache --log-every 400 \
   -o $RUN/model.gguf --log $RUN/log.jsonl 2>&1 | grep -v "^ggml_cuda\|Device \|^Backend\|packing cost" > $RUN/job-$SLURM_JOB_ID.out
