@@ -17,14 +17,15 @@ int main(int argc, char **argv) {
   auto usage = [&] {
     fmt::print(stderr,
                "usage: {} --data DIR --init INIT.gguf -o OUT.gguf [--epochs {}] [--batch-size {}]\n"
-               "          [--gpus {}] [--lr {}] [--warmup-fraction {}] [--grad-clip {}] [--seed {}]\n"
+               "          [--gpus {}] [--lr {}] [--warmup-fraction {}] [--schedule cosine|linear] [--decay-after {}]\n"
+               "          [--min-lr {}] [--grad-clip {}] [--seed {}]\n"
                "          [--threads {}] [--cache-dir DIR] [--max-steps N] [--log-every {}]\n"
                "          [--mb-growth {}] [--mb-budget {}] [--max-neighbors N] [--max-attention A] [--tile-nb-ratio R] [--tile-atom-ratio {}]\n"
                "          [--graph-cache {}] [--prefetch {}] [--pack step|worker] [--optimizer adam|muon] [--muon-momentum {}]\n"
                "          [--muon-lr-scale {}] [--muon-ns-steps {}]\n"
                "          [--dump-errors PREFIX] [--log-errors FILE] [--log-errors-epochs {}] [--exclude DIR]\n"
                "          [--conservative] [--energy-weight {}] [--force-weight {}] [--nc-force-weight {}] [--model-baselines]\n"
-               "          [--allreduce {}]\n"
+               "          [--allreduce {}] [--save-every N] [--log JSONL] [--state-every N] [--max-hours H] [--resume STATE]\n"
                "--dump-errors writes PREFIX.{{val,test}}.bin, --log-errors the training structures' errors\n"
                "before each update (24-byte records, see SystemError); --exclude DIR drops the split\n"
                "indices in DIR/{{train,val,test}}.npy;\n"
@@ -36,8 +37,13 @@ int main(int argc, char **argv) {
                "--model-baselines (fine-tuning) keeps --init's composition and scales;\n"
                "--allreduce 1 (NCCL builds, the default there) averages the gradients with one\n"
                "all-reduce and steps a replica of the optimizer on every GPU;\n"
+               "--schedule linear: lr constant for --decay-after epochs, then linear to --min-lr (LOREM);\n"
+               "OUT.best.gguf: the epoch with the highest R^2(E) + R^2(F) on val/; --log: val metrics per epoch;\n"
+               "--save-every N: OUT.epoch%05d.gguf every N epochs (default: OUT.epoch<k> after each);\n"
+               "--state-every N / --max-hours H: OUT and OUT.state every N epochs and when pausing after H hours;\n"
+               "continue with --init OUT --resume OUT.state;\n"
                "--epochs 0 only evaluates --init on val/ and test/ (-o is ignored).\n",
-               argv[0], o.epochs, o.batch_size, o.n_gpus, o.lr, o.warmup_fraction,
+               argv[0], o.epochs, o.batch_size, o.n_gpus, o.lr, o.warmup_fraction, o.decay_after, o.min_lr,
                o.grad_clip, o.seed, o.n_threads, o.log_every, o.mb_growth, o.mb_budget,
                o.tile_atom_ratio, o.graph_cache, o.prefetch, o.muon_momentum, o.muon_lr_scale, o.muon_ns_steps,
                o.log_errors_epochs, o.energy_weight, o.force_weight, o.nc_force_weight, int(o.allreduce));
@@ -55,6 +61,9 @@ int main(int argc, char **argv) {
     else if (a == "--gpus") o.n_gpus = std::stoi(val());
     else if (a == "--lr") o.lr = std::stod(val());
     else if (a == "--warmup-fraction") o.warmup_fraction = std::stod(val());
+    else if (a == "--schedule") o.schedule = val();
+    else if (a == "--decay-after") o.decay_after = std::stoi(val());
+    else if (a == "--min-lr") o.min_lr = std::stod(val());
     else if (a == "--grad-clip") o.grad_clip = std::stod(val());
     else if (a == "--seed") o.seed = std::stoull(val());
     else if (a == "--threads") o.n_threads = std::stoi(val());
@@ -83,6 +92,11 @@ int main(int argc, char **argv) {
     else if (a == "--nc-force-weight") o.nc_force_weight = std::stod(val());
     else if (a == "--model-baselines") o.model_baselines = true;
     else if (a == "--allreduce") o.allreduce = std::stoi(val()) != 0;
+    else if (a == "--save-every") o.save_every = std::stoi(val());
+    else if (a == "--log") o.log_jsonl = val();
+    else if (a == "--state-every") o.state_every = std::stoi(val());
+    else if (a == "--max-hours") o.max_hours = std::stod(val());
+    else if (a == "--resume") o.resume = val();
     else usage();
   }
   if (o.data_dir.empty() || o.init_gguf.empty() || o.output.empty()) usage();

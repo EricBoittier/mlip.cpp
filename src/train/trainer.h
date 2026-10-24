@@ -25,6 +25,11 @@ struct TrainOptions {
   int n_gpus = 1;      // 0 = CPU
   double lr = 1e-4;
   double warmup_fraction = 0.01;
+  // "cosine" (metatrain: warmup_fraction, then cosine to 0) or "linear"
+  // (LOREM: constant for decay_after epochs, then linear to min_lr at the end)
+  std::string schedule = "cosine";
+  int decay_after = 10;
+  double min_lr = 1e-6;
   double grad_clip = 1.0;
   uint64_t seed = 42;
   int n_threads = 8;    // batch preparation and neighbour lists
@@ -63,6 +68,19 @@ struct TrainOptions {
   // fine-tuning: keep the composition and scales stored in --init instead of
   // fitting them on the training set
   bool model_baselines = false;
+  // checkpoints: save_every > 0 writes <output>.epoch%05d.gguf every that many
+  // epochs (numbered by epochs done) instead of <output>.epoch<k> after every
+  // epoch; <output>.best.gguf is the epoch with the highest R^2(E) + R^2(F) on
+  // val/ (LOREM's criterion); log_jsonl: one line of val metrics per epoch
+  int save_every = 0;
+  std::string log_jsonl;
+  // chains of jobs: <output>.state (optimizer state, step, epoch, best score)
+  // with the model in <output>, every state_every epochs and when stopping
+  // after the epoch in which max_hours passed ("paused at epoch k"); resume:
+  // --init <output> --resume <output>.state
+  int state_every = 0;
+  double max_hours = 0;
+  std::string resume;
   // several GPUs: average the gradients with one NCCL all-reduce and step a
   // replica of the optimizer on every device (no gradient staging on device
   // 0, no weight broadcast); default with a build that has NCCL
@@ -92,6 +110,11 @@ struct StepStats {
   double loss_nc = 0, se_force_nc = 0; // conservative mode: the direct head's term and (eV/Å)^2
   double se_energy_per_atom = 0; // Σ_s (ΔE_s / N_s)^2, eV^2
   double se_force = 0;           // Σ_i,k ΔF_ik^2, (eV/Å)^2 (conservative mode: of -dE/dx)
+  // MAE and R^2 = 1 - SSE / SST (energies per atom after the composition,
+  // force components pooled): Σ|ΔE_s / N_s|, Σ|ΔF_ik| (conservative mode
+  // only), and the sums of the targets and of their squares
+  double ae_energy_per_atom = 0, ae_force = 0;
+  double sum_e = 0, sum2_e = 0, sum_f = 0, sum2_f = 0;
   int64_t n_systems = 0, n_force_components = 0;
 
   StepStats &operator+=(const StepStats &o);
@@ -269,6 +292,10 @@ public:
   /// Profiling only (steps the parameters): mean wall time of `reps` whole
   /// steps, then the step graph node by node (synchronised), by op.
   double profile(int reps, std::map<std::string, Worker::OpStats> &ops);
+  /// The optimizer state for resuming (step count, Adam moments, Muon
+  /// momenta: device 0's buffer; not with the Muon split over devices).
+  std::vector<uint8_t> get_state() const;
+  void set_state(const std::vector<uint8_t> &state);
   std::vector<std::string> muon_groups; // "ne0 x ne1 x count" per orthogonalised group
   std::string muon_split;               // Newton-Schulz FLOPs per device ("" if not split)
   std::string allreduce_info;           // "" without the all-reduce
