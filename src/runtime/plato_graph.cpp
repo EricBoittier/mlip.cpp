@@ -252,6 +252,10 @@ PlatoOutputs build_plato(ggml_context *ctx, const PlatoSpec &spec, const std::ma
     }
   }
   out.total = in.energy_weights ? ggml_sum(ctx, ggml_mul(ctx, out.energies, in.energy_weights)) : ggml_sum(ctx, out.energies);
+  if (in.charge_weights && out.charges) { // a loss on the charges enters the parameter gradient through total
+    ggml_tensor *q0 = ggml_view_2d(ctx, out.charges, n, 1, out.charges->nb[1], 0);
+    out.total = ggml_add(ctx, out.total, ggml_sum(ctx, ggml_mul(ctx, q0, in.charge_weights)));
+  }
   return out;
 }
 

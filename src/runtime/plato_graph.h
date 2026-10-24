@@ -61,6 +61,8 @@ struct PlatoInputs {
   bool shared_filter = false;
   ggml_tensor *struct_index = nullptr;     // I32 [n], structure of each atom
   ggml_tensor *energy_weights = nullptr;   // F32 [1, G]: total = sum_g w_g E_g
+  ggml_tensor *charge_weights = nullptr;   // F32 [n, 1] (training, optional): total += sum_i c_i q_i,
+                                           // first latent charge channel
   // long range (periodic batches: every structure on the same mesh and the same
   // integer k set; open systems: one structure)
   ggml_tensor *positions = nullptr;        // F32 [3, n] (param)
@@ -82,7 +84,7 @@ struct PlatoInputs {
 
 struct PlatoOutputs {
   ggml_tensor *energies = nullptr;    // [1, G] unscaled energy per structure
-  ggml_tensor *total = nullptr;       // [1] sum_g w_g E_g: differentiate this
+  ggml_tensor *total = nullptr;       // [1] sum_g w_g E_g (+ sum_i c_i q_i): differentiate this
   ggml_tensor *short_range = nullptr; // [1, G] energy head part
   ggml_tensor *les = nullptr;         // [1, G] LES part (or nullptr)
   ggml_tensor *chi = nullptr;         // [1, G] electronegativity part (or nullptr)

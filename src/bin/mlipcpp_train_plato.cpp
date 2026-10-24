@@ -6,6 +6,14 @@
 //       [--seed 0] [--no-augment] [--fd-eps 5e-3] [--gpus 1] [--save-every 100] [--log FILE.jsonl]
 //       [--resume STATE] [--state STATE] [--state-every 10] [--max-epochs-this-run N] [--max-hours H] [--backend cuda]
 //   With --val, OUT.best.gguf holds the epoch with the highest R^2(E) + R^2(F) on it (LOREM's criterion).
+//   --charge-weight W (datasets with molecules, plato_dataset.py --molecules): adds
+//   W * mean_structures 1/2 sum_m (Q_m - Q'_m)^2, Q_m the latent charge (e, first channel) summed
+//   over molecule m and Q'_m its formal charge, centred as the latent charges are
+//   (Q'_m = Q_m^formal - Q_total n_m / n). Its parameter gradient inside the central difference
+//   as the force term would lose it to float32 cancellation, so it is one more plain backward pass
+//   with charge weights c_i = dL/dq_i on the graph's total and energy weights 0 (exact).
+//   mlipcpp-train-plato --init model.gguf --train data.bin --gradcheck H [--batch-size 8] [weights]: the loss
+//       along the trainer's gradient direction, (L(p + h g/|g|) - L(p - h g/|g|)) / 2h against |g|
 //   mlipcpp-train-plato --init model.gguf --train data.bin --check REF   (REF.json / REF.f64 of
 //       scripts/plato/plato_grad_reference.py: loss and parameter gradients vs PyTorch)
 //
@@ -75,6 +83,9 @@ struct Structure {
   std::vector<double> x, F; // [n][3]
   double cell[9] = {}, energy = 0, stress[9] = {};
   bool pbc = true, has_forces = false, has_stress = false;
+  bool has_molecules = false; // two molecules: atoms [0, split) and [split, n), formal charges QA, QB
+  int split = 0;
+  double QA = 0, QB = 0;
 };
 
 std::vector<Structure> read_dataset(const std::string &path) {
@@ -94,10 +105,14 @@ std::vector<Structure> read_dataset(const std::string &path) {
     f.read(reinterpret_cast<char *>(s.cell), 72);
     uint8_t fl[4];
     f.read(reinterpret_cast<char *>(fl), 4);
-    s.pbc = fl[0], s.has_forces = fl[1], s.has_stress = fl[2];
+    s.pbc = fl[0], s.has_forces = fl[1], s.has_stress = fl[2], s.has_molecules = fl[3];
     f.read(reinterpret_cast<char *>(&s.energy), 8);
     if (s.has_forces) s.F.resize(3 * s.n), f.read(reinterpret_cast<char *>(s.F.data()), 8 * 3 * s.n);
     if (s.has_stress) f.read(reinterpret_cast<char *>(s.stress), 72);
+    if (s.has_molecules) {
+      f.read(reinterpret_cast<char *>(&s.split), 4), f.read(reinterpret_cast<char *>(&s.QA), 8), f.read(reinterpret_cast<char *>(&s.QB), 8);
+      if (s.split <= 0 || s.split >= s.n) throw std::runtime_error(path + ": bad molecule split");
+    }
   }
   return out;
 }
@@ -347,7 +362,7 @@ struct Worker {
   ggml_tensor *adamw = nullptr, *clip_value = nullptr, *sumsq = nullptr;
   std::list<std::pair<std::tuple<int, int64_t, int, int, int64_t, int, int, int>, std::unique_ptr<BatchGraph>>> cache;
   size_t cache_limit = 12;
-  double fd_eps = 5e-3, energy_weight = 1, force_weight = 1;
+  double fd_eps = 5e-3, energy_weight = 1, force_weight = 1, charge_weight = 0;
   double t_build = 0, t_compute = 0, t_host = 0; // ms
   int64_t builds = 0;
 
@@ -471,6 +486,7 @@ struct Worker {
     in.rel_identity = input(GGML_TYPE_F32, 9, 1, 1, "rel_identity");
     in.struct_index = input(GGML_TYPE_I32, n, 1, 1, "struct_index");
     in.energy_weights = input(GGML_TYPE_F32, 1, G, 1, "energy_weights");
+    if (spec.les) in.charge_weights = input(GGML_TYPE_F32, n, 1, 1, "charge_weights");
     in.positions = input(GGML_TYPE_F32, 3, n, 1, "positions");
     in.strain = input(GGML_TYPE_F32, 3, 3, 1, "strain");
     in.atom_inv_cell_t = input(GGML_TYPE_F32, 3, 3, n, "atom_inv_cell_t");
@@ -491,6 +507,7 @@ struct Worker {
     ggml_set_param(in.edge_vectors), ggml_set_param(in.positions);
     bg->out = runtime::build_plato(ctx, spec, model->weights(), in, n, E, P.L, true);
     ggml_set_output(bg->out.energies);
+    if (bg->out.charges) ggml_set_output(bg->out.charges);
     bg->graph = ggml_new_graph_custom(ctx, GS, true);
     ggml_build_forward_expand(bg->graph, bg->out.energies);
     ggml_build_forward_expand(bg->graph, bg->out.total);
@@ -546,6 +563,10 @@ struct Worker {
     // force components pooled
     double e_sq = 0, f_sq = 0, f_sum = 0, f_sum2 = 0;
     std::vector<double> e_target; // (E - composition) / n per structure
+    // molecule charges: loss (normalised by norm_G), sum |Q_m - Q'_m| over molecules, and the
+    // sign of Q_m against the formal charge of the charged molecules
+    double loss_q = 0, q_abs = 0;
+    int64_t q_count = 0, q_sign_ok = 0, q_charged = 0;
   };
 
   // eval0 for the forces; with `train` the two displaced evaluations accumulate
@@ -566,8 +587,10 @@ struct Worker {
       if (in.les_k) set(in.les_k, P.lk.data()), set(in.les_n, P.ln.data()), set(in.les_taper, P.taper.data());
       bg.constants_set = true;
     }
-    auto run = [&](const std::vector<float> &ev, const std::vector<float> &pos, const std::vector<float> &w, float s) {
+    auto run = [&](const std::vector<float> &ev, const std::vector<float> &pos, const std::vector<float> &w, const std::vector<float> &cw,
+                   float s) {
       set(in.edge_vectors, ev.data()), set(in.positions, pos.data()), set(in.energy_weights, w.data()), set(bg.loss_grad, &s);
+      if (in.charge_weights) set(in.charge_weights, cw.data());
       const auto a = clk::now();
       if (model->backend()->compute(bg.graph) != GGML_STATUS_SUCCESS) throw std::runtime_error("compute failed");
       t_compute += ms_since(a);
@@ -575,10 +598,12 @@ struct Worker {
     std::vector<float> w1(G, 1.0f);
     w1[Gr] = 0.0f;
     t_host += ms_since(t0);
-    run(P.ev0, P.pos0, w1, 1.0f);
+    const std::vector<float> cw0(n, 0.0f);
+    run(P.ev0, P.pos0, w1, cw0, 1.0f);
     const auto t1 = clk::now();
-    std::vector<float> Eraw(G), gev(3 * E), gpos(3 * size_t(n));
+    std::vector<float> Eraw(G), gev(3 * E), gpos(3 * size_t(n)), q(bg.out.charges ? n : 0);
     ggml_backend_tensor_get(bg.out.energies, Eraw.data(), 0, 4 * G);
+    if (bg.out.charges) ggml_backend_tensor_get(bg.out.charges, q.data(), 0, 4 * size_t(n)); // first channel
     ggml_backend_tensor_get(bg.g_ev, gev.data(), 0, gev.size() * 4);
     ggml_backend_tensor_get(bg.g_pos, gpos.data(), 0, gpos.size() * 4);
     zero_acc(); // eval0 accumulated dT/dtheta with seed 1
@@ -601,6 +626,26 @@ struct Worker {
         u[3 * A + c] = force_weight * 2 * d / (3.0 * P.norm_N);
       }
     const double scale = model->energy_scale();
+    std::vector<double> cq(n, 0.0); // dL/dq_i of the molecule-charge term
+    if (!q.empty()) {
+      const double unit = std::sqrt(scale); // latent charge in e = sqrt(energy scale) q
+      for (int g = 0; g < Gr; g++) {
+        const Structure &s = *P.structs[g];
+        if (!s.has_molecules) continue;
+        const double Qt = s.QA + s.QB;
+        const int lo[2] = {0, s.split}, hi[2] = {s.split, s.n};
+        const double Qf[2] = {s.QA, s.QB};
+        for (int m = 0; m < 2; m++) {
+          double S = 0;
+          for (int i = lo[m]; i < hi[m]; i++) S += unit * q[P.a0[g] + i];
+          const double target = Qf[m] - Qt * double(hi[m] - lo[m]) / s.n, res = S - target;
+          r.loss_q += 0.5 * res * res / P.norm_G;
+          r.q_abs += std::abs(res), r.q_count++;
+          if (Qf[m] != 0) r.q_charged++, r.q_sign_ok += (S > 0) == (Qf[m] > 0);
+          for (int i = lo[m]; i < hi[m]; i++) cq[P.a0[g] + i] = charge_weight * res * unit / P.norm_G;
+        }
+      }
+    }
     r.E.resize(Gr), r.F.resize(Gr);
     for (int g = 0; g < Gr; g++) {
       const Structure &s = *P.structs[g];
@@ -627,7 +672,7 @@ struct Worker {
       for (double x : u) umax = std::max(umax, std::abs(x));
       for (double x : a) umax = std::max(umax, std::abs(x));
       const double eps = umax > 0 ? fd_eps / umax : fd_eps;
-      std::vector<float> ev(3 * E), pos(3 * size_t(n)), w(G, 0.0f);
+      std::vector<float> ev(3 * E), pos(3 * size_t(n)), w(G, 0.0f), cw(n, 0.0f);
       for (int sgn : {+1, -1}) {
         for (int A = 0; A < n; A++)
           for (int c = 0; c < 3; c++) pos[3 * A + c] = float(P.pos0[3 * A + c] + sgn * eps * u[3 * A + c]);
@@ -635,7 +680,15 @@ struct Worker {
           for (int c = 0; c < 3; c++) ev[3 * e + c] = float(P.ev0[3 * e + c] + sgn * eps * (u[3 * P.ej[e] + c] - u[3 * P.cen[e] + c]));
         for (int g = 0; g < Gr; g++) w[g] = float(1.0 + sgn * eps * a[g]);
         t_host += ms_since(t1);
-        run(ev, pos, w, float(sgn / (2 * eps)));
+        run(ev, pos, w, cw0, float(sgn / (2 * eps)));
+      }
+      // the charge term is linear in q: its gradient is one plain backward pass of sum_i cq_i q_i
+      // (energy weights 0), exact; inside the central difference it would be lost to the
+      // float32 cancellation of the weight-1 energies
+      if (charge_weight > 0 && in.charge_weights) {
+        std::vector<float> w0s(G, 0.0f);
+        for (int i = 0; i < n; i++) cw[i] = float(cq[i]);
+        run(P.ev0, P.pos0, w0s, cw, 1.0f);
       }
     } else {
       t_host += ms_since(t1);
@@ -827,6 +880,7 @@ int main(int argc, char **argv) {
       w->fd_eps = std::stod(arg(argc, argv, "--fd-eps", "5e-3"));
       w->energy_weight = std::stod(arg(argc, argv, "--energy-weight", "1"));
       w->force_weight = std::stod(arg(argc, argv, "--force-weight", "1"));
+      w->charge_weight = std::stod(arg(argc, argv, "--charge-weight", "0"));
       w->cache_limit = std::stoul(arg(argc, argv, "--graph-cache", "12"));
       workers.push_back(std::move(w));
     }
@@ -883,6 +937,41 @@ int main(int argc, char **argv) {
       return 0;
     }
 
+    const std::string gradcheck = arg(argc, argv, "--gradcheck", "");
+    if (!gradcheck.empty()) { // directional derivative of the loss along the trainer's gradient vs |g|
+      const double h = std::stod(gradcheck);
+      const int nb = std::min<int>(std::stoi(arg(argc, argv, "--batch-size", "8")), int(train.size()));
+      std::vector<const Structure *> b; // half of them with charged molecules, when there are any
+      for (const auto &s : train)
+        if (int(b.size()) < nb / 2 && s.has_molecules && (s.QA != 0 || s.QB != 0)) b.push_back(&s);
+      for (const auto &s : train)
+        if (int(b.size()) < nb && std::find(b.begin(), b.end(), &s) == b.end()) b.push_back(&s);
+      void *vesin = nullptr;
+      Prepared P = prepare(cx, b, std::vector<Mat3>(b.size(), IDENTITY), vesin);
+      plato::free_vesin(vesin);
+      P.norm_G = P.Greal, P.norm_N = P.n_real;
+      auto loss = [&](const Worker::Result &r) { return w0.energy_weight * r.loss_e + w0.force_weight * r.loss_f + w0.charge_weight * r.loss_q; };
+      w0.zero_acc();
+      const auto r0 = w0.evaluate(P, true);
+      const std::vector<float> g = w0.get_acc(), p0 = w0.get_params();
+      double gn = 0;
+      for (float x : g) gn += double(x) * x;
+      gn = std::sqrt(gn);
+      double L[2];
+      for (int k = 0; k < 2; k++) {
+        std::vector<float> p = p0;
+        for (size_t i = 0; i < p.size(); i++) p[i] += float((k ? -h : h) * g[i] / gn);
+        w0.set_params(p);
+        L[k] = loss(w0.evaluate(P, false));
+      }
+      w0.set_params(p0);
+      const double dd = (L[0] - L[1]) / (2 * h);
+      std::printf("gradcheck (%d structures, weights E %g F %g Q %g): loss %.8g (E %.4g F %.4g Q %.4g), |g| %.6e, "
+                  "dL/dh along g %.6e, rel %.2e; molecule charge MAE %.4f e over %lld molecules\n",
+                  nb, w0.energy_weight, w0.force_weight, w0.charge_weight, loss(r0), r0.loss_e, r0.loss_f, r0.loss_q, gn, dd,
+                  std::abs(dd - gn) / gn, r0.q_abs / std::max<int64_t>(r0.q_count, 1), (long long)r0.q_count);
+      return 0;
+    }
     const auto val = read_dataset(arg(argc, argv, "--val", ""));
     const std::string output = arg(argc, argv, "-o", "plato-trained.gguf");
     const int epochs = std::stoi(arg(argc, argv, "--epochs", "3")), B = std::stoi(arg(argc, argv, "--batch-size", "16"));
@@ -934,8 +1023,8 @@ int main(int argc, char **argv) {
 
     // E MAE, F MAE, loss, R^2 of E and F in % (LOREM's checkpoint metric is their sum)
     auto validate = [&]() {
-      double e = 0, f = 0, loss = 0, e_sq = 0, f_sq = 0, f_sum = 0, f_sum2 = 0;
-      int64_t fc = 0, ns = 0;
+      double e = 0, f = 0, loss = 0, e_sq = 0, f_sq = 0, f_sum = 0, f_sum2 = 0, q_abs = 0;
+      int64_t fc = 0, ns = 0, qn = 0, q_ok = 0, q_ch = 0;
       std::vector<double> et;
       void *vesin = nullptr;
       for (size_t s = 0; s < val.size(); s += B) {
@@ -945,7 +1034,8 @@ int main(int argc, char **argv) {
         P.norm_G = P.Greal, P.norm_N = P.n_real;
         auto r = w0.evaluate(P, false);
         e += r.e_abs, f += r.f_abs, fc += r.f_count, ns += P.Greal;
-        loss += (w0.energy_weight * r.loss_e + w0.force_weight * r.loss_f) * P.Greal;
+        loss += (w0.energy_weight * r.loss_e + w0.force_weight * r.loss_f + w0.charge_weight * r.loss_q) * P.Greal;
+        q_abs += r.q_abs, qn += r.q_count, q_ok += r.q_sign_ok, q_ch += r.q_charged;
         e_sq += r.e_sq, f_sq += r.f_sq, f_sum += r.f_sum, f_sum2 += r.f_sum2;
         et.insert(et.end(), r.e_target.begin(), r.e_target.end());
       }
@@ -954,8 +1044,9 @@ int main(int argc, char **argv) {
       double e_sst = 0;
       for (double y : et) e_sst += (y - em) * (y - em);
       const double f_sst = f_sum2 - f_sum * f_sum / std::max<int64_t>(fc, 1);
-      return std::array<double, 5>{e / ns, f / std::max<int64_t>(fc, 1), loss / ns, 100 * (1 - e_sq / e_sst),
-                                   100 * (1 - f_sq / f_sst)};
+      // E MAE, F MAE, loss, R2 E, R2 F, molecule charge MAE (e), charged molecules with the formal sign (%), molecules
+      return std::array<double, 8>{e / ns, f / std::max<int64_t>(fc, 1), loss / ns, 100 * (1 - e_sq / e_sst), 100 * (1 - f_sq / f_sst),
+                                   q_abs / std::max<int64_t>(qn, 1), 100.0 * q_ok / std::max<int64_t>(q_ch, 1), double(qn)};
     };
     auto log_line = [&](const nlohmann::json &j) {
       std::ofstream(log_path, std::ios::app) << j.dump() << "\n";
@@ -964,8 +1055,10 @@ int main(int argc, char **argv) {
       const auto m = validate();
       std::printf("epoch 0 val: E MAE %.4f meV/atom, F MAE %.4f meV/A, loss %.6g, R2 E %.4f%% F %.4f%%\n", 1e3 * m[0], 1e3 * m[1],
                   m[2], m[3], m[4]);
-      log_line({{"epoch", 0}, {"val_e_mae_mev_atom", 1e3 * m[0]}, {"val_f_mae_mev_a", 1e3 * m[1]}, {"val_loss", m[2]},
-                {"val_r2_e", m[3]}, {"val_r2_f", m[4]}});
+      nlohmann::json l0 = {{"epoch", 0}, {"val_e_mae_mev_atom", 1e3 * m[0]}, {"val_f_mae_mev_a", 1e3 * m[1]}, {"val_loss", m[2]},
+                           {"val_r2_e", m[3]}, {"val_r2_f", m[4]}};
+      if (m[7] > 0) l0.update({{"val_q_mae_e", m[5]}, {"val_q_sign_pct", m[6]}});
+      log_line(l0);
       std::fflush(stdout);
     }
     const auto run_start = clk::now();
@@ -1000,7 +1093,7 @@ int main(int argc, char **argv) {
       };
       pf.start(0, spe, prep_threads);
       const auto t0 = clk::now();
-      double le = 0, lf = 0, gn = 0, wait_ms = 0;
+      double le = 0, lf = 0, lq = 0, gn = 0, wait_ms = 0;
       int64_t nb = 0;
       for (auto &w : workers) w->t_build = w->t_compute = w->t_host = 0, w->builds = 0;
       for (int64_t s = 0; s < spe; s++) {
@@ -1015,7 +1108,7 @@ int main(int argc, char **argv) {
         for (size_t d = mb.size(); d < workers.size(); d++) workers[d]->zero_acc();
         for (auto &f : fut) {
           auto r = f.get();
-          le += r.loss_e, lf += r.loss_f;
+          le += r.loss_e, lf += r.loss_f, lq += r.loss_q;
         }
 #ifdef MLIPCPP_NCCL
         if (nccl) nccl->allreduce_sum(workers);
@@ -1027,7 +1120,7 @@ int main(int argc, char **argv) {
         nb++;
         if (st.step % 100 == 0) {
           std::printf("  step %lld loss %.6g (E %.4g F %.4g) |g| %.3g lr %.3g\n", (long long)st.step,
-                      (w0.energy_weight * le + w0.force_weight * lf) / nb, le / nb, lf / nb, gn, lr_at(st.step));
+                      (w0.energy_weight * le + w0.force_weight * lf + w0.charge_weight * lq) / nb, le / nb, lf / nb, gn, lr_at(st.step));
           std::fflush(stdout);
         }
         if (max_steps > 0 && st.step >= max_steps) break;
@@ -1035,30 +1128,33 @@ int main(int argc, char **argv) {
       pf.finish();
       const double wall = std::chrono::duration<double>(clk::now() - t0).count();
       st.epoch = ep, epochs_this_run++;
-      std::array<double, 5> m = {0, 0, 0, 0, 0};
+      std::array<double, 8> m = {0, 0, 0, 0, 0, 0, 0, 0};
       const bool do_val = !no_val && (ep % val_every == 0 || ep == epochs);
       const auto tv = clk::now();
       if (do_val) m = validate();
       const double val_s = std::chrono::duration<double>(clk::now() - tv).count();
       std::printf("epoch %d: train loss %.6g (E %.4g F %.4g), %.1f s (host wait %.1f, build %.1f, inputs %.1f, compute %.1f s; %lld graphs built), lr %.3g",
-                  ep, (w0.energy_weight * le + w0.force_weight * lf) / nb, le / nb, lf / nb, wall, wait_ms / 1e3, w0.t_build / 1e3,
+                  ep, (w0.energy_weight * le + w0.force_weight * lf + w0.charge_weight * lq) / nb, le / nb, lf / nb, wall, wait_ms / 1e3, w0.t_build / 1e3,
                   w0.t_host / 1e3, w0.t_compute / 1e3, (long long)w0.builds, lr_at(st.step));
       if (do_val)
         std::printf(", val E MAE %.4f meV/atom, F MAE %.4f meV/A, loss %.6g, R2 E %.4f%% F %.4f%% (%.1f s)", 1e3 * m[0], 1e3 * m[1],
                     m[2], m[3], m[4], val_s);
+      if (do_val && m[7] > 0) std::printf(", molecule charge MAE %.4f e, formal sign %.1f%%", m[5], m[6]);
       std::printf("\n");
       std::fflush(stdout);
-      nlohmann::json line = {{"epoch", ep}, {"step", st.step}, {"train_loss", (w0.energy_weight * le + w0.force_weight * lf) / nb},
-                             {"train_loss_e", le / nb}, {"train_loss_f", lf / nb}, {"wall_s", wall}, {"lr", lr_at(st.step)}};
+      nlohmann::json line = {{"epoch", ep}, {"step", st.step}, {"train_loss", (w0.energy_weight * le + w0.force_weight * lf + w0.charge_weight * lq) / nb},
+                             {"train_loss_e", le / nb}, {"train_loss_f", lf / nb}, {"train_loss_q", lq / nb}, {"wall_s", wall}, {"lr", lr_at(st.step)}};
       // the best checkpoint by LOREM's criterion: highest R^2(E) + R^2(F) on the validation set
       const bool best = do_val && -(m[3] + m[4]) < st.best;
       if (do_val) line.update({{"val_e_mae_mev_atom", 1e3 * m[0]}, {"val_f_mae_mev_a", 1e3 * m[1]}, {"val_loss", m[2]},
                                {"val_r2_e", m[3]}, {"val_r2_f", m[4]}, {"best", best}});
+      if (do_val && m[7] > 0) line.update({{"val_q_mae_e", m[5]}, {"val_q_sign_pct", m[6]}});
       log_line(line);
       const bool last = ep == epochs || epochs_this_run >= max_epochs_run || (max_steps > 0 && st.step >= max_steps) ||
                         std::chrono::duration<double>(clk::now() - run_start).count() / 3600.0 > max_hours;
       const nlohmann::json info = {{"epoch", ep}, {"step", st.step}, {"init", init}, {"lr", lr0}, {"schedule", schedule},
-                                   {"epochs", epochs}, {"batch_size", B}, {"fd_eps", w0.fd_eps}, {"gpus", W}};
+                                   {"epochs", epochs}, {"batch_size", B}, {"fd_eps", w0.fd_eps}, {"gpus", W},
+                                   {"charge_weight", w0.charge_weight}};
       if (best) {
         st.best = -(m[3] + m[4]);
         nlohmann::json bi = info;
