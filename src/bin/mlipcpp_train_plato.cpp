@@ -12,6 +12,8 @@
 //   (Q'_m = Q_m^formal - Q_total n_m / n). Its parameter gradient inside the central difference
 //   as the force term would lose it to float32 cancellation, so it is one more plain backward pass
 //   with charge weights c_i = dL/dq_i on the graph's total and energy weights 0 (exact).
+//   --optimizer muon [--muon-lr-scale 10 --muon-momentum 0.95 --muon-ns-steps 5]: Muon (as mlipcpp-train) on the
+//   hidden weight matrices, each FrameLinear basis kernel a matrix of its own; Adam for the rest (default: Adam).
 //   --max-len N drops the structures with more than N - 1 neighbours of an atom (training and validation):
 //   the ragged attention keeps a sequence in shared memory (the limit depends on head width, frames, GPU).
 //   mlipcpp-train-plato --init model.gguf --train data.bin --gradcheck H [--batch-size 8] [weights]: the loss
@@ -436,6 +438,32 @@ struct BatchGraph {
   }
 };
 
+// Muon (as mlipcpp-train's, src/train/trainer.cpp): hidden weight matrices, both of the last two
+// dimensions >= 16, not embeddings; a FrameLinear kernel [n_basis, out, in] (ggml ne [in, out, n_basis]) is
+// a stack of n_basis matrices, each orthogonalised on its own. Momentum b = mu b + (1 - mu) g, Nesterov
+// u = (1 - mu) g + mu b, Newton-Schulz quintic, step lr * scale * 0.2 sqrt(max(out, in)); the rest Adam.
+bool is_muon_param(const ggml_tensor *p, const std::string &name) {
+  return (ggml_n_dims(p) == 2 || ggml_n_dims(p) == 3) && std::min(p->ne[0], p->ne[1]) >= 16 &&
+         name.find("embed") == std::string::npos;
+}
+
+// Newton-Schulz quintic (Muon's fixed coefficients): approximately U V^T of each g[:, :, i] = U S V^T
+ggml_tensor *orthogonalize(ggml_context *ctx, ggml_tensor *g, int steps) {
+  const float a = 3.4445f, b = -4.7750f, c = 2.0315f;
+  const bool tall = g->ne[0] < g->ne[1]; // more rows than cols: work on g^T
+  ggml_tensor *x = tall ? ggml_cont(ctx, ggml_transpose(ctx, g)) : g;
+  const int64_t cols = x->ne[0], rows = x->ne[1], k = x->ne[2];
+  ggml_tensor *n2 = ggml_sum_rows(ctx, ggml_reshape_2d(ctx, ggml_sqr(ctx, x), cols * rows, k));
+  x = ggml_div(ctx, x, ggml_reshape_3d(ctx, ggml_scale_bias(ctx, ggml_sqrt(ctx, n2), 1.0f, 1e-7f), 1, 1, k));
+  for (int it = 0; it < steps; it++) {
+    ggml_tensor *A = ggml_mul_mat(ctx, x, x); // X X^T
+    ggml_tensor *B = ggml_add(ctx, ggml_scale(ctx, A, b), ggml_scale(ctx, ggml_mul_mat(ctx, A, A), c));
+    ggml_tensor *BX = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, x)), B); // B X (B symmetric)
+    x = ggml_add(ctx, ggml_scale(ctx, x, a), BX);
+  }
+  return tall ? ggml_cont(ctx, ggml_transpose(ctx, x)) : x;
+}
+
 struct Worker {
   int device = 0;
   std::unique_ptr<plato::PlatoModel> model;
@@ -448,6 +476,13 @@ struct Worker {
   ggml_cgraph *step_graph = nullptr;
   ggml_gallocr_t step_galloc = nullptr;
   ggml_tensor *adamw = nullptr, *clip_value = nullptr, *sumsq = nullptr;
+  // Muon: per Muon parameter (lr * scale * 0.2 sqrt(max dim), wd = 0)
+  bool muon = false;
+  double muon_momentum = 0.95, muon_lr_scale = 10.0;
+  int muon_ns_steps = 5;
+  ggml_tensor *muon_lr = nullptr;
+  std::vector<float> muon_rms;
+  int64_t n_muon_values = 0;
   std::list<std::pair<std::tuple<int, int64_t, int, int, int64_t, int, int, int>, std::unique_ptr<BatchGraph>>> cache;
   size_t cache_limit = 12;
   double fd_eps = 5e-3, energy_weight = 1, force_weight = 1, charge_weight = 0, stress_weight = 0;
@@ -476,7 +511,7 @@ struct Worker {
     (void)ctx_mv;
     ctx_mv_ = c2;
     // the step graph: clip by the global norm, Adam
-    const size_t GS = 4 * params.size() + 64;
+    const size_t GS = (muon ? 64 : 4) * params.size() + 64; // Muon: ~50 nodes per matrix (Newton-Schulz)
     ctx_step = ggml_init({ggml_tensor_overhead() * GS * 4 + ggml_graph_overhead_custom(GS * 4, false), nullptr, true});
     adamw = ggml_new_tensor_1d(ctx_step, GGML_TYPE_F32, 7), ggml_set_input(adamw);
     clip_value = ggml_new_tensor_1d(ctx_step, GGML_TYPE_F32, 1), ggml_set_input(clip_value);
@@ -488,15 +523,35 @@ struct Worker {
     ggml_set_output(sumsq);
     ggml_tensor *f = ggml_clamp(ctx_step, ggml_div(ctx_step, clip_value, ggml_scale_bias(ctx_step, ggml_sqrt(ctx_step, sumsq), 1.0f, 1e-6f)), 0.0f, 1.0f);
     ggml_build_forward_expand(step_graph, sumsq);
+    std::vector<size_t> mk;
     for (size_t k = 0; k < params.size(); k++)
-      ggml_build_forward_expand(step_graph, ggml_opt_step_adamw(ctx_step, params[k], ggml_mul(ctx_step, acc[k], f), m[k], v[k], adamw));
+      if (muon && is_muon_param(params[k], names[k])) mk.push_back(k);
+    muon_lr = ggml_new_tensor_1d(ctx_step, GGML_TYPE_F32, 2 * std::max<int64_t>(1, int64_t(mk.size()))), ggml_set_input(muon_lr);
+    const float mu = float(muon_momentum);
+    for (size_t k = 0, j = 0; k < params.size(); k++) {
+      ggml_tensor *g = ggml_mul(ctx_step, acc[k], f);
+      if (j < mk.size() && mk[j] == k) { // Muon: momentum in m[k]
+        ggml_tensor *b = ggml_add(ctx_step, ggml_scale(ctx_step, m[k], mu), ggml_scale(ctx_step, g, 1.0f - mu));
+        ggml_build_forward_expand(step_graph, ggml_cpy(ctx_step, b, m[k]));
+        ggml_tensor *u = ggml_add(ctx_step, ggml_scale(ctx_step, g, 1.0f - mu), ggml_scale(ctx_step, b, mu));
+        ggml_tensor *o = orthogonalize(ctx_step, ggml_reshape_3d(ctx_step, u, u->ne[0], u->ne[1], ggml_nelements(u) / (u->ne[0] * u->ne[1])), muon_ns_steps);
+        ggml_build_forward_expand(step_graph, ggml_opt_step_sgd(ctx_step, params[k], ggml_reshape(ctx_step, o, params[k]),
+                                                                ggml_view_1d(ctx_step, muon_lr, 2, 2 * j * sizeof(float))));
+        muon_rms.push_back(0.2f * std::sqrt(float(std::max(params[k]->ne[0], params[k]->ne[1]))));
+        n_muon_values += ggml_nelements(params[k]);
+        j++;
+      } else {
+        ggml_build_forward_expand(step_graph, ggml_opt_step_adamw(ctx_step, params[k], g, m[k], v[k], adamw));
+      }
+    }
     ggml_context *ci = ggml_init({ggml_tensor_overhead() * 2, nullptr, true});
     (void)ci;
     ggml_free(ci);
-    step_inputs = ggml_backend_buft_alloc_buffer(model->backend()->buffer_type(), 1024);
-    char *base = static_cast<char *>(ggml_backend_buffer_get_base(step_inputs));
     const size_t al = ggml_backend_buft_get_alignment(model->backend()->buffer_type());
+    step_inputs = ggml_backend_buft_alloc_buffer(model->backend()->buffer_type(), 2 * GGML_PAD(64, al) + GGML_PAD(ggml_nbytes(muon_lr), al));
+    char *base = static_cast<char *>(ggml_backend_buffer_get_base(step_inputs));
     ggml_backend_tensor_alloc(step_inputs, adamw, base), ggml_backend_tensor_alloc(step_inputs, clip_value, base + GGML_PAD(64, al));
+    ggml_backend_tensor_alloc(step_inputs, muon_lr, base + 2 * GGML_PAD(64, al));
     step_galloc = ggml_gallocr_new(model->backend()->buffer_type());
     if (!ggml_gallocr_alloc_graph(step_galloc, step_graph)) throw std::runtime_error("cannot allocate the step graph");
   }
@@ -832,6 +887,11 @@ struct Worker {
     const float c = float(clip);
     ggml_backend_tensor_set(adamw, p, 0, sizeof(p));
     ggml_backend_tensor_set(clip_value, &c, 0, sizeof(c));
+    if (!muon_rms.empty()) {
+      std::vector<float> mp(2 * muon_rms.size(), 0.0f);
+      for (size_t i = 0; i < muon_rms.size(); i++) mp[2 * i] = float(lr * muon_lr_scale) * muon_rms[i];
+      ggml_backend_tensor_set(muon_lr, mp.data(), 0, mp.size() * sizeof(float));
+    }
     const auto a = clk::now();
     if (model->backend()->compute(step_graph) != GGML_STATUS_SUCCESS) throw std::runtime_error("step failed");
     t_compute += ms_since(a);
@@ -1005,6 +1065,12 @@ int main(int argc, char **argv) {
     for (int d = 0; d < W; d++) {
       auto w = std::make_unique<Worker>();
       o.device = d;
+      const std::string opt = arg(argc, argv, "--optimizer", "adam");
+      if (opt != "adam" && opt != "muon") throw std::runtime_error("--optimizer adam|muon");
+      w->muon = opt == "muon";
+      w->muon_momentum = std::stod(arg(argc, argv, "--muon-momentum", "0.95"));
+      w->muon_lr_scale = std::stod(arg(argc, argv, "--muon-lr-scale", "10"));
+      w->muon_ns_steps = std::stoi(arg(argc, argv, "--muon-ns-steps", "5"));
       w->init(init, o, names);
       w->fd_eps = std::stod(arg(argc, argv, "--fd-eps", "5e-3"));
       w->energy_weight = std::stod(arg(argc, argv, "--energy-weight", "1"));
@@ -1016,6 +1082,11 @@ int main(int argc, char **argv) {
     }
     Worker &w0 = *workers[0];
     std::printf("backend %s x %d\n", w0.model->backend_name(), W);
+    if (w0.muon)
+      std::printf("optimizer: Muon on %zu tensors (%lld of %lld values), momentum %g, lr scale %g, %d NS steps; Adam for the rest\n",
+                  w0.muon_rms.size(), (long long)w0.n_muon_values, (long long)w0.n_values, w0.muon_momentum, w0.muon_lr_scale, w0.muon_ns_steps);
+    else
+      std::printf("optimizer: Adam\n");
     auto train = read_dataset(train_path);
     const int max_len = std::stoi(arg(argc, argv, "--max-len", "0"));
     if (max_len > 0)
@@ -1336,7 +1407,8 @@ int main(int argc, char **argv) {
                         std::chrono::duration<double>(clk::now() - run_start).count() / 3600.0 > max_hours;
       const nlohmann::json info = {{"epoch", ep}, {"step", st.step}, {"init", init}, {"lr", lr0}, {"schedule", schedule},
                                    {"epochs", epochs}, {"batch_size", B}, {"fd_eps", w0.fd_eps}, {"gpus", W},
-                                   {"charge_weight", w0.charge_weight}, {"stress_weight", w0.stress_weight}};
+                                   {"charge_weight", w0.charge_weight}, {"stress_weight", w0.stress_weight},
+                                   {"optimizer", w0.muon ? "muon" : "adam"}, {"muon_lr_scale", w0.muon_lr_scale}};
       if (best) {
         st.best = -(m[3] + m[4]);
         nlohmann::json bi = info;

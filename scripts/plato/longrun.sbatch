@@ -4,7 +4,8 @@
 # from the trainer state; each job resubmits the next until the run is done.
 #   NAME=chi INIT=init-chi.gguf sbatch longrun.sbatch
 # Optional: BASE (run directory under dev-plato, default long), DATA (directory with train.bin and
-# val.bin, default data), CLIP (gradient clip, default 1; 1e30 = none), VAL_EVERY (default 1), SEED.
+# val.bin, default data), CLIP (gradient clip, default 1; 1e30 = none), VAL_EVERY (default 1), SEED,
+# OPT (adam or muon) and MUON_SCALE (default 3).
 #SBATCH --job-name=plato-long
 #SBATCH --account=cosmo
 #SBATCH --partition=rtx6000
@@ -33,8 +34,8 @@ else
 fi
 $RUN/mlipcpp-train-plato $ARGS --train $DDIR/train.bin --val $DDIR/val.bin --backend cuda \
   --epochs ${EPOCHS:-4000} --batch-size 32 --lr 1e-4 --schedule linear --decay-after 10 --min-lr 1e-6 \
-  --grad-clip ${CLIP:-1} --val-every ${VAL_EVERY:-1} --fd-eps 5e-3 --seed ${SEED:-0} --save-every 100 --state-every 10 --max-hours ${HOURS:-23.3} \
-  -o $RUN/model.gguf --log $RUN/log.jsonl 2>&1 | grep -v "^ggml_cuda\|Device \|warmup\|^Backend" > $RUN/job-$SLURM_JOB_ID.out
+  --grad-clip ${CLIP:-1} --val-every ${VAL_EVERY:-1} --optimizer ${OPT:-adam} --muon-lr-scale ${MUON_SCALE:-3} --fd-eps 5e-3 --seed ${SEED:-0} --save-every 100 --state-every 10 --max-hours ${HOURS:-23.3} \
+  -o $RUN/model.gguf --log $RUN/log.jsonl 2>&1 | grep --line-buffered -v "^ggml_cuda\|Device \|warmup\|^Backend" > $RUN/job-$SLURM_JOB_ID.out
 tail -2 $RUN/job-$SLURM_JOB_ID.out
 if grep -q "^paused at epoch" $RUN/job-$SLURM_JOB_ID.out; then
   cd $D && NAME=$NAME INIT=$INIT sbatch --job-name=plato-long-$NAME $D/longrun.sbatch
