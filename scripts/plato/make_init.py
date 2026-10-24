@@ -5,9 +5,12 @@ electronegativity term (metatrain branch feat/plato-chi-frozen: checkpoint v4).
 
     python scripts/plato/make_init.py trained.ckpt init.ckpt --seed 0 \
         [--electronegativity linear --chi0-frozen --dchi-bound 1.0] [--keep-weights] [--random-dchi 0.3]
+        [--frames identity]
     python scripts/plato/export_plato_gguf.py init.ckpt -o init.gguf
 
 --keep-weights carries every weight of the source over (a parity-test model);
+--frames replaces the frame group (identity: the same model without frames; frame_mode stays
+attention, which with one frame is plain RoPE attention).
 --random-dchi s draws the last layer of the dchi head with std s (it starts at zero).
 charge_unit = sqrt(energy scale), as metatrain's trainer sets it when a run starts.
 """
@@ -28,6 +31,7 @@ def main():
     ap.add_argument("--dchi-bound", type=float, default=0.0)
     ap.add_argument("--keep-weights", action="store_true")
     ap.add_argument("--random-dchi", type=float, default=0.0)
+    ap.add_argument("--frames", default=None)
     a = ap.parse_args()
     from metatrain.experimental.plato_pet_lr.model import PlatoPETLR
     from metatrain.experimental.plato_pet_lr.trainer import Trainer
@@ -39,6 +43,8 @@ def main():
     hypers = dict(src_model.hypers)
     if a.electronegativity:
         hypers.update(electronegativity=a.electronegativity, chi0_trainable=not a.chi0_frozen, dchi_bound=a.dchi_bound)
+    if a.frames:
+        hypers.update(frames=a.frames)
     torch.manual_seed(a.seed)
     model = PlatoPETLR(hypers, ck["model_data"]["dataset_info"])
     state = model.state_dict()
@@ -60,7 +66,7 @@ def main():
                scheduler_state_dict=None, best_metric=None, best_optimizer_state_dict=None, epoch=None, best_epoch=None)
     torch.save(out, a.out)
     print(f"{a.out}: seed {a.seed}, {'source weights' if a.keep_weights else 'fresh weights'}, "
-          f"electronegativity {hypers.get('electronegativity', 'none')}, charge unit {math.sqrt(scale):.4f}")
+          f"frames {hypers.get('frames')}, electronegativity {hypers.get('electronegativity', 'none')}, charge unit {math.sqrt(scale):.4f}")
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@
 //       [--decay-after 10] [--min-lr 1e-6] [--energy-weight 1] [--force-weight 1] [--grad-clip 1]
 //       [--seed 0] [--no-augment] [--fd-eps 5e-3] [--gpus 1] [--save-every 100] [--log FILE.jsonl]
 //       [--resume STATE] [--state STATE] [--state-every 10] [--max-epochs-this-run N] [--max-hours H] [--backend cuda]
+//   With --val, OUT.best.gguf holds the epoch with the highest R^2(E) + R^2(F) on it (LOREM's criterion).
 //   mlipcpp-train-plato --init model.gguf --train data.bin --check REF   (REF.json / REF.f64 of
 //       scripts/plato/plato_grad_reference.py: loss and parameter gradients vs PyTorch)
 //
@@ -541,6 +542,10 @@ struct Worker {
     std::vector<std::vector<double>> F;
     double e_abs = 0, f_abs = 0;     // sum |dE| / n per structure, sum |dF| (physical)
     int64_t f_count = 0;
+    // for R^2 as LOREM (marathon) computes it: per-atom energies after the composition baseline,
+    // force components pooled
+    double e_sq = 0, f_sq = 0, f_sum = 0, f_sum2 = 0;
+    std::vector<double> e_target; // (E - composition) / n per structure
   };
 
   // eval0 for the forces; with `train` the two displaced evaluations accumulate
@@ -601,6 +606,8 @@ struct Worker {
       const Structure &s = *P.structs[g];
       r.E[g] = scale * Eraw[g] + (scale * P.Et[g] - (s.energy - 0.0)) * -1.0; // = scale E_raw + composition
       r.e_abs += std::abs(scale * (Eraw[g] - P.Et[g])) / s.n;
+      r.e_sq += std::pow(scale * (Eraw[g] - P.Et[g]) / s.n, 2);
+      r.e_target.push_back(scale * P.Et[g] / s.n);
       r.F[g].resize(3 * s.n);
       const double *R = P.rot[g].data(); // back to the dataset frame: R^T
       for (int i = 0; i < s.n; i++)
@@ -608,7 +615,10 @@ struct Worker {
           double vv = 0;
           for (int b = 0; b < 3; b++) vv += R[3 * b + a2] * (-scale * dEdx[3 * (P.a0[g] + i) + b]);
           r.F[g][3 * i + a2] = vv;
-          if (s.has_forces) r.f_abs += std::abs(vv - s.F[3 * i + a2]), r.f_count++;
+          if (s.has_forces) {
+            const double y = s.F[3 * i + a2];
+            r.f_abs += std::abs(vv - y), r.f_sq += (vv - y) * (vv - y), r.f_sum += y, r.f_sum2 += y * y, r.f_count++;
+          }
         }
     }
     if (train) {
@@ -922,9 +932,11 @@ int main(int argc, char **argv) {
       for (int d = 1; d < W; d++) workers[d]->set_params(p);
     }
 
+    // E MAE, F MAE, loss, R^2 of E and F in % (LOREM's checkpoint metric is their sum)
     auto validate = [&]() {
-      double e = 0, f = 0, loss = 0;
+      double e = 0, f = 0, loss = 0, e_sq = 0, f_sq = 0, f_sum = 0, f_sum2 = 0;
       int64_t fc = 0, ns = 0;
+      std::vector<double> et;
       void *vesin = nullptr;
       for (size_t s = 0; s < val.size(); s += B) {
         std::vector<const Structure *> b;
@@ -934,17 +946,26 @@ int main(int argc, char **argv) {
         auto r = w0.evaluate(P, false);
         e += r.e_abs, f += r.f_abs, fc += r.f_count, ns += P.Greal;
         loss += (w0.energy_weight * r.loss_e + w0.force_weight * r.loss_f) * P.Greal;
+        e_sq += r.e_sq, f_sq += r.f_sq, f_sum += r.f_sum, f_sum2 += r.f_sum2;
+        et.insert(et.end(), r.e_target.begin(), r.e_target.end());
       }
       plato::free_vesin(vesin);
-      return std::array<double, 3>{e / ns, f / std::max<int64_t>(fc, 1), loss / ns};
+      const double em = std::accumulate(et.begin(), et.end(), 0.0) / std::max<size_t>(et.size(), 1);
+      double e_sst = 0;
+      for (double y : et) e_sst += (y - em) * (y - em);
+      const double f_sst = f_sum2 - f_sum * f_sum / std::max<int64_t>(fc, 1);
+      return std::array<double, 5>{e / ns, f / std::max<int64_t>(fc, 1), loss / ns, 100 * (1 - e_sq / e_sst),
+                                   100 * (1 - f_sq / f_sst)};
     };
     auto log_line = [&](const nlohmann::json &j) {
       std::ofstream(log_path, std::ios::app) << j.dump() << "\n";
     };
     if (st.epoch == 0 && !no_val) {
       const auto m = validate();
-      std::printf("epoch 0 val: E MAE %.4f meV/atom, F MAE %.4f meV/A, loss %.6g\n", 1e3 * m[0], 1e3 * m[1], m[2]);
-      log_line({{"epoch", 0}, {"val_e_mae_mev_atom", 1e3 * m[0]}, {"val_f_mae_mev_a", 1e3 * m[1]}, {"val_loss", m[2]}});
+      std::printf("epoch 0 val: E MAE %.4f meV/atom, F MAE %.4f meV/A, loss %.6g, R2 E %.4f%% F %.4f%%\n", 1e3 * m[0], 1e3 * m[1],
+                  m[2], m[3], m[4]);
+      log_line({{"epoch", 0}, {"val_e_mae_mev_atom", 1e3 * m[0]}, {"val_f_mae_mev_a", 1e3 * m[1]}, {"val_loss", m[2]},
+                {"val_r2_e", m[3]}, {"val_r2_f", m[4]}});
       std::fflush(stdout);
     }
     const auto run_start = clk::now();
@@ -1014,7 +1035,7 @@ int main(int argc, char **argv) {
       pf.finish();
       const double wall = std::chrono::duration<double>(clk::now() - t0).count();
       st.epoch = ep, epochs_this_run++;
-      std::array<double, 3> m = {0, 0, 0};
+      std::array<double, 5> m = {0, 0, 0, 0, 0};
       const bool do_val = !no_val && (ep % val_every == 0 || ep == epochs);
       const auto tv = clk::now();
       if (do_val) m = validate();
@@ -1022,19 +1043,30 @@ int main(int argc, char **argv) {
       std::printf("epoch %d: train loss %.6g (E %.4g F %.4g), %.1f s (host wait %.1f, build %.1f, inputs %.1f, compute %.1f s; %lld graphs built), lr %.3g",
                   ep, (w0.energy_weight * le + w0.force_weight * lf) / nb, le / nb, lf / nb, wall, wait_ms / 1e3, w0.t_build / 1e3,
                   w0.t_host / 1e3, w0.t_compute / 1e3, (long long)w0.builds, lr_at(st.step));
-      if (do_val) std::printf(", val E MAE %.4f meV/atom, F MAE %.4f meV/A, loss %.6g (%.1f s)", 1e3 * m[0], 1e3 * m[1], m[2], val_s);
+      if (do_val)
+        std::printf(", val E MAE %.4f meV/atom, F MAE %.4f meV/A, loss %.6g, R2 E %.4f%% F %.4f%% (%.1f s)", 1e3 * m[0], 1e3 * m[1],
+                    m[2], m[3], m[4], val_s);
       std::printf("\n");
       std::fflush(stdout);
       nlohmann::json line = {{"epoch", ep}, {"step", st.step}, {"train_loss", (w0.energy_weight * le + w0.force_weight * lf) / nb},
                              {"train_loss_e", le / nb}, {"train_loss_f", lf / nb}, {"wall_s", wall}, {"lr", lr_at(st.step)}};
-      if (do_val) line.update({{"val_e_mae_mev_atom", 1e3 * m[0]}, {"val_f_mae_mev_a", 1e3 * m[1]}, {"val_loss", m[2]}});
+      // the best checkpoint by LOREM's criterion: highest R^2(E) + R^2(F) on the validation set
+      const bool best = do_val && -(m[3] + m[4]) < st.best;
+      if (do_val) line.update({{"val_e_mae_mev_atom", 1e3 * m[0]}, {"val_f_mae_mev_a", 1e3 * m[1]}, {"val_loss", m[2]},
+                               {"val_r2_e", m[3]}, {"val_r2_f", m[4]}, {"best", best}});
       log_line(line);
       const bool last = ep == epochs || epochs_this_run >= max_epochs_run || (max_steps > 0 && st.step >= max_steps) ||
                         std::chrono::duration<double>(clk::now() - run_start).count() / 3600.0 > max_hours;
-      if (ep % save_every == 0 || ep % state_every == 0 || last) {
+      const nlohmann::json info = {{"epoch", ep}, {"step", st.step}, {"init", init}, {"lr", lr0}, {"schedule", schedule},
+                                   {"epochs", epochs}, {"batch_size", B}, {"fd_eps", w0.fd_eps}, {"gpus", W}};
+      if (best) {
+        st.best = -(m[3] + m[4]);
+        nlohmann::json bi = info;
+        bi.update({{"val_r2_e", m[3]}, {"val_r2_f", m[4]}});
+        save_gguf(init, output + ".best.gguf", w0, w0.get_params(), bi);
+      }
+      if (ep % save_every == 0 || ep % state_every == 0 || last || best) {
         const auto p = w0.get_params();
-        const nlohmann::json info = {{"epoch", ep}, {"step", st.step}, {"init", init}, {"lr", lr0}, {"schedule", schedule},
-                                     {"epochs", epochs}, {"batch_size", B}, {"fd_eps", w0.fd_eps}, {"gpus", W}};
         save_gguf(init, output, w0, p, info);
         if (ep % save_every == 0) {
           char tag[32];
