@@ -2,6 +2,7 @@
 
     python scripts/plato/plato_dataset.py train.xyz train.bin --energy e_res --forces f [--stress stress]
         [--molecules bio_dimers_train.xyz]
+    python scripts/plato/plato_dataset.py train.jsonl.gz train.bin [--fit-baseline baseline.json]
 
 Layout (little endian): b"PLATOD1\\0", int64 count, then per structure: int32 n,
 int32 Z[n], f64 positions[n][3], f64 cell[3][3] (rows), uint8 pbc, uint8 has_forces,
@@ -11,6 +12,11 @@ molecule), f64 formal charge of the first and of the second molecule.
 
 --molecules reads split / charges (indexB, chargeA, chargeB) from a file with the same
 structures in the same order (the LOREM archive's bio_dimers files); atoms must match.
+
+.jsonl / .jsonl.gz input: rows {"atoms": {numbers, positions, cell, pbc}, "energy", "forces",
+"stress"} (eV, eV/A, ASE tensile-positive eV/A^3), as the ai4sci-atomistic-materials training
+files. --fit-baseline writes the least-squares energy per element over the structures and the
+RMS per-atom energy left after it (the energy scale), for export_plato_gguf.py --baseline.
 """
 import argparse
 import struct
@@ -27,7 +33,10 @@ def main():
     ap.add_argument("--forces", default="forces")
     ap.add_argument("--stress", default="stress")
     ap.add_argument("--molecules", default=None)
+    ap.add_argument("--fit-baseline", default=None)
     a = ap.parse_args()
+    if a.xyz.endswith((".jsonl", ".jsonl.gz")):
+        return from_jsonl(a)
     frames = ase.io.read(a.xyz, ":")
     mols = [None] * len(frames)
     if a.molecules:
@@ -64,6 +73,58 @@ def main():
             if mol is not None:
                 f.write(struct.pack("<idd", *mol))
     print(f"{a.out}: {len(frames)} structures")
+
+
+def write_structure(f, numbers, positions, cell, pbc, energy, forces=None, stress=None, mol=None):
+    n = len(numbers)
+    f.write(struct.pack("<i", n))
+    f.write(np.asarray(numbers, "<i4").tobytes())
+    f.write(np.asarray(positions, "<f8").reshape(n, 3).tobytes())
+    f.write(np.asarray(cell, "<f8").reshape(3, 3).tobytes())
+    f.write(struct.pack("<BBBB", pbc, forces is not None, stress is not None, mol is not None))
+    f.write(struct.pack("<d", float(energy)))
+    if forces is not None:
+        f.write(np.asarray(forces, "<f8").reshape(n, 3).tobytes())
+    if stress is not None:
+        f.write(np.asarray(stress, "<f8").reshape(9).tobytes())
+    if mol is not None:
+        f.write(struct.pack("<idd", *mol))
+
+
+def from_jsonl(a):
+    import gzip
+    import json
+
+    opener = gzip.open if a.xyz.endswith(".gz") else open
+    counts, energies, natoms, count = [], [], [], 0
+    with open(a.out, "wb") as f, opener(a.xyz, "rt") as src:
+        f.write(b"PLATOD1\0" + struct.pack("<q", 0))  # the count is written at the end
+        for line in src:
+            r = json.loads(line)
+            at = r["atoms"]
+            pbc = bool(np.all(at["pbc"]))
+            S = r.get("stress")
+            S = None if S is None else np.asarray(S, float).reshape(3, 3)
+            write_structure(f, at["numbers"], at["positions"], at["cell"], pbc, r["energy"], r.get("forces"), S)
+            if a.fit_baseline:
+                counts.append(np.bincount(at["numbers"], minlength=119))
+                energies.append(float(r["energy"]))
+                natoms.append(len(at["numbers"]))
+            count += 1
+        f.seek(8)
+        f.write(struct.pack("<q", count))
+    print(f"{a.out}: {count} structures")
+    if a.fit_baseline:
+        X = np.array(counts, float)
+        types = np.nonzero(X.sum(0))[0]
+        X = X[:, types]
+        E = np.array(energies)
+        w = np.linalg.lstsq(X, E, rcond=None)[0]
+        res = (E - X @ w) / np.array(natoms)
+        out = {"composition": {str(int(z)): float(v) for z, v in zip(types, w)}, "energy_scale": float(np.sqrt(np.mean(res**2))),
+               "residual_per_atom_mae_ev": float(np.mean(np.abs(res)))}
+        json.dump(out, open(a.fit_baseline, "w"), indent=1)
+        print(f"{a.fit_baseline}: {len(types)} elements, energy scale {out['energy_scale']:.4f} eV/atom")
 
 
 if __name__ == "__main__":

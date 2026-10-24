@@ -78,7 +78,7 @@ struct PlatoInputs {
   ggml_tensor *mesh_deconv = nullptr;      // F32 [1, ...], (k != 0) / prod_a ((4 + 2 cos(2 pi m_a / M_a)) / 6)^2
   ggml_tensor *les_k = nullptr;            // F32 [3, nk, G], half-space k vectors with |k| < kcut / sigma
   ggml_tensor *les_n = nullptr;            // F32 [3, nk], 2 pi n (phases 2 pi n . frac)
-  ggml_tensor *les_taper = nullptr;        // F32 [1, nk], 1 where the cosine window is not 1
+  ggml_tensor *les_taper = nullptr;        // F32 [1, nk], unused (the window is clamped); kept for callers
   ggml_tensor *offdiag = nullptr;          // F32 [n, n], open-system LES (one structure): 1 - I
 };
 

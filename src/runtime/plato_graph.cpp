@@ -210,9 +210,10 @@ PlatoOutputs build_plato(ggml_context *ctx, const PlatoSpec &spec, const std::ma
       ggml_tensor *k = b.strained(in.les_k);                         // [3, nk, G]
       ggml_tensor *k2 = ggml_reshape_2d(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, k)), nk, in.les_k->ne[2]); // [nk, G or 1]
       const float kc = spec.les_kcut / sigma, wd = 1.0f / sigma;
-      // cosine window over |k| in (kc - wd, kc): x = (|k| - (kc - wd)) / wd where tapered, else 0
-      ggml_tensor *taper = ggml_reshape_2d(ctx, in.les_taper, nk, 1);
-      ggml_tensor *xw = ggml_mul(ctx, ggml_scale_bias(ctx, ggml_sqrt(ctx, k2), 1.0f / wd, -(kc - wd) / wd), taper);
+      // cosine window over |k| in (kc - wd, kc): x = (|k| - (kc - wd)) / wd clamped to [0, 1], so 1 inside
+      // kc - wd and 0 from kc on; a batch of different cells shares one integer k set (the union) and
+      // each structure's k beyond kc drops out
+      ggml_tensor *xw = ggml_clamp(ctx, ggml_scale_bias(ctx, ggml_sqrt(ctx, k2), 1.0f / wd, -(kc - wd) / wd), 0.0f, 1.0f);
       ggml_tensor *win = ggml_scale_bias(ctx, ggml_cos(ctx, ggml_scale(ctx, xw, static_cast<float>(M_PI))), 0.5f, 0.5f);
       ggml_tensor *gk = ggml_div(ctx, ggml_mul(ctx, win, ggml_exp(ctx, ggml_scale(ctx, k2, -0.5f * sigma * sigma))), k2);
       ggml_tensor *rec;

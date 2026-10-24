@@ -42,8 +42,10 @@ struct Edges {
 };
 Edges neighbor_edges(const AtomicSystem &system, double cutoff, void *&vesin_state);
 void free_vesin(void *&vesin_state);
-/// mesh size by PyTorch's rule from a cell row (|a| in double)
-int mesh_points(const float *cell_row, double spacing);
+/// mesh size by PyTorch's rule from a cell row (|a| in double); with round_fft, the next size of the
+/// form 2^k, 3 2^k or 5 2^k (8, 10, 12, 16, 20, 24, 32, 40, 48, ...) at or above it (GGUF
+/// "plato.mesh_round" = "fft"): fewer distinct meshes over many cells, a finer spacing
+int mesh_points(const float *cell_row, double spacing, bool round_fft = false);
 
 class PlatoModel : public Model {
 public:
@@ -75,6 +77,7 @@ public:
   std::shared_ptr<BackendProvider> backend() const { return backend_; }
   double energy_scale() const { return energy_scale_; }
   double mesh_spacing() const { return mesh_spacing_; }
+  bool mesh_round_fft() const { return mesh_round_fft_; }
   const std::map<int, double> &composition() const { return composition_; }
   const std::map<int, int> &species_index() const { return species_index_; }
 
@@ -83,6 +86,7 @@ private:
   PlatoOptions options_;
   runtime::PlatoSpec spec_;
   double energy_scale_ = 1.0, mesh_spacing_ = 1.0;
+  bool mesh_round_fft_ = false;
   std::map<int, double> composition_;
   std::map<int, int> species_index_;
   std::shared_ptr<BackendProvider> backend_;

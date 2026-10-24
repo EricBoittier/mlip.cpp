@@ -62,6 +62,7 @@
 #include <mutex>
 #include <numeric>
 #include <random>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -168,16 +169,27 @@ struct Prepared {
   std::vector<int32_t> species, sidx, ecs, nbs, cen, ej, rev, off;
   std::vector<float> ev0, pos0, aict, onehot, invc, invv, mk, mpad, mdec, lk, ln, taper;
   std::vector<double> Et, Ft;        // scaled targets (rotated frame)
+  std::vector<double> St;            // [9 Greal] scaled stress targets (rotated frame), row-major
+  std::vector<double> vol;           // [Greal] cell volumes
   std::tuple<int, int64_t, int, int, int64_t, int, int, int> key() const { return {n, E, L, G, nk, mesh[0], mesh[1], mesh[2]}; }
 };
 
 struct Context {
   const runtime::PlatoSpec &spec;
   double scale, spacing;
+  bool mesh_round_fft;
   const std::map<int, double> &composition;
   const std::map<int, int> &species_index;
   bool shared_filter = true;
 };
+
+// the mesh size of a structure: from its unrotated cell
+void mesh_dims(const Structure &s, double spacing, bool round_fft, int out[3]) {
+  for (int a = 0; a < 3; a++) {
+    const float row[3] = {float(s.cell[3 * a]), float(s.cell[3 * a + 1]), float(s.cell[3 * a + 2])};
+    out[a] = plato::mesh_points(row, spacing, round_fft);
+  }
+}
 
 Prepared prepare(const Context &cx, const std::vector<const Structure *> &batch, const std::vector<Mat3> &rot, void *&vesin) {
   Prepared P;
@@ -192,7 +204,6 @@ Prepared prepare(const Context &cx, const std::vector<const Structure *> &batch,
   for (int g = 0; g < Gr; g++) {
     const Structure &s = *batch[g];
     if (!s.pbc) throw std::runtime_error("training batches of periodic structures only");
-    if (std::memcmp(s.cell, s0.cell, sizeof(s.cell)) != 0) throw std::runtime_error("a micro-batch needs one cell (rotations aside)");
     const double *R = rot[g].data();
     X[g].resize(3 * s.n);
     for (int i = 0; i < s.n; i++)
@@ -206,10 +217,13 @@ Prepared prepare(const Context &cx, const std::vector<const Structure *> &batch,
     for (int i = 0; i < s.n; i++) L = std::max<int>(L, 1 + int(ed[g].start[i + 1] - ed[g].start[i]));
     P.a0[g + 1] = P.a0[g] + s.n;
   }
-  // the mesh from the unrotated cell: a rotation must not change it (docs/plato.md)
-  for (int a = 0; a < 3; a++) {
-    const float row[3] = {float(s0.cell[3 * a]), float(s0.cell[3 * a + 1]), float(s0.cell[3 * a + 2])};
-    P.mesh[a] = plato::mesh_points(row, cx.spacing);
+  // the mesh from the unrotated cell: a rotation must not change it (docs/plato.md); one mesh
+  // size per micro-batch (the FFT), the cells may differ (k vectors, volumes per structure)
+  mesh_dims(s0, cx.spacing, cx.mesh_round_fft, P.mesh);
+  for (int g = 1; g < Gr; g++) {
+    int m[3];
+    mesh_dims(*batch[g], cx.spacing, cx.mesh_round_fft, m);
+    if (m[0] != P.mesh[0] || m[1] != P.mesh[1] || m[2] != P.mesh[2]) throw std::runtime_error("a micro-batch needs one mesh size");
   }
   P.n_real = P.a0[Gr];
   std::vector<int64_t> e0(Gr + 1, 0);
@@ -223,20 +237,26 @@ Prepared prepare(const Context &cx, const std::vector<const Structure *> &batch,
   const int n = P.n, G = P.G;
   const int64_t E = P.E, T = n + E;
 
-  double Ci0[9], det0;
-  inverse3(s0.cell, Ci0, det0);
+  // each structure's rotated cell (the padding structure: structure 0's) and its inverse
+  std::vector<std::array<double, 9>> Cr(G), Cinv(G);
+  P.vol.resize(Gr);
+  for (int g = 0; g < G; g++) {
+    const Structure &s = *batch[g < Gr ? g : 0];
+    const double *R = rot[g < Gr ? g : 0].data();
+    for (int a = 0; a < 3; a++)
+      for (int c = 0; c < 3; c++) Cr[g][3 * a + c] = double(float(R[3 * c] * s.cell[3 * a] + R[3 * c + 1] * s.cell[3 * a + 1] + R[3 * c + 2] * s.cell[3 * a + 2]));
+    double det;
+    inverse3(Cr[g].data(), Cinv[g].data(), det);
+    if (g < Gr) P.vol[g] = std::abs(det);
+  }
   P.species.assign(n, 0), P.sidx.assign(n, Gr), P.ecs.resize(E), P.nbs.resize(E), P.cen.resize(E), P.ej.resize(E);
   P.rev.resize(T), P.off.resize(n + 1);
   P.ev0.resize(3 * E), P.pos0.assign(3 * size_t(n), 0.0f), P.aict.resize(9 * size_t(n)), P.onehot.assign(size_t(n) * G, 0.0f);
-  P.invc.resize(G), P.invv.assign(1, float(1.0 / std::abs(det0)));
+  P.invc.resize(G), P.invv.resize(G);
+  for (int g = 0; g < G; g++) P.invv[g] = float(1.0 / (g < Gr ? P.vol[g] : P.vol[0]));
   for (int g = 0; g < Gr; g++) {
     const Structure &s = *batch[g];
-    double Ci[9], det;
-    double cr[9];
-    const double *R = rot[g].data();
-    for (int a = 0; a < 3; a++)
-      for (int c = 0; c < 3; c++) cr[3 * a + c] = double(float(R[3 * c] * s.cell[3 * a] + R[3 * c + 1] * s.cell[3 * a + 1] + R[3 * c + 2] * s.cell[3 * a + 2]));
-    inverse3(cr, Ci, det);
+    const double *Ci = Cinv[g].data();
     P.invc[g] = 1.0f / float(s.n);
     for (int i = 0; i < s.n; i++) {
       const int A = P.a0[g] + i;
@@ -264,9 +284,9 @@ Prepared prepare(const Context &cx, const std::vector<const Structure *> &batch,
   int64_t e = P.E_real;
   for (int A = P.n_real; A < n; A++) {
     P.rev[A] = A, P.onehot[size_t(Gr) * n + A] = 1.0f;
-    for (int c = 0; c < 3; c++) P.pos0[3 * A + c] = float(0.5 * (s0.cell[c] + s0.cell[3 + c] + s0.cell[6 + c]) + 0.01 * (A - P.n_real));
+    for (int c = 0; c < 3; c++) P.pos0[3 * A + c] = float(0.5 * (Cr[Gr][c] + Cr[Gr][3 + c] + Cr[Gr][6 + c]) + 0.01 * (A - P.n_real));
     for (int j = 0; j < 3; j++)
-      for (int k = 0; k < 3; k++) P.aict[9 * A + j * 3 + k] = float(Ci0[k * 3 + j]);
+      for (int k = 0; k < 3; k++) P.aict[9 * A + j * 3 + k] = float(Cinv[Gr][k * 3 + j]);
     P.off[A] = int32_t(e);
     for (int q = 0; q < P.L - 1 && e < E; q++, e++) {
       P.ecs[e] = 0, P.nbs[e] = 0, P.cen[e] = A, P.ej[e] = A, P.rev[n + e] = int32_t(n + e);
@@ -275,12 +295,13 @@ Prepared prepare(const Context &cx, const std::vector<const Structure *> &batch,
   }
   P.off[n] = int32_t(E);
   if (e != E) throw std::runtime_error("padding edges");
-  // shared long-range constants: from the unrotated cell (only |k| enters)
+  // long-range k vectors per structure from its rotated cell (|k| alone sets the energy; the
+  // orientation matters for the strain derivative); deconvolution and k = 0 from the mesh size
   const int M0 = P.mesh[0], M1 = P.mesh[1], M2 = P.mesh[2], Mh2 = M2 / 2 + 1;
   const int64_t Mh = int64_t(M0) * M1 * Mh2;
   auto freq = [](int i, int M) { return i <= (M - 1) / 2 ? i : i - M; };
   if (spec.mesh) {
-    P.mk.resize(3 * Mh), P.mpad.assign(Mh, 0.0f), P.mdec.resize(Mh);
+    P.mk.resize(3 * Mh * size_t(G)), P.mpad.assign(Mh, 0.0f), P.mdec.resize(Mh);
     for (int i0 = 0; i0 < M0; i0++)
       for (int i1 = 0; i1 < M1; i1++)
         for (int i2 = 0; i2 < Mh2; i2++) {
@@ -291,30 +312,54 @@ Prepared prepare(const Context &cx, const std::vector<const Structure *> &batch,
             const double f = (4 + 2 * std::cos(2 * M_PI * m[a] / P.mesh[a])) / 6;
             dc *= f * f;
           }
-          for (int b = 0; b < 3; b++) P.mk[3 * q + b] = float(2 * M_PI * (m[0] * Ci0[3 * b] + m[1] * Ci0[3 * b + 1] + m[2] * Ci0[3 * b + 2]));
+          for (int g = 0; g < G; g++) {
+            const double *Ci = Cinv[g].data();
+            for (int b = 0; b < 3; b++)
+              P.mk[3 * (size_t(g) * Mh + q) + b] = float(2 * M_PI * (m[0] * Ci[3 * b] + m[1] * Ci[3 * b + 1] + m[2] * Ci[3 * b + 2]));
+          }
           P.mpad[q] = q == 0 ? 1.0f : 0.0f, P.mdec[q] = q == 0 ? 0.0f : float(1.0 / dc);
         }
   }
   if (spec.les) {
-    const double kc = spec.les_kcut / spec.les_sigma, wd = 1.0 / spec.les_sigma;
-    int nmax[3];
-    for (int a = 0; a < 3; a++)
-      nmax[a] = int(std::floor(kc * std::sqrt(s0.cell[3 * a] * s0.cell[3 * a] + s0.cell[3 * a + 1] * s0.cell[3 * a + 1] + s0.cell[3 * a + 2] * s0.cell[3 * a + 2]) / (2 * M_PI)));
-    for (int a = -nmax[0]; a <= nmax[0]; a++)
-      for (int b = -nmax[1]; b <= nmax[1]; b++)
-        for (int c = -nmax[2]; c <= nmax[2]; c++) {
-          if (!(a > 0 || (a == 0 && b > 0) || (a == 0 && b == 0 && c > 0))) continue;
-          double k[3], k2 = 0;
-          for (int q = 0; q < 3; q++) k[q] = 2 * M_PI * (a * Ci0[3 * q] + b * Ci0[3 * q + 1] + c * Ci0[3 * q + 2]), k2 += k[q] * k[q];
-          if (!(k2 < kc * kc)) continue;
-          for (int q = 0; q < 3; q++) P.lk.push_back(float(k[q]));
-          P.ln.push_back(float(2 * M_PI * a)), P.ln.push_back(float(2 * M_PI * b)), P.ln.push_back(float(2 * M_PI * c));
-          P.taper.push_back(std::sqrt(k2) >= kc - wd ? 1.0f : 0.0f);
-        }
-    P.nk = int64_t(P.taper.size());
+    // the union of the structures' half-space integer sets with |k| < kc; each structure's k beyond
+    // kc (from another cell's set, or padding to a multiple of 64 with ln = 0, |k| = 2 kc) has window 0
+    const double kc = spec.les_kcut / spec.les_sigma;
+    auto kvec = [&](int g, const std::array<int, 3> &v, double *k) {
+      const double *Ci = Cinv[g].data();
+      double k2 = 0;
+      for (int q = 0; q < 3; q++) k[q] = 2 * M_PI * (v[0] * Ci[3 * q] + v[1] * Ci[3 * q + 1] + v[2] * Ci[3 * q + 2]), k2 += k[q] * k[q];
+      return k2;
+    };
+    std::set<std::array<int, 3>> ns;
+    for (int g = 0; g < Gr; g++) {
+      int nmax[3];
+      for (int a = 0; a < 3; a++)
+        nmax[a] = int(std::floor(kc * std::sqrt(Cr[g][3 * a] * Cr[g][3 * a] + Cr[g][3 * a + 1] * Cr[g][3 * a + 1] + Cr[g][3 * a + 2] * Cr[g][3 * a + 2]) / (2 * M_PI)));
+      for (int a = -nmax[0]; a <= nmax[0]; a++)
+        for (int b = -nmax[1]; b <= nmax[1]; b++)
+          for (int c = -nmax[2]; c <= nmax[2]; c++) {
+            if (!(a > 0 || (a == 0 && b > 0) || (a == 0 && b == 0 && c > 0))) continue;
+            double k[3];
+            if (kvec(g, {a, b, c}, k) < kc * kc) ns.insert({a, b, c});
+          }
+    }
+    P.nk = round_up(std::max<int64_t>(int64_t(ns.size()), 1), 64);
+    P.ln.assign(3 * P.nk, 0.0f), P.lk.resize(3 * P.nk * size_t(G)), P.taper.assign(P.nk, 1.0f);
+    int64_t q = 0;
+    for (const auto &v : ns) {
+      for (int c = 0; c < 3; c++) P.ln[3 * q + c] = float(2 * M_PI * v[c]);
+      for (int g = 0; g < G; g++) {
+        double k[3];
+        kvec(g, v, k);
+        for (int c = 0; c < 3; c++) P.lk[3 * (size_t(g) * P.nk + q) + c] = float(k[c]);
+      }
+      q++;
+    }
+    for (; q < P.nk; q++)
+      for (int g = 0; g < G; g++) P.lk[3 * (size_t(g) * P.nk + q)] = float(2 * kc), P.lk[3 * (size_t(g) * P.nk + q) + 1] = 0, P.lk[3 * (size_t(g) * P.nk + q) + 2] = 0;
   }
   // targets (scaled, composition removed) in the rotated frame
-  P.Et.resize(Gr), P.Ft.resize(3 * size_t(P.n_real));
+  P.Et.resize(Gr), P.Ft.resize(3 * size_t(P.n_real)), P.St.assign(9 * size_t(Gr), 0.0);
   for (int g = 0; g < Gr; g++) {
     const Structure &s = *batch[g];
     double c = 0;
@@ -325,6 +370,14 @@ Prepared prepare(const Context &cx, const std::vector<const Structure *> &batch,
     for (int i = 0; i < s.n; i++)
       for (int a = 0; a < 3; a++)
         P.Ft[3 * (P.a0[g] + i) + a] = s.has_forces ? (R[3 * a] * s.F[3 * i] + R[3 * a + 1] * s.F[3 * i + 1] + R[3 * a + 2] * s.F[3 * i + 2]) / cx.scale : 0.0;
+    if (s.has_stress) // R S R^T
+      for (int a = 0; a < 3; a++)
+        for (int b = 0; b < 3; b++) {
+          double v = 0;
+          for (int c = 0; c < 3; c++)
+            for (int d = 0; d < 3; d++) v += R[3 * a + c] * s.stress[3 * c + d] * R[3 * b + d];
+          P.St[9 * g + 3 * a + b] = v / cx.scale;
+        }
   }
   return P;
 }
@@ -339,8 +392,7 @@ struct BatchGraph {
   ggml_gallocr_t galloc = nullptr;
   PlatoInputs in;
   runtime::PlatoOutputs out;
-  ggml_tensor *g_ev = nullptr, *g_pos = nullptr, *loss_grad = nullptr;
-  bool constants_set = false;
+  ggml_tensor *g_ev = nullptr, *g_pos = nullptr, *g_strain = nullptr, *loss_grad = nullptr;
   ~BatchGraph() {
     if (galloc) ggml_gallocr_free(galloc);
     if (ibuf) ggml_backend_buffer_free(ibuf);
@@ -362,7 +414,7 @@ struct Worker {
   ggml_tensor *adamw = nullptr, *clip_value = nullptr, *sumsq = nullptr;
   std::list<std::pair<std::tuple<int, int64_t, int, int, int64_t, int, int, int>, std::unique_ptr<BatchGraph>>> cache;
   size_t cache_limit = 12;
-  double fd_eps = 5e-3, energy_weight = 1, force_weight = 1, charge_weight = 0;
+  double fd_eps = 5e-3, energy_weight = 1, force_weight = 1, charge_weight = 0, stress_weight = 0;
   double t_build = 0, t_compute = 0, t_host = 0; // ms
   int64_t builds = 0;
 
@@ -488,23 +540,23 @@ struct Worker {
     in.energy_weights = input(GGML_TYPE_F32, 1, G, 1, "energy_weights");
     if (spec.les) in.charge_weights = input(GGML_TYPE_F32, n, 1, 1, "charge_weights");
     in.positions = input(GGML_TYPE_F32, 3, n, 1, "positions");
-    in.strain = input(GGML_TYPE_F32, 3, 3, 1, "strain");
+    in.strain = input(GGML_TYPE_F32, 3, 3, G, "strain");
     in.atom_inv_cell_t = input(GGML_TYPE_F32, 3, 3, n, "atom_inv_cell_t");
-    in.inv_volume = input(GGML_TYPE_F32, 1, 1, 1, "inv_volume");
+    in.inv_volume = input(GGML_TYPE_F32, 1, G, 1, "inv_volume");
     in.onehot = input(GGML_TYPE_F32, n, G, 1, "onehot");
     in.inv_count = input(GGML_TYPE_F32, 1, G, 1, "inv_count");
     for (int a = 0; a < 3; a++) in.mesh_size[a] = P.mesh[a];
     if (spec.mesh) {
-      in.mesh_k = input(GGML_TYPE_F32, 3, Mh, 1, "mesh_k");
+      in.mesh_k = input(GGML_TYPE_F32, 3, Mh, G, "mesh_k");
       in.mesh_k0_pad = input(GGML_TYPE_F32, 1, Mh, 1, "mesh_k0_pad");
       in.mesh_deconv = input(GGML_TYPE_F32, 1, Mh, 1, "mesh_deconv");
     }
     if (spec.les) {
-      in.les_k = input(GGML_TYPE_F32, 3, nk, 1, "les_k");
+      in.les_k = input(GGML_TYPE_F32, 3, nk, G, "les_k");
       in.les_n = input(GGML_TYPE_F32, 3, nk, 1, "les_n");
       in.les_taper = input(GGML_TYPE_F32, 1, nk, 1, "les_taper");
     }
-    ggml_set_param(in.edge_vectors), ggml_set_param(in.positions);
+    ggml_set_param(in.edge_vectors), ggml_set_param(in.positions), ggml_set_param(in.strain);
     bg->out = runtime::build_plato(ctx, spec, model->weights(), in, n, E, P.L, true);
     ggml_set_output(bg->out.energies);
     if (bg->out.charges) ggml_set_output(bg->out.charges);
@@ -516,6 +568,8 @@ struct Worker {
     bg->g_ev = ggml_graph_get_grad(bg->graph, in.edge_vectors), bg->g_pos = ggml_graph_get_grad(bg->graph, in.positions);
     for (ggml_tensor *t = bg->g_ev; t; t = t->view_src) ggml_set_output(t);
     for (ggml_tensor *t = bg->g_pos; t; t = t->view_src) ggml_set_output(t);
+    bg->g_strain = ggml_graph_get_grad(bg->graph, in.strain); // nullptr without long range
+    for (ggml_tensor *t = bg->g_strain; t; t = t->view_src) ggml_set_output(t);
     bg->loss_grad = ggml_graph_get_grad_acc(bg->graph, bg->out.total);
     ggml_set_input(bg->loss_grad), inputs.push_back(bg->loss_grad);
     for (size_t k = 0; k < params.size(); k++) {
@@ -544,9 +598,8 @@ struct Worker {
       rbf0[k] = float(std::exp(-std::pow((1e-6 - mu) / w, 2)));
     }
     ggml_backend_tensor_set(in.rbf0, rbf0.data(), 0, ggml_nbytes(in.rbf0));
-    const float I9[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1}, Z9[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0}, one = 1.0f;
+    const float I9[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1}, one = 1.0f;
     ggml_backend_tensor_set(in.rel_identity, I9, 0, sizeof(I9));
-    ggml_backend_tensor_set(in.strain, Z9, 0, sizeof(Z9));
     ggml_backend_tensor_set(bg->loss_grad, &one, 0, sizeof(one));
     cache.emplace_front(key, std::move(bg));
     t_build += ms_since(t0), builds++;
@@ -567,7 +620,14 @@ struct Worker {
     // sign of Q_m against the formal charge of the charged molecules
     double loss_q = 0, q_abs = 0;
     int64_t q_count = 0, q_sign_ok = 0, q_charged = 0;
+    // stress (structures with stress labels): loss, sum |dS| (eV/A^3) and R^2 sums over components
+    double loss_s = 0, s_abs = 0, s_sq = 0, s_sum = 0, s_sum2 = 0;
+    int64_t s_count = 0;
   };
+
+  double total(const Result &r) const {
+    return energy_weight * r.loss_e + force_weight * r.loss_f + charge_weight * r.loss_q + stress_weight * r.loss_s;
+  }
 
   // eval0 for the forces; with `train` the two displaced evaluations accumulate
   // dL/dtheta (this micro-batch's share) into acc
@@ -582,14 +642,13 @@ struct Worker {
     set(in.neighbor_species, P.nbs.data()), set(in.centers, P.cen.data()), set(in.reverse, P.rev.data()), set(in.offsets, P.off.data());
     set(in.atom_inv_cell_t, P.aict.data()), set(in.onehot, P.onehot.data()), set(in.inv_count, P.invc.data());
     set(in.inv_volume, P.invv.data());
-    if (!bg.constants_set) { // the long-range constants of the (one) cell
-      if (in.mesh_k) set(in.mesh_k, P.mk.data()), set(in.mesh_k0_pad, P.mpad.data()), set(in.mesh_deconv, P.mdec.data());
-      if (in.les_k) set(in.les_k, P.lk.data()), set(in.les_n, P.ln.data()), set(in.les_taper, P.taper.data());
-      bg.constants_set = true;
-    }
+    // the long-range inputs of this batch's cells (shapes from the bucket key)
+    if (in.mesh_k) set(in.mesh_k, P.mk.data()), set(in.mesh_k0_pad, P.mpad.data()), set(in.mesh_deconv, P.mdec.data());
+    if (in.les_k) set(in.les_k, P.lk.data()), set(in.les_n, P.ln.data()), set(in.les_taper, P.taper.data());
     auto run = [&](const std::vector<float> &ev, const std::vector<float> &pos, const std::vector<float> &w, const std::vector<float> &cw,
-                   float s) {
+                   const std::vector<float> &strain, float s) {
       set(in.edge_vectors, ev.data()), set(in.positions, pos.data()), set(in.energy_weights, w.data()), set(bg.loss_grad, &s);
+      set(in.strain, strain.data());
       if (in.charge_weights) set(in.charge_weights, cw.data());
       const auto a = clk::now();
       if (model->backend()->compute(bg.graph) != GGML_STATUS_SUCCESS) throw std::runtime_error("compute failed");
@@ -598,14 +657,16 @@ struct Worker {
     std::vector<float> w1(G, 1.0f);
     w1[Gr] = 0.0f;
     t_host += ms_since(t0);
-    const std::vector<float> cw0(n, 0.0f);
-    run(P.ev0, P.pos0, w1, cw0, 1.0f);
+    const std::vector<float> cw0(n, 0.0f), strain0(9 * size_t(G), 0.0f);
+    run(P.ev0, P.pos0, w1, cw0, strain0, 1.0f);
     const auto t1 = clk::now();
     std::vector<float> Eraw(G), gev(3 * E), gpos(3 * size_t(n)), q(bg.out.charges ? n : 0);
     ggml_backend_tensor_get(bg.out.energies, Eraw.data(), 0, 4 * G);
     if (bg.out.charges) ggml_backend_tensor_get(bg.out.charges, q.data(), 0, 4 * size_t(n)); // first channel
     ggml_backend_tensor_get(bg.g_ev, gev.data(), 0, gev.size() * 4);
     ggml_backend_tensor_get(bg.g_pos, gpos.data(), 0, gpos.size() * 4);
+    std::vector<float> geps(9 * size_t(G), 0.0f);
+    if (bg.g_strain) ggml_backend_tensor_get(bg.g_strain, geps.data(), 0, geps.size() * 4);
     zero_acc(); // eval0 accumulated dT/dtheta with seed 1
     std::vector<double> dEdx(3 * size_t(P.n_real), 0.0);
     for (int A = 0; A < P.n_real; A++)
@@ -646,6 +707,30 @@ struct Worker {
         }
       }
     }
+    // stress (scaled energy / A^3) as inference computes it: (sum_e r_e (x) dE/dr_e + dE/deps) / V; the
+    // loss's gradient enters the central difference as a homogeneous deformation along
+    // Delta_g = dL/dS_g / V_g: edges r_b += sum_a Delta_ab r_a and strain = Delta (positions, i.e. the
+    // fractional coordinates, unchanged)
+    std::vector<double> Dl(9 * size_t(G), 0.0);
+    {
+      std::vector<double> S(9 * size_t(Gr), 0.0);
+      for (int64_t e = 0; e < P.E_real; e++) {
+        const int g = P.sidx[P.cen[e]];
+        for (int c = 0; c < 3; c++)
+          for (int b = 0; b < 3; b++) S[9 * g + 3 * c + b] += double(P.ev0[3 * e + c]) * gev[3 * e + b];
+      }
+      for (int g = 0; g < Gr; g++) {
+        const Structure &s = *P.structs[g];
+        if (!s.has_stress) continue;
+        for (int k = 0; k < 9; k++) {
+          const double Sg = (S[9 * g + k] + geps[9 * g + k]) / P.vol[g], d = Sg - P.St[9 * g + k];
+          r.loss_s += d * d / (9.0 * P.norm_G);
+          Dl[9 * g + k] = stress_weight * 2 * d / (9.0 * P.norm_G * P.vol[g]);
+          const double y = scale * P.St[9 * g + k];
+          r.s_abs += scale * std::abs(d), r.s_sq += scale * scale * d * d, r.s_sum += y, r.s_sum2 += y * y, r.s_count++;
+        }
+      }
+    }
     r.E.resize(Gr), r.F.resize(Gr);
     for (int g = 0; g < Gr; g++) {
       const Structure &s = *P.structs[g];
@@ -671,16 +756,24 @@ struct Worker {
       double umax = 0;
       for (double x : u) umax = std::max(umax, std::abs(x));
       for (double x : a) umax = std::max(umax, std::abs(x));
+      for (double x : Dl) umax = std::max(umax, std::abs(x) * model->spec().cutoff); // edge displacement |Delta r|
       const double eps = umax > 0 ? fd_eps / umax : fd_eps;
-      std::vector<float> ev(3 * E), pos(3 * size_t(n)), w(G, 0.0f), cw(n, 0.0f);
+      std::vector<float> ev(3 * E), pos(3 * size_t(n)), w(G, 0.0f), cw(n, 0.0f), strain(9 * size_t(G), 0.0f);
       for (int sgn : {+1, -1}) {
         for (int A = 0; A < n; A++)
           for (int c = 0; c < 3; c++) pos[3 * A + c] = float(P.pos0[3 * A + c] + sgn * eps * u[3 * A + c]);
-        for (int64_t e = 0; e < E; e++)
-          for (int c = 0; c < 3; c++) ev[3 * e + c] = float(P.ev0[3 * e + c] + sgn * eps * (u[3 * P.ej[e] + c] - u[3 * P.cen[e] + c]));
+        for (int64_t e = 0; e < E; e++) {
+          const double *D = &Dl[9 * size_t(P.sidx[P.cen[e]])];
+          for (int b = 0; b < 3; b++) {
+            double dr = 0;
+            for (int c = 0; c < 3; c++) dr += D[3 * c + b] * P.ev0[3 * e + c];
+            ev[3 * e + b] = float(P.ev0[3 * e + b] + sgn * eps * (u[3 * P.ej[e] + b] - u[3 * P.cen[e] + b] + dr));
+          }
+        }
         for (int g = 0; g < Gr; g++) w[g] = float(1.0 + sgn * eps * a[g]);
+        for (size_t k = 0; k < strain.size(); k++) strain[k] = float(sgn * eps * Dl[k]);
         t_host += ms_since(t1);
-        run(ev, pos, w, cw0, float(sgn / (2 * eps)));
+        run(ev, pos, w, cw0, strain, float(sgn / (2 * eps)));
       }
       // the charge term is linear in q: its gradient is one plain backward pass of sum_i cq_i q_i
       // (energy weights 0), exact; inside the central difference it would be lost to the
@@ -688,7 +781,7 @@ struct Worker {
       if (charge_weight > 0 && in.charge_weights) {
         std::vector<float> w0s(G, 0.0f);
         for (int i = 0; i < n; i++) cw[i] = float(cq[i]);
-        run(P.ev0, P.pos0, w0s, cw, 1.0f);
+        run(P.ev0, P.pos0, w0s, cw, strain0, 1.0f);
       }
     } else {
       t_host += ms_since(t1);
@@ -881,6 +974,7 @@ int main(int argc, char **argv) {
       w->energy_weight = std::stod(arg(argc, argv, "--energy-weight", "1"));
       w->force_weight = std::stod(arg(argc, argv, "--force-weight", "1"));
       w->charge_weight = std::stod(arg(argc, argv, "--charge-weight", "0"));
+      w->stress_weight = std::stod(arg(argc, argv, "--stress-weight", "0"));
       w->cache_limit = std::stoul(arg(argc, argv, "--graph-cache", "12"));
       workers.push_back(std::move(w));
     }
@@ -888,7 +982,7 @@ int main(int argc, char **argv) {
     std::printf("backend %s x %d\n", w0.model->backend_name(), W);
     const auto train = read_dataset(train_path);
     std::printf("%zu training structures, %lld parameters\n", train.size(), (long long)w0.n_values);
-    const Context cx{w0.model->spec(), w0.model->energy_scale(), w0.model->mesh_spacing(), w0.model->composition(),
+    const Context cx{w0.model->spec(), w0.model->energy_scale(), w0.model->mesh_spacing(), w0.model->mesh_round_fft(), w0.model->composition(),
                      w0.model->species_index()};
 
     const std::string check = arg(argc, argv, "--check", "");
@@ -941,16 +1035,25 @@ int main(int argc, char **argv) {
     if (!gradcheck.empty()) { // directional derivative of the loss along the trainer's gradient vs |g|
       const double h = std::stod(gradcheck);
       const int nb = std::min<int>(std::stoi(arg(argc, argv, "--batch-size", "8")), int(train.size()));
-      std::vector<const Structure *> b; // half of them with charged molecules, when there are any
+      // one mesh size (that of the first structure; the cells may differ), half of them with charged
+      // molecules when there are any
+      int m0[3];
+      mesh_dims(train[0], cx.spacing, cx.mesh_round_fft, m0);
+      auto same_mesh = [&](const Structure &s) {
+        int m[3];
+        mesh_dims(s, cx.spacing, cx.mesh_round_fft, m);
+        return m[0] == m0[0] && m[1] == m0[1] && m[2] == m0[2];
+      };
+      std::vector<const Structure *> b;
       for (const auto &s : train)
-        if (int(b.size()) < nb / 2 && s.has_molecules && (s.QA != 0 || s.QB != 0)) b.push_back(&s);
+        if (int(b.size()) < nb / 2 && s.has_molecules && (s.QA != 0 || s.QB != 0) && same_mesh(s)) b.push_back(&s);
       for (const auto &s : train)
-        if (int(b.size()) < nb && std::find(b.begin(), b.end(), &s) == b.end()) b.push_back(&s);
+        if (int(b.size()) < nb && same_mesh(s) && std::find(b.begin(), b.end(), &s) == b.end()) b.push_back(&s);
       void *vesin = nullptr;
       Prepared P = prepare(cx, b, std::vector<Mat3>(b.size(), IDENTITY), vesin);
       plato::free_vesin(vesin);
       P.norm_G = P.Greal, P.norm_N = P.n_real;
-      auto loss = [&](const Worker::Result &r) { return w0.energy_weight * r.loss_e + w0.force_weight * r.loss_f + w0.charge_weight * r.loss_q; };
+      auto loss = [&](const Worker::Result &r) { return w0.total(r); };
       w0.zero_acc();
       const auto r0 = w0.evaluate(P, true);
       const std::vector<float> g = w0.get_acc(), p0 = w0.get_params();
@@ -966,9 +1069,10 @@ int main(int argc, char **argv) {
       }
       w0.set_params(p0);
       const double dd = (L[0] - L[1]) / (2 * h);
-      std::printf("gradcheck (%d structures, weights E %g F %g Q %g): loss %.8g (E %.4g F %.4g Q %.4g), |g| %.6e, "
+      std::printf("gradcheck (%d structures, weights E %g F %g Q %g S %g): loss %.8g (E %.4g F %.4g Q %.4g S %.4g), |g| %.6e, "
                   "dL/dh along g %.6e, rel %.2e; molecule charge MAE %.4f e over %lld molecules\n",
-                  nb, w0.energy_weight, w0.force_weight, w0.charge_weight, loss(r0), r0.loss_e, r0.loss_f, r0.loss_q, gn, dd,
+                  nb, w0.energy_weight, w0.force_weight, w0.charge_weight, w0.stress_weight, loss(r0), r0.loss_e, r0.loss_f, r0.loss_q,
+                  r0.loss_s, gn, dd,
                   std::abs(dd - gn) / gn, r0.q_abs / std::max<int64_t>(r0.q_count, 1), (long long)r0.q_count);
       return 0;
     }
@@ -987,7 +1091,29 @@ int main(int argc, char **argv) {
     const bool augment = !flag(argc, argv, "--no-augment"), no_val = flag(argc, argv, "--no-val");
     const std::string log_path = arg(argc, argv, "--log", output + ".log.jsonl"), state_path = arg(argc, argv, "--state", output + ".state");
     const int prep_threads = std::stoi(arg(argc, argv, "--prep-threads", "4"));
-    const int64_t spe = (int64_t(train.size()) + B - 1) / B, total = int64_t(epochs) * spe;
+    // micro-batches share a mesh size (one FFT): structures grouped by it, batches within a group
+    auto groups = [&](const std::vector<Structure> &set) {
+      std::map<std::array<int, 3>, std::vector<size_t>> gr;
+      for (size_t i = 0; i < set.size(); i++) {
+        std::array<int, 3> m;
+        mesh_dims(set[i], cx.spacing, cx.mesh_round_fft, m.data());
+        gr[m].push_back(i);
+      }
+      return gr;
+    };
+    // [lo, hi) ranges of `order` (grouped indices) that stay inside one group
+    auto ranges = [&](const std::map<std::array<int, 3>, std::vector<size_t>> &gr) {
+      std::vector<std::pair<size_t, size_t>> out;
+      size_t base = 0;
+      for (const auto &[m, idx] : gr) {
+        for (size_t lo = 0; lo < idx.size(); lo += B) out.emplace_back(base + lo, base + std::min(idx.size(), lo + size_t(B)));
+        base += idx.size();
+      }
+      return out;
+    };
+    const auto train_groups = groups(train);
+    const int64_t spe = int64_t(ranges(train_groups).size()), total = int64_t(epochs) * spe;
+    std::printf("%zu mesh-size groups, %lld micro-batch steps per epoch\n", train_groups.size(), (long long)spe);
     auto lr_at = [&](int64_t step) {
       if (schedule == "linear") { // LOREM: constant for decay_after epochs, then linear to min_lr at the end
         const int64_t s0 = int64_t(decay_after) * spe;
@@ -1022,19 +1148,23 @@ int main(int argc, char **argv) {
     }
 
     // E MAE, F MAE, loss, R^2 of E and F in % (LOREM's checkpoint metric is their sum)
+    std::vector<size_t> val_order;
+    for (const auto &[m, idx] : groups(val)) val_order.insert(val_order.end(), idx.begin(), idx.end());
+    const auto val_ranges = ranges(groups(val));
     auto validate = [&]() {
-      double e = 0, f = 0, loss = 0, e_sq = 0, f_sq = 0, f_sum = 0, f_sum2 = 0, q_abs = 0;
-      int64_t fc = 0, ns = 0, qn = 0, q_ok = 0, q_ch = 0;
+      double e = 0, f = 0, loss = 0, e_sq = 0, f_sq = 0, f_sum = 0, f_sum2 = 0, q_abs = 0, s_abs = 0, s_sq = 0, s_sum = 0, s_sum2 = 0;
+      int64_t fc = 0, ns = 0, qn = 0, q_ok = 0, q_ch = 0, sc = 0;
       std::vector<double> et;
       void *vesin = nullptr;
-      for (size_t s = 0; s < val.size(); s += B) {
+      for (const auto &[lo, hi] : val_ranges) {
         std::vector<const Structure *> b;
-        for (size_t k = s; k < std::min(val.size(), s + B); k++) b.push_back(&val[k]);
+        for (size_t k = lo; k < hi; k++) b.push_back(&val[val_order[k]]);
         Prepared P = prepare(cx, b, std::vector<Mat3>(b.size(), IDENTITY), vesin);
         P.norm_G = P.Greal, P.norm_N = P.n_real;
         auto r = w0.evaluate(P, false);
         e += r.e_abs, f += r.f_abs, fc += r.f_count, ns += P.Greal;
-        loss += (w0.energy_weight * r.loss_e + w0.force_weight * r.loss_f + w0.charge_weight * r.loss_q) * P.Greal;
+        loss += w0.total(r) * P.Greal;
+        s_abs += r.s_abs, s_sq += r.s_sq, s_sum += r.s_sum, s_sum2 += r.s_sum2, sc += r.s_count;
         q_abs += r.q_abs, qn += r.q_count, q_ok += r.q_sign_ok, q_ch += r.q_charged;
         e_sq += r.e_sq, f_sq += r.f_sq, f_sum += r.f_sum, f_sum2 += r.f_sum2;
         et.insert(et.end(), r.e_target.begin(), r.e_target.end());
@@ -1044,9 +1174,12 @@ int main(int argc, char **argv) {
       double e_sst = 0;
       for (double y : et) e_sst += (y - em) * (y - em);
       const double f_sst = f_sum2 - f_sum * f_sum / std::max<int64_t>(fc, 1);
-      // E MAE, F MAE, loss, R2 E, R2 F, molecule charge MAE (e), charged molecules with the formal sign (%), molecules
-      return std::array<double, 8>{e / ns, f / std::max<int64_t>(fc, 1), loss / ns, 100 * (1 - e_sq / e_sst), 100 * (1 - f_sq / f_sst),
-                                   q_abs / std::max<int64_t>(qn, 1), 100.0 * q_ok / std::max<int64_t>(q_ch, 1), double(qn)};
+      const double s_sst = s_sum2 - s_sum * s_sum / std::max<int64_t>(sc, 1);
+      // E MAE, F MAE, loss, R2 E, R2 F, molecule charge MAE (e), charged molecules with the formal sign (%), molecules,
+      // stress MAE (eV/A^3), stress R2 (%), stress components
+      return std::array<double, 11>{e / ns, f / std::max<int64_t>(fc, 1), loss / ns, 100 * (1 - e_sq / e_sst), 100 * (1 - f_sq / f_sst),
+                                    q_abs / std::max<int64_t>(qn, 1), 100.0 * q_ok / std::max<int64_t>(q_ch, 1), double(qn),
+                                    s_abs / std::max<int64_t>(sc, 1), sc ? 100 * (1 - s_sq / s_sst) : 0.0, double(sc)};
     };
     auto log_line = [&](const nlohmann::json &j) {
       std::ofstream(log_path, std::ios::app) << j.dump() << "\n";
@@ -1058,6 +1191,7 @@ int main(int argc, char **argv) {
       nlohmann::json l0 = {{"epoch", 0}, {"val_e_mae_mev_atom", 1e3 * m[0]}, {"val_f_mae_mev_a", 1e3 * m[1]}, {"val_loss", m[2]},
                            {"val_r2_e", m[3]}, {"val_r2_f", m[4]}};
       if (m[7] > 0) l0.update({{"val_q_mae_e", m[5]}, {"val_q_sign_pct", m[6]}});
+      if (m[10] > 0) l0.update({{"val_s_mae_gpa", 160.21766 * m[8]}, {"val_r2_s", m[9]}});
       log_line(l0);
       std::fflush(stdout);
     }
@@ -1065,16 +1199,21 @@ int main(int argc, char **argv) {
     int epochs_this_run = 0;
     std::string stop_reason = "done";
     for (int ep = st.epoch + 1; ep <= epochs; ep++) {
-      // the epoch's order and rotations, drawn up front (reproducible on resume)
-      std::vector<size_t> order(train.size());
-      std::iota(order.begin(), order.end(), 0);
-      std::shuffle(order.begin(), order.end(), rng);
+      // the epoch's order and rotations, drawn up front (reproducible on resume): each group
+      // shuffled, cut into batches, the batches shuffled
+      std::vector<size_t> order;
+      for (auto [m, idx] : train_groups) {
+        std::shuffle(idx.begin(), idx.end(), rng);
+        order.insert(order.end(), idx.begin(), idx.end());
+      }
+      auto batches = ranges(train_groups);
+      std::shuffle(batches.begin(), batches.end(), rng);
       std::vector<Mat3> rots(train.size(), IDENTITY);
       if (augment)
         for (auto &R : rots) R = random_o3(rng);
       Prefetcher pf;
       pf.make = [&](int64_t s, void *&vesin) {
-        const size_t lo = size_t(s) * B, hi = std::min(order.size(), lo + B);
+        const auto [lo, hi] = batches[size_t(s)];
         const size_t per = (hi - lo + W - 1) / W;
         std::vector<Prepared> mb;
         double norm_G = double(hi - lo), norm_N = 0;
@@ -1093,7 +1232,7 @@ int main(int argc, char **argv) {
       };
       pf.start(0, spe, prep_threads);
       const auto t0 = clk::now();
-      double le = 0, lf = 0, lq = 0, gn = 0, wait_ms = 0;
+      double le = 0, lf = 0, lq = 0, ls = 0, lt = 0, gn = 0, wait_ms = 0;
       int64_t nb = 0;
       for (auto &w : workers) w->t_build = w->t_compute = w->t_host = 0, w->builds = 0;
       for (int64_t s = 0; s < spe; s++) {
@@ -1108,7 +1247,7 @@ int main(int argc, char **argv) {
         for (size_t d = mb.size(); d < workers.size(); d++) workers[d]->zero_acc();
         for (auto &f : fut) {
           auto r = f.get();
-          le += r.loss_e, lf += r.loss_f, lq += r.loss_q;
+          le += r.loss_e, lf += r.loss_f, lq += r.loss_q, ls += r.loss_s, lt += w0.total(r);
         }
 #ifdef MLIPCPP_NCCL
         if (nccl) nccl->allreduce_sum(workers);
@@ -1120,7 +1259,7 @@ int main(int argc, char **argv) {
         nb++;
         if (st.step % 100 == 0) {
           std::printf("  step %lld loss %.6g (E %.4g F %.4g) |g| %.3g lr %.3g\n", (long long)st.step,
-                      (w0.energy_weight * le + w0.force_weight * lf + w0.charge_weight * lq) / nb, le / nb, lf / nb, gn, lr_at(st.step));
+                      lt / nb, le / nb, lf / nb, gn, lr_at(st.step));
           std::fflush(stdout);
         }
         if (max_steps > 0 && st.step >= max_steps) break;
@@ -1128,33 +1267,35 @@ int main(int argc, char **argv) {
       pf.finish();
       const double wall = std::chrono::duration<double>(clk::now() - t0).count();
       st.epoch = ep, epochs_this_run++;
-      std::array<double, 8> m = {0, 0, 0, 0, 0, 0, 0, 0};
+      std::array<double, 11> m{};
       const bool do_val = !no_val && (ep % val_every == 0 || ep == epochs);
       const auto tv = clk::now();
       if (do_val) m = validate();
       const double val_s = std::chrono::duration<double>(clk::now() - tv).count();
       std::printf("epoch %d: train loss %.6g (E %.4g F %.4g), %.1f s (host wait %.1f, build %.1f, inputs %.1f, compute %.1f s; %lld graphs built), lr %.3g",
-                  ep, (w0.energy_weight * le + w0.force_weight * lf + w0.charge_weight * lq) / nb, le / nb, lf / nb, wall, wait_ms / 1e3, w0.t_build / 1e3,
+                  ep, lt / nb, le / nb, lf / nb, wall, wait_ms / 1e3, w0.t_build / 1e3,
                   w0.t_host / 1e3, w0.t_compute / 1e3, (long long)w0.builds, lr_at(st.step));
       if (do_val)
         std::printf(", val E MAE %.4f meV/atom, F MAE %.4f meV/A, loss %.6g, R2 E %.4f%% F %.4f%% (%.1f s)", 1e3 * m[0], 1e3 * m[1],
                     m[2], m[3], m[4], val_s);
       if (do_val && m[7] > 0) std::printf(", molecule charge MAE %.4f e, formal sign %.1f%%", m[5], m[6]);
+      if (do_val && m[10] > 0) std::printf(", stress MAE %.4f GPa, R2 %.3f%%", 160.21766 * m[8], m[9]);
       std::printf("\n");
       std::fflush(stdout);
-      nlohmann::json line = {{"epoch", ep}, {"step", st.step}, {"train_loss", (w0.energy_weight * le + w0.force_weight * lf + w0.charge_weight * lq) / nb},
-                             {"train_loss_e", le / nb}, {"train_loss_f", lf / nb}, {"train_loss_q", lq / nb}, {"wall_s", wall}, {"lr", lr_at(st.step)}};
+      nlohmann::json line = {{"epoch", ep}, {"step", st.step}, {"train_loss", lt / nb},
+                             {"train_loss_e", le / nb}, {"train_loss_f", lf / nb}, {"train_loss_q", lq / nb}, {"train_loss_s", ls / nb}, {"wall_s", wall}, {"lr", lr_at(st.step)}};
       // the best checkpoint by LOREM's criterion: highest R^2(E) + R^2(F) on the validation set
       const bool best = do_val && -(m[3] + m[4]) < st.best;
       if (do_val) line.update({{"val_e_mae_mev_atom", 1e3 * m[0]}, {"val_f_mae_mev_a", 1e3 * m[1]}, {"val_loss", m[2]},
                                {"val_r2_e", m[3]}, {"val_r2_f", m[4]}, {"best", best}});
       if (do_val && m[7] > 0) line.update({{"val_q_mae_e", m[5]}, {"val_q_sign_pct", m[6]}});
+      if (do_val && m[10] > 0) line.update({{"val_s_mae_gpa", 160.21766 * m[8]}, {"val_r2_s", m[9]}});
       log_line(line);
       const bool last = ep == epochs || epochs_this_run >= max_epochs_run || (max_steps > 0 && st.step >= max_steps) ||
                         std::chrono::duration<double>(clk::now() - run_start).count() / 3600.0 > max_hours;
       const nlohmann::json info = {{"epoch", ep}, {"step", st.step}, {"init", init}, {"lr", lr0}, {"schedule", schedule},
                                    {"epochs", epochs}, {"batch_size", B}, {"fd_eps", w0.fd_eps}, {"gpus", W},
-                                   {"charge_weight", w0.charge_weight}};
+                                   {"charge_weight", w0.charge_weight}, {"stress_weight", w0.stress_weight}};
       if (best) {
         st.best = -(m[3] + m[4]);
         nlohmann::json bi = info;

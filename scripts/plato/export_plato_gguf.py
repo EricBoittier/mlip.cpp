@@ -56,6 +56,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("checkpoint")
     ap.add_argument("-o", "--output", required=True)
+    ap.add_argument("--baseline", default=None, help="JSON {composition: {Z: eV}, energy_scale}: replaces the model's")
+    ap.add_argument("--mesh-round", choices=["none", "fft"], default=None,
+                    help="mlip.cpp mesh sizes rounded up to 2^k, 3 2^k, 5 2^k (plato.mesh_round); PyTorch does not round")
     args = ap.parse_args()
 
     from metatrain.utils.io import load_model
@@ -68,6 +71,9 @@ def main():
     if hypers["frame_mode"] != "attention" or hypers["num_framed_layers"] not in (None, hypers["num_layers"]):
         raise ValueError("mlip.cpp builds frame_mode: attention with every layer framed")
     comp, scale = baselines(model)
+    if args.baseline:  # a fresh model's composition and scale, fitted outside metatrain (plato_dataset.py)
+        bl = json.load(open(args.baseline))
+        comp, scale = {int(z): float(v) for z, v in bl["composition"].items()}, float(bl["energy_scale"])
 
     w = gguf.GGUFWriter(args.output, ARCH)
     w.add_string("plato.hypers", json.dumps(hypers))
@@ -78,6 +84,8 @@ def main():
     w.add_key_value("plato.composition_energies", list(comp.values()), gguf.GGUFValueType.ARRAY,
                     sub_type=gguf.GGUFValueType.FLOAT64)
     w.add_key_value("plato.energy_scale", scale, gguf.GGUFValueType.FLOAT64)
+    if args.mesh_round:
+        w.add_string("plato.mesh_round", args.mesh_round)
     w.add_float32("plato.cutoff", float(hypers["cutoff"]))
     names = []
     # the checkpoint's own tensors (load_model casts a few float64 buffers to float32)

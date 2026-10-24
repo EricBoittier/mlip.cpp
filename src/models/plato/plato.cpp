@@ -165,7 +165,13 @@ double row_norm(const float *a) {
   return std::sqrt(double(a[0]) * a[0] + double(a[1]) * a[1] + double(a[2]) * a[2]);
 }
 } // namespace
-int mesh_points(const float *a, double spacing) { return std::max(8, static_cast<int>(std::ceil(row_norm(a) / spacing))); }
+int mesh_points(const float *a, double spacing, bool round_fft) {
+  const int m = std::max(8, static_cast<int>(std::ceil(row_norm(a) / spacing)));
+  if (!round_fft) return m;
+  for (int p = 8;; p *= 2)
+    for (int f : {p, 5 * p / 4, 3 * p / 2})
+      if (f >= m) return f;
+}
 namespace {
 
 int env_mesh(int out[3]) {
@@ -231,6 +237,11 @@ bool PlatoModel::load_from_gguf(const std::string &path) {
   const nlohmann::json hy = nlohmann::json::parse(str("plato.hypers"));
   const nlohmann::json info = nlohmann::json::parse(str("plato.dataset_info"));
   energy_scale_ = gguf_get_val_f64(g, gguf_find_key(g, "plato.energy_scale"));
+  if (const int64_t k = gguf_find_key(g, "plato.mesh_round"); k >= 0) {
+    const std::string r = gguf_get_val_str(g, k);
+    if (r != "fft" && r != "none") throw std::runtime_error("Plato: unknown plato.mesh_round " + r);
+    mesh_round_fft_ = r == "fft";
+  }
   {
     const int64_t kt = gguf_find_key(g, "plato.composition_types"), ke = gguf_find_key(g, "plato.composition_energies");
     const size_t nc = gguf_get_arr_n(g, kt);
@@ -369,7 +380,7 @@ ModelResult PlatoModel::predict(const AtomicSystem &system, bool compute_forces)
     for (int a = 0; a < 3; a++)
       mesh[a] = options_.fixed_mesh[0] > 0
                     ? options_.fixed_mesh[a]
-                    : mesh_points(cell->matrix[a], mesh_spacing_);
+                    : mesh_points(cell->matrix[a], mesh_spacing_, mesh_round_fft_);
   CellConsts &K = consts_;
   bool same_cell = K.valid && K.periodic == periodic && K.mesh[0] == mesh[0] && K.mesh[1] == mesh[1] && K.mesh[2] == mesh[2];
   if (same_cell && periodic) same_cell = std::memcmp(K.cell, &cell->matrix[0][0], sizeof(K.cell)) == 0;
