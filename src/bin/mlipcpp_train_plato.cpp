@@ -12,6 +12,8 @@
 //   (Q'_m = Q_m^formal - Q_total n_m / n). Its parameter gradient inside the central difference
 //   as the force term would lose it to float32 cancellation, so it is one more plain backward pass
 //   with charge weights c_i = dL/dq_i on the graph's total and energy weights 0 (exact).
+//   --max-len N drops the structures with more than N - 1 neighbours of an atom (training and validation):
+//   the ragged attention keeps a sequence in shared memory (the limit depends on head width, frames, GPU).
 //   mlipcpp-train-plato --init model.gguf --train data.bin --gradcheck H [--batch-size 8] [weights]: the loss
 //       along the trainer's gradient direction, (L(p + h g/|g|) - L(p - h g/|g|)) / 2h against |g|
 //   mlipcpp-train-plato --init model.gguf --train data.bin --check REF   (REF.json / REF.f64 of
@@ -182,6 +184,40 @@ struct Context {
   const std::map<int, int> &species_index;
   bool shared_filter = true;
 };
+
+// drop the structures whose longest attention sequence (1 + neighbours within the cutoff) exceeds
+// max_len (the ragged attention kernels hold a whole sequence in shared memory); returns the count
+size_t drop_long(std::vector<Structure> &set, int max_len, double cutoff) {
+  if (max_len <= 0) return 0;
+  std::vector<char> keep(set.size(), 1);
+  const unsigned nt = std::max(1u, std::min(32u, std::thread::hardware_concurrency()));
+  std::vector<std::thread> th;
+  for (unsigned w = 0; w < nt; w++)
+    th.emplace_back([&, w] {
+      void *vesin = nullptr;
+      for (size_t k = w; k < set.size(); k += nt) {
+        const Structure &s = set[k];
+        std::vector<float> X(s.x.begin(), s.x.end());
+        float Lc[3][3];
+        for (int a = 0; a < 3; a++)
+          for (int c = 0; c < 3; c++) Lc[a][c] = float(s.cell[3 * a + c]);
+        Cell cell(Lc, true, true, true);
+        AtomicSystem sys(s.n, X.data(), s.Z.data(), &cell);
+        const plato::Edges ed = plato::neighbor_edges(sys, cutoff, vesin);
+        for (int i = 0; i < s.n; i++)
+          if (1 + ed.start[i + 1] - ed.start[i] > max_len) keep[k] = 0;
+      }
+      plato::free_vesin(vesin);
+    });
+  for (auto &x : th) x.join();
+  std::vector<Structure> out;
+  out.reserve(set.size());
+  for (size_t k = 0; k < set.size(); k++)
+    if (keep[k]) out.push_back(std::move(set[k]));
+  const size_t dropped = set.size() - out.size();
+  set = std::move(out);
+  return dropped;
+}
 
 // the mesh size of a structure: from its unrotated cell
 void mesh_dims(const Structure &s, double spacing, bool round_fft, int out[3]) {
@@ -980,7 +1016,10 @@ int main(int argc, char **argv) {
     }
     Worker &w0 = *workers[0];
     std::printf("backend %s x %d\n", w0.model->backend_name(), W);
-    const auto train = read_dataset(train_path);
+    auto train = read_dataset(train_path);
+    const int max_len = std::stoi(arg(argc, argv, "--max-len", "0"));
+    if (max_len > 0)
+      std::printf("--max-len %d: dropped %zu training structures\n", max_len, drop_long(train, max_len, w0.model->spec().cutoff));
     std::printf("%zu training structures, %lld parameters\n", train.size(), (long long)w0.n_values);
     const Context cx{w0.model->spec(), w0.model->energy_scale(), w0.model->mesh_spacing(), w0.model->mesh_round_fft(), w0.model->composition(),
                      w0.model->species_index()};
@@ -1076,7 +1115,9 @@ int main(int argc, char **argv) {
                   std::abs(dd - gn) / gn, r0.q_abs / std::max<int64_t>(r0.q_count, 1), (long long)r0.q_count);
       return 0;
     }
-    const auto val = read_dataset(arg(argc, argv, "--val", ""));
+    auto val = read_dataset(arg(argc, argv, "--val", ""));
+    if (max_len > 0)
+      std::printf("--max-len %d: dropped %zu validation structures\n", max_len, drop_long(val, max_len, w0.model->spec().cutoff));
     const std::string output = arg(argc, argv, "-o", "plato-trained.gguf");
     const int epochs = std::stoi(arg(argc, argv, "--epochs", "3")), B = std::stoi(arg(argc, argv, "--batch-size", "16"));
     const double lr0 = std::stod(arg(argc, argv, "--lr", "1e-4")), warm = std::stod(arg(argc, argv, "--warmup", "0.01"));
