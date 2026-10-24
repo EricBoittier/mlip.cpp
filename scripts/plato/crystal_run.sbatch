@@ -2,7 +2,7 @@
 # A crystal (ai4sci-atomistic-materials) Plato-PET-LR run on the B200 as a chain of jobs that resume
 # from the trainer state: E + F + stress (weight SW), linear schedule after DECAY epochs, validation
 # every epoch on the 5,000 labeled-dev frames, a checkpoint every 5 epochs, the best by R2(E) + R2(F).
-#   NAME=D2 INIT=crystal/init128-D2-0.gguf EPOCHS=60 sbatch crystal_run.sbatch   [SW=1000 LR=1e-4 DECAY=2 SEED=0]
+#   NAME=D2 INIT=crystal/init128h8-D2-0.gguf EPOCHS=60 sbatch crystal_run.sbatch   [SW=1000 LR=1e-4 DECAY=2 SEED=0 MAXLEN=100]
 #SBATCH --job-name=plato-crystal
 #SBATCH --account=cosmo
 #SBATCH --partition=b200
@@ -30,8 +30,8 @@ else
 fi
 $RUN/mlipcpp-train-plato $ARGS --train $X/train.bin --val $X/val.bin --backend cuda \
   --epochs $EPOCHS --batch-size 32 --lr ${LR:-1e-4} --schedule linear --decay-after ${DECAY:-2} --min-lr 1e-6 \
-  --grad-clip 1e30 --stress-weight ${SW:-1000} --seed ${SEED:-0} --save-every 5 --state-every 1 --max-hours ${HOURS:-23.3} \
-  -o $RUN/model.gguf --log $RUN/log.jsonl 2>&1 | grep -v "^ggml_cuda\|Device \|warmup\|^Backend" > $RUN/job-$SLURM_JOB_ID.out
+  --grad-clip 1e30 --stress-weight ${SW:-1000} --max-len ${MAXLEN:-100} --seed ${SEED:-0} --save-every 5 --state-every 1 --max-hours ${HOURS:-23.3} \
+  -o $RUN/model.gguf --log $RUN/log.jsonl 2>&1 | grep --line-buffered -v "^ggml_cuda\|Device \|warmup\|^Backend" > $RUN/job-$SLURM_JOB_ID.out
 tail -2 $RUN/job-$SLURM_JOB_ID.out
 if grep -q "^paused at epoch" $RUN/job-$SLURM_JOB_ID.out; then
   cd $D && sbatch --job-name=plato-crystal-$NAME $D/mlip.cpp/scripts/plato/crystal_run.sbatch
