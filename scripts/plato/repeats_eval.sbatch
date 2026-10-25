@@ -4,6 +4,7 @@
 # final weights (model.gguf) -> metatrain checkpoint -> mtt export -> the study's evaluate.py;
 # then analyze_chi.py (charge identifiability) on the best checkpoints, and a summary over seeds.
 #   NAMES="chi-s0 chi-s1 ..." sbatch repeats_eval.sbatch     (default: every run under rep/)
+#   REP=rep-muon sbatch repeats_eval.sbatch                     (the runs under another directory, e.g. the Muon repeats)
 #SBATCH --job-name=plato-rep-eval
 #SBATCH --account=cosmo
 #SBATCH --partition=rtx6000
@@ -21,14 +22,15 @@ STUDY=/work/cosmo/boittier/lyra/plato/study
 source /work/cosmo/boittier/lyra/plato/venv/bin/activate
 export PYTHONPATH=$D/metatrain-chi/src:$D/pylib
 export LD_LIBRARY_PATH=$VIRTUAL_ENV/lib/python3.12/site-packages/nvidia/cuda_nvrtc/lib:${LD_LIBRARY_PATH:-}
-E=$D/eval-full; mkdir -p $E/runs/rep $E/runs/options_cheap; cd $E
+REP=${REP:-rep}
+E=$D/eval-full; mkdir -p $E/runs/$REP $E/runs/options_cheap; cd $E
 ln -sfn $D/data-full data
 ln -sfn $STUDY/runs/options_cheap/plato-D2-att runs/options_cheap/plato-D2-att
-NAMES=${NAMES:-$(ls $D/rep)}
+NAMES=${NAMES:-$(ls $D/$REP)}
 for n in $NAMES; do
   for which in best final; do
-    src=$D/rep/$n/model.gguf; [ $which = best ] && src=$D/rep/$n/model.gguf.best.gguf
-    m=runs/rep/$n-$which; mkdir -p $m
+    src=$D/$REP/$n/model.gguf; [ $which = best ] && src=$D/$REP/$n/model.gguf.best.gguf
+    m=runs/$REP/$n-$which; mkdir -p $m
     [ -f $src ] || { echo "missing $src"; continue; }
     python $D/mlip.cpp/scripts/plato/gguf_to_plato_ckpt.py $src -o $m/model.ckpt 2>&1 | grep -v Warn
     mtt export $m/model.ckpt -o $m/model.pt > $m/export.log 2>&1 || tail -3 $m/export.log
@@ -36,9 +38,9 @@ for n in $NAMES; do
     echo "$n $which: $(python -c "import json; d=json.load(open('$m/metrics.json')); print({k: round(d[k], 4) for k in ('e_mae_mev_atom', 'f_mae_mev_a', 'f_rmse_mev_a', 'cc_f_mae_mev_a', 'far_e_mae_mev')})")"
   done
 done
-chi_names=$(for n in $NAMES; do [[ $n == id-* ]] || echo $n-best; done)
-python -W ignore $STUDY/analyze_chi.py rep $chi_names > runs/rep/identifiability.log 2>&1 || tail -5 runs/rep/identifiability.log
-python - $D/rep $E/runs/rep <<'EOF'
+chi_names=$(for n in $NAMES; do [[ $n == id-* ]] || echo $n-${CHI_CKPT:-best}; done)   # CHI_CKPT=final when the best checkpoint is early (Muon)
+python -W ignore $STUDY/analyze_chi.py $REP $chi_names > runs/$REP/identifiability.log 2>&1 || tail -5 runs/$REP/identifiability.log
+python - $D/$REP $E/runs/$REP <<'EOF'
 import json, sys
 from collections import defaultdict
 from pathlib import Path
@@ -67,4 +69,4 @@ for (model, which), r in sorted(rows.items()):
           [x[-1] for x in r])
 json.dump(out, open(ev / "summary.json", "w"), indent=1)
 EOF
-grep -v "^\s*$" runs/rep/identifiability.log | cut -c1-600 | tail -12
+grep -v "^\s*$" runs/$REP/identifiability.log | cut -c1-600 | tail -12
