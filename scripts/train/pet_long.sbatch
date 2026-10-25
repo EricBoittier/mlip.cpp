@@ -7,6 +7,10 @@
 # a GGUF every 100 epochs. A chain of jobs that resume from the trainer state; each job
 # resubmits the next until the run is done.
 #   NAME=pet sbatch pet_long.sbatch        (GPUS=2 for two GPUs of one node, data parallel; OPT=muon [MUON_SCALE=10])
+# PAD_EXACT=1: padded neighbour slots get an attention bias of -inf (MLIPCPP_PAD_EXACT) instead of PET's
+# log(1e-15) = -34.5. With the finite bias a model can learn to attend to the padded slots (Muon x10 put
+# all of one layer's weight there), and metatrain, which fills those slots differently, then evaluates it
+# order- and batch-dependently. The chained jobs inherit the setting.
 #SBATCH --job-name=pet-long
 #SBATCH --account=cosmo
 #SBATCH --partition=rtx6000
@@ -26,6 +30,8 @@ echo "node $(hostname) gpu $(nvidia-smi --query-gpu=name,driver_version --format
 RUN=$P/long/$NAME; mkdir -p $RUN
 [ -x $RUN/mlipcpp-train ] || cp $P/build-cuda/bin/mlipcpp-train $RUN/   # the binary of the run's first job
 export GGML_CUDA_NO_TF32=1
+[ "${PAD_EXACT:-0}" = 1 ] && export MLIPCPP_PAD_EXACT=1
+echo "exact padding mask: ${MLIPCPP_PAD_EXACT:-0}"
 if [ -f $RUN/model.gguf.state ]; then
   FROM="--init $RUN/model.gguf --resume $RUN/model.gguf.state"
 else
