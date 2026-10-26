@@ -290,6 +290,9 @@ else()
         # analytic position derivatives, erf, and the GET_ROWS_BACK gradient;
         # CPU + CUDA
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-plato.patch"
+        # CUDA F32 copies: the tiled transpose only when its grid fits (y, z < 65535); a large
+        # Plato mesh (>= 180^3 points) otherwise aborts on GGML_ASSERT(grid_y < USHRT_MAX)
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-cpy-transpose-grid.patch"
     )
     # the source cache is keyed by the ggml tag and the patches' contents:
     # CPM's default key hashes the arguments, i.e. the patch paths, so every
