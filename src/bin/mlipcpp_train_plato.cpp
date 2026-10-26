@@ -1223,6 +1223,35 @@ int main(int argc, char **argv) {
       }
       return out;
     };
+    // --bench-val N: ms per batched energy + forces graph (eval0 of the trainer, which also accumulates the
+    // parameter gradient) on the first validation micro-batch, prepared once; median of N after 5 warm-ups
+    if (const int nb = std::stoi(arg(argc, argv, "--bench-val", "0")); nb > 0) {
+      std::vector<size_t> vo;
+      for (const auto &[m, idx] : groups(val)) vo.insert(vo.end(), idx.begin(), idx.end());
+      const auto [lo, hi] = ranges(groups(val)).at(0);
+      std::vector<const Structure *> b;
+      for (size_t k = lo; k < hi; k++) b.push_back(&val[vo[k]]);
+      void *vesin = nullptr;
+      const auto tp = clk::now();
+      Prepared P = prepare(cx, b, std::vector<Mat3>(b.size(), IDENTITY), vesin);
+      const double prep_ms = ms_since(tp);
+      plato::free_vesin(vesin);
+      P.norm_G = P.Greal, P.norm_N = P.n_real;
+      for (int i = 0; i < 5; i++) w0.evaluate(P, false);
+      std::vector<double> t;
+      double esum = 0;
+      for (int i = 0; i < nb; i++) {
+        const auto a = clk::now();
+        const auto r = w0.evaluate(P, false);
+        t.push_back(ms_since(a));
+        esum = std::accumulate(r.E.begin(), r.E.end(), 0.0);
+      }
+      std::sort(t.begin(), t.end());
+      std::printf("{\"structures\": %d, \"atoms\": %d, \"edges\": %lld, \"energy_sum\": %.6f, \"ms\": %.3f, \"ms_min\": %.3f, "
+                  "\"ms_prepare_once\": %.3f, \"repeat\": %d}\n",
+                  P.Greal, P.n_real, (long long)P.E_real, esum, t[t.size() / 2], t[0], prep_ms, nb);
+      return 0;
+    }
     const auto train_groups = groups(train);
     const int64_t spe = int64_t(ranges(train_groups).size()), total = int64_t(epochs) * spe;
     std::printf("%zu mesh-size groups, %lld micro-batch steps per epoch\n", train_groups.size(), (long long)spe);

@@ -10,6 +10,8 @@
 // bench: ms per energy + forces call of the first frame tiled K x K x K (median of N).
 #include "mlipcpp/io.h"
 #include "models/plato/plato.h"
+#include "core/gguf_loader.h"
+#include "runtime/graph_model.h"
 
 #include <algorithm>
 #include <chrono>
@@ -185,12 +187,65 @@ int bench(int argc, char **argv) {
   return 0;
 }
 
-// any GGUF through load_model (e.g. a PET GraphModel): ms per energy + forces call
+std::unique_ptr<Model> any_model(int argc, char **argv) {
+  const BackendPreference be = backend_of(arg(argc, argv, "--backend", "auto"));
+  GGUFLoader probe(argv[2]);
+  const std::string a = probe.get_string("general.architecture", "");
+  if (a == "pet-graph") {
+    auto gm = std::make_unique<runtime::GraphModel>();
+    gm->set_backend_preference(be);
+    if (!gm->load_from_gguf(argv[2])) throw std::runtime_error("failed to load graph model");
+    return gm;
+  }
+  if (a.rfind("plato", 0) == 0) {
+    plato::PlatoOptions o;
+    o.backend = be;
+    auto m = std::make_unique<plato::PlatoModel>(o);
+    m->load_from_gguf(argv[2]);
+    return m;
+  }
+  return load_model(argv[2]);
+}
+
+// energy and forces of every frame as JSON lines
+int dump(int argc, char **argv) {
+  auto m = any_model(argc, argv);
+  for (const auto &s : read_all(argv[3])) {
+    const ModelResult r = m->predict(s, true);
+    json j = {{"n", s.num_atoms()}, {"energy", r.energy}, {"forces", r.forces}};
+    std::printf("%s\n", j.dump().c_str());
+  }
+  return 0;
+}
+
+// any GGUF (PET GraphModel, Plato, ...): ms per energy + forces call
 int bench_any(int argc, char **argv) {
   const int K = std::stoi(arg(argc, argv, "--tile", "1")), N = std::stoi(arg(argc, argv, "--repeat", "20")),
             W = std::stoi(arg(argc, argv, "--warmup", "3"));
-  auto m = load_model(argv[2]);
-  const AtomicSystem s = tile(read_all(argv[3]).at(0), K);
+  auto m = any_model(argc, argv);
+  if (flag(argc, argv, "--all")) { // one pass over every frame, one call each (neighbour lists included)
+    const auto all = read_all(argv[3]);
+    auto pass = [&] {
+      double E = 0;
+      for (const auto &s : all) E += m->predict(s, true).energy;
+      return E;
+    };
+    for (int i = 0; i < W; i++) pass();
+    std::vector<double> t;
+    double E = 0;
+    int atoms = 0;
+    for (const auto &s : all) atoms += s.num_atoms();
+    for (int i = 0; i < N; i++) {
+      const auto t0 = std::chrono::steady_clock::now();
+      E = pass();
+      t.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    }
+    std::sort(t.begin(), t.end());
+    std::printf("{\"model\": \"%s\", \"frames\": %zu, \"atoms\": %d, \"energy_sum\": %.6f, \"ms_total\": %.3f, \"ms_min\": %.3f, \"repeat\": %d}\n",
+                m->model_type().c_str(), all.size(), atoms, E, t[t.size() / 2], t[0], N);
+    return 0;
+  }
+  const AtomicSystem s = tile(read_all(argv[3]).at(std::stoi(arg(argc, argv, "--frame", "0"))), K);
   for (int i = 0; i < W; i++) m->predict(s, true);
   std::vector<double> tot;
   double E = 0;
@@ -217,6 +272,7 @@ int main(int argc, char **argv) {
     if (!std::strcmp(argv[1], "check")) return check(argc, argv);
     if (!std::strcmp(argv[1], "bench")) return bench(argc, argv);
     if (!std::strcmp(argv[1], "bench-any")) return bench_any(argc, argv);
+    if (!std::strcmp(argv[1], "dump")) return dump(argc, argv);
   } catch (const std::exception &e) {
     std::fprintf(stderr, "error: %s\n", e.what());
     return 1;
