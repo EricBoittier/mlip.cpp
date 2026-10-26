@@ -1,0 +1,21 @@
+def forward(self,
+    r: Tensor) -> Tensor:
+  dist = torch.linalg_vector_norm(r, 2, [-1], True)
+  emb = self.emb
+  x = (emb).forward(torch.cat([r, dist], -1), )
+  _0 = torch.clamp(torch.div(dist, 5.), None, 1.)
+  _1 = torch.cos(torch.mul(_0, 3.1415926535897931))
+  fc = torch.mul(torch.add(_1, 1.), 0.5)
+  _2 = torch.clamp_min(fc, 1.0000000000000001e-15)
+  bias = torch.expand(torch.transpose(torch.log(_2), 1, 2), [-1, (torch.size(r))[1], -1])
+  qkv = self.qkv
+  _3 = (qkv).forward(x, )
+  _4 = torch.contiguous(bias)
+  H = self.H
+  scale = self.scale
+  o, lse = ops.mlipcpp.pet_attention(_3, _4, H, scale)
+  out = self.out
+  return torch.sum((out).forward(o, ))
+
+energy -116.390213; max |eager - scripted|, |eager - reloaded| over E, F, dL/dparams: 0.00e+00
+libraries a metatomic export would collect: {'/home/boittier/bench/attn-op/build/mlipcpp_torch.so'}

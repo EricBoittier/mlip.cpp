@@ -1,0 +1,600 @@
+{
+ "gpu": "NVIDIA GeForce RTX 4070 Ti SUPER",
+ "torch": "2.13.0+cu130",
+ "results": [
+  {
+   "N": 650,
+   "L": 24,
+   "H": 4,
+   "d": 16,
+   "mode": "fwd",
+   "method": "mlipcpp",
+   "peak_MiB": 4.046875,
+   "ms": 0.08806400001049042
+  },
+  {
+   "N": 650,
+   "L": 24,
+   "H": 4,
+   "d": 16,
+   "mode": "fwd",
+   "method": "manual",
+   "peak_MiB": 27.6171875,
+   "ms": 0.33263999223709106
+  },
+  {
+   "N": 650,
+   "L": 24,
+   "H": 4,
+   "d": 16,
+   "mode": "fwd",
+   "method": "sdpa",
+   "peak_MiB": 3.80859375,
+   "ms": 0.2077759951353073
+  },
+  {
+   "N": 650,
+   "L": 24,
+   "H": 4,
+   "d": 16,
+   "mode": "fb",
+   "method": "mlipcpp",
+   "peak_MiB": 18.1943359375,
+   "ms": 0.31142398715019226
+  },
+  {
+   "N": 650,
+   "L": 24,
+   "H": 4,
+   "d": 16,
+   "mode": "fb",
+   "method": "manual",
+   "peak_MiB": 47.6171875,
+   "ms": 1.0393600463867188
+  },
+  {
+   "N": 650,
+   "L": 24,
+   "H": 4,
+   "d": 16,
+   "mode": "fb",
+   "method": "sdpa",
+   "peak_MiB": 64.970703125,
+   "ms": 0.8468480110168457
+  },
+  {
+   "N": 650,
+   "L": 24,
+   "H": 4,
+   "d": 16,
+   "mode": "force",
+   "method": "mlipcpp",
+   "peak_MiB": 52.92724609375,
+   "ms": 0.9951040148735046
+  },
+  {
+   "N": 650,
+   "L": 24,
+   "H": 4,
+   "d": 16,
+   "mode": "force",
+   "method": "mlipcpp_ggmljvp",
+   "peak_MiB": 72.5390625,
+   "ms": 1.7878079414367676
+  },
+  {
+   "N": 650,
+   "L": 24,
+   "H": 4,
+   "d": 16,
+   "mode": "force",
+   "method": "manual",
+   "peak_MiB": 117.73974609375,
+   "ms": 3.0556159019470215
+  },
+  {
+   "N": 650,
+   "L": 24,
+   "H": 4,
+   "d": 16,
+   "mode": "force",
+   "method": "sdpa",
+   "error": "RuntimeError: derivative for aten::_scaled_dot_product_efficient_attention_backward is not implemented"
+  },
+  {
+   "N": 650,
+   "L": 32,
+   "H": 4,
+   "d": 32,
+   "mode": "fwd",
+   "method": "mlipcpp",
+   "peak_MiB": 10.4736328125,
+   "ms": 0.19353599846363068
+  },
+  {
+   "N": 650,
+   "L": 32,
+   "H": 4,
+   "d": 32,
+   "mode": "fwd",
+   "method": "manual",
+   "peak_MiB": 40.625,
+   "ms": 0.46489599347114563
+  },
+  {
+   "N": 650,
+   "L": 32,
+   "H": 4,
+   "d": 32,
+   "mode": "fwd",
+   "method": "sdpa",
+   "peak_MiB": 10.15625,
+   "ms": 0.20479999482631683
+  },
+  {
+   "N": 650,
+   "L": 32,
+   "H": 4,
+   "d": 32,
+   "mode": "fb",
+   "method": "mlipcpp",
+   "peak_MiB": 43.798828125,
+   "ms": 1.044319987297058
+  },
+  {
+   "N": 650,
+   "L": 32,
+   "H": 4,
+   "d": 32,
+   "mode": "fb",
+   "method": "manual",
+   "peak_MiB": 93.9453125,
+   "ms": 1.8247679471969604
+  },
+  {
+   "N": 650,
+   "L": 32,
+   "H": 4,
+   "d": 32,
+   "mode": "fb",
+   "method": "sdpa",
+   "peak_MiB": 93.9453125,
+   "ms": 1.4551039934158325
+  },
+  {
+   "N": 650,
+   "L": 32,
+   "H": 4,
+   "d": 32,
+   "mode": "force",
+   "method": "mlipcpp",
+   "peak_MiB": 130.44580078125,
+   "ms": 3.009536027908325
+  },
+  {
+   "N": 650,
+   "L": 32,
+   "H": 4,
+   "d": 32,
+   "mode": "force",
+   "method": "mlipcpp_ggmljvp",
+   "peak_MiB": 182.81396484375,
+   "ms": 6.292223930358887
+  },
+  {
+   "N": 650,
+   "L": 32,
+   "H": 4,
+   "d": 32,
+   "mode": "force",
+   "method": "manual",
+   "peak_MiB": 246.92529296875,
+   "ms": 4.958208084106445
+  },
+  {
+   "N": 650,
+   "L": 32,
+   "H": 4,
+   "d": 32,
+   "mode": "force",
+   "method": "sdpa",
+   "error": "RuntimeError: derivative for aten::_scaled_dot_product_efficient_attention_backward is not implemented"
+  },
+  {
+   "N": 650,
+   "L": 32,
+   "H": 8,
+   "d": 16,
+   "mode": "fwd",
+   "method": "mlipcpp",
+   "peak_MiB": 10.791015625,
+   "ms": 0.1812479943037033
+  },
+  {
+   "N": 650,
+   "L": 32,
+   "H": 8,
+   "d": 16,
+   "mode": "fwd",
+   "method": "manual",
+   "peak_MiB": 60.9375,
+   "ms": 0.745248019695282
+  },
+  {
+   "N": 650,
+   "L": 32,
+   "H": 8,
+   "d": 16,
+   "mode": "fwd",
+   "method": "sdpa",
+   "peak_MiB": 10.15625,
+   "ms": 0.3604480028152466
+  },
+  {
+   "N": 650,
+   "L": 32,
+   "H": 8,
+   "d": 16,
+   "mode": "fb",
+   "method": "mlipcpp",
+   "peak_MiB": 44.43359375,
+   "ms": 0.9348800182342529
+  },
+  {
+   "N": 650,
+   "L": 32,
+   "H": 8,
+   "d": 16,
+   "mode": "fb",
+   "method": "manual",
+   "peak_MiB": 121.875,
+   "ms": 2.7074880599975586
+  },
+  {
+   "N": 650,
+   "L": 32,
+   "H": 8,
+   "d": 16,
+   "mode": "fb",
+   "method": "sdpa",
+   "peak_MiB": 144.20703125,
+   "ms": 2.078752040863037
+  },
+  {
+   "N": 650,
+   "L": 32,
+   "H": 8,
+   "d": 16,
+   "mode": "force",
+   "method": "mlipcpp",
+   "peak_MiB": 131.39794921875,
+   "ms": 2.8875839710235596
+  },
+  {
+   "N": 650,
+   "L": 32,
+   "H": 8,
+   "d": 16,
+   "mode": "force",
+   "method": "mlipcpp_ggmljvp",
+   "peak_MiB": 182.81396484375,
+   "ms": 5.799935817718506
+  },
+  {
+   "N": 650,
+   "L": 32,
+   "H": 8,
+   "d": 16,
+   "mode": "force",
+   "method": "manual",
+   "peak_MiB": 359.27880859375,
+   "ms": 7.562240123748779
+  },
+  {
+   "N": 650,
+   "L": 32,
+   "H": 8,
+   "d": 16,
+   "mode": "force",
+   "method": "sdpa",
+   "error": "RuntimeError: derivative for aten::_scaled_dot_product_efficient_attention_backward is not implemented"
+  },
+  {
+   "N": 650,
+   "L": 40,
+   "H": 8,
+   "d": 32,
+   "mode": "fwd",
+   "method": "mlipcpp",
+   "peak_MiB": 26.79345703125,
+   "ms": 0.5120000243186951
+  },
+  {
+   "N": 650,
+   "L": 40,
+   "H": 8,
+   "d": 32,
+   "mode": "fwd",
+   "method": "manual",
+   "peak_MiB": 116.0,
+   "ms": 1.1906239986419678
+  },
+  {
+   "N": 650,
+   "L": 40,
+   "H": 8,
+   "d": 32,
+   "mode": "fwd",
+   "method": "sdpa",
+   "peak_MiB": 26.0,
+   "ms": 0.4403199851512909
+  },
+  {
+   "N": 650,
+   "L": 40,
+   "H": 8,
+   "d": 32,
+   "mode": "fb",
+   "method": "mlipcpp",
+   "peak_MiB": 107.72607421875,
+   "ms": 2.9718079566955566
+  },
+  {
+   "N": 650,
+   "L": 40,
+   "H": 8,
+   "d": 32,
+   "mode": "fb",
+   "method": "manual",
+   "peak_MiB": 234.31103515625,
+   "ms": 4.952064037322998
+  },
+  {
+   "N": 650,
+   "L": 40,
+   "H": 8,
+   "d": 32,
+   "mode": "fb",
+   "method": "sdpa",
+   "peak_MiB": 234.31103515625,
+   "ms": 3.9246718883514404
+  },
+  {
+   "N": 650,
+   "L": 40,
+   "H": 8,
+   "d": 32,
+   "mode": "force",
+   "method": "mlipcpp",
+   "peak_MiB": 320.79931640625,
+   "ms": 9.212127685546875
+  },
+  {
+   "N": 650,
+   "L": 40,
+   "H": 8,
+   "d": 32,
+   "mode": "force",
+   "method": "mlipcpp_ggmljvp",
+   "peak_MiB": 448.72998046875,
+   "ms": 18.59174346923828
+  },
+  {
+   "N": 650,
+   "L": 40,
+   "H": 8,
+   "d": 32,
+   "mode": "force",
+   "method": "manual",
+   "peak_MiB": 690.1572265625,
+   "ms": 13.731840133666992
+  },
+  {
+   "N": 650,
+   "L": 40,
+   "H": 8,
+   "d": 32,
+   "mode": "force",
+   "method": "sdpa",
+   "error": "RuntimeError: derivative for aten::_scaled_dot_product_efficient_attention_backward is not implemented"
+  },
+  {
+   "N": 10000,
+   "L": 32,
+   "H": 4,
+   "d": 32,
+   "mode": "fwd",
+   "method": "mlipcpp",
+   "peak_MiB": 161.1328125,
+   "ms": 2.618367910385132
+  },
+  {
+   "N": 10000,
+   "L": 32,
+   "H": 4,
+   "d": 32,
+   "mode": "fwd",
+   "method": "manual",
+   "peak_MiB": 625.0,
+   "ms": 8.007488250732422
+  },
+  {
+   "N": 10000,
+   "L": 32,
+   "H": 4,
+   "d": 32,
+   "mode": "fwd",
+   "method": "sdpa",
+   "peak_MiB": 156.25,
+   "ms": 2.5617599487304688
+  },
+  {
+   "N": 10000,
+   "L": 32,
+   "H": 4,
+   "d": 32,
+   "mode": "fb",
+   "method": "mlipcpp",
+   "peak_MiB": 674.765625,
+   "ms": 13.894432067871094
+  },
+  {
+   "N": 10000,
+   "L": 32,
+   "H": 4,
+   "d": 32,
+   "mode": "fb",
+   "method": "manual",
+   "peak_MiB": 1445.3125,
+   "ms": 32.262081146240234
+  },
+  {
+   "N": 10000,
+   "L": 32,
+   "H": 4,
+   "d": 32,
+   "mode": "fb",
+   "method": "sdpa",
+   "peak_MiB": 1445.3125,
+   "ms": 24.17043113708496
+  },
+  {
+   "N": 10000,
+   "L": 32,
+   "H": 4,
+   "d": 32,
+   "mode": "force",
+   "method": "mlipcpp",
+   "peak_MiB": 2007.77490234375,
+   "ms": 44.133182525634766
+  },
+  {
+   "N": 10000,
+   "L": 32,
+   "H": 4,
+   "d": 32,
+   "mode": "force",
+   "method": "mlipcpp_ggmljvp",
+   "peak_MiB": 2813.93896484375,
+   "ms": 92.07990264892578
+  },
+  {
+   "N": 10000,
+   "L": 32,
+   "H": 4,
+   "d": 32,
+   "mode": "force",
+   "method": "manual",
+   "peak_MiB": 3798.82958984375,
+   "ms": 88.8832015991211
+  },
+  {
+   "N": 10000,
+   "L": 32,
+   "H": 4,
+   "d": 32,
+   "mode": "force",
+   "method": "sdpa",
+   "error": "RuntimeError: derivative for aten::_scaled_dot_product_efficient_attention_backward is not implemented"
+  },
+  {
+   "N": 10000,
+   "L": 40,
+   "H": 8,
+   "d": 32,
+   "mode": "fwd",
+   "method": "mlipcpp",
+   "peak_MiB": 402.83203125,
+   "ms": 6.254591941833496
+  },
+  {
+   "N": 10000,
+   "L": 40,
+   "H": 8,
+   "d": 32,
+   "mode": "fwd",
+   "method": "manual",
+   "peak_MiB": 1757.8125,
+   "ms": 19.535839080810547
+  },
+  {
+   "N": 10000,
+   "L": 40,
+   "H": 8,
+   "d": 32,
+   "mode": "fwd",
+   "method": "sdpa",
+   "peak_MiB": 390.625,
+   "ms": 6.177631855010986
+  },
+  {
+   "N": 10000,
+   "L": 40,
+   "H": 8,
+   "d": 32,
+   "mode": "fb",
+   "method": "mlipcpp",
+   "peak_MiB": 1649.0390625,
+   "ms": 40.53504180908203
+  },
+  {
+   "N": 10000,
+   "L": 40,
+   "H": 8,
+   "d": 32,
+   "mode": "fb",
+   "method": "manual",
+   "peak_MiB": 3576.91015625,
+   "ms": 79.20105743408203
+  },
+  {
+   "N": 10000,
+   "L": 40,
+   "H": 8,
+   "d": 32,
+   "mode": "fb",
+   "method": "sdpa",
+   "peak_MiB": 3576.78515625,
+   "ms": 60.75788879394531
+  },
+  {
+   "N": 10000,
+   "L": 40,
+   "H": 8,
+   "d": 32,
+   "mode": "force",
+   "method": "mlipcpp",
+   "peak_MiB": 4908.56787109375,
+   "ms": 134.4509735107422
+  },
+  {
+   "N": 10000,
+   "L": 40,
+   "H": 8,
+   "d": 32,
+   "mode": "force",
+   "method": "mlipcpp_ggmljvp",
+   "peak_MiB": 6886.35693359375,
+   "ms": 275.4447326660156
+  },
+  {
+   "N": 10000,
+   "L": 40,
+   "H": 8,
+   "d": 32,
+   "mode": "force",
+   "method": "manual",
+   "peak_MiB": 10534.91943359375,
+   "ms": 221.70594787597656
+  },
+  {
+   "N": 10000,
+   "L": 40,
+   "H": 8,
+   "d": 32,
+   "mode": "force",
+   "method": "sdpa",
+   "error": "RuntimeError: derivative for aten::_scaled_dot_product_efficient_attention_backward is not implemented"
+  }
+ ]
+}
