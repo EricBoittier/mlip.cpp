@@ -315,7 +315,10 @@ def state_dict_names(wrapper, pet):
     by_id = {}
     for name, p in outer.named_parameters():  # first (registered) name of shared ones
         by_id.setdefault(id(p), name)
-    return {n.replace(".", "_"): by_id[id(p)] for n, p in wrapper.named_parameters() if id(p) in by_id}
+    out = {n.replace(".", "_"): by_id[id(p)] for n, p in wrapper.named_parameters() if id(p) in by_id}
+    if getattr(wrapper, "plato_lr", None) is not None:  # the folded mesh projections
+        out.update(wrapper.plato.state_dict_names(by_id))
+    return out
 
 
 def metatrain_baselines(model):
@@ -512,6 +515,9 @@ def main():
         writer.add_int32("pet.system_conditioning", 1)
         writer.add_int32("pet.max_charge", wrapper.max_charge)
         writer.add_int32("pet.max_spin_multiplicity", wrapper.max_spin_multiplicity)
+    if wrapper.plato_lr is not None:
+        from export_pytorch.plato_lr import gguf_metadata as plato_lr_metadata
+        plato_lr_metadata(writer, wrapper.plato_lr)
     if nc_force_scales:
         writer.add_array_int32("pet.nc_force_scale_keys", list(nc_force_scales))
         writer.add_array_float32("pet.nc_force_scale_values", list(nc_force_scales.values()))

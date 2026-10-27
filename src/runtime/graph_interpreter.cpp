@@ -325,7 +325,12 @@ ggml_tensor *GraphInterpreter::build(ggml_context *ctx) {
 ggml_tensor *GraphInterpreter::build_node(ggml_context *ctx,
                                           const GIRNode &node) {
   // Dispatch based on operation type
-  if (node.op == "ADD") {
+  if (node.op.rfind("MLIPCPP_", 0) == 0) {
+    if (!custom_op) throw std::runtime_error("graph op " + node.op + " needs a native builder (Plato-PET-LR model?)");
+    std::vector<ggml_tensor *> in;
+    for (const auto &ref : node.inputs) in.push_back(resolve_input(ctx, ref));
+    return custom_op(ctx, node, in);
+  } else if (node.op == "ADD") {
     return build_add(ctx, node);
   } else if (node.op == "SUB") {
     return build_sub(ctx, node);

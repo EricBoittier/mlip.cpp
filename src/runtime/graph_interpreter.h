@@ -41,6 +41,12 @@ public:
   // This uses the provided context for allocations
   ggml_tensor *build(ggml_context *ctx);
 
+  // Native builders of the MLIPCPP_* custom ops (export_pytorch/plato_lr.py:
+  // Plato-PET-LR frame RoPE attention, edge group sum, mesh, LES): the node and
+  // its resolved inputs (tensors in GIR order); unset: such a node is an error.
+  std::function<ggml_tensor *(ggml_context *, const GIRNode &, const std::vector<ggml_tensor *> &)>
+      custom_op;
+
   // Optional native replacement for the PET-LR matrix application.
   std::function<ggml_tensor *(ggml_context *, ggml_tensor *)>
       coulomb_application;

@@ -232,7 +232,7 @@ void GraphModel::release_cached_resources() {
 }
 
 bool GraphModel::cached_path_supported() const {
-  return forces_mode_ && !long_range_ &&
+  return forces_mode_ && !long_range_ && !plato_lr_.enabled &&
          (num_neighbors_adaptive_ <= 0.0f || adaptive_cutoff_method_ == "solver");
 }
 

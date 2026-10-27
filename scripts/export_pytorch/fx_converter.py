@@ -1039,6 +1039,30 @@ def convert_exported_to_gir(
             name_map[node.name] = f"weight:{attr_name}"
 
         elif node.op == "call_function":
+            # custom ops of export_pytorch/plato_lr.py (torch.ops.mlipcpp.*): one GIR
+            # node MLIPCPP_<NAME>, tensor arguments as inputs in schema order, the
+            # others as params by schema name (the interpreter builds them natively)
+            if isinstance(node.target, torch._ops.OpOverload) and node.target.namespace == "mlipcpp":
+                schema = node.target._schema
+                input_refs, params = [], {}
+                for i, arg in enumerate(schema.arguments):
+                    val = node.args[i] if i < len(node.args) else node.kwargs.get(arg.name, arg.default_value)
+                    if isinstance(val, fx.Node):
+                        input_refs.append(name_map[val.name])
+                    else:
+                        params[arg.name] = val
+                gir_nodes.append(GGMLNode(
+                    id=node_id,
+                    op="MLIPCPP_" + node.target._opname.upper(),
+                    name=node.name,
+                    inputs=input_refs,
+                    output_shape=_to_runtime_shape(shape),
+                    output_dtype=dtype,
+                    params=params,
+                ))
+                name_map[node.name] = f"node:{node_id}"
+                node_id += 1
+                continue
             target_name = get_aten_op_name(node.target)
             ggml_op = ATEN_TO_GGML.get(target_name)
 

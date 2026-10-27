@@ -5,6 +5,7 @@
 #include "core/coulomb.h"
 #include "graph_interpreter.h"
 #include "pet_ragged.h"
+#include "pet_plato_lr.h"
 #include "mlipcpp/model.h"
 #include "mlipcpp/neighbor_list.h"
 
@@ -153,6 +154,8 @@ public:
   const CoulombParameters &coulomb_parameters() const { return coulomb_parameters_; }
   bool long_range() const { return long_range_; }
   bool nc_forces() const { return nc_forces_; }
+  /// Plato-PET-LR components (GGUF pet.plato_lr.*; enabled false: a plain PET)
+  const PetPlatoLRSpec &plato_lr() const { return plato_lr_; }
   const std::string &gguf_path() const { return gguf_path_; }
   /// Names of the trainable tensors (GGUF "train.param_names"; buffers and
   /// constants excluded). Empty for exports that predate it.
@@ -185,6 +188,7 @@ private:
   std::string cutoff_function_ = "cosine";
   bool forces_mode_ = false;
   bool nc_forces_ = false;
+  PetPlatoLRSpec plato_lr_;
   bool long_range_ = false;
   bool p3m_ = false;
   CoulombParameters coulomb_parameters_;

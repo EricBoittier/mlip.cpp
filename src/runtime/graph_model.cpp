@@ -393,6 +393,9 @@ bool GraphModel::load_from_gguf(const std::string &path) {
   adaptive_cutoff_method_ = loader.get_string("pet.adaptive_cutoff_method", "grid");
   num_heads_ = loader.get_int32("pet.num_heads", 0);
   conditioning_.enabled = loader.get_int32("pet.system_conditioning", 0) != 0;
+  plato_lr_ = PetPlatoLRSpec::from_gguf(loader);
+  if (plato_lr_.enabled && !forces_mode_)
+    throw std::runtime_error("Plato-PET-LR GGUFs are forces-mode exports");
   conditioning_.max_charge = loader.get_int32("pet.max_charge", 10);
   conditioning_.max_spin_multiplicity = loader.get_int32("pet.max_spin_multiplicity", 10);
   state_dict_names_ = json::parse(loader.get_string("train.state_dict_names", "{}"))
@@ -912,6 +915,25 @@ ModelResult GraphModel::predict_single(
     }
   }
 
+  // Plato-PET-LR: positions (and strain) inputs of the long-range ops, read by the
+  // interpreter's MLIPCPP_* builders
+  std::unique_ptr<PetPlatoLR> plato;
+  if (plato_lr_.enabled) {
+    PetPlatoLRStructure st;
+    st.a0 = 0, st.a1 = n_atoms;
+    if (const Cell *c = system.cell()) {
+      const int np = c->periodic[0] + c->periodic[1] + c->periodic[2];
+      if (np != 0 && np != 3 && plato_lr_.long_range())
+        throw std::runtime_error("Plato-PET-LR long range needs full or no periodicity");
+      st.periodic = np == 3;
+      for (int a = 0; a < 3; a++)
+        for (int b = 0; b < 3; b++) st.cell[a][b] = c->matrix[a][b];
+    }
+    st.charge = system.charge();
+    plato = std::make_unique<PetPlatoLR>();
+    plato->create(input_ctx, plato_lr_, {st}, n_atoms, compute_forces && plato_lr_.long_range());
+  }
+
   // Allocate input buffer
   ggml_backend_buffer_t input_buffer =
       ggml_backend_alloc_ctx_tensors(input_ctx, compute_backend_);
@@ -919,6 +941,14 @@ ModelResult GraphModel::predict_single(
       input_buffer_owner(input_buffer, ggml_backend_buffer_free);
   if (!input_buffer) {
     throw std::runtime_error("Failed to allocate input buffer");
+  }
+
+  if (plato) {
+    std::vector<float> pos(system.positions(), system.positions() + 3 * size_t(n_atoms));
+    plato->upload(pos.data());
+    interp_.custom_op = [&](ggml_context *ctx, const GIRNode &node, const std::vector<ggml_tensor *> &in) {
+      return plato->build(ctx, node, in);
+    };
   }
 
   // --- Pack neighbor list data ---
@@ -1095,10 +1125,12 @@ ModelResult GraphModel::predict_single(
     output = interp_.build(compute_ctx);
   } catch (...) {
     interp_.coulomb_application = {};
+    interp_.custom_op = {};
     interp_.set_input_gradients(false);
     throw;
   }
   interp_.coulomb_application = {};
+  interp_.custom_op = {};
   interp_.set_input_gradients(false);
   if (p3m_ && !lr_charges)
     throw std::runtime_error("Missing PET-LR charge application");
@@ -1154,6 +1186,10 @@ ModelResult GraphModel::predict_single(
     } else {
       compute_forces = false;
     }
+    if (plato)
+      for (ggml_tensor *p : {plato->positions, plato->strain})
+        if (ggml_tensor *g = p ? ggml_graph_get_grad(cgraph, p) : nullptr)
+          for (; g; g = g->view_src) ggml_set_output(g);
   } else {
     cgraph = ggml_new_graph(compute_ctx);
     ggml_build_forward_expand(cgraph, output);
@@ -1346,6 +1382,20 @@ ModelResult GraphModel::predict_single(
         }
       }
 
+      // Plato-PET-LR: the explicit position and strain dependence of the long-range ops
+      std::vector<float> plato_geps;
+      if (plato) {
+        if (ggml_tensor *g = ggml_graph_get_grad(cgraph, plato->positions)) {
+          std::vector<float> gp(3 * size_t(n_atoms));
+          ggml_backend_tensor_get(g, gp.data(), 0, gp.size() * sizeof(float));
+          for (int i = 0; i < n_atoms * 3; i++) result.forces[i] -= gp[i];
+        }
+        if (ggml_tensor *g = plato->strain ? ggml_graph_get_grad(cgraph, plato->strain) : nullptr) {
+          plato_geps.resize(9);
+          ggml_backend_tensor_get(g, plato_geps.data(), 0, 9 * sizeof(float));
+        }
+      }
+
       // Apply energy scale
       for (int i = 0; i < n_atoms * 3; i++) {
         result.forces[i] *= energy_scale_;
@@ -1398,6 +1448,13 @@ ModelResult GraphModel::predict_single(
             result.stress[5] += static_cast<float>(0.5 * (r[0] * g[1] + r[1] * g[0]));
           }
 
+          if (!plato_geps.empty()) { // row-major dE/d eps
+            const auto &q = plato_geps;
+            result.stress[0] += q[0], result.stress[1] += q[4], result.stress[2] += q[8];
+            result.stress[3] += 0.5f * (q[5] + q[7]);
+            result.stress[4] += 0.5f * (q[2] + q[6]);
+            result.stress[5] += 0.5f * (q[1] + q[3]);
+          }
           for (int i = 0; i < 6; i++) {
             result.stress[i] *= energy_scale_ / vol;
           }

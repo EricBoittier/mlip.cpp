@@ -385,6 +385,21 @@ class PETFullModel(torch.nn.Module):
         # spin multiplicity (charge + max_charge, 2S+1 - 1), filled by the C++ side
         self.system_conditioning = getattr(pet_model, 'system_conditioning', None)
         self.conditioning = self.system_conditioning is not None
+
+        # Plato-PET-LR components (metatrain plato_lr hypers; export_pytorch/plato_lr.py)
+        from export_pytorch import plato_lr as _plato_lr
+        self.plato_lr = _plato_lr.plato_lr_hypers(pet_model)
+        self.frame_rope = bool(self.plato_lr and self.plato_lr["rope"])
+        self.couple_at = -1
+        if self.plato_lr is not None:
+            if self.long_range:
+                raise NotImplementedError("plato_lr together with PET-LR long_range")
+            if not forces:
+                raise NotImplementedError("plato_lr export needs the forces graph")
+            _plato_lr.patch_modules()
+            self.plato = _plato_lr.PlatoLRParts(pet_model, self.plato_lr)
+            if self.plato_lr["mesh_coupling"]:
+                self.couple_at = self.plato_lr["couple_at"]
         if self.conditioning:
             self.max_charge = int(self.system_conditioning.max_charge)
             self.max_spin_multiplicity = int(self.system_conditioning.max_spin_multiplicity)
@@ -434,6 +449,12 @@ class PETFullModel(torch.nn.Module):
             self.edge_force_final = torch.nn.ModuleList([
                 pet_model.edge_last_layers[name][i][key] for i in range(self.num_readout_layers)
             ])
+
+    def _token_positions(self, edge_vectors):
+        """plato_lr frame RoPE: the centre at the origin, then the edge vectors."""
+        if not self.frame_rope:
+            return None
+        return torch.cat([torch.zeros_like(edge_vectors[:, :1]), edge_vectors], dim=1)
 
     def _readout(self, node_heads, node_final, edge_heads, edge_final, i,
                  node_feat, edge_feat, padding_mask, cutoff_factors):
@@ -540,6 +561,7 @@ class PETFullModel(torch.nn.Module):
         edges = []
 
         # Process through GNN layers with per-layer energy readout
+        token_positions = self._token_positions(edge_vectors)
         for gnn_idx, (node_embedder, gnn_layer) in enumerate(
             zip(self.node_embedders, self.gnn_layers)
         ):
@@ -557,7 +579,8 @@ class PETFullModel(torch.nn.Module):
                 ~padding_mask,  # Invert for metatrain convention
                 edge_distances,
                 cutoff_factors,
-                use_manual_attention=self.forces
+                use_manual_attention=self.forces,
+                token_positions=token_positions,
             )
             # Zero out padded edge positions (GNN may produce non-zero values)
             output_edge = torch.where(
@@ -567,6 +590,8 @@ class PETFullModel(torch.nn.Module):
             )
             if cond is not None:  # metatrain: after the GNN layer, before the readout
                 output_node = output_node + cond
+            if gnn_idx == self.couple_at:  # plato_lr mesh coupling
+                output_node = output_node + self.plato.mesh_update(output_node)
 
             nodes.append(output_node)
             edges.append(output_edge)
@@ -597,6 +622,8 @@ class PETFullModel(torch.nn.Module):
                 self.node_energy_heads, self.node_final_layers,
                 self.edge_energy_heads, self.edge_final_layers, i,
                 node, edge, padding_mask, cutoff_factors).squeeze(-1)
+        if self.plato_lr is not None and self.plato_lr["les"]:
+            atomic_energies = atomic_energies + self.plato.les_energy(nodes, edges, padding_mask, cutoff_factors)
         return atomic_energies
 
     def _forward_feedforward(self, species, neighbor_species, edge_vectors, edge_distances,
@@ -614,9 +641,10 @@ class PETFullModel(torch.nn.Module):
         )
 
         # Process through GNN layers with combination MLPs
-        for combination_norm, combination_mlp, gnn_layer in zip(
+        token_positions = self._token_positions(edge_vectors)
+        for gnn_idx, (combination_norm, combination_mlp, gnn_layer) in enumerate(zip(
             self.combination_norms, self.combination_mlps, self.gnn_layers
-        ):
+        )):
             # Note: metatrain uses True=valid, False=padded convention
             output_node, output_edge = gnn_layer(
                 input_node_embeddings,
@@ -626,7 +654,8 @@ class PETFullModel(torch.nn.Module):
                 ~padding_mask,  # Invert for metatrain convention
                 edge_distances,
                 cutoff_factors,
-                use_manual_attention=self.forces
+                use_manual_attention=self.forces,
+                token_positions=token_positions,
             )
             # Zero out padded edge positions (GNN may produce non-zero values)
             output_edge = torch.where(
@@ -637,6 +666,8 @@ class PETFullModel(torch.nn.Module):
 
             if cond is not None:  # metatrain: after the GNN layer, before the next one
                 output_node = output_node + cond
+            if gnn_idx == self.couple_at:  # plato_lr mesh coupling
+                output_node = output_node + self.plato.mesh_update(output_node)
             # Update node embeddings for next layer
             input_node_embeddings = output_node
 
@@ -691,6 +722,9 @@ class PETFullModel(torch.nn.Module):
 
         # Total atomic energies
         atomic_energies = node_e.squeeze(-1) + edge_e_sum
+        if self.plato_lr is not None and self.plato_lr["les"]:
+            atomic_energies = atomic_energies + self.plato.les_energy(
+                [input_node_embeddings], [input_messages], padding_mask, cutoff_factors)
         if not self.nc_forces:
             return atomic_energies
         forces = self._readout(self.node_force_heads, self.node_force_final,
