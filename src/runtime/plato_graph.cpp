@@ -205,7 +205,25 @@ PlatoOutputs build_plato(ggml_context *ctx, const PlatoSpec &spec, const std::ma
     out.charges = q;
     const float sigma = spec.les_sigma;
     ggml_tensor *e = nullptr;
-    if (periodic) {
+    if (periodic && in.les_mesh[0] > 0) {
+      if (Q != 1) throw std::runtime_error("Plato: LES PME needs one charge channel");
+      const int M0 = in.les_mesh[0], M1 = in.les_mesh[1], M2 = in.les_mesh[2];
+      // structure g on channel g of one mesh
+      ggml_tensor *rho = ggml_plato_spread_order(ctx, ggml_reshape_2d(ctx, q, 1, n), frac, G > 1 ? in.struct_index : nullptr,
+                                                 (int) G, M0, M1, M2, in.les_order);   // [M2, M1, M0, G]
+      ggml_tensor *rk = ggml_plato_fft3(ctx, rho, 0, M0, M1, M2);                       // [2 Mh2, M1, M0, G]
+      ggml_tensor *K = b.strained(in.les_K);                                            // [3, 3, G]
+      ggml_tensor *A = ggml_reshape_2d(ctx, mm_f32(ctx, K, K), 9, K->ne[2]);            // k^2 = m^T A m
+      const float kc = spec.les_kcut / sigma, wd = 1.0f / sigma;
+      ggml_tensor *ep = ggml_plato_pme(ctx, rk, A, in.les_tab, M0, M1, M2, sigma, kc, wd); // [M0, G]
+      // (2 pi / V) sum over the full spectrum = (4 pi / V) over the half space, as the direct sum
+      ggml_tensor *rec = ggml_mul(ctx, ggml_reshape_2d(ctx, ggml_sum_rows(ctx, ep), 1, G), ggml_scale(ctx, b.inv_volume(), 2.0f * M_PI));
+      ggml_tensor *qb = G == 1 ? q : ggml_mul(ctx, in.onehot, q);
+      ggml_tensor *self = G == 1 ? ggml_reshape_2d(ctx, ggml_sum(ctx, ggml_sqr(ctx, q)), 1, 1)
+                                 : ggml_sum_rows(ctx, ggml_sqr(ctx, qb));
+      self = ggml_scale(ctx, self, 1.0f / (std::sqrt(2.0f * M_PI) * sigma));
+      e = ggml_scale(ctx, ggml_sub(ctx, rec, self), KE);
+    } else if (periodic) {
       ggml_tensor *qb = G == 1 ? q : ggml_mul(ctx, in.onehot, q);    // [n, G Q]: each structure's charges
       const int64_t nk = in.les_n->ne[1];
       ggml_tensor *sk;                                               // [nk, G Q]: |S(k)|^2

@@ -69,6 +69,69 @@ first order, which is exact for the derivative at `eps = 0`.
 | `PLATO_ERF` | erf | `2 / sqrt(pi) exp(-x^2)` as ops |
 | `GET_ROWS_BACK` | (upstream) | its gradient, a `GET_ROWS` (the readout `h = tok_i + sum_e f_c tok_e`) |
 
+## LES by particle-mesh Ewald (`les_method`)
+
+The direct LES sum costs `O(atoms x k vectors)` and the k set grows with the
+cell volume, so a large cell costs about `O(N^2)` (25M k vectors at 10,240 atoms).
+`les_method: pme` evaluates the same windowed sum by smooth PME, as metatrain's
+`modules/ewald.py` `les_energy_pme_batched`:
+
+- order-`p` B-spline spread of the centred latent charges (`ggml_plato_spread_order`,
+  default `p = 8`), one mesh channel per structure of a batch;
+- `ggml_plato_fft3` mode 0 (rfftn, unnormalised);
+- `ggml_plato_pme`: per structure `sum_bins t0 t1 t2 phi(m^T A m) |rk|^2`, `phi` the
+  windowed `w(|k|) exp(-sigma^2 k^2 / 2) / k^2` of the direct sum, `t_a` the
+  energy-optimal (Hockney-Eastwood) influence factors for B-splines,
+  `sinc^2p(pi m / M) / (sum_j B_2p(j) cos(2 pi m j / M))^2` (0 on Nyquist bins, the
+  rfft multiplicity in `t2`; `plato::pme_axis_table`), and the metric
+  `A = K'^T K'`, `K' = (1 - eps) K`, `K = 2 pi inv(cell)^T`; the energy is
+  `KE ((2 pi / V) sum - self)`, i.e. the direct sum's `4 pi / V` over the half space.
+  No inverse FFT: the gradients are `PLATO_PME_BACK` (d rk, d A per plane), the
+  rfftn adjoint and the spread's (gathers): forces, virial, d q.
+
+Mesh: per cell vector the `2^a 3^b 5^c` size at or above
+`max(p, floor(|a| / h + 1/2) + 1)`, `h = les_pme_spacing * les_sigma` (default 0.5):
+size changes sit at half-integer `|a| / h`, away from integer box lengths and their
+rotated copies (where the coupling mesh flips between 30 and 31 points). Below
+`h = pi sigma / kcut` (0.52) the mesh holds every k vector of the direct sum and the
+Nyquist bins have weight 0, so the only error is the interpolation error; where the
+mesh size changes under strain the energy jumps by it (2e-7 eV at the 30 A dimer,
+the float32 floor). Fractional coordinates and the metric make it exactly
+rotation invariant for fixed charges.
+
+Selection: hypers `les_method` (`ewald | pme | auto`), `les_pme_order`,
+`les_pme_spacing`, `les_pme_atoms` (auto: PME from 128 atoms per structure), or the
+GGUF key `plato.les_method`, `MLIPCPP_PLATO_LES_METHOD`, `--les-method` on
+`mlipcpp-plato` and `mlipcpp-train-plato` (one PME mesh per micro-batch). Older GGUFs:
+auto, order 8, spacing 0.5.
+
+Accuracy against the direct sum, float64 PyTorch, LES part only (forces and stress
+relative to the LES contribution), D2-attention model on the 30 A dimer tiled 2^3
+(160 atoms) and 4^3 (1,280):
+
+| order | h / sigma | energy | forces | stress |
+|---|---|---|---|---|
+| 6 | 0.4 | 8e-7 - 1e-6 | 2e-5 | 6e-6 |
+| 6 | 0.5 | 5e-8 | 8e-5 - 1e-4 | 3e-7 |
+| 8 | 0.4 | 4e-8 | 6e-7 | 3e-7 |
+| 8 | 0.5 (default) | 2e-9 | 5e-6 - 7e-6 | 2e-8 |
+| 8 | 0.6 | 6e-8 | 3e-5 | 9e-6 |
+| 8 | 0.7 | 2e-5 | 2e-4 | 1e-4 |
+
+mlip.cpp float32 PME against its direct sum: forces 3e-6 - 1e-5 of the LES forces;
+CPU against CUDA 3e-6 - 7e-6; `tests/test_plato_pme.cpp` checks the ops against the
+direct sum in double.
+
+GH200 (fp32, `GGML_CUDA_NO_TF32=1`), D2-attention, energy + forces + stress per call,
+graph compute (ms):
+
+| atoms | direct | PME | no LES |
+|---|---|---|---|
+| 1,280 | 23.4 | 6.1 | 5.5 |
+| 10,240 | 749 | 42.3 | 37.2 |
+| 20,000 | 3,672 | 79.2 | 71.8 |
+| 98,260 | - | 386 | 359 |
+
 ## Mesh size
 
 PyTorch uses `max(8, ceil(|a_i| / mesh_spacing))` per cell vector, from the

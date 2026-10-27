@@ -112,6 +112,25 @@ target_include_directories(test_graph_interpreter
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/
 )
 
+# Plato LES by PME: ggml ops against the direct Ewald sum
+add_executable(test_plato_pme
+    test_plato_pme.cpp
+)
+
+target_link_libraries(test_plato_pme
+    PRIVATE
+        mlipcpp
+        Catch2::Catch2WithMain
+        ggml
+        fmt::fmt
+)
+
+target_include_directories(test_plato_pme
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/
+)
+
 # Auto-export vs manual comparison tests
 add_executable(test_auto_vs_manual
     test_auto_vs_manual.cpp
@@ -141,6 +160,7 @@ catch_discover_tests(test_pet_gradients)
 catch_discover_tests(test_io)
 catch_discover_tests(test_neighbor_list)
 catch_discover_tests(test_system)
+catch_discover_tests(test_plato_pme)
 catch_discover_tests(test_graph_interpreter)
 catch_discover_tests(test_auto_vs_manual)
 
