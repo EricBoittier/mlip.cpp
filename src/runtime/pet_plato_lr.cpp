@@ -379,6 +379,39 @@ ggml_tensor *PetPlatoLR::rope_attn(ggml_context *ctx, const GIRNode &node, const
   auto half = [&](ggml_tensor *x, int s) {
     return ggml_view_4d(ctx, x, C2, L, H, N, x->nb[1], x->nb[2], x->nb[3], s * C2 * ggml_element_size(x));
   };
+  static const bool loop = std::getenv("MLIPCPP_PLATO_FRAME_LOOP") != nullptr;
+  if (!loop) {
+    // every frame at once: the frames as an outer block of the sequence axis, N F sequences in
+    // one fused attention (fewer, larger kernels than one attention per frame)
+    const int64_t NF = N * F;
+    ggml_tensor *Rw = mm_f32(ctx, ggml_reshape_2d(ctx, cont(ctx, frames), 3, 3 * F), omega); // [3F, C2]: (R_f omega_c)_a
+    Rw = ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, Rw, 3, F, C2), 0, 2, 1, 3)), 3, C2 * F);
+    ggml_tensor *ang = mm_f32(ctx, Rw, pos);                                                   // [C2 F, L N]
+    ang = ggml_reshape_4d(ctx, ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, ang, C2, F, L * N), 0, 2, 1, 3)), C2, 1, L, NF);
+    ggml_tensor *c = ggml_cos(ctx, ang), *s = ggml_sin(ctx, ang);
+    auto heads = [&](ggml_tensor *x) { // [Ch, L, H, N] -> [Ch, H, L, N F], the frames' copies
+      ggml_tensor *t = ggml_cont(ctx, ggml_permute(ctx, x, 0, 2, 1, 3));
+      return ggml_repeat(ctx, t, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, Ch, H, L, NF));
+    };
+    auto rope = [&](ggml_tensor *x) { // [Ch, H, L, NF] -> [D, 1, L, NF]
+      ggml_tensor *x1 = ggml_view_4d(ctx, x, C2, H, L, NF, x->nb[1], x->nb[2], x->nb[3], 0);
+      ggml_tensor *x2 = ggml_view_4d(ctx, x, C2, H, L, NF, x->nb[1], x->nb[2], x->nb[3], C2 * ggml_element_size(x));
+      ggml_tensor *y = ggml_concat(ctx, ggml_sub(ctx, ggml_mul(ctx, x1, c), ggml_mul(ctx, x2, s)),
+                                   ggml_add(ctx, ggml_mul(ctx, x1, s), ggml_mul(ctx, x2, c)), 0);
+      return ggml_reshape_4d(ctx, y, D, 1, L, NF);
+    };
+    ggml_tensor *vF = ggml_repeat(ctx, vt, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, 1, L, NF));
+    ggml_tensor *xt = ggml_concat(ctx, ggml_concat(ctx, rope(heads(q)), rope(heads(k)), 1), vF, 1); // [D, 3, L, NF]
+    ggml_tensor *bF = ggml_repeat(ctx, bias, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, L, L, 1, NF));
+    ggml_tensor *r = ggml_pet_attn(ctx, xt, bF, static_cast<int>(H), scale);                            // [D + H, L, NF]
+    ggml_tensor *o = nullptr;
+    for (int f = 0; f < F; f++) {
+      ggml_tensor *of = ggml_view_3d(ctx, r, D, L, N, r->nb[1], r->nb[2], f * N * r->nb[2]);
+      o = o ? ggml_add(ctx, o, of) : ggml_cont(ctx, of);
+    }
+    if (F > 1) o = ggml_scale(ctx, o, 1.0f / F);
+    return ggml_permute(ctx, ggml_reshape_4d(ctx, o, Ch, H, L, N), 0, 2, 1, 3); // [Ch, L, H, N]
+  }
   ggml_tensor *acc = nullptr;
   for (int f = 0; f < F; f++) {
     ggml_tensor *R = ggml_view_2d(ctx, frames, 3, 3, frames->nb[1], f * frames->nb[2]);
@@ -406,6 +439,19 @@ ggml_tensor *PetPlatoLR::edge_sum(ggml_context *ctx, const std::vector<ggml_tens
   const int64_t M = x->ne[1], n = x->ne[2], E = M * n, d = W->ne[1];
   const int F = static_cast<int>(frames->ne[2]);
   ggml_tensor *r = ggml_cont(ctx, ggml_view_2d(ctx, cont(ctx, x), 3, E, x->ne[0] * ggml_element_size(x), 0)); // [3, E]
+  static const bool loop = std::getenv("MLIPCPP_PLATO_FRAME_LOOP") != nullptr;
+  if (!loop) { // every frame in one product: A [3, 3F], A[j, i + 3f] = R_f[j][i]
+    ggml_tensor *A = ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_permute(ctx, frames, 1, 0, 2, 3)), 3, 3 * F);
+    ggml_tensor *rf = ggml_reshape_2d(ctx, mm_f32(ctx, A, r), 3, F * E);       // R_f^T r, frame-fastest
+    ggml_tensor *t = ggml_reshape_3d(ctx, ggml_silu(ctx, ggml_mul_mat(ctx, W, rf)), d, F, E);
+    ggml_tensor *o = nullptr;
+    for (int f = 0; f < F; f++) {
+      ggml_tensor *tf = ggml_view_2d(ctx, t, d, E, t->nb[2], f * t->nb[1]);
+      o = o ? ggml_add(ctx, o, tf) : ggml_cont(ctx, tf);
+    }
+    if (F > 1) o = ggml_scale(ctx, o, 1.0f / F);
+    return ggml_reshape_3d(ctx, o, d, M, n);
+  }
   ggml_tensor *acc = nullptr;
   for (int f = 0; f < F; f++) {
     ggml_tensor *R = ggml_view_2d(ctx, frames, 3, 3, frames->nb[1], f * frames->nb[2]);
