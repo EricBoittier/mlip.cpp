@@ -18,4 +18,5 @@ for w in final best; do
   done
 done
 cp $R/test.final.metrics.json $R/test.metrics.json
+$PY -I $Q/scripts/curves.py $Q/runs $Q/runs/curves >> $R/eval.log 2>&1
 echo "$(date -Is) finished $NAME" >> $R/train.out
