@@ -94,6 +94,30 @@ public:
   // PET attention through ggml_pet_attn_jvp (nothing L x L stored), else the
   // unfused expression (pet_attn above); MLIPCPP_JVP_UNFUSED_ATTN=1: unfused
   bool fused_attention = std::getenv("MLIPCPP_JVP_UNFUSED_ATTN") == nullptr;
+  // the Plato long-range ops (Plato-PET-LR in PET graphs): their position
+  // dependence (fractional coordinates) and ggml_plato_ewald / ggml_plato_pme are
+  // differentiated by central differences along the tangent, f(x + h t) - f(x - h t)
+  // over 2h, which ggml's backward pass then differentiates in the parameters
+  // (exact for the quadratic structure-factor sums; O(h^2) in the coordinates, so the
+  // tangents should be O(1): the caller normalises them). Linear parts are exact.
+  float fd_h = 1e-2f;
+  // a copy of node x with some sources replaced
+  ggml_tensor *clone(ggml_tensor *x, ggml_tensor *s0, ggml_tensor *s1) {
+    ggml_tensor *y = ggml_new_tensor(c, x->type, GGML_MAX_DIMS, x->ne);
+    y->op = x->op;
+    std::memcpy(y->op_params, x->op_params, sizeof(x->op_params));
+    for (int i = 0; i < GGML_MAX_SRC; i++) y->src[i] = x->src[i];
+    if (s0) y->src[0] = s0;
+    if (s1) y->src[1] = s1;
+    return y;
+  }
+  ggml_tensor *shift(ggml_tensor *a, ggml_tensor *t, float h) { return t ? ggml_add(c, a, ggml_scale(c, cont(t), h)) : a; }
+  // central difference of x along the tangents (u, v) of its first two sources
+  ggml_tensor *central(ggml_tensor *x, ggml_tensor *u, ggml_tensor *v) {
+    ggml_tensor *p = clone(x, shift(x->src[0], u, fd_h), shift(x->src[1], v, fd_h));
+    ggml_tensor *m = clone(x, shift(x->src[0], u, -fd_h), shift(x->src[1], v, -fd_h));
+    return ggml_scale(c, ggml_sub(c, p, m), 0.5f / fd_h);
+  }
   void seed(ggml_tensor *x, ggml_tensor *v) { tangents[x] = v; }
   ggml_tensor *operator()(ggml_tensor *x) {
     if (!x)
@@ -250,6 +274,27 @@ public:
       } else {
         t = pet_attn(x, u, v);
       }
+      break;
+    case GGML_OP_GET_ROWS_BACK:
+      t = u ? ggml_get_rows_back(c, cont(u), b, x) : nullptr;
+      break;
+    case GGML_OP_PLATO_ERF:
+      t = mul(ggml_scale(c, ggml_exp(c, ggml_scale(c, ggml_sqr(c, a), -1.0f)), 1.1283791670955126f), u);
+      break;
+    case GGML_OP_PLATO_FFT3: // linear
+      t = clone(x, cont(u), nullptr);
+      break;
+    case GGML_OP_PLATO_SPREAD: // linear in the values (src0), smooth in the coordinates (src1)
+    case GGML_OP_PLATO_GATHER: // linear in the mesh (src0), smooth in the coordinates (src1)
+      if (x->op == GGML_OP_PLATO_GATHER && x->op_params[0] != 0) {
+        t = unsupported("JVP of plato_gather derivatives");
+        break;
+      }
+      t = add(u ? clone(x, cont(u), nullptr) : nullptr, v ? central(x, nullptr, v) : nullptr);
+      break;
+    case GGML_OP_PLATO_EWALD: // coordinates (src0) and charges (src1); quadratic in the charges
+    case GGML_OP_PLATO_PME:   // the half spectrum (src0; quadratic), the metric (src1)
+      t = central(x, u, v);
       break;
     case GGML_OP_UNARY:
       switch (ggml_get_unary_op(x)) {

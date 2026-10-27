@@ -9,6 +9,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
+#include <array>
 #include <map>
 #include <stdexcept>
 
@@ -86,13 +88,12 @@ PetPlatoLRSpec PetPlatoLRSpec::from_gguf(const GGUFLoader &L) {
 void PetPlatoLR::create(ggml_context *ctx, const PetPlatoLRSpec &spec, const std::vector<PetPlatoLRStructure> &structures,
                         int n_atoms, bool grad) {
   spec_ = spec, st_ = structures, n_ = n_atoms;
-  all_.clear();
+  all_.clear(), groups_.clear();
   frac_ = pair_r_ = nullptr;
+  strain = nullptr, pair_i_ = pair_j_ = nullptr, atom_inv_cell_t_ = nullptr, open_mask_ = nullptr;
+  n_pairs_ = 0, any_open_ = false;
   const int G = static_cast<int>(st_.size());
   if (G < 1) throw std::runtime_error("Plato-PET-LR: no structure");
-  periodic_ = st_[0].periodic;
-  for (const auto &s : st_)
-    if (s.periodic != periodic_) throw std::runtime_error("Plato-PET-LR: a batch mixes periodic and open structures");
   auto input = [&](ggml_type t, int64_t a, int64_t b = 1, int64_t c = 1, const char *name = "") {
     ggml_tensor *x = ggml_new_tensor_3d(ctx, t, a, b, c);
     ggml_set_name(x, name);
@@ -102,120 +103,142 @@ void PetPlatoLR::create(ggml_context *ctx, const PetPlatoLRSpec &spec, const std
   };
   positions = input(GGML_TYPE_F32, 3, n_, 1, "plato_lr.positions");
   if (grad) ggml_set_param(positions);
-  // structure bookkeeping
   h_sidx_.assign(n_, 0), h_onehot_.assign(size_t(n_) * G, 0.0f), h_invc_.assign(G, 0.0f), h_qpa_.assign(n_, 0.0f);
+  h_omask_.assign(n_, 0.0f);
   for (int g = 0; g < G; g++) {
     const auto &s = st_[g];
     const int na = s.a1 - s.a0;
     if (na <= 0 || s.a0 < 0 || s.a1 > n_) throw std::runtime_error("Plato-PET-LR: bad structure atom range");
     h_invc_[g] = 1.0f / na;
-    for (int i = s.a0; i < s.a1; i++)
+    for (int i = s.a0; i < s.a1; i++) {
       h_sidx_[i] = g, h_onehot_[size_t(g) * n_ + i] = 1.0f, h_qpa_[i] = static_cast<float>(s.charge / na);
+      if (!s.periodic) h_omask_[i] = 1.0f;
+    }
+    any_open_ |= !s.periodic;
   }
   struct_index_ = input(GGML_TYPE_I32, n_, 1, 1, "plato_lr.struct_index");
   onehot_ = ggml_reshape_2d(ctx, input(GGML_TYPE_F32, n_, G, 1, "plato_lr.onehot"), n_, G);
   inv_count_ = ggml_reshape_2d(ctx, input(GGML_TYPE_F32, 1, G, 1, "plato_lr.inv_count"), 1, G);
   charge_per_atom_ = ggml_reshape_2d(ctx, input(GGML_TYPE_F32, 1, n_, 1, "plato_lr.charge_per_atom"), 1, n_);
-  mesh_[0] = mesh_[1] = mesh_[2] = 0, les_mesh_[0] = les_mesh_[1] = les_mesh_[2] = 0, nk_ = 0, n_pairs_ = 0;
-  strain = nullptr;
   if (!spec_.long_range()) return;
 
-  if (!periodic_) { // off-diagonal pairs within each structure
+  if (any_open_) { // off-diagonal pairs within each open structure
     h_pi_.clear(), h_pj_.clear();
     for (const auto &s : st_)
-      for (int i = s.a0; i < s.a1; i++)
-        for (int j = s.a0; j < s.a1; j++)
-          if (i != j) h_pi_.push_back(i), h_pj_.push_back(j);
+      if (!s.periodic)
+        for (int i = s.a0; i < s.a1; i++)
+          for (int j = s.a0; j < s.a1; j++)
+            if (i != j) h_pi_.push_back(i), h_pj_.push_back(j);
     n_pairs_ = static_cast<int64_t>(h_pi_.size());
     if (n_pairs_ > 0) {
       pair_i_ = input(GGML_TYPE_I32, n_pairs_, 1, 1, "plato_lr.pair_i");
       pair_j_ = input(GGML_TYPE_I32, n_pairs_, 1, 1, "plato_lr.pair_j");
     }
-    return;
+    open_mask_ = ggml_reshape_2d(ctx, input(GGML_TYPE_F32, 1, n_, 1, "plato_lr.open_mask"), 1, n_);
   }
+  bool any_periodic = false;
+  for (const auto &s : st_) any_periodic |= s.periodic;
+  if (!any_periodic) return;
 
-  // periodic: inverse cells, volumes, mesh and k vectors per structure
-  strain = input(GGML_TYPE_F32, 3, 3, G, "plato_lr.strain");
-  if (grad) ggml_set_param(strain);
+  // periodic structures: inverse cells, then groups of equal meshes
   std::vector<std::array<std::array<double, 3>, 3>> inv(G);
-  h_invv_.assign(G, 0.0f), h_aict_.assign(9 * size_t(n_), 0.0f);
-  for (int g = 0; g < G; g++) {
-    double Ci[3][3], det;
-    inverse3(st_[g].cell, Ci, det);
-    for (int a = 0; a < 3; a++)
-      for (int b = 0; b < 3; b++) inv[g][a][b] = Ci[a][b];
-    h_invv_[g] = static_cast<float>(1.0 / std::abs(det));
-    for (int i = st_[g].a0; i < st_[g].a1; i++)
-      for (int j = 0; j < 3; j++)
-        for (int k = 0; k < 3; k++) h_aict_[9 * size_t(i) + j * 3 + k] = static_cast<float>(Ci[k][j]);
-  }
-  atom_inv_cell_t_ = input(GGML_TYPE_F32, 3, 3, n_, "plato_lr.atom_inv_cell_t");
-  inv_volume_ = ggml_reshape_2d(ctx, input(GGML_TYPE_F32, 1, G, 1, "plato_lr.inv_volume"), 1, G);
-  auto row = [&](int g, int a) {
-    static thread_local float r[3];
+  std::vector<double> vol(G, 0.0);
+  h_aict_.assign(9 * size_t(n_), 0.0f);
+  auto row = [&](int g, int a, float *r) {
     for (int b = 0; b < 3; b++) r[b] = static_cast<float>(st_[g].cell[a][b]);
     return r;
   };
   auto rnorm = [&](int g, int a) {
-    double s = 0;
-    for (int b = 0; b < 3; b++) s += st_[g].cell[a][b] * st_[g].cell[a][b];
-    return std::sqrt(s);
+    double x = 0;
+    for (int b = 0; b < 3; b++) x += st_[g].cell[a][b] * st_[g].cell[a][b];
+    return std::sqrt(x);
   };
-  if (spec_.mesh) {
-    for (int a = 0; a < 3; a++) mesh_[a] = plato::mesh_points(row(0, a), spec_.mesh_spacing);
-    for (int g = 1; g < G; g++)
-      for (int a = 0; a < 3; a++)
-        if (plato::mesh_points(row(g, a), spec_.mesh_spacing) != mesh_[a])
-          throw std::runtime_error("Plato-PET-LR: the periodic structures of a batch need the same mesh");
-    const int M0 = mesh_[0], M1 = mesh_[1], M2 = mesh_[2], Mh2 = M2 / 2 + 1;
-    const int64_t Mh = int64_t(M0) * M1 * Mh2;
-    h_mk_.assign(3 * size_t(Mh) * G, 0.0f), h_mpad_.assign(Mh, 0.0f), h_mdec_.assign(Mh, 0.0f);
-    auto freq = [](int i, int M) { return i <= (M - 1) / 2 ? i : i - M; };
-    for (int i0 = 0; i0 < M0; i0++)
-      for (int i1 = 0; i1 < M1; i1++)
-        for (int i2 = 0; i2 < Mh2; i2++) {
-          const int64_t e = (int64_t(i0) * M1 + i1) * Mh2 + i2;
-          const double m[3] = {double(freq(i0, M0)), double(freq(i1, M1)), double(i2)};
-          for (int g = 0; g < G; g++)
-            for (int b = 0; b < 3; b++)
-              h_mk_[3 * (size_t(g) * Mh + e) + b] =
-                  static_cast<float>(2 * M_PI * (m[0] * inv[g][b][0] + m[1] * inv[g][b][1] + m[2] * inv[g][b][2]));
-          double dc = 1;
-          for (int a = 0; a < 3; a++) {
-            const double f = (4 + 2 * std::cos(2 * M_PI * m[a] / mesh_[a])) / 6;
-            dc *= f * f;
-          }
-          const bool zero = i0 == 0 && i1 == 0 && i2 == 0;
-          h_mpad_[e] = zero ? 1.0f : 0.0f;
-          h_mdec_[e] = zero ? 0.0f : static_cast<float>(1.0 / dc);
-        }
-    mesh_k_ = input(GGML_TYPE_F32, 3, Mh, G, "plato_lr.mesh_k");
-    mesh_k0_pad_ = ggml_reshape_2d(ctx, input(GGML_TYPE_F32, 1, Mh, 1, "plato_lr.mesh_k0_pad"), 1, Mh);
-    mesh_deconv_ = ggml_reshape_2d(ctx, input(GGML_TYPE_F32, 1, Mh, 1, "plato_lr.mesh_deconv"), 1, Mh);
+  int max_atoms = 0;
+  for (const auto &s : st_) max_atoms = std::max(max_atoms, s.a1 - s.a0);
+  const bool pme = spec_.les && (spec_.les_method == "pme" || (spec_.les_method == "auto" && max_atoms >= spec_.les_pme_atoms));
+  if (pme && spec_.num_charges != 1) throw std::runtime_error("Plato-PET-LR: LES PME needs one charge channel");
+  const double h_pme = spec_.les_pme_spacing * spec_.les_sigma;
+  for (int g = 0; g < G; g++) {
+    if (!st_[g].periodic) continue;
+    double Ci[3][3], det;
+    inverse3(st_[g].cell, Ci, det);
+    for (int a = 0; a < 3; a++)
+      for (int b = 0; b < 3; b++) inv[g][a][b] = Ci[a][b];
+    vol[g] = std::abs(det);
+    for (int i = st_[g].a0; i < st_[g].a1; i++)
+      for (int j = 0; j < 3; j++)
+        for (int k = 0; k < 3; k++) h_aict_[9 * size_t(i) + j * 3 + k] = static_cast<float>(Ci[k][j]);
+    int mesh[3] = {0, 0, 0}, lmesh[3] = {0, 0, 0};
+    float r[3];
+    for (int a = 0; a < 3; a++) {
+      if (spec_.mesh) mesh[a] = plato::mesh_points(row(g, a, r), spec_.mesh_spacing);
+      if (pme) lmesh[a] = plato::pme_mesh_points(row(g, a, r), h_pme, spec_.les_pme_order);
+    }
+    Group *grp = nullptr;
+    for (auto &q : groups_)
+      if (std::equal(mesh, mesh + 3, q.mesh) && std::equal(lmesh, lmesh + 3, q.les_mesh)) grp = &q;
+    if (!grp) {
+      groups_.emplace_back();
+      grp = &groups_.back();
+      std::copy(mesh, mesh + 3, grp->mesh), std::copy(lmesh, lmesh + 3, grp->les_mesh);
+    }
+    grp->structs.push_back(g);
   }
-  if (spec_.les) {
-    int max_atoms = 0;
-    for (const auto &s : st_) max_atoms = std::max(max_atoms, s.a1 - s.a0);
-    const bool pme = spec_.les_method == "pme" || (spec_.les_method == "auto" && max_atoms >= spec_.les_pme_atoms);
-    if (pme) {
-      if (spec_.num_charges != 1) throw std::runtime_error("Plato-PET-LR: LES PME needs one charge channel");
-      const double h = spec_.les_pme_spacing * spec_.les_sigma;
-      for (int a = 0; a < 3; a++) les_mesh_[a] = plato::pme_mesh_points(row(0, a), h, spec_.les_pme_order);
-      for (int g = 1; g < G; g++)
-        for (int a = 0; a < 3; a++)
-          if (plato::pme_mesh_points(row(g, a), h, spec_.les_pme_order) != les_mesh_[a])
-            throw std::runtime_error("Plato-PET-LR: the periodic structures of a batch need the same LES mesh");
-      h_tab_ = plato::pme_axis_table(les_mesh_, spec_.les_pme_order);
-      h_lK_.assign(9 * size_t(G), 0.0f);
-      for (int g = 0; g < G; g++)
-        for (int b = 0; b < 3; b++)
-          for (int q = 0; q < 3; q++) h_lK_[9 * size_t(g) + 3 * b + q] = static_cast<float>(2 * M_PI * inv[g][q][b]);
-      les_K_ = input(GGML_TYPE_F32, 3, 3, G, "plato_lr.les_K");
-      les_tab_ = input(GGML_TYPE_F32, static_cast<int64_t>(h_tab_.size()), 1, 1, "plato_lr.les_tab");
-    } else { // the union over the batch of the integer k sets (each structure's window drops the rest)
+  atom_inv_cell_t_ = input(GGML_TYPE_F32, 3, 3, n_, "plato_lr.atom_inv_cell_t");
+  auto freq = [](int i, int M) { return i <= (M - 1) / 2 ? i : i - M; };
+  for (Group &q : groups_) {
+    const int Gq = q.size();
+    q.h_bidx.assign(n_, 0), q.h_mask.assign(n_, 0.0f), q.h_invc.resize(Gq), q.h_invv.resize(Gq);
+    for (int b = 0; b < Gq; b++) {
+      const auto &s = st_[q.structs[b]];
+      q.h_invc[b] = 1.0f / (s.a1 - s.a0), q.h_invv[b] = static_cast<float>(1.0 / vol[q.structs[b]]);
+      for (int i = s.a0; i < s.a1; i++) q.h_bidx[i] = b, q.h_mask[i] = 1.0f;
+    }
+    q.bidx = input(GGML_TYPE_I32, n_, 1, 1, "plato_lr.group_index");
+    q.mask = ggml_reshape_2d(ctx, input(GGML_TYPE_F32, 1, n_, 1, "plato_lr.group_mask"), 1, n_);
+    q.inv_count = ggml_reshape_2d(ctx, input(GGML_TYPE_F32, 1, Gq, 1, "plato_lr.group_inv_count"), 1, Gq);
+    q.inv_volume = ggml_reshape_2d(ctx, input(GGML_TYPE_F32, 1, Gq, 1, "plato_lr.inv_volume"), 1, Gq);
+    q.strain = input(GGML_TYPE_F32, 3, 3, Gq, "plato_lr.strain");
+    if (grad) ggml_set_param(q.strain);
+    if (spec_.mesh) {
+      const int M0 = q.mesh[0], M1 = q.mesh[1], M2 = q.mesh[2], Mh2 = M2 / 2 + 1;
+      const int64_t Mh = int64_t(M0) * M1 * Mh2;
+      q.h_mk.assign(3 * size_t(Mh) * Gq, 0.0f), q.h_mpad.assign(Mh, 0.0f), q.h_mdec.assign(Mh, 0.0f);
+      for (int i0 = 0; i0 < M0; i0++)
+        for (int i1 = 0; i1 < M1; i1++)
+          for (int i2 = 0; i2 < Mh2; i2++) {
+            const int64_t e = (int64_t(i0) * M1 + i1) * Mh2 + i2;
+            const double m[3] = {double(freq(i0, M0)), double(freq(i1, M1)), double(i2)};
+            for (int b = 0; b < Gq; b++) {
+              const auto &I = inv[q.structs[b]];
+              for (int c = 0; c < 3; c++)
+                q.h_mk[3 * (size_t(b) * Mh + e) + c] = static_cast<float>(2 * M_PI * (m[0] * I[c][0] + m[1] * I[c][1] + m[2] * I[c][2]));
+            }
+            double dc = 1;
+            for (int a = 0; a < 3; a++) {
+              const double f = (4 + 2 * std::cos(2 * M_PI * m[a] / q.mesh[a])) / 6;
+              dc *= f * f;
+            }
+            const bool zero = i0 == 0 && i1 == 0 && i2 == 0;
+            q.h_mpad[e] = zero ? 1.0f : 0.0f;
+            q.h_mdec[e] = zero ? 0.0f : static_cast<float>(1.0 / dc);
+          }
+      q.mesh_k = input(GGML_TYPE_F32, 3, Mh, Gq, "plato_lr.mesh_k");
+      q.mesh_k0_pad = ggml_reshape_2d(ctx, input(GGML_TYPE_F32, 1, Mh, 1, "plato_lr.mesh_k0_pad"), 1, Mh);
+      q.mesh_deconv = ggml_reshape_2d(ctx, input(GGML_TYPE_F32, 1, Mh, 1, "plato_lr.mesh_deconv"), 1, Mh);
+    }
+    if (spec_.les && pme) {
+      q.h_tab = plato::pme_axis_table(q.les_mesh, spec_.les_pme_order);
+      q.h_lK.assign(9 * size_t(Gq), 0.0f);
+      for (int b = 0; b < Gq; b++)
+        for (int c = 0; c < 3; c++)
+          for (int k = 0; k < 3; k++) q.h_lK[9 * size_t(b) + 3 * c + k] = static_cast<float>(2 * M_PI * inv[q.structs[b]][k][c]);
+      q.les_K = input(GGML_TYPE_F32, 3, 3, Gq, "plato_lr.les_K");
+      q.les_tab = input(GGML_TYPE_F32, static_cast<int64_t>(q.h_tab.size()), 1, 1, "plato_lr.les_tab");
+    } else if (spec_.les) { // the union over the group of the integer k sets (each structure's window drops the rest)
       const double kc = spec_.les_kcut / spec_.les_sigma;
       int nmax[3] = {0, 0, 0};
-      for (int g = 0; g < G; g++)
+      for (int g : q.structs)
         for (int a = 0; a < 3; a++) nmax[a] = std::max(nmax[a], static_cast<int>(std::floor(kc * rnorm(g, a) / (2 * M_PI))));
       std::vector<std::array<int, 3>> ns;
       for (int a = -nmax[0]; a <= nmax[0]; a++)
@@ -223,30 +246,40 @@ void PetPlatoLR::create(ggml_context *ctx, const PetPlatoLRSpec &spec, const std
           for (int c = -nmax[2]; c <= nmax[2]; c++) {
             if (!(a > 0 || (a == 0 && b > 0) || (a == 0 && b == 0 && c > 0))) continue;
             bool any = false;
-            for (int g = 0; g < G && !any; g++) {
+            for (size_t t = 0; t < q.structs.size() && !any; t++) {
+              const auto &I = inv[q.structs[t]];
               double k2 = 0;
-              for (int q = 0; q < 3; q++) {
-                const double k = 2 * M_PI * (a * inv[g][q][0] + b * inv[g][q][1] + c * inv[g][q][2]);
+              for (int d = 0; d < 3; d++) {
+                const double k = 2 * M_PI * (a * I[d][0] + b * I[d][1] + c * I[d][2]);
                 k2 += k * k;
               }
               any = k2 < kc * kc;
             }
             if (any) ns.push_back({a, b, c});
           }
-      nk_ = static_cast<int64_t>(ns.size());
-      if (nk_ == 0) ns.push_back({1, 0, 0}), nk_ = 1; // a tiny cell: one k, outside the window (weight 0)
-      h_ln_.clear(), h_lk_.assign(3 * size_t(nk_) * G, 0.0f);
-      for (int64_t e = 0; e < nk_; e++) {
-        for (int q = 0; q < 3; q++) h_ln_.push_back(static_cast<float>(2 * M_PI * ns[e][q]));
-        for (int g = 0; g < G; g++)
-          for (int q = 0; q < 3; q++)
-            h_lk_[3 * (size_t(g) * nk_ + e) + q] = static_cast<float>(
-                2 * M_PI * (ns[e][0] * inv[g][q][0] + ns[e][1] * inv[g][q][1] + ns[e][2] * inv[g][q][2]));
+      if (ns.empty()) ns.push_back({1, 0, 0}); // a tiny cell: one k, outside the window (weight 0)
+      q.nk = static_cast<int64_t>(ns.size());
+      q.h_ln.clear(), q.h_lk.assign(3 * size_t(q.nk) * Gq, 0.0f);
+      for (int64_t e = 0; e < q.nk; e++) {
+        for (int d = 0; d < 3; d++) q.h_ln.push_back(static_cast<float>(2 * M_PI * ns[e][d]));
+        for (int b = 0; b < Gq; b++) {
+          const auto &I = inv[q.structs[b]];
+          for (int d = 0; d < 3; d++)
+            q.h_lk[3 * (size_t(b) * q.nk + e) + d] =
+                static_cast<float>(2 * M_PI * (ns[e][0] * I[d][0] + ns[e][1] * I[d][1] + ns[e][2] * I[d][2]));
+        }
       }
-      les_n_ = ggml_reshape_2d(ctx, input(GGML_TYPE_F32, 3, nk_, 1, "plato_lr.les_n"), 3, nk_);
-      les_k_ = input(GGML_TYPE_F32, 3, nk_, G, "plato_lr.les_k");
+      q.les_n = ggml_reshape_2d(ctx, input(GGML_TYPE_F32, 3, q.nk, 1, "plato_lr.les_n"), 3, q.nk);
+      q.les_k = input(GGML_TYPE_F32, 3, q.nk, Gq, "plato_lr.les_k");
     }
   }
+  strain = groups_[0].strain;
+}
+
+std::vector<ggml_tensor *> PetPlatoLR::strains() const {
+  std::vector<ggml_tensor *> out;
+  for (const auto &q : groups_) out.push_back(q.strain);
+  return out;
 }
 
 void PetPlatoLR::upload(const float *pos) const {
@@ -257,14 +290,17 @@ void PetPlatoLR::upload(const float *pos) const {
   set(struct_index_, h_sidx_.data());
   set(onehot_, h_onehot_.data()), set(inv_count_, h_invc_.data()), set(charge_per_atom_, h_qpa_.data());
   if (pair_i_) set(pair_i_, h_pi_.data()), set(pair_j_, h_pj_.data());
-  if (strain) {
-    std::vector<float> z(ggml_nelements(strain), 0.0f);
-    set(strain, z.data());
+  if (open_mask_) set(open_mask_, h_omask_.data());
+  if (atom_inv_cell_t_) set(atom_inv_cell_t_, h_aict_.data());
+  for (const Group &q : groups_) {
+    std::vector<float> z(ggml_nelements(q.strain), 0.0f);
+    set(q.strain, z.data());
+    set(q.bidx, q.h_bidx.data()), set(q.mask, q.h_mask.data()), set(q.inv_count, q.h_invc.data());
+    set(q.inv_volume, q.h_invv.data());
+    if (q.mesh_k) set(q.mesh_k, q.h_mk.data()), set(q.mesh_k0_pad, q.h_mpad.data()), set(q.mesh_deconv, q.h_mdec.data());
+    if (q.les_n) set(q.les_n, q.h_ln.data()), set(q.les_k, q.h_lk.data());
+    if (q.les_K) set(q.les_K, q.h_lK.data()), set(q.les_tab, q.h_tab.data());
   }
-  if (atom_inv_cell_t_) set(atom_inv_cell_t_, h_aict_.data()), set(inv_volume_, h_invv_.data());
-  if (mesh_k_) set(mesh_k_, h_mk_.data()), set(mesh_k0_pad_, h_mpad_.data()), set(mesh_deconv_, h_mdec_.data());
-  if (les_n_) set(les_n_, h_ln_.data()), set(les_k_, h_lk_.data());
-  if (les_K_) set(les_K_, h_lK_.data()), set(les_tab_, h_tab_.data());
 }
 
 ggml_tensor *PetPlatoLR::build(ggml_context *ctx, const GIRNode &node, const std::vector<ggml_tensor *> &in) {
@@ -342,18 +378,25 @@ ggml_tensor *PetPlatoLR::edge_sum(ggml_context *ctx, const std::vector<ggml_tens
   return ggml_reshape_3d(ctx, acc, d, M, n);
 }
 
+ggml_tensor *PetPlatoLR::inv_volume(ggml_context *ctx, const Group &g) {
+  const int Gq = g.size();
+  auto e = [&](int k) { return ggml_cont(ctx, ggml_view_2d(ctx, g.strain, 1, Gq, g.strain->nb[2], k * sizeof(float))); };
+  ggml_tensor *tr = ggml_add(ctx, ggml_add(ctx, e(0), e(4)), e(8));
+  return ggml_mul(ctx, ggml_scale_bias(ctx, tr, -1.0f, 1.0f), g.inv_volume);
+}
+
 // v [C, n], filt.0 (w [1, h], b [h]), filt.2 (w [h, C], b [C]), k_quad [nq], w_quad [nq] -> [C, n]
 ggml_tensor *PetPlatoLR::mesh_op(ggml_context *ctx, const GIRNode &node, const std::vector<ggml_tensor *> &in) {
   if (in.size() != 7) throw std::runtime_error("PLATO_MESH: 7 inputs");
   ggml_tensor *v = cont(ctx, in[0]);
-  const int64_t C = v->ne[0], n = v->ne[1];
-  const int G = n_struct();
+  const int64_t C = v->ne[0];
   auto filt = [&](ggml_tensor *kk) { // [1, m] -> [C, m]
     return ggml_add(ctx, ggml_mul_mat(ctx, in[3], ggml_silu(ctx, ggml_add(ctx, ggml_mul_mat(ctx, in[1], kk), in[2]))), in[4]);
   };
   const float sigma = static_cast<float>(param_num(node, "sigma", spec_.mesh_sigma));
-  if (!periodic_) {
-    if (param_num(node, "open_boundary", 1) == 0) return ggml_scale(ctx, v, 0.0f);
+  ggml_tensor *m = nullptr;
+  auto acc = [&](ggml_tensor *t) { m = m ? ggml_add(ctx, m, t) : t; };
+  if (any_open_ && param_num(node, "open_boundary", 1) != 0) {
     ggml_tensor *kq = in[5], *wq = in[6];
     const int64_t nq = kq->ne[0];
     ggml_tensor *wf = ggml_mul(ctx, filt(ggml_reshape_2d(ctx, kq, 1, nq)), ggml_reshape_2d(ctx, wq, 1, nq)); // [C, nq]
@@ -361,111 +404,114 @@ ggml_tensor *PetPlatoLR::mesh_op(ggml_context *ctx, const GIRNode &node, const s
     // i = j: K(0) = sqrt(2 / pi) / sigma + sum_n w_n f(k_n)
     const float k0 = static_cast<float>(std::sqrt(2.0 / M_PI) / sigma);
     ggml_tensor *diag = ggml_scale_bias(ctx, ggml_reshape_2d(ctx, ggml_sum_rows(ctx, A), C, 1), 1.0f, k0); // [C, 1]
-    ggml_tensor *m = ggml_mul(ctx, v, diag);
+    acc(ggml_mul(ctx, ggml_mul(ctx, v, diag), open_mask_));
     if (n_pairs_ > 0) {
-      ggml_tensor *r = pair_r(ctx);                                                              // [1, P]
-      const int64_t P = n_pairs_;
-      ggml_tensor *kr = ggml_mul(ctx, ggml_repeat(ctx, r, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nq, P)),
-                                 ggml_reshape_2d(ctx, kq, nq, 1));                                  // [nq, P]
+      ggml_tensor *r = pair_r(ctx); // [1, P]
+      ggml_tensor *kr = ggml_mul(ctx, ggml_repeat(ctx, r, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nq, n_pairs_)),
+                                 ggml_reshape_2d(ctx, kq, nq, 1)); // [nq, P]
       ggml_tensor *j0 = ggml_div(ctx, ggml_sin(ctx, kr), kr);
       ggml_tensor *K = ggml_add(ctx, mm_f32(ctx, A, j0),
                                 ggml_div(ctx, ggml_plato_erf(ctx, ggml_scale(ctx, r, 1.0f / (std::sqrt(2.0f) * sigma))), r)); // [C, P]
-      ggml_tensor *t = ggml_mul(ctx, K, ggml_get_rows(ctx, v, pair_j_));
-      m = ggml_add(ctx, m, ggml_get_rows_back(ctx, t, pair_i_, v));
+      acc(ggml_get_rows_back(ctx, ggml_mul(ctx, K, ggml_get_rows(ctx, v, pair_j_)), pair_i_, v));
     }
-    return m;
   }
-  // periodic (runtime/plato_graph.cpp's mesh coupling), times the mesh points
-  const int M0 = mesh_[0], M1 = mesh_[1], M2 = mesh_[2];
-  const int64_t Mh = int64_t(M0) * M1 * (M2 / 2 + 1);
-  ggml_tensor *fr = frac(ctx);
-  ggml_tensor *rho = G > 1 ? ggml_plato_spread_blocked(ctx, v, fr, struct_index_, G, M0, M1, M2)
-                           : ggml_plato_spread(ctx, v, fr, M0, M1, M2);
-  ggml_tensor *rk = ggml_plato_fft3(ctx, rho, 0, M0, M1, M2);
-  ggml_tensor *k = ggml_sub(ctx, mesh_k_, mm_f32(ctx, strain, mesh_k_)); // [3, Mh, G]
-  ggml_tensor *k2 = ggml_sum_rows(ctx, ggml_sqr(ctx, k));                // [1, Mh, G]
-  ggml_tensor *k2s = ggml_add(ctx, k2, mesh_k0_pad_);
-  ggml_tensor *base = ggml_div(ctx, ggml_exp(ctx, ggml_scale(ctx, k2, -0.5f * sigma * sigma)), k2s);
-  auto e = [&](int q) { return ggml_cont(ctx, ggml_view_2d(ctx, strain, 1, G, strain->nb[2], q * sizeof(float))); };
-  ggml_tensor *tr = ggml_add(ctx, ggml_add(ctx, e(0), e(4)), e(8));
-  ggml_tensor *ivol = ggml_mul(ctx, ggml_scale_bias(ctx, tr, -1.0f, 1.0f), inv_volume_); // [1, G]
-  const float npts = static_cast<float>(double(M0) * M1 * M2);
-  base = ggml_mul(ctx, ggml_mul(ctx, base, mesh_deconv_), ggml_reshape_3d(ctx, ggml_scale(ctx, ivol, 4.0f * M_PI * npts), 1, 1, G));
-  ggml_tensor *g = ggml_mul(ctx, ggml_scale_bias(ctx, filt(ggml_reshape_2d(ctx, ggml_sqrt(ctx, k2s), 1, Mh * G)), 1.0f, 1.0f),
-                            ggml_reshape_2d(ctx, base, 1, Mh * G)); // [C, Mh G]
-  g = ggml_reshape_4d(ctx, ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, g, C, Mh, G), 1, 0, 2, 3)), 1, Mh, C, G);
-  rk = ggml_reshape_4d(ctx, ggml_mul(ctx, ggml_reshape_4d(ctx, rk, 2, Mh, C, G), g), rk->ne[0], M1, M0, C * G);
-  ggml_tensor *phi = ggml_plato_fft3(ctx, rk, 1, M0, M1, M2);
-  return G > 1 ? ggml_plato_gather_blocked(ctx, phi, fr, struct_index_, static_cast<int>(C), false)
-               : ggml_plato_gather(ctx, phi, fr, false); // [C, n]
+  // periodic groups (runtime/plato_graph.cpp's mesh coupling), times the mesh points
+  for (const Group &g : groups_) {
+    const int M0 = g.mesh[0], M1 = g.mesh[1], M2 = g.mesh[2], Gq = g.size();
+    const int64_t Mh = int64_t(M0) * M1 * (M2 / 2 + 1);
+    ggml_tensor *fr = frac(ctx);
+    ggml_tensor *vg = ggml_mul(ctx, v, g.mask); // the group's atoms only
+    ggml_tensor *rho = ggml_plato_spread_blocked(ctx, vg, fr, g.bidx, Gq, M0, M1, M2);
+    ggml_tensor *rk = ggml_plato_fft3(ctx, rho, 0, M0, M1, M2);
+    ggml_tensor *k = ggml_sub(ctx, g.mesh_k, mm_f32(ctx, g.strain, g.mesh_k)); // [3, Mh, Gq]
+    ggml_tensor *k2 = ggml_sum_rows(ctx, ggml_sqr(ctx, k));                    // [1, Mh, Gq]
+    ggml_tensor *k2s = ggml_add(ctx, k2, g.mesh_k0_pad);
+    ggml_tensor *base = ggml_div(ctx, ggml_exp(ctx, ggml_scale(ctx, k2, -0.5f * sigma * sigma)), k2s);
+    const float npts = static_cast<float>(double(M0) * M1 * M2);
+    base = ggml_mul(ctx, ggml_mul(ctx, base, g.mesh_deconv),
+                    ggml_reshape_3d(ctx, ggml_scale(ctx, inv_volume(ctx, g), 4.0f * M_PI * npts), 1, 1, Gq));
+    ggml_tensor *gk = ggml_mul(ctx, ggml_scale_bias(ctx, filt(ggml_reshape_2d(ctx, ggml_sqrt(ctx, k2s), 1, Mh * Gq)), 1.0f, 1.0f),
+                               ggml_reshape_2d(ctx, base, 1, Mh * Gq)); // [C, Mh Gq]
+    gk = ggml_reshape_4d(ctx, ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, gk, C, Mh, Gq), 1, 0, 2, 3)), 1, Mh, C, Gq);
+    rk = ggml_reshape_4d(ctx, ggml_mul(ctx, ggml_reshape_4d(ctx, rk, 2, Mh, C, Gq), gk), rk->ne[0], M1, M0, C * Gq);
+    ggml_tensor *phi = ggml_plato_fft3(ctx, rk, 1, M0, M1, M2);
+    acc(ggml_mul(ctx, ggml_plato_gather_blocked(ctx, phi, fr, g.bidx, static_cast<int>(C), false), g.mask)); // [C, n]
+  }
+  return m ? m : ggml_scale(ctx, v, 0.0f);
 }
 
 // q [Q, n], charge_unit [1] -> [n]
 ggml_tensor *PetPlatoLR::les_op(ggml_context *ctx, const GIRNode &node, const std::vector<ggml_tensor *> &in) {
   if (in.size() != 2) throw std::runtime_error("PLATO_LES: 2 inputs");
   ggml_tensor *q = cont(ctx, in[0]);
-  if (std::getenv("MLIPCPP_PLATO_LR_DEBUG"))
-    std::fprintf(stderr, "PLATO_LES q [%lld %lld %lld %lld]\n", (long long)q->ne[0], (long long)q->ne[1], (long long)q->ne[2], (long long)q->ne[3]);
   const int64_t Q = q->ne[0], n = q->ne[1];
-  const int G = n_struct();
   const float sigma = static_cast<float>(param_num(node, "sigma", spec_.les_sigma));
   const float kcut = static_cast<float>(param_num(node, "kcut", spec_.les_kcut));
   const bool tcc = param_num(node, "total_charge_constraint", spec_.total_charge_constraint) != 0;
   // neutral per structure (or the structure's total charge / charge_unit)
-  ggml_tensor *qt = ggml_cont(ctx, ggml_transpose(ctx, q));                                           // [n, Q]
+  ggml_tensor *qt = ggml_cont(ctx, ggml_transpose(ctx, q));                                                    // [n, Q]
   ggml_tensor *mean = ggml_mul(ctx, ggml_cont(ctx, ggml_transpose(ctx, mm_f32(ctx, onehot_, qt))), inv_count_); // [Q, G]
   q = ggml_sub(ctx, q, ggml_get_rows(ctx, mean, struct_index_));
   if (tcc) q = ggml_add(ctx, q, ggml_div(ctx, charge_per_atom_, ggml_repeat(ctx, in[1], charge_per_atom_)));
-  auto per_atom = [&](ggml_tensor *Eg) { // [1, G] -> [n], E_g / N_g on each atom of g
-    return ggml_reshape_1d(ctx, ggml_get_rows(ctx, ggml_mul(ctx, Eg, inv_count_), struct_index_), n);
-  };
-  if (!periodic_) {
-    if (n_pairs_ == 0) return ggml_reshape_1d(ctx, ggml_scale(ctx, ggml_sum_rows(ctx, q), 0.0f), n);
+  ggml_tensor *e = nullptr; // [1, n]
+  auto acc = [&](ggml_tensor *t) { e = e ? ggml_add(ctx, e, t) : t; };
+  if (n_pairs_ > 0) { // open structures: the erf pair sum, per atom
     ggml_tensor *r = pair_r(ctx);
     ggml_tensor *pair = ggml_div(ctx, ggml_plato_erf(ctx, ggml_scale(ctx, r, 1.0f / (std::sqrt(2.0f) * sigma))), r); // [1, P]
     ggml_tensor *s = ggml_get_rows_back(ctx, ggml_mul(ctx, ggml_get_rows(ctx, q, pair_j_), pair), pair_i_, q);     // [Q, n]
-    return ggml_reshape_1d(ctx, ggml_scale(ctx, ggml_sum_rows(ctx, ggml_mul(ctx, q, s)), static_cast<float>(0.5 * KE)), n);
+    acc(ggml_scale(ctx, ggml_sum_rows(ctx, ggml_mul(ctx, q, s)), static_cast<float>(0.5 * KE)));
   }
-  qt = ggml_cont(ctx, ggml_transpose(ctx, q));                                                   // [n, Q], centred
-  ggml_tensor *fr = frac(ctx);
-  auto e = [&](int k) { return ggml_cont(ctx, ggml_view_2d(ctx, strain, 1, G, strain->nb[2], k * sizeof(float))); };
-  ggml_tensor *ivol = ggml_mul(ctx, ggml_scale_bias(ctx, ggml_add(ctx, ggml_add(ctx, e(0), e(4)), e(8)), -1.0f, 1.0f), inv_volume_);
-  // sum_i q_i^2 per structure: [1, n] . onehot [n, G]
-  ggml_tensor *q2 = ggml_cont(ctx, ggml_transpose(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, q)))); // [n, 1]
-  ggml_tensor *selfE = ggml_scale(ctx, ggml_reshape_2d(ctx, mm_f32(ctx, q2, onehot_), 1, G), 1.0f / (std::sqrt(2.0f * M_PI) * sigma));
-  ggml_tensor *rec;
-  if (les_mesh_[0] > 0) {
-    const int M0 = les_mesh_[0], M1 = les_mesh_[1], M2 = les_mesh_[2];
-    ggml_tensor *rho = ggml_plato_spread_order(ctx, ggml_reshape_2d(ctx, q, 1, n), fr, G > 1 ? struct_index_ : nullptr, G, M0,
-                                               M1, M2, spec_.les_pme_order);
-    ggml_tensor *rk = ggml_plato_fft3(ctx, rho, 0, M0, M1, M2);
-    ggml_tensor *K = ggml_sub(ctx, les_K_, mm_f32(ctx, strain, les_K_));
-    ggml_tensor *A = ggml_reshape_2d(ctx, mm_f32(ctx, K, K), 9, G);
-    const float kc = kcut / sigma, wd = 1.0f / sigma;
-    ggml_tensor *ep = ggml_plato_pme(ctx, rk, A, les_tab_, M0, M1, M2, sigma, kc, wd); // [M0, G]
-    rec = ggml_mul(ctx, ggml_reshape_2d(ctx, ggml_sum_rows(ctx, ep), 1, G), ggml_scale(ctx, ivol, 2.0f * M_PI));
-  } else {
-    ggml_tensor *sk; // [nk, G Q]
-    if (Q == 1) {
-      ggml_tensor *r = ggml_plato_ewald(ctx, fr, ggml_reshape_1d(ctx, q, n), G == 1 ? nullptr : struct_index_, les_n_, G);
-      sk = ggml_view_2d(ctx, r, nk_, G, r->nb[1], 2 * r->nb[2]);
-    } else {
-      if (G != 1) throw std::runtime_error("Plato-PET-LR: batched periodic LES needs one charge channel");
-      ggml_tensor *ph = mm_f32(ctx, fr, les_n_); // [n, nk]
-      ggml_tensor *Cq = mm_f32(ctx, ggml_cos(ctx, ph), qt), *Sq = mm_f32(ctx, ggml_sin(ctx, ph), qt); // [nk, Q]
-      sk = ggml_add(ctx, ggml_sqr(ctx, Cq), ggml_sqr(ctx, Sq));
+  if (!groups_.empty()) {
+    ggml_tensor *fr = frac(ctx);
+    // the self energy of the periodic atoms, per atom: q^2 / (sqrt(2 pi) sigma)
+    ggml_tensor *pmask = nullptr;
+    for (const Group &g : groups_) pmask = pmask ? ggml_add(ctx, pmask, g.mask) : g.mask;
+    ggml_tensor *self = ggml_scale(ctx, ggml_mul(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, q)), pmask),
+                                   static_cast<float>(KE / (std::sqrt(2.0 * M_PI) * sigma))); // [1, n]
+    acc(ggml_scale(ctx, self, -1.0f));
+    for (const Group &g : groups_) {
+      const int Gq = g.size();
+      ggml_tensor *qg = ggml_mul(ctx, q, g.mask); // [Q, n]
+      ggml_tensor *ivol = inv_volume(ctx, g);
+      ggml_tensor *rec; // [1, Gq]
+      if (g.les_mesh[0] > 0) {
+        const int M0 = g.les_mesh[0], M1 = g.les_mesh[1], M2 = g.les_mesh[2];
+        ggml_tensor *rho = ggml_plato_spread_order(ctx, ggml_reshape_2d(ctx, qg, 1, n), fr, g.bidx, Gq, M0, M1, M2,
+                                                   spec_.les_pme_order);
+        ggml_tensor *rk = ggml_plato_fft3(ctx, rho, 0, M0, M1, M2);
+        ggml_tensor *K = ggml_sub(ctx, g.les_K, mm_f32(ctx, g.strain, g.les_K));
+        ggml_tensor *A = ggml_reshape_2d(ctx, mm_f32(ctx, K, K), 9, Gq);
+        ggml_tensor *ep = ggml_plato_pme(ctx, rk, A, g.les_tab, M0, M1, M2, sigma, kcut / sigma, 1.0f / sigma); // [M0, Gq]
+        rec = ggml_mul(ctx, ggml_reshape_2d(ctx, ggml_sum_rows(ctx, ep), 1, Gq), ggml_scale(ctx, ivol, 2.0f * M_PI));
+      } else {
+        const int64_t nk = g.nk;
+        ggml_tensor *sk; // [nk, Gq] (Q = 1) or [nk, Q] (one structure)
+        if (Q == 1) {
+          ggml_tensor *r = ggml_plato_ewald(ctx, fr, ggml_reshape_1d(ctx, qg, n), g.bidx, g.les_n, Gq);
+          sk = ggml_view_2d(ctx, r, nk, Gq, r->nb[1], 2 * r->nb[2]);
+        } else {
+          if (Gq != 1) throw std::runtime_error("Plato-PET-LR: batched periodic LES needs one charge channel");
+          ggml_tensor *qgt = ggml_cont(ctx, ggml_transpose(ctx, qg)); // [n, Q]
+          ggml_tensor *ph = mm_f32(ctx, fr, g.les_n);                 // [n, nk]
+          ggml_tensor *Cq = mm_f32(ctx, ggml_cos(ctx, ph), qgt), *Sq = mm_f32(ctx, ggml_sin(ctx, ph), qgt); // [nk, Q]
+          sk = ggml_add(ctx, ggml_sqr(ctx, Cq), ggml_sqr(ctx, Sq));
+        }
+        ggml_tensor *k = ggml_sub(ctx, g.les_k, mm_f32(ctx, g.strain, g.les_k));
+        ggml_tensor *k2 = ggml_reshape_2d(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, k)), nk, Gq);
+        const float kc = kcut / sigma, wd = 1.0f / sigma;
+        ggml_tensor *xw = ggml_clamp(ctx, ggml_scale_bias(ctx, ggml_sqrt(ctx, k2), 1.0f / wd, -(kc - wd) / wd), 0.0f, 1.0f);
+        ggml_tensor *win = ggml_scale_bias(ctx, ggml_cos(ctx, ggml_scale(ctx, xw, static_cast<float>(M_PI))), 0.5f, 0.5f);
+        ggml_tensor *gk = ggml_div(ctx, ggml_mul(ctx, win, ggml_exp(ctx, ggml_scale(ctx, k2, -0.5f * sigma * sigma))), k2); // [nk, Gq]
+        rec = Q == 1 ? ggml_sum_rows(ctx, ggml_mul(ctx, sk, gk)) : ggml_reshape_2d(ctx, ggml_sum(ctx, ggml_mul(ctx, sk, gk)), 1, 1);
+        rec = ggml_mul(ctx, rec, ggml_scale(ctx, ivol, 4.0f * M_PI));
+      }
+      // E_rec of structure b spread evenly over its atoms
+      ggml_tensor *per = ggml_get_rows(ctx, ggml_reshape_2d(ctx, ggml_mul(ctx, rec, g.inv_count), 1, Gq), g.bidx); // [1, n]
+      acc(ggml_scale(ctx, ggml_mul(ctx, ggml_reshape_2d(ctx, per, 1, n), g.mask), static_cast<float>(KE)));
     }
-    ggml_tensor *k = ggml_sub(ctx, les_k_, mm_f32(ctx, strain, les_k_));
-    ggml_tensor *k2 = ggml_reshape_2d(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, k)), nk_, G);
-    const float kc = kcut / sigma, wd = 1.0f / sigma;
-    ggml_tensor *xw = ggml_clamp(ctx, ggml_scale_bias(ctx, ggml_sqrt(ctx, k2), 1.0f / wd, -(kc - wd) / wd), 0.0f, 1.0f);
-    ggml_tensor *win = ggml_scale_bias(ctx, ggml_cos(ctx, ggml_scale(ctx, xw, static_cast<float>(M_PI))), 0.5f, 0.5f);
-    ggml_tensor *gk = ggml_div(ctx, ggml_mul(ctx, win, ggml_exp(ctx, ggml_scale(ctx, k2, -0.5f * sigma * sigma))), k2); // [nk, G]
-    rec = Q == 1 ? ggml_sum_rows(ctx, ggml_mul(ctx, sk, gk)) // [1, G]
-                 : ggml_reshape_2d(ctx, ggml_sum(ctx, ggml_mul(ctx, sk, gk)), 1, 1);
-    rec = ggml_mul(ctx, rec, ggml_scale(ctx, ivol, 4.0f * M_PI));
   }
-  return per_atom(ggml_scale(ctx, ggml_sub(ctx, rec, selfE), static_cast<float>(KE)));
+  if (!e) return ggml_reshape_1d(ctx, ggml_scale(ctx, ggml_sum_rows(ctx, q), 0.0f), n);
+  return ggml_reshape_1d(ctx, e, n);
 }
 
 } // namespace mlipcpp::runtime

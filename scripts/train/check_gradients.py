@@ -101,6 +101,8 @@ def main():
     ap.add_argument("--fp32-spread", type=int, default=0,
                     help="1: also run PyTorch in float32 and gate on its spread from float64")
     ap.add_argument("--spread-factor", type=float, default=3.0)
+    ap.add_argument("--zero-tol", type=float, default=1e-6,
+                    help="tensors with both gradient norms below this pass (identically zero gradients)")
     ap.add_argument("--pad", choices=["mlipcpp", "metatrain"], default="mlipcpp",
                     help="contents of padded neighbour slots in the reference")
     ap.add_argument("--pad-exact", type=int, default=0,
@@ -189,7 +191,24 @@ def main():
         wrapper = PETFullModel(pet, n_atoms=7, max_neighbors=11, d_pet=p["d_pet"], forces=True,
                                cutoff=p["cutoff"], cutoff_width=p["cutoff_width"],
                                cutoff_function=p["cutoff_function"], nc_forces=True)
-        return {n.replace(".", "_"): t for n, t in wrapper.named_parameters()}
+        out = {n.replace(".", "_"): t for n, t in wrapper.named_parameters()}
+        plato = getattr(wrapper, "plato", None)
+        mesh = plato.__dict__.get("_mesh_module") if plato is not None else None
+        if mesh is not None:
+            # Plato-PET-LR: the folded mesh projections W_eff = sum_b k_b W_b stand for the
+            # FrameLinears: dL/dW_eff = sum_b k_b dL/dW_b / |k|^2, the bias as it is
+            from export_pytorch.plato_lr import fold_frame_linear
+
+            class G:
+                def __init__(self, g):
+                    self.grad = g
+            for name in ("down", "up"):
+                fl = getattr(mesh.coupling, name)
+                _, k = fold_frame_linear(fl)
+                gW = None if fl.W.grad is None else torch.einsum("b,boc->oc", k, fl.W.grad.double()) / (k @ k)
+                out[f"plato_mesh_{name}_weight"] = G(gW)
+                out[f"plato_mesh_{name}_bias"] = G(fl.b.grad)
+        return out
 
     def rel_err(g, ref):
         norm = np.linalg.norm(ref)
@@ -203,6 +222,8 @@ def main():
         flat = lambda t: t.grad.reshape(-1).double().numpy() if t.grad is not None else np.zeros_like(g_cpp)
         g_ref = flat(by_name[entry["name"]])
         rel = rel_err(g_cpp, g_ref)
+        if np.linalg.norm(g_ref) < args.zero_tol and np.linalg.norm(g_cpp) < args.zero_tol:
+            rel = 0.0  # a gradient that vanishes identically (e.g. a bias the LES neutralisation removes)
         worst = max(worst, rel)
         allowed = args.tol
         if by_name32:

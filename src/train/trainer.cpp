@@ -308,8 +308,10 @@ Worker::Worker(const std::string &gguf, int device, size_t cache_graphs) : cache
   model_.set_backend_preference(device < 0 ? BackendPreference::CPU : BackendPreference::Auto);
   model_.set_device(std::max(device, 0));
   model_.load_from_gguf(gguf);
-  if (!model_.nc_forces() || !model_.forces_mode())
-    throw std::runtime_error(gguf + ": training needs a forces-mode export with --nc-forces");
+  if (!model_.forces_mode())
+    throw std::runtime_error(gguf + ": training needs a forces-mode export");
+  if (!model_.nc_forces() && !model_.plato_lr().enabled)
+    throw std::runtime_error(gguf + ": training needs an export with --nc-forces");
   if (model_.param_names().empty())
     throw std::runtime_error(gguf + ": no train.param_names; re-export with export_pet_gguf.py");
   for (const auto &name : model_.param_names()) {
@@ -477,6 +479,31 @@ Worker::GraphCost Worker::graph_cost(int n, int m, int S, bool backward) {
   return c;
 }
 
+void Worker::plato_create(StepGraph &g, ggml_context *ctx, int n, bool grad) {
+  std::vector<runtime::PetPlatoLRStructure> st;
+  if (plato_batch_ && plato_batch_->n_atoms == n) {
+    const Batch &b = *plato_batch_;
+    int a0 = 0;
+    for (int k = 0; k < b.n_real_systems; k++) {
+      runtime::PetPlatoLRStructure s;
+      s.a0 = a0, s.a1 = a0 + b.n_per_system[k], a0 = s.a1;
+      s.periodic = b.periodic[k] != 0;
+      for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 3; c++) s.cell[r][c] = b.cells[k][3 * r + c];
+      s.charge = b.system_charge[k];
+      st.push_back(s);
+    }
+    // padding atoms (micro-batch / tile padding) belong to no structure: masked out of the long-range ops
+    if (a0 > n) throw std::logic_error("Plato-PET-LR training: batch atom count");
+  } else { // a shape without data (graph_cost): one open structure
+    runtime::PetPlatoLRStructure s;
+    s.a1 = n;
+    st.push_back(s);
+  }
+  g.plato = std::make_unique<runtime::PetPlatoLR>();
+  g.plato->create(ctx, model_.plato_lr(), st, n, grad);
+}
+
 std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode mode, bool cached) {
   const bool backward = mode != FORWARD;
   // the tangent graph and its reverse pass: several times the loss graph
@@ -517,6 +544,15 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
     interp.set_input("charge_index", in(GGML_TYPE_I32, {n}, "charge_index"));
     interp.set_input("spin_index", in(GGML_TYPE_I32, {n}, "spin_index"));
   }
+  if (model_.plato_lr().enabled) {
+    plato_create(*g, ctx, n, mode == FORCES);
+    interp.custom_op = [p = g->plato.get()](ggml_context *c, const runtime::GIRNode &node,
+                                            const std::vector<ggml_tensor *> &in) { return p->build(c, node, in); };
+  }
+  struct ClearHook {
+    runtime::GraphInterpreter &i;
+    ~ClearHook() { i.custom_op = {}; }
+  } clear_hook{interp};
   if (mode == FORCES) {
     // dE/d(edge vectors, cutoff values) of E = sum of the atomic energies;
     // the weights are not differentiated (their flags restored after)
@@ -534,6 +570,10 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
     for (ggml_tensor *p : params_) ggml_set_param(p);
     g->grad_v = ggml_graph_get_grad(g->gf, edges);
     g->grad_c = ggml_graph_get_grad(g->gf, cv);
+    if (g->plato) {
+      g->grad_x = ggml_graph_get_grad(g->gf, g->plato->positions);
+      if (g->grad_x) ggml_set_output(g->grad_x);
+    }
     if (!g->grad_v) throw std::runtime_error("conservative forces: E does not depend on the edge vectors");
     ggml_set_output(g->grad_v);
     if (g->grad_c) ggml_set_output(g->grad_c);
@@ -555,12 +595,18 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
     // residual, Worker::run_conservative)
     ggml_tensor *dv = mode == MIXED ? in(GGML_TYPE_F32, {3, m, n}, "edge_tangent") : nullptr;
     ggml_tensor *dc = mode == MIXED ? in(GGML_TYPE_F32, {m, n}, "cutoff_tangent") : nullptr;
+    if (mode == MIXED && g->plato) { // not in g->inputs: uploaded with the Plato inputs
+      g->dx = input(ctx, GGML_TYPE_F32, {3, n}, "position_tangent");
+      g->jvp_scale = input(ctx, GGML_TYPE_F32, {1}, "jvp_scale");
+    }
 
     // out: [n_atoms, 4] = (energy | force) per atom; ggml ne = (4, n)
     ggml_tensor *out = interp.build(ctx);
     ggml_tensor *energy = ggml_reshape_2d(
         ctx, ggml_cont(ctx, ggml_view_2d(ctx, out, 1, n, out->nb[1], 0)), n, 1);
-    ggml_tensor *force = ggml_cont(ctx, ggml_view_2d(ctx, out, 3, n, out->nb[1], sizeof(float)));
+    // energy-only exports (conservative training): no direct force head, its loss terms are 0
+    ggml_tensor *force = out->ne[0] >= 4 ? ggml_cont(ctx, ggml_view_2d(ctx, out, 3, n, out->nb[1], sizeof(float)))
+                                         : ggml_mul(ctx, force_target, force_mask);
     // metatrain's average_by_num_atoms: per-structure Σ_i e_i / N
     ggml_tensor *d_energy = ggml_sub(ctx, ggml_mul_mat(ctx, atom_weight, energy), energy_target);
     ggml_tensor *d_force = ggml_mul(ctx, ggml_sub(ctx, force, force_target), force_mask);
@@ -574,8 +620,10 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
       runtime::GraphJVP jvp(ctx);
       jvp.seed(edges, dv);
       jvp.seed(cv, dc);
+      if (g->dx) jvp.seed(g->plato->positions, g->dx);
       ggml_tensor *J = jvp(ggml_sum(ctx, energy));
       if (!J) throw std::runtime_error("conservative forces: E has no tangent");
+      if (g->jvp_scale) J = ggml_mul(ctx, J, g->jvp_scale); // the tangents were normalised
       loss = ggml_sub(ctx, loss, J);
     }
     // physical force squared error, for the metrics (not differentiated)
@@ -683,6 +731,14 @@ void Worker::upload_inputs(StepGraph &g, const Batch &b, const std::vector<float
                            span(b.force_mask), span(b.force_scale), {norms, sizeof norms}});
   if (dv) src.insert(src.end(), {span(*dv), span(*dc)});
   if (src.size() != g.inputs.size()) throw std::logic_error("upload_inputs: input count");
+  if (g.plato) {
+    g.plato->upload(b.positions.data());
+    if (g.dx) {
+      if (plato_dx_.size() != size_t(3) * b.n_atoms) throw std::logic_error("upload_inputs: position tangent");
+      ggml_backend_tensor_set(g.dx, plato_dx_.data(), 0, ggml_nbytes(g.dx));
+      ggml_backend_tensor_set(g.jvp_scale, &plato_jvp_scale_, 0, sizeof(float));
+    }
+  }
   for (size_t i = 0; i < g.inputs.size(); i++)
     if (ggml_nbytes(g.inputs[i]) != src[i].second)
       throw std::logic_error(std::string("upload size mismatch for ") + ggml_get_name(g.inputs[i]));
@@ -701,7 +757,7 @@ void Worker::upload_inputs(StepGraph &g, const Batch &b, const std::vector<float
 
 Worker::StepGraph &Worker::graph(int n, int m, int S, Mode mode, std::unique_ptr<StepGraph> &once) {
   auto t0 = clock_type::now();
-  if (cache_limit_ > 0) {
+  if (cache_limit_ > 0 && !model_.plato_lr().enabled) { // Plato-PET-LR graphs depend on the batch
     StepGraph &g = cached_graph(n, m, S, mode);
     t_build += seconds_since(t0);
     return g;
@@ -769,7 +825,9 @@ void Worker::compute(StepGraph &g) {
 
 StepStats Worker::run(const Batch &b, double energy_scale, bool backward) {
   t_build = t_alloc = t_upload = t_compute = t_download = t_cpu = 0;
+  plato_batch_ = &b;
   if (conservative.on) return run_conservative(b, energy_scale, backward);
+  if (!model_.nc_forces()) throw std::runtime_error("an energy-only model trains with conservative forces only");
   const int n = b.n_atoms, m = b.max_neighbors, S = b.n_systems;
   std::unique_ptr<StepGraph> once;
   StepGraph *g = &graph(n, m, S, backward ? BACKWARD : FORWARD, once);
@@ -813,6 +871,9 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
   const int n = b.n_atoms, m = b.max_neighbors, S = b.n_systems;
   const auto [e_norm, f_norm] = loss_norms(b);
   const Conservative &w = conservative;
+  plato_batch_ = &b;
+  const bool nc = model_.nc_forces();
+  const int ow = nc ? 4 : 1; // graph output columns: (energy | direct force) or energy
 
   // 1. forward + backward to the edge vectors and cutoff values
   std::unique_ptr<StepGraph> once;
@@ -822,7 +883,7 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
   t_upload += seconds_since(t0);
   compute(gf);
   t0 = clock_type::now();
-  std::vector<float> out(4 * static_cast<size_t>(n)), gv(3 * static_cast<size_t>(n) * m), gc;
+  std::vector<float> out(ow * static_cast<size_t>(n)), gv(3 * static_cast<size_t>(n) * m), gc, gx;
   ggml_backend_tensor_get(gf.out, out.data(), 0, out.size() * sizeof(float));
   ggml_backend_tensor_get(gf.grad_v, gv.data(), 0, gv.size() * sizeof(float));
   const bool taper = !b.taper_center.empty();
@@ -830,6 +891,10 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
     if (!gf.grad_c) throw std::runtime_error("conservative forces: no cutoff-value gradient");
     gc.resize(static_cast<size_t>(n) * m);
     ggml_backend_tensor_get(gf.grad_c, gc.data(), 0, gc.size() * sizeof(float));
+  }
+  if (gf.grad_x) { // Plato-PET-LR: the explicit position dependence (mesh, LES)
+    gx.resize(3 * static_cast<size_t>(n));
+    ggml_backend_tensor_get(gf.grad_x, gx.data(), 0, gx.size() * sizeof(float));
   }
   once.reset();
   t_download += seconds_since(t0);
@@ -846,6 +911,7 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
     const int i = f / m, k = b.neighbor_atom[f];
     for (int c = 0; c < 3; c++) F[3 * i + c] += gv[3 * f + c], F[3 * k + c] -= gv[3 * f + c];
   }
+  for (size_t k = 0; k < gx.size(); k++) F[k] -= gx[k];
   std::vector<double> Sk;
   if (taper) {
     Sk.assign(n, 0.0);
@@ -866,7 +932,7 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
   st.n_systems = b.n_real_systems;
   std::vector<double> d_e(S, 0.0), u(3 * static_cast<size_t>(n), 0.0), fse(S, 0.0);
   for (int k = 0; k < S; k++) {
-    for (int a = 0; a < n; a++) d_e[k] += double(b.atom_weight[static_cast<size_t>(k) * n + a]) * out[4 * a];
+    for (int a = 0; a < n; a++) d_e[k] += double(b.atom_weight[static_cast<size_t>(k) * n + a]) * out[ow * a];
     d_e[k] -= b.energy_target[k];
     st.loss_energy += w.energy * e_norm * d_e[k] * d_e[k];
     st.se_energy_per_atom += d_e[k] * d_e[k] * energy_scale * energy_scale;
@@ -882,7 +948,7 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
     double e2 = 0;
     for (int c = 0; c < 3; c++) {
       const double target = double(b.force_target[3 * a + c]) * b.force_scale[a];
-      const double r = F[3 * a + c] - target / energy_scale, rnc = out[4 * a + 1 + c] - b.force_target[3 * a + c];
+      const double r = F[3 * a + c] - target / energy_scale, rnc = nc ? out[4 * a + 1 + c] - b.force_target[3 * a + c] : 0.0;
       st.loss_force += w.force * f_norm * r * r;
       st.loss_nc += w.nc_force * f_norm * rnc * rnc;
       st.se_force_nc += std::pow(rnc * b.force_scale[a], 2);
@@ -928,6 +994,19 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
     }
     for (int f = 0; f < n * m; f++)
       if (real(f)) dc[f] = static_cast<float>(0.5 * (dr[f / m] + dr[b.neighbor_atom[f]]));
+  }
+  if (model_.plato_lr().enabled) {
+    // the long-range ops' coordinate tangents are central differences (runtime/graph_jvp.h):
+    // tangents of O(1), the J term scaled back
+    double umax = 0;
+    for (double x : u) umax = std::max(umax, std::abs(x));
+    if (!(umax > 0)) umax = 1;
+    const float inv = static_cast<float>(1.0 / umax);
+    for (float &x : dv) x *= inv;
+    for (float &x : dc) x *= inv;
+    plato_dx_.resize(u.size());
+    for (size_t k = 0; k < u.size(); k++) plato_dx_[k] = static_cast<float>(u[k] / umax);
+    plato_jvp_scale_ = static_cast<float>(umax);
   }
   t_cpu = seconds_since(t_host);
   StepGraph &gm = graph(n, m, S, MIXED, once);

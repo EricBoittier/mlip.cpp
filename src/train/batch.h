@@ -58,6 +58,13 @@ struct Batch {
   // charge and spin multiplicity of each atom's structure (padding atoms: 0, 1),
   // the conditioned model's table rows are made from them at upload
   std::vector<int32_t> atom_charge, atom_spin; // [n_atoms]
+  // Plato-PET-LR long range (mesh, LES): rotated positions [n_atoms, 3] (padding
+  // atoms: 0) and per real structure its rotated cell (rows, zeros: open), whether
+  // it is periodic (every cell row nonzero) and its total charge
+  std::vector<float> positions;
+  std::vector<std::array<float, 9>> cells;
+  std::vector<uint8_t> periodic;
+  std::vector<int32_t> system_charge;
 
   // Loss normalisation: 1/S and 1/(3N) of the *whole* step batch, so that
   // micro-batch losses (and gradients) sum to the full-batch ones.

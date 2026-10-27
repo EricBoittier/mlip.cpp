@@ -162,6 +162,10 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
   b.species.assign(n, 0);
   b.atom_charge.assign(n, 0);
   b.atom_spin.assign(n, 1);
+  b.positions.assign(static_cast<size_t>(n) * 3, 0.0f);
+  b.cells.assign(b.n_real_systems, {});
+  b.periodic.assign(b.n_real_systems, 0);
+  b.system_charge.assign(b.n_real_systems, 0);
   // padding atoms: no neighbours, so every slot is padded and points to itself
   for (int a = n_real; a < n; a++)
     for (int j = 0; j < m; j++) b.reverse_neighbor_index[a * m + j] = a * m + j;
@@ -190,6 +194,17 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
       float f[3];
       rotate(F + 3 * i, f);
       for (int r = 0; r < 3; r++) b.force_target[3 * a + r] = static_cast<float>(f[r] / fs);
+    }
+    {
+      const float *X = split.positions(s), *C = split.cell(s);
+      for (int i = 0; i < ns; i++) rotate(X + 3 * i, &b.positions[3 * size_t(offset + i)]);
+      int np = 0;
+      for (int r = 0; r < 3; r++) {
+        rotate(C + 3 * r, &b.cells[k][3 * r]);
+        np += C[3 * r] != 0 || C[3 * r + 1] != 0 || C[3 * r + 2] != 0;
+      }
+      b.periodic[k] = np == 3;
+      b.system_charge[k] = split.charge(s);
     }
     b.energy_target[k] = static_cast<float>(
         (split.energy(s) - scaling.comp(Z, ns)) / (scaling.energy_scale * ns));

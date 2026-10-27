@@ -73,41 +73,51 @@ public:
   ggml_tensor *build(ggml_context *ctx, const GIRNode &node, const std::vector<ggml_tensor *> &inputs);
 
   ggml_tensor *positions = nullptr; // F32 [3, n]
-  ggml_tensor *strain = nullptr;    // F32 [3, 3, G] (periodic), else nullptr
-  bool periodic() const { return periodic_; }
+  ggml_tensor *strain = nullptr;    // F32 [3, 3, G_p] of the first periodic group (one structure: its strain), or nullptr
+  /// the strain of every periodic group (each [3, 3, structures of the group])
+  std::vector<ggml_tensor *> strains() const;
+  bool periodic() const { return !groups_.empty(); }
   int n_struct() const { return static_cast<int>(st_.size()); }
-  const int *mesh() const { return mesh_; }
-  const int *les_mesh() const { return les_mesh_; }
-  int64_t n_k() const { return nk_; }
-  /// the input tensors (tangent seeds of the conservative trainer: positions)
-  const std::vector<ggml_tensor *> &tensors() const { return all_; }
+  const int *mesh() const { return groups_.empty() ? zero3_ : groups_[0].mesh; }
+  const int *les_mesh() const { return groups_.empty() ? zero3_ : groups_[0].les_mesh; }
+  int64_t n_k() const { return groups_.empty() ? 0 : groups_[0].nk; }
 
 private:
+  // periodic structures on one mesh (and one LES mesh): blocks of one spread / FFT / gather
+  struct Group {
+    std::vector<int> structs; // batch structure indices
+    int mesh[3] = {0, 0, 0}, les_mesh[3] = {0, 0, 0};
+    int64_t nk = 0;
+    std::vector<int32_t> h_bidx;
+    std::vector<float> h_mask, h_invc, h_invv, h_mk, h_mpad, h_mdec, h_lk, h_ln, h_lK, h_tab;
+    ggml_tensor *bidx = nullptr, *mask = nullptr, *inv_count = nullptr, *strain = nullptr, *inv_volume = nullptr;
+    ggml_tensor *mesh_k = nullptr, *mesh_k0_pad = nullptr, *mesh_deconv = nullptr;
+    ggml_tensor *les_k = nullptr, *les_n = nullptr, *les_K = nullptr, *les_tab = nullptr;
+    int size() const { return static_cast<int>(structs.size()); }
+  };
+  static constexpr int zero3_[3] = {0, 0, 0};
   PetPlatoLRSpec spec_;
   std::vector<PetPlatoLRStructure> st_;
   int n_ = 0;
-  bool periodic_ = false;
-  int mesh_[3] = {0, 0, 0}, les_mesh_[3] = {0, 0, 0};
-  int64_t nk_ = 0, n_pairs_ = 0;
+  std::vector<Group> groups_;
+  int64_t n_pairs_ = 0;
+  bool any_open_ = false;
   std::vector<ggml_tensor *> all_;
-  // inputs
+  // every structure
   ggml_tensor *struct_index_ = nullptr, *onehot_ = nullptr, *inv_count_ = nullptr, *charge_per_atom_ = nullptr;
-  ggml_tensor *atom_inv_cell_t_ = nullptr, *inv_volume_ = nullptr;
-  ggml_tensor *mesh_k_ = nullptr, *mesh_k0_pad_ = nullptr, *mesh_deconv_ = nullptr;
-  ggml_tensor *les_k_ = nullptr, *les_n_ = nullptr, *les_K_ = nullptr, *les_tab_ = nullptr;
-  ggml_tensor *pair_i_ = nullptr, *pair_j_ = nullptr; // open: off-diagonal pairs within structures
-  // host data
+  ggml_tensor *atom_inv_cell_t_ = nullptr, *open_mask_ = nullptr;
+  ggml_tensor *pair_i_ = nullptr, *pair_j_ = nullptr; // open structures: off-diagonal pairs within each
   std::vector<int32_t> h_sidx_, h_pi_, h_pj_;
-  std::vector<float> h_onehot_, h_invc_, h_qpa_, h_aict_, h_invv_, h_mk_, h_mpad_, h_mdec_, h_lk_, h_ln_, h_lK_, h_tab_;
-  ggml_tensor *frac_ = nullptr; // [3, n], built once per graph
+  std::vector<float> h_onehot_, h_invc_, h_qpa_, h_aict_, h_omask_;
+  ggml_tensor *frac_ = nullptr, *pair_r_ = nullptr; // built once per graph
 
   ggml_tensor *frac(ggml_context *ctx);
+  ggml_tensor *pair_r(ggml_context *ctx); // [1, P] distances of the pairs
   ggml_tensor *rope_attn(ggml_context *ctx, const GIRNode &node, const std::vector<ggml_tensor *> &in);
   ggml_tensor *edge_sum(ggml_context *ctx, const std::vector<ggml_tensor *> &in);
   ggml_tensor *mesh_op(ggml_context *ctx, const GIRNode &node, const std::vector<ggml_tensor *> &in);
   ggml_tensor *les_op(ggml_context *ctx, const GIRNode &node, const std::vector<ggml_tensor *> &in);
-  ggml_tensor *pair_r(ggml_context *ctx); // [1, P] distances of the pairs
-  ggml_tensor *pair_r_ = nullptr;
+  ggml_tensor *inv_volume(ggml_context *ctx, const Group &g); // (1 - tr eps) / V, [1, G_g]
 };
 
 } // namespace runtime

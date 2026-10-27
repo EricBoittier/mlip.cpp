@@ -234,6 +234,10 @@ private:
     ggml_tensor *blob = nullptr;
     size_t blob_bytes = 0;
     uint64_t last_use = 0;
+    // Plato-PET-LR: the long-range ops' inputs (built per batch, never cached),
+    // FORCES: dE/dx; MIXED: the position tangent and the scale of the normalised tangents
+    std::unique_ptr<runtime::PetPlatoLR> plato;
+    ggml_tensor *grad_x = nullptr, *dx = nullptr, *jvp_scale = nullptr;
     ~StepGraph();
   };
   /// graph kinds: the loss (FORWARD / BACKWARD to the weights); conservative
@@ -254,6 +258,12 @@ private:
   size_t ctx_bytes_[4] = {0, 0, 0, 0};  // graph context size per Mode; measured on the first build
   std::vector<uint8_t> staging_;   // host side of the input blob
   std::vector<int32_t> cond_rows_[2]; // charge / spin table rows of the batch's atoms (conditioned models)
+  // Plato-PET-LR: the batch the next graph is built for (structures, cells, charges),
+  // the MIXED graph's position tangent and tangent scale
+  const Batch *plato_batch_ = nullptr;
+  std::vector<float> plato_dx_;
+  float plato_jvp_scale_ = 1.0f;
+  void plato_create(StepGraph &g, ggml_context *ctx, int n, bool grad);
 
   runtime::GraphModel model_;
   std::vector<ggml_tensor *> params_;
