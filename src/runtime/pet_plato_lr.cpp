@@ -426,8 +426,9 @@ ggml_tensor *PetPlatoLR::rope_attn(ggml_context *ctx, const GIRNode &node, const
     ggml_tensor *ss = ggml_mul(ctx, ggml_repeat(ctx, ggml_mul(ctx, ggml_sin(ctx, ang), ggml_reshape_4d(ctx, rope_sign_, Ch, 1, 1, 1)), shape3),
                                slot_mask_);                                                    // sign sin (q, k), 0 (v)
     ggml_tensor *xF = ggml_repeat(ctx, ggml_reshape_4d(ctx, x3, Ch, H, 3, S), ggml_new_tensor_4d(ctx, GGML_TYPE_F32, Ch, H, 3, S * F));
-    const int64_t rows = 2 * H * 3 * S * F;
-    ggml_tensor *xs = ggml_reshape_4d(ctx, ggml_get_rows(ctx, ggml_reshape_2d(ctx, xF, C2, rows), swap_index(ctx, rows)), Ch, H, 3, S * F);
+    const int64_t rows = 2 * H * 3 * S; // swapped before the frames' copies are made
+    ggml_tensor *xs = ggml_get_rows(ctx, ggml_reshape_2d(ctx, cont(ctx, x3), C2, rows), swap_index(ctx, rows));
+    xs = ggml_repeat(ctx, ggml_reshape_4d(ctx, xs, Ch, H, 3, S), ggml_new_tensor_4d(ctx, GGML_TYPE_F32, Ch, H, 3, S * F));
     ggml_tensor *xt = ggml_reshape_4d(ctx, ggml_add(ctx, ggml_mul(ctx, xF, cc), ggml_mul(ctx, xs, ss)), D, 3, L, NF);
     ggml_tensor *bF = ggml_repeat(ctx, bias, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, L, L, 1, NF));
     ggml_tensor *r = ggml_pet_attn(ctx, xt, bF, static_cast<int>(H), scale); // [D + H, L, NF]
