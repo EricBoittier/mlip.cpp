@@ -22,7 +22,8 @@ class GraphJVP {
   ggml_tensor *mul(ggml_tensor *a, ggml_tensor *b) {
     return a && b ? ggml_mul(c, a, b) : nullptr;
   }
-  ggml_tensor *neg(ggml_tensor *a) { return a ? ggml_neg(c, a) : nullptr; }
+  // (CUDA unary ops need contiguous operands: a tangent may be a view)
+  ggml_tensor *neg(ggml_tensor *a) { return a ? ggml_neg(c, cont(a)) : nullptr; }
   // a contiguous copy only where the layout needs one: ggml_cont always
   // copies, and each copy costs again in the reverse pass through the
   // tangent (MLIPCPP_JVP_CONT=1: always copy, as before)
