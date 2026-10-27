@@ -34,7 +34,7 @@ def main():
                     help="prep_omol25_val.py *_partial_charges.npz: also mulliken_charge.bin / lowdin_charge.bin "
                          "(f32 [n_atoms], NaN where absent) next to the memmap")
     a = ap.parse_args()
-    d = np.load(a.npz)
+    d = dict(np.load(a.npz))
     n, Z, R, F, E = d["n"], d["Z"], d["R"], d["F"], d["E"]
     q, s = d["charge"], d["spin_multiplicity"]
     off = np.concatenate([[0], np.cumsum(n)])

@@ -50,7 +50,7 @@ def block(sel, d, pc, a, b):
 
 
 def main():
-    d = np.load(sys.argv[1]); pc = np.load(sys.argv[2]); out = sys.argv[3]
+    d = dict(np.load(sys.argv[1])); pc = dict(np.load(sys.argv[2])); out = sys.argv[3]
     q, dom = d["charge"], d["domain"]
     groups = {"all": np.arange(len(q))}
     for g in np.unique(dom):

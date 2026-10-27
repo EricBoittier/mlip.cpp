@@ -57,8 +57,11 @@ def main():
     ap.add_argument("idx", nargs="?")
     ap.add_argument("--refit", default=None)
     ap.add_argument("--label", default="")
+    ap.add_argument("--per-structure", default=None,
+                    help="eval: also an npz of per-structure errors (dE eV, n, sum |dF|, sum dF^2, scan Delta E error) and "
+                         "the stratum masks, for compare_paired.py")
     a = ap.parse_args()
-    d = np.load(a.npz)
+    d = dict(np.load(a.npz))
     n, Z, E, F = d["n"], d["Z"], d["E"], d["F"]
     off = np.concatenate([[0], np.cumsum(n)])
     types = np.unique(Z)
@@ -84,7 +87,7 @@ def main():
     dE = np.array([Em[k] + b[Z[off[k]:off[k + 1]]].sum() - E[k] for k in range(len(n))])
     dF = [Fm[k] - F[off[k]:off[k + 1]] for k in range(len(n))]
     strata = {"all": np.ones(len(n), bool)}
-    keys = d.files
+    keys = list(d)
     if "subset" in keys:
         names = ["nucleic_acids", "lipids", "sugars", "ions_water", "dimers"]
         for s in np.unique(d["subset"]):
@@ -149,6 +152,22 @@ def main():
                            "scan_r": [float(sr[k]) for k in ks]}
         if per:
             r["curves"] = {"scans": len(per), "dE_mae_mev": float(1e3 * np.mean(np.abs(allerr))), "per_scan": per}
+    if a.per_structure:
+        names = list(strata)
+        scan_err = np.full(len(n), np.nan)
+        if "scan" in keys:
+            sc, sr = d["scan"], d["scan_r"]
+            for s_ in np.unique(sc[sc >= 0]):
+                ks = np.nonzero(sc == s_)[0]
+                if len(ks) < 3:
+                    continue
+                ks = ks[np.argsort(sr[ks])]
+                ref = ks[-1]
+                for k in ks[:-1]:
+                    scan_err[k] = (Em[k] - Em[ref]) - (E[k] - E[ref])
+        np.savez(a.per_structure, dE=dE, n=n, f_abs=np.array([np.abs(x).sum() for x in dF]),
+                 f_sq=np.array([(x ** 2).sum() for x in dF]), scan_err=scan_err,
+                 strata_names=np.array(names), strata=np.array([strata[k] for k in names]))
     json.dump(r, open(a.out, "w"), indent=1)
     show = ("all", "charge=0", "|charge|=1", "|charge|>=2", "dimer cc sep<4", "dimer cc sep 4-8", "dimer cn sep 4-8",
             "dimer cn sep>=8", "no pair within 5 A")

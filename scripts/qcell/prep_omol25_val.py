@@ -129,7 +129,7 @@ def main():
                           "data_id": {k: int(v) for k, v in zip(*np.unique(cols[2], return_counts=True))}}))
     elif a.mode == "select":
         meta, out = a.args
-        m = np.load(meta)
+        m = dict(np.load(meta))  # npz members decode on every access: load once
         rng = np.random.default_rng(a.seed)
         did, q, sp, na = m["data_id"], m["charge"], m["spin"], m["natoms"]
         grp = np.array([GROUPS.get(x, "other") for x in did])
@@ -180,7 +180,7 @@ def main():
         print(json.dumps(recipe))
     elif a.mode == "refit-sample":
         meta, chosen, out = a.args  # N random val rows outside the selection (seed): composition refit only
-        m = np.load(meta)
+        m = dict(np.load(meta))  # npz members decode on every access: load once
         sel = set(json.load(open(chosen))["indices"])
         rest = np.array([k for k in range(len(m["natoms"])) if k not in sel])
         pick = np.random.default_rng(a.seed).choice(rest, 5000, replace=False)
@@ -189,7 +189,7 @@ def main():
         print(out, len(pick))
     else:
         valdir, meta, selp, out = a.args
-        m = np.load(meta)
+        m = dict(np.load(meta))  # npz members decode on every access: load once
         sel = json.load(open(selp))["indices"]
         by = defaultdict(list)
         for k in sel:
