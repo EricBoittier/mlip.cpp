@@ -189,6 +189,7 @@ private:
   bool forces_mode_ = false;
   bool nc_forces_ = false;
   PetPlatoLRSpec plato_lr_;
+  std::vector<PetPlatoLRStructure> plato_st_; // the cached path's structure (set before fit_cached_graph)
   bool long_range_ = false;
   bool p3m_ = false;
   CoulombParameters coulomb_parameters_;

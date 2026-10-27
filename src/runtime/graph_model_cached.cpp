@@ -232,7 +232,7 @@ void GraphModel::release_cached_resources() {
 }
 
 bool GraphModel::cached_path_supported() const {
-  return forces_mode_ && !long_range_ && !plato_lr_.enabled &&
+  return forces_mode_ && !long_range_ &&
          (num_neighbors_adaptive_ <= 0.0f || adaptive_cutoff_method_ == "solver" ||
           adaptive_cutoff_method_ == "grid");
 }
@@ -283,6 +283,19 @@ void GraphModel::build_cached_graph(int n, int M, bool exact_mask, bool backward
     ggml_set_param(g->edge_vectors);
     if (adaptive) ggml_set_param(g->cutoff_values);
   }
+  if (plato_lr_.enabled) {
+    g->plato = std::make_unique<PetPlatoLR>();
+    g->plato->create(ctx, plato_lr_, plato_st_, n, backward && plato_lr_.long_range());
+    g->plato->set_padding_mask(g->padding_mask);
+    for (ggml_tensor *t : g->plato->tensors()) inputs.push_back(t);
+    interp_.custom_op = [p = g->plato.get()](ggml_context *c, const GIRNode &node, const std::vector<ggml_tensor *> &in) {
+      return p->build(c, node, in);
+    };
+  }
+  struct ClearHook {
+    GraphInterpreter &i;
+    ~ClearHook() { i.custom_op = {}; }
+  } clear_hook{interp_};
 
   interp_.coulomb_application = {};
   interp_.set_input_gradients(backward);
@@ -322,6 +335,12 @@ void GraphModel::build_cached_graph(int n, int M, bool exact_mask, bool backward
     if (!g->grad_ev) throw std::runtime_error("GraphModel: the energy does not depend on the edge vectors");
     ggml_set_output(g->grad_ev);
     if (g->grad_cv) ggml_set_output(g->grad_cv);
+    if (g->plato) {
+      g->grad_pos = ggml_graph_get_grad(g->graph, g->plato->positions);
+      g->grad_eps = g->plato->strain ? ggml_graph_get_grad(g->graph, g->plato->strain) : nullptr;
+      for (ggml_tensor *t : {g->grad_pos, g->grad_eps})
+        for (; t; t = t->view_src) ggml_set_output(t);
+    }
     constants.emplace_back(ggml_graph_get_grad_acc(g->graph, total), 1.0f);
   }
   for (auto &c : interp_.take_constants()) constants.push_back(c);
@@ -496,7 +515,7 @@ bool GraphModel::fit_cached_graph(int n, int max_kept) {
   const int pad = pad_env >= 0 ? pad_env : (backend_provider_->is_gpu() ? 4 : 0);
   const int need = std::max(max_kept, 1);
   if (cached_ && cached_->n_atoms == n && cached_->exact_mask == exact && cached_->backward == backward &&
-      need <= cached_->M && cached_->M <= need + 2 * pad)
+      need <= cached_->M && cached_->M <= need + 2 * pad && (!cached_->plato || cached_->plato->refresh(plato_st_)))
     return false;
   build_cached_graph(n, need + pad, exact, backward);
   return true;
@@ -515,6 +534,7 @@ void GraphModel::upload_conditioning(CachedGraph &g, int charge, int spin_multip
 bool GraphModel::use_ragged() {
   if (ragged_state_ >= 0) return ragged_state_ == 1;
   ragged_state_ = 0;
+  if (plato_lr_.enabled) return false; // the Plato-PET-LR ops are built on the padded layout
   const char *e = std::getenv("MLIPCPP_RAGGED");
   if (!e || !*e || *e == '0') return false;
   std::string why;
@@ -671,9 +691,23 @@ ModelResult GraphModel::predict_cached(const AtomicSystem &system, bool compute_
   }
 #ifdef MLIPCPP_HAVE_CUDA_INPUTS
   static const bool host_inputs = std::getenv("MLIPCPP_HOST_INPUTS") != nullptr;
-  if (!host_inputs && std::string_view(ggml_backend_name(compute_backend_)).rfind("CUDA", 0) == 0)
+  if (!host_inputs && !plato_lr_.enabled && std::string_view(ggml_backend_name(compute_backend_)).rfind("CUDA", 0) == 0)
     return predict_cached_device(system, compute_forces, species);
 #endif
+  if (plato_lr_.enabled) { // the structure of the long-range ops (cell, total charge)
+    PetPlatoLRStructure st;
+    st.a1 = n;
+    if (const Cell *c = system.cell()) {
+      const int np = c->periodic[0] + c->periodic[1] + c->periodic[2];
+      if (np != 0 && np != 3 && plato_lr_.long_range())
+        throw std::runtime_error("Plato-PET-LR long range needs full or no periodicity");
+      st.periodic = np == 3;
+      for (int a = 0; a < 3; a++)
+        for (int b = 0; b < 3; b++) st.cell[a][b] = c->matrix[a][b];
+    }
+    st.charge = system.charge();
+    plato_st_ = {st};
+  }
 
   GraphProfile profile;
   const HostEdges edges = host_edges(system, cutoff, nt, vesin_);
@@ -759,6 +793,7 @@ ModelResult GraphModel::predict_cached(const AtomicSystem &system, bool compute_
   ggml_backend_tensor_set(g.reverse, rev.data(), 0, ggml_nbytes(g.reverse));
   ggml_backend_tensor_set(g.cutoff_values, cv.data(), 0, ggml_nbytes(g.cutoff_values));
   upload_conditioning(g, system.charge(), system.spin_multiplicity());
+  if (g.plato) g.plato->upload(system.positions());
   if (ragged) {
     std::vector<int32_t> off(first.begin(), first.end());
     ggml_backend_tensor_set(g.offsets, off.data(), 0, ggml_nbytes(g.offsets));
@@ -826,12 +861,23 @@ ModelResult GraphModel::predict_cached(const AtomicSystem &system, bool compute_
           for (int c = 0; c < 3; c++) F[3 * k + c] += chain[3 * e + c] - chain[3 * b + c];
         }
     }
+    std::array<double, 6> w_plato{};
+    if (g.grad_pos) { // Plato-PET-LR: -dE/dx and dE/d strain of the long-range ops
+      std::vector<float> gp(3 * size_t(n));
+      ggml_backend_tensor_get(g.grad_pos, gp.data(), 0, gp.size() * sizeof(float));
+      for (size_t k = 0; k < F.size(); k++) F[k] -= gp[k];
+    }
+    if (g.grad_eps && periodic) {
+      float q[9];
+      ggml_backend_tensor_get(g.grad_eps, q, 0, sizeof q);
+      w_plato = {q[0], q[4], q[8], 0.5 * (q[5] + q[7]), 0.5 * (q[2] + q[6]), 0.5 * (q[1] + q[3])};
+    }
     result.forces.resize(3 * size_t(n));
     for (size_t k = 0; k < F.size(); k++) result.forces[k] = static_cast<float>(energy_scale_ * F[k]);
     result.has_forces = true;
 
     if (periodic) {
-      std::array<double, 6> w{};
+      std::array<double, 6> w = w_plato;
       for (const auto &v : virial)
         for (int c = 0; c < 6; c++) w[c] += v[c];
       set_stress(*cell, energy_scale_, w, result);
@@ -983,7 +1029,7 @@ ModelResult GraphModel::predict_cached_device(const AtomicSystem &system, bool c
 
 bool GraphModel::device_step_supported() const {
 #ifdef MLIPCPP_HAVE_CUDA_INPUTS
-  return cached_path_supported() && !nc_forces_ && compute_backend_ &&
+  return cached_path_supported() && !nc_forces_ && !plato_lr_.enabled && compute_backend_ &&
          std::string_view(ggml_backend_name(compute_backend_)).rfind("CUDA", 0) == 0;
 #else
   return false;

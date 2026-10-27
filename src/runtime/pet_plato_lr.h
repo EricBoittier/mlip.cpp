@@ -69,6 +69,11 @@ public:
               int n_atoms, bool grad);
   /// writes the host data into the created tensors; positions [n][3]
   void upload(const float *positions) const;
+  /// new structures (cells, charges) for the same graph: false if they need other shapes
+  /// (another mesh, k set, pair count, structure layout), then nothing is changed
+  bool refresh(const std::vector<PetPlatoLRStructure> &structures);
+  /// every input tensor created (cached graphs place them in their input buffer)
+  const std::vector<ggml_tensor *> &tensors() const { return all_; }
   /// the MLIPCPP_* op of `node`
   ggml_tensor *build(ggml_context *ctx, const GIRNode &node, const std::vector<ggml_tensor *> &inputs);
   /// the graph's padding mask [max_neighbors, n] (1 = padded): the frame RoPE attention masks the

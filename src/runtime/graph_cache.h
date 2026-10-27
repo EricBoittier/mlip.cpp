@@ -2,6 +2,8 @@
 // Internals shared by GraphModel's two prediction paths (graph_model.cpp,
 // graph_model_cached.cpp).
 
+#include "pet_plato_lr.h"
+#include <memory>
 #include <ggml-backend.h>
 #include <ggml.h>
 
@@ -62,6 +64,9 @@ struct CachedGraph {
   ggml_tensor *energy = nullptr, *nc = nullptr;            // [1, n], [3, n] (unscaled)
   ggml_tensor *loss = nullptr;                             // what the backward pass differentiates
   ggml_tensor *grad_ev = nullptr, *grad_cv = nullptr;      // dE / d edge_vectors, cutoff_values
+  // Plato-PET-LR: the long-range ops' inputs (positions, cell constants) and dE / d positions, strain
+  std::unique_ptr<PetPlatoLR> plato;
+  ggml_tensor *grad_pos = nullptr, *grad_eps = nullptr;
   // predict_device_step: 1 when every node runs on the compute backend, so the
   // graph goes to it directly and asynchronously (-1: not checked yet)
   int direct = -1;

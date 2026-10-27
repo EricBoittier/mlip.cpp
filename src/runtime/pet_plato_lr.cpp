@@ -276,6 +276,35 @@ void PetPlatoLR::create(ggml_context *ctx, const PetPlatoLRSpec &spec, const std
   strain = groups_[0].strain;
 }
 
+bool PetPlatoLR::refresh(const std::vector<PetPlatoLRStructure> &structures) {
+  PetPlatoLR t;
+  ggml_context *c = ggml_init({ggml_tensor_overhead() * 512, nullptr, true});
+  try {
+    t.create(c, spec_, structures, n_, false);
+  } catch (...) {
+    ggml_free(c);
+    throw;
+  }
+  ggml_free(c);
+  bool same = t.n_pairs_ == n_pairs_ && t.any_open_ == any_open_ && t.groups_.size() == groups_.size() &&
+              t.st_.size() == st_.size() && t.h_pi_ == h_pi_ && t.h_sidx_ == h_sidx_;
+  for (size_t k = 0; same && k < groups_.size(); k++) {
+    const Group &a = groups_[k], &b = t.groups_[k];
+    same = a.structs == b.structs && a.nk == b.nk && std::equal(a.mesh, a.mesh + 3, b.mesh) &&
+           std::equal(a.les_mesh, a.les_mesh + 3, b.les_mesh) && a.h_bidx == b.h_bidx;
+  }
+  if (!same) return false;
+  st_ = t.st_;
+  h_onehot_ = t.h_onehot_, h_invc_ = t.h_invc_, h_qpa_ = t.h_qpa_, h_aict_ = t.h_aict_, h_omask_ = t.h_omask_;
+  for (size_t k = 0; k < groups_.size(); k++) {
+    Group &a = groups_[k];
+    const Group &b = t.groups_[k];
+    a.h_mask = b.h_mask, a.h_invc = b.h_invc, a.h_invv = b.h_invv, a.h_mk = b.h_mk, a.h_mpad = b.h_mpad;
+    a.h_mdec = b.h_mdec, a.h_lk = b.h_lk, a.h_ln = b.h_ln, a.h_lK = b.h_lK, a.h_tab = b.h_tab;
+  }
+  return true;
+}
+
 std::vector<ggml_tensor *> PetPlatoLR::strains() const {
   std::vector<ggml_tensor *> out;
   for (const auto &q : groups_) out.push_back(q.strain);
