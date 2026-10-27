@@ -13,7 +13,7 @@ parity and training checks. metatrain builds and converts the model
 Writes OUT ({"model": PET}, what export_pet_gguf.py --model reads), OUT with .ckpt
 (model.get_checkpoint()) and OUT with .json (the plato_lr hypers, the new tensors, the
 gate values). --gates random sets every gate (rope_gate, edge_gate, mesh_gate, les_gate)
-to nonzero values so each branch moves the outputs; --gates zero keeps the exact
+to nonzero values (times --gate-scale) so each branch moves the outputs; --gates zero keeps the exact
 conversion (the model is the pretrained PET).
 """
 import argparse
@@ -108,9 +108,9 @@ def set_gates(model, mode, seed=0, scale=1.0):
                 continue
             if mode == "random":
                 if name.endswith("rope_gate"):
-                    p.copy_(torch.rand(p.shape, generator=g) * 0.6 + 0.2)
+                    p.copy_(scale * (torch.rand(p.shape, generator=g) * 0.6 + 0.2))
                 elif name.endswith("les_gate"):
-                    p.fill_(0.8)
+                    p.fill_(0.8 * scale)
                 else:  # per-channel gates of edge and mesh updates
                     p.copy_(scale * 0.5 * torch.randn(p.shape, generator=g))
             else:

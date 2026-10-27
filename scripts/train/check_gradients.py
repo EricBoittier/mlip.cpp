@@ -26,6 +26,7 @@ src/core/padding.h (species index 0, vector (0, 0, cutoff)). --pad mlipcpp
 same function; --pad metatrain keeps metatrain's own.
 """
 import argparse
+import os
 import json
 import sys
 from pathlib import Path
@@ -101,8 +102,8 @@ def main():
     ap.add_argument("--fp32-spread", type=int, default=0,
                     help="1: also run PyTorch in float32 and gate on its spread from float64")
     ap.add_argument("--spread-factor", type=float, default=3.0)
-    ap.add_argument("--zero-tol", type=float, default=1e-6,
-                    help="tensors with both gradient norms below this pass (identically zero gradients)")
+    ap.add_argument("--zero-tol", type=float, default=1e-4,
+                    help="a tensor whose reference gradient vanishes (|g| < 1e-10) passes if mlip.cpp's is below this")
     ap.add_argument("--pad", choices=["mlipcpp", "metatrain"], default="mlipcpp",
                     help="contents of padded neighbour slots in the reference")
     ap.add_argument("--pad-exact", type=int, default=0,
@@ -129,7 +130,8 @@ def main():
         model.train()
         if args.attn_eps is not None:
             for mod in model.modules():
-                if type(mod).__name__ == "AttentionBlock":
+                # AttentionBlock and its subclasses (Plato-PET-LR's FrameRoPEAttention)
+                if any(t.__name__ == "AttentionBlock" for t in type(mod).__mro__):
                     mod.epsilon = torch.finfo(dtype).tiny if args.attn_eps == "tiny" else args.attn_eps
         nl_options = model.requested_neighbor_lists()
         comp = {int(k): v for k, v in meta["composition"].items()}
@@ -158,6 +160,8 @@ def main():
         f_atom = out["non_conservative_force"].block().values.reshape(-1, 3)
         counts = [len(s) for s in systems]
         e_pa = torch.stack([chunk.sum() / len(chunk) for chunk in torch.split(e_atom, counts)])
+        if os.environ.get("CHECK_GRADIENTS_DEBUG"):
+            print("e_pa", e_pa.tolist(), "n", counts)
         loss_e = ((e_pa - torch.tensor(e_target, dtype=dtype)) ** 2).mean()
         loss_f = ((f_atom - torch.tensor(np.concatenate(f_target), dtype=dtype)) ** 2).mean()
         if cons:
@@ -222,15 +226,18 @@ def main():
         flat = lambda t: t.grad.reshape(-1).double().numpy() if t.grad is not None else np.zeros_like(g_cpp)
         g_ref = flat(by_name[entry["name"]])
         rel = rel_err(g_cpp, g_ref)
-        if np.linalg.norm(g_ref) < args.zero_tol and np.linalg.norm(g_cpp) < args.zero_tol:
-            rel = 0.0  # a gradient that vanishes identically (e.g. a bias the LES neutralisation removes)
+        if np.linalg.norm(g_ref) < 1e-10 and np.linalg.norm(g_cpp) < args.zero_tol:
+            # a gradient that vanishes identically (the LES charge-head output bias, removed by the
+            # per-structure neutralisation): float32 leaves rounding noise
+            print(f"  {entry['name']}: zero gradient (|g| torch {np.linalg.norm(g_ref):.1e}, mlip.cpp {np.linalg.norm(g_cpp):.1e})")
+            rel = 0.0
         worst = max(worst, rel)
         allowed = args.tol
         if by_name32:
             rel32 = rel_err(flat(by_name32[entry["name"]]), g_ref)
             worst32 = max(worst32, rel32)
             allowed = max(allowed, args.spread_factor * rel32)
-        if "system_conditioning" in entry["name"]:  # charge / spin conditioning: always shown
+        if any(k in entry["name"] for k in ("system_conditioning", "_gate", "plato_", "rope_omega", "edge_embedder_vec")):  # conditioning and Plato-PET-LR tensors: always shown
             print(f"  {entry['name']}: |g| {np.linalg.norm(g_ref):.4e}, relative error {rel:.2e}")
         if rel > allowed:
             failures.append((entry["name"], rel, allowed, np.linalg.norm(g_ref)))
