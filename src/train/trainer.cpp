@@ -289,6 +289,8 @@ std::string cache_path(const std::string &cache_dir, const MemmapSplit &split, f
 StepStats &StepStats::operator+=(const StepStats &o) {
   loss += o.loss, loss_energy += o.loss_energy, loss_force += o.loss_force;
   loss_nc += o.loss_nc, se_force_nc += o.se_force_nc;
+  loss_charge += o.loss_charge, sum_charge_r += o.sum_charge_r;
+  n_charge_r += o.n_charge_r, n_charge_skipped += o.n_charge_skipped;
   se_energy_per_atom += o.se_energy_per_atom, se_force += o.se_force;
   ae_energy_per_atom += o.ae_energy_per_atom, ae_force += o.ae_force;
   sum_e += o.sum_e, sum2_e += o.sum2_e, sum_f += o.sum_f, sum2_f += o.sum2_f;
@@ -479,6 +481,38 @@ Worker::GraphCost Worker::graph_cost(int n, int m, int S, bool backward) {
   return c;
 }
 
+ggml_tensor *Worker::charge_corr_graph(StepGraph &g, ggml_context *ctx, int S, bool loss) {
+  (void)S;
+  if (!(charge_corr.weight > 0)) return nullptr;
+  ggml_tensor *q = g.plato ? g.plato->charges() : nullptr;
+  if (!q) throw std::runtime_error("--charge-corr-weight needs a Plato-PET-LR model with LES");
+  const int64_t n = q->ne[1], G = g.plato->n_struct();
+  g.qref = input(ctx, GGML_TYPE_F32, {1, n}, "ref_charge");
+  g.qok = input(ctx, GGML_TYPE_F32, {1, G}, "ref_ok");
+  g.qw = input(ctx, GGML_TYPE_F32, {1}, "charge_corr_weight");
+  // the first latent charge channel (Pearson is shift and scale invariant: the charge unit
+  // and the total-charge shift do not matter)
+  ggml_tensor *q0 = ggml_cont(ctx, ggml_view_2d(ctx, q, 1, n, q->nb[1], 0));
+  g.charge_r = g.plato->pearson(ctx, q0, g.qref); // [1, G]
+  ggml_set_output(g.charge_r);
+  if (!loss) return nullptr;
+  ggml_tensor *hinge = ggml_mul(ctx, ggml_relu(ctx, ggml_scale_bias(ctx, g.charge_r, -1.0f, static_cast<float>(charge_corr.r_min))), g.qok);
+  return g.charge_loss = ggml_mul(ctx, ggml_sum(ctx, hinge), g.qw);
+}
+
+void Worker::charge_corr_stats(StepGraph &g, const Batch &b, StepStats &st) {
+  st.n_charge_skipped += b.n_ref_skipped;
+  if (!g.charge_r) return;
+  std::vector<float> r(ggml_nelements(g.charge_r));
+  ggml_backend_tensor_get(g.charge_r, r.data(), 0, r.size() * sizeof(float));
+  const double norm = b.charge_norm > 0 ? b.charge_norm : 1.0 / std::max<double>(1, std::accumulate(b.ref_ok.begin(), b.ref_ok.end(), 0.0));
+  for (size_t k = 0; k < r.size() && k < b.ref_ok.size(); k++)
+    if (b.ref_ok[k] != 0.0f) {
+      st.sum_charge_r += r[k], st.n_charge_r++;
+      st.loss_charge += charge_corr.weight * norm * std::max(0.0, charge_corr.r_min - r[k]);
+    }
+}
+
 void Worker::plato_create(StepGraph &g, ggml_context *ctx, int n, bool grad) {
   std::vector<runtime::PetPlatoLRStructure> st;
   if (plato_batch_ && plato_batch_->n_atoms == n) {
@@ -561,10 +595,12 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
     g->out = interp.build(ctx);
     ggml_set_output(g->out); // (an energy-only export's [n]: the source of the view below, kept too)
     if (ggml_n_dims(g->out) == 1) g->out = ggml_reshape_2d(ctx, g->out, 1, n), ggml_set_output(g->out);
+    charge_corr_graph(*g, ctx, S, false); // r for the metrics (the loss term is in MIXED)
     ggml_tensor *E = ggml_sum(ctx, ggml_cont(ctx, ggml_view_2d(ctx, g->out, 1, n, g->out->nb[1], 0)));
     g->gf = ggml_new_graph_custom(ctx, graph_size, true);
     ggml_build_forward_expand(g->gf, g->out);
     ggml_build_forward_expand(g->gf, E);
+    if (g->charge_r) ggml_build_forward_expand(g->gf, g->charge_r);
     g->n_forward = ggml_graph_n_nodes(g->gf);
     ggml_set_loss(E);
     ggml_build_backward_expand(ctx, g->gf, nullptr);
@@ -615,6 +651,7 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
     ggml_tensor *loss_e = ggml_mul(ctx, ggml_sum(ctx, ggml_sqr(ctx, d_energy)), e_norm);
     ggml_tensor *loss_f = ggml_mul(ctx, ggml_sum(ctx, ggml_sqr(ctx, d_force)), f_norm);
     ggml_tensor *loss = ggml_add(ctx, loss_e, loss_f);
+    if (ggml_tensor *lq = charge_corr_graph(*g, ctx, S, true)) loss = ggml_add(ctx, loss, lq);
     if (mode == MIXED) {
       // - <dE/dx, u> along the scaled residual u: its weight gradient is the
       // conservative force loss's (u held fixed)
@@ -733,6 +770,17 @@ void Worker::upload_inputs(StepGraph &g, const Batch &b, const std::vector<float
                            span(b.force_mask), span(b.force_scale), {norms, sizeof norms}});
   if (dv) src.insert(src.end(), {span(*dv), span(*dc)});
   if (src.size() != g.inputs.size()) throw std::logic_error("upload_inputs: input count");
+  if (g.qref) {
+    std::vector<float> ref(ggml_nelements(g.qref), 0.0f), ok(ggml_nelements(g.qok), 0.0f);
+    std::copy_n(b.ref_charge.begin(), std::min(ref.size(), b.ref_charge.size()), ref.begin());
+    std::copy_n(b.ref_ok.begin(), std::min(ok.size(), b.ref_ok.size()), ok.begin());
+    double n_ok = 0;
+    for (float x : ok) n_ok += x;
+    const float w = static_cast<float>(charge_corr.weight * (b.charge_norm > 0 ? b.charge_norm : 1.0 / std::max(1.0, n_ok)));
+    ggml_backend_tensor_set(g.qref, ref.data(), 0, ggml_nbytes(g.qref));
+    if (g.qok->buffer) ggml_backend_tensor_set(g.qok, ok.data(), 0, ggml_nbytes(g.qok)); // (FORCES graphs: r only)
+    if (g.qw->buffer) ggml_backend_tensor_set(g.qw, &w, 0, sizeof(float));
+  }
   if (g.plato) {
     g.plato->upload(b.positions.data());
     if (g.dx) {
@@ -850,6 +898,7 @@ StepStats Worker::run(const Batch &b, double energy_scale, bool backward) {
   st.se_energy_per_atom = double(stats[1]) / loss_norms(b).first * energy_scale * energy_scale;
   st.se_force = stats[3];
   st.n_systems = b.n_real_systems;
+  charge_corr_stats(*g, b, st);
   for (float w : b.force_mask) st.n_force_components += 3 * static_cast<int64_t>(w);
   add_target_sums(b, energy_scale, st);
   if (system_errors) {
@@ -894,6 +943,8 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
     gc.resize(static_cast<size_t>(n) * m);
     ggml_backend_tensor_get(gf.grad_c, gc.data(), 0, gc.size() * sizeof(float));
   }
+  StepStats st;
+  charge_corr_stats(gf, b, st);
   if (gf.grad_x) { // Plato-PET-LR: the explicit position dependence (mesh, LES)
     gx.resize(3 * static_cast<size_t>(n));
     ggml_backend_tensor_get(gf.grad_x, gx.data(), 0, gx.size() * sizeof(float));
@@ -930,7 +981,6 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
 
   // the loss terms and metrics; force targets are physical F / s_Z, the
   // conservative ones F / s_E (the gradient of the scaled energy)
-  StepStats st;
   st.n_systems = b.n_real_systems;
   std::vector<double> d_e(S, 0.0), u(3 * static_cast<size_t>(n), 0.0), fse(S, 0.0);
   for (int k = 0; k < S; k++) {
@@ -962,7 +1012,7 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
     per_atom[a] = static_cast<float>(e2);
     fse[sys] += e2;
   }
-  st.loss = st.loss_energy + st.loss_force + st.loss_nc;
+  st.loss = st.loss_energy + st.loss_force + st.loss_nc + st.loss_charge;
   if (system_errors) {
     for (int k = 0; k < b.n_real_systems; k++)
       system_errors->push_back({b.ids[k], -1, b.n_per_system[k], static_cast<float>(d_e[k] * energy_scale),
@@ -1830,6 +1880,22 @@ void train(const TrainOptions &o) {
         o.init_gguf, o.n_gpus == 0 ? -1 : w,
         o.tile_nb_ratio > 1 ? static_cast<size_t>(o.graph_cache) : 0));
   for (auto &w : workers) w->conservative = {o.conservative, o.energy_weight, o.force_weight, o.nc_force_weight};
+  for (auto &w : workers) w->charge_corr = {o.charge_corr_weight, o.charge_corr_min};
+  if (o.charge_corr_weight > 0) {
+    if (o.charge_corr_target != "mulliken" && o.charge_corr_target != "lowdin" && o.charge_corr_target != "nbo")
+      throw std::runtime_error("--charge-corr-target mulliken|lowdin|nbo, not " + o.charge_corr_target);
+    if (!workers[0]->model().plato_lr().les)
+      throw std::runtime_error("--charge-corr-weight needs a Plato-PET-LR model with LES latent charges");
+    for (MemmapSplit *sp : {&train_split, &val_split, &test_split}) {
+      const bool got = sp->load_partial_charges(o.charge_corr_target);
+      int64_t ok = 0;
+      for (int64_t s = 0; s < sp->size(); s++) ok += sp->partial_charges_ok(s);
+      fmt::print("charge correlation: {}: {}_charge.bin {}, {} of {} structures taking part\n", sp->dir(),
+                 o.charge_corr_target, got ? "read" : "absent", ok, sp->size());
+    }
+    fmt::print("charge correlation: weight {} x mean over structures of max(0, {} - r), r = Pearson(first latent "
+               "charge channel, {} charges)\n", o.charge_corr_weight, o.charge_corr_min, o.charge_corr_target);
+  }
   if (o.conservative)
     fmt::print("conservative forces -dE/dx: loss weights energy {}, forces {}, direct forces {}\n", o.energy_weight,
                o.force_weight, o.nc_force_weight);
@@ -2189,7 +2255,12 @@ void train(const TrainOptions &o) {
                    "sync {:.1f} ms; {:.2f} micro-batches/worker; graphs {} cached ({:.1f} GB buffer), {} misses, {} flushes\n",
                    epoch, step + 1, steps_per_epoch, step_total.loss / W, step_total.loss_energy / W,
                    step_total.loss_force / W,
-                   o.conservative ? fmt::format(", F_nc {:.4g}", step_total.loss_nc / W) : std::string(),
+                   (o.conservative ? fmt::format(", F_nc {:.4g}", step_total.loss_nc / W) : std::string()) +
+                       (o.charge_corr_weight > 0
+                            ? fmt::format(", q {:.4g}: mean r {:.4f}, {} skipped", step_total.loss_charge / W,
+                                          step_total.sum_charge_r / std::max<int64_t>(1, step_total.n_charge_r),
+                                          step_total.n_charge_skipped)
+                            : std::string()),
                    lr, norm, (step + 1) * W * B / el, 1e3 * t_wait / (step + 1),
                    1e3 * t_gpu / (step + 1), 1e3 * t_build / (step + 1),
                    1e3 * t_compute / (step + 1), 1e3 * t_sync / (step + 1),
@@ -2220,6 +2291,10 @@ void train(const TrainOptions &o) {
                "F {:.2f} meV/A{} | val ({:.1f} s) RMSE E {:.2f} meV/atom, F {:.2f} meV/A{}, R2 E {:.4f}% F {:.4f}%\n",
                epoch, t_train, ep.n_systems / t_train, ep.loss / done, tre, trf, nc_rmse(ep),
                t_val, ve, vf, nc_rmse(val), re, rf);
+    if (o.charge_corr_weight > 0)
+      fmt::print("epoch {} charge correlation ({}): mean r train {:.4f} ({} structures, {} skipped), val {:.4f} ({} structures)\n",
+                 epoch, o.charge_corr_target, ep.sum_charge_r / std::max<int64_t>(1, ep.n_charge_r), ep.n_charge_r,
+                 ep.n_charge_skipped, val.sum_charge_r / std::max<int64_t>(1, val.n_charge_r), val.n_charge_r);
     std::fflush(stdout);
     params = w0.get_params(); // the master copy lives on device 0
     const int64_t done_epochs = epoch + 1;

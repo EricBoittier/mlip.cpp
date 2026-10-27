@@ -158,7 +158,15 @@ def main():
         requested = {"energy": ModelOutput(sample_kind="atom")}
         if nc_head:
             requested["non_conservative_force"] = ModelOutput(sample_kind="atom")
+        qcorr = meta.get("charge_corr")
+        captured = {}
+        hook = None
+        if qcorr:  # the LES latent charges (before the shift; Pearson is shift and scale invariant)
+            les = model.backend.les
+            hook = les.register_forward_hook(lambda mod, inputs, out: captured.__setitem__("args", inputs))
         out = model(systems, requested)
+        if hook is not None:
+            hook.remove()
         e_atom = out["energy"].block().values.reshape(-1)
         f_atom = out["non_conservative_force"].block().values.reshape(-1, 3) if nc_head else None
         counts = [len(s) for s in systems]
@@ -178,6 +186,24 @@ def main():
             loss = loss_e + loss_f + loss_nc
         else:
             loss = loss_e + loss_f
+        if qcorr:
+            a = captured["args"]
+            q = model.backend.les.charges(a[0], a[1], a[2], a[3])[:, 0]
+            pq = np.fromfile(Path(args.data) / "train" / f"{qcorr['target']}_charge.bin", np.float32)
+            terms = []
+            for k, s in enumerate(meta["ids"]):
+                lo, hi = int(sum(counts[:k])), int(sum(counts[:k + 1]))
+                ref = pq[split["na"][s]: split["na"][s + 1]].astype(np.float64)
+                if len(ref) < 3 or not np.all(np.isfinite(ref)) or ref.max() - ref.min() <= 1e-6:
+                    continue
+                qa = q[lo:hi] - q[lo:hi].mean()
+                pa = torch.tensor(ref - ref.mean(), dtype=dtype)
+                r = (qa * pa).sum() / torch.sqrt((qa * qa).sum() * (pa * pa).sum() + 1e-30)
+                terms.append(torch.relu(qcorr["r_min"] - r))
+            loss_q = qcorr["weight"] * torch.stack(terms).mean()
+            print(f"loss_q torch {loss_q.item():.8g}  mlipcpp {qcorr['loss']:.8g}  (mean r mlip.cpp {qcorr['mean_r']:.6f}, "
+                  f"{len(terms)} structures, {qcorr['skipped']} skipped)")
+            loss = loss + loss_q
         loss.backward()
         return model, loss, loss_e, loss_f, (loss_nc if cons else None)
 

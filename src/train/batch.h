@@ -65,6 +65,12 @@ struct Batch {
   std::vector<std::array<float, 9>> cells;
   std::vector<uint8_t> periodic;
   std::vector<int32_t> system_charge;
+  // auxiliary charge correlation (--charge-corr-weight): DFT partial charges [n_atoms]
+  // (0 where absent) and per real structure whether it takes part; charge_norm: 1 / the
+  // structures taking part in the whole step (0: those of this batch)
+  std::vector<float> ref_charge, ref_ok;
+  int n_ref_skipped = 0; // structures with partial charges that were left out (NaN, constant, < 3 atoms)
+  float charge_norm = 0.0f;
 
   // Loss normalisation: 1/S and 1/(3N) of the *whole* step batch, so that
   // micro-batch losses (and gradients) sum to the full-batch ones.

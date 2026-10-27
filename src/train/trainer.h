@@ -64,6 +64,12 @@ struct TrainOptions {
   // them, the direct head keeps a term of its own; loss weights of the
   // energy, the conservative and the direct forces
   bool conservative = false;
+  // auxiliary loss on the LES latent charges (Plato-PET-LR): weight * mean_s max(0, r_min - r_s), r_s the
+  // Pearson correlation of the first latent charge channel with the DFT partial charges
+  // <split>/<target>_charge.bin (float32 per atom; target mulliken | lowdin | nbo); structures without
+  // them, with fewer than 3 atoms, a NaN or a constant reference are left out; weight 0: off
+  double charge_corr_weight = 0.0, charge_corr_min = 1.0;
+  std::string charge_corr_target = "mulliken";
   double energy_weight = 1.0, force_weight = 1.0, nc_force_weight = 1.0;
   // fine-tuning: keep the composition and scales stored in --init instead of
   // fitting them on the training set
@@ -114,6 +120,8 @@ static_assert(sizeof(SystemError) == 24);
 struct StepStats {
   double loss = 0, loss_energy = 0, loss_force = 0;
   double loss_nc = 0, se_force_nc = 0; // conservative mode: the direct head's term and (eV/Å)^2
+  double loss_charge = 0, sum_charge_r = 0; // charge correlation: loss term, sum of r over the structures taking part
+  int64_t n_charge_r = 0, n_charge_skipped = 0;
   double se_energy_per_atom = 0; // Σ_s (ΔE_s / N_s)^2, eV^2
   double se_force = 0;           // Σ_i,k ΔF_ik^2, (eV/Å)^2 (conservative mode: of -dE/dx)
   // MAE and R^2 = 1 - SSE / SST (energies per atom after the composition,
@@ -176,6 +184,12 @@ public:
     bool on = false;
     double energy = 1.0, force = 1.0, nc_force = 1.0;
   } conservative;
+  /// auxiliary loss on the LES latent charges (Plato-PET-LR): weight * mean over the structures with
+  /// partial charges of max(0, r_min - r_s), r_s the Pearson correlation of the first latent charge
+  /// channel with the DFT partial charges (Batch::ref_charge); weight 0: off
+  struct ChargeCorr {
+    double weight = 0.0, r_min = 1.0;
+  } charge_corr;
 
   /// Profiling: compute node by node (synchronised) and accumulate, per op
   /// ("fwd:OP" / "bwd:OP"; conservative mode "F.fwd:OP" / "F.bwd:OP" for the
@@ -238,6 +252,8 @@ private:
     // FORCES: dE/dx; MIXED: the position tangent and the scale of the normalised tangents
     std::unique_ptr<runtime::PetPlatoLR> plato;
     ggml_tensor *grad_x = nullptr, *dx = nullptr, *jvp_scale = nullptr;
+    // charge correlation: inputs (partial charges, structures taking part, weight x norm) and r [1, G]
+    ggml_tensor *qref = nullptr, *qok = nullptr, *qw = nullptr, *charge_r = nullptr, *charge_loss = nullptr;
     ~StepGraph();
   };
   /// graph kinds: the loss (FORWARD / BACKWARD to the weights); conservative
@@ -262,6 +278,8 @@ private:
   // the MIXED graph's position tangent and tangent scale
   const Batch *plato_batch_ = nullptr;
   std::vector<float> plato_dx_;
+  ggml_tensor *charge_corr_graph(StepGraph &g, ggml_context *ctx, int S, bool loss); // r [1, G] (+ the loss term)
+  void charge_corr_stats(StepGraph &g, const Batch &b, StepStats &st);
   float plato_jvp_scale_ = 1.0f;
   void plato_create(StepGraph &g, ggml_context *ctx, int n, bool grad);
 

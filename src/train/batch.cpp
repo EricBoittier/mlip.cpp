@@ -205,6 +205,13 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
       }
       b.periodic[k] = np == 3;
       b.system_charge[k] = split.charge(s);
+      if (split.has_partial_charges()) {
+        if (b.ref_charge.empty()) b.ref_charge.assign(n, 0.0f), b.ref_ok.assign(b.n_real_systems, 0.0f);
+        b.ref_ok[k] = split.partial_charges_ok(s) ? 1.0f : 0.0f;
+        b.n_ref_skipped += b.ref_ok[k] == 0.0f;
+        if (b.ref_ok[k] != 0.0f)
+          std::copy(split.partial_charges(s), split.partial_charges(s) + ns, b.ref_charge.begin() + offset);
+      }
     }
     b.energy_target[k] = static_cast<float>(
         (split.energy(s) - scaling.comp(Z, ns)) / (scaling.energy_scale * ns));
@@ -244,6 +251,9 @@ std::vector<Batch> make_microbatches(const MemmapSplit &split, const NeighborCac
                                      const std::map<int, int> &species_to_index,
                                      const TargetScaling &scaling, float cutoff, double budget,
                                      double growth, const Tiling &tiling) {
+  int n_ok = 0;
+  for (int64_t s : ids) n_ok += split.partial_charges_ok(s);
+  const float charge_norm = n_ok ? 1.0f / n_ok : 0.0f;
   std::vector<size_t> order(ids.size());
   std::iota(order.begin(), order.end(), 0);
   std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
@@ -270,6 +280,7 @@ std::vector<Batch> make_microbatches(const MemmapSplit &split, const NeighborCac
                              pad_nb, tiling.enabled() ? tiling.systems : 0));
     out.back().energy_norm = 1.0f / ids.size();
     out.back().force_norm = 1.0f / (3.0f * n_total);
+    out.back().charge_norm = charge_norm;
     g_ids.clear(), g_rot.clear(), g_atoms = 0;
   };
   for (size_t k : order) {
@@ -298,6 +309,9 @@ std::vector<std::vector<Batch>> make_step_batches(const MemmapSplit &split, cons
                                                   const Tiling &tiling) {
   const size_t K = ids.size();
   const int W = std::max(1, n_workers);
+  int n_ok = 0;
+  for (int64_t s : ids) n_ok += split.partial_charges_ok(s);
+  const float charge_norm = n_ok ? static_cast<float>(W) / n_ok : 0.0f;
   std::vector<size_t> order(K);
   std::iota(order.begin(), order.end(), 0);
   std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
@@ -384,6 +398,7 @@ std::vector<std::vector<Batch>> make_step_batches(const MemmapSplit &split, cons
                            pad_nb, tiling.enabled() ? tiling.systems : 0);
       b.energy_norm = static_cast<float>(W) / K;
       b.force_norm = static_cast<float>(W) / (3.0f * atoms[K]);
+      b.charge_norm = charge_norm;
       return b;
     }));
   std::vector<std::vector<Batch>> out(W);

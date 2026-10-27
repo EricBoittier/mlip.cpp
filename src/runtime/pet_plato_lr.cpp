@@ -89,7 +89,7 @@ void PetPlatoLR::create(ggml_context *ctx, const PetPlatoLRSpec &spec, const std
                         int n_atoms, bool grad) {
   spec_ = spec, st_ = structures, n_ = n_atoms;
   all_.clear(), groups_.clear();
-  frac_ = pair_r_ = nullptr;
+  frac_ = pair_r_ = charges_ = nullptr;
   strain = nullptr, pair_i_ = pair_j_ = nullptr, atom_inv_cell_t_ = nullptr, open_mask_ = nullptr;
   n_pairs_ = 0, any_open_ = false;
   const int G = static_cast<int>(st_.size());
@@ -378,6 +378,20 @@ ggml_tensor *PetPlatoLR::edge_sum(ggml_context *ctx, const std::vector<ggml_tens
   return ggml_reshape_3d(ctx, acc, d, M, n);
 }
 
+ggml_tensor *PetPlatoLR::pearson(ggml_context *ctx, ggml_tensor *a, ggml_tensor *b) const {
+  const int G = n_struct();
+  auto smean = [&](ggml_tensor *x) { // per-structure mean of x [1, n], on every atom: [1, n]
+    ggml_tensor *m = ggml_mul(ctx, ggml_reshape_2d(ctx, mm_f32(ctx, onehot_, ggml_cont(ctx, ggml_transpose(ctx, x))), 1, G), inv_count_);
+    return ggml_reshape_2d(ctx, ggml_get_rows(ctx, ggml_reshape_2d(ctx, m, 1, G), struct_index_), 1, n_);
+  };
+  auto ssum = [&](ggml_tensor *x) { // per-structure sum of x [1, n]: [1, G]
+    return ggml_reshape_2d(ctx, mm_f32(ctx, onehot_, ggml_cont(ctx, ggml_transpose(ctx, x))), 1, G);
+  };
+  ggml_tensor *ac = ggml_sub(ctx, a, smean(a)), *bc = ggml_sub(ctx, b, smean(b));
+  ggml_tensor *var = ggml_mul(ctx, ssum(ggml_sqr(ctx, ac)), ssum(ggml_sqr(ctx, bc)));
+  return ggml_div(ctx, ssum(ggml_mul(ctx, ac, bc)), ggml_sqrt(ctx, ggml_scale_bias(ctx, var, 1.0f, 1e-30f)));
+}
+
 ggml_tensor *PetPlatoLR::inv_volume(ggml_context *ctx, const Group &g) {
   const int Gq = g.size();
   auto e = [&](int k) { return ggml_cont(ctx, ggml_view_2d(ctx, g.strain, 1, Gq, g.strain->nb[2], k * sizeof(float))); };
@@ -453,6 +467,7 @@ ggml_tensor *PetPlatoLR::les_op(ggml_context *ctx, const GIRNode &node, const st
   ggml_tensor *mean = ggml_mul(ctx, ggml_cont(ctx, ggml_transpose(ctx, mm_f32(ctx, onehot_, qt))), inv_count_); // [Q, G]
   q = ggml_sub(ctx, q, ggml_get_rows(ctx, mean, struct_index_));
   if (tcc) q = ggml_add(ctx, q, ggml_div(ctx, charge_per_atom_, ggml_repeat(ctx, in[1], charge_per_atom_)));
+  charges_ = q;
   ggml_tensor *e = nullptr; // [1, n]
   auto acc = [&](ggml_tensor *t) { e = e ? ggml_add(ctx, e, t) : t; };
   if (n_pairs_ > 0) { // open structures: the erf pair sum, per atom

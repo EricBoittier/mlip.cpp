@@ -54,6 +54,14 @@ public:
   int charge(int64_t s) const { return charge_.empty() ? 0 : charge_[s]; }
   int spin_multiplicity(int64_t s) const { return spin_.empty() ? 1 : spin_[s]; }
   bool has_conditioning_data() const { return !charge_.empty() || !spin_.empty(); }
+  /// DFT partial charges per atom, <target>_charge.bin (float32 [N]; e.g. mulliken, lowdin,
+  /// nbo), for mlipcpp-train --charge-corr-weight; false if the file is absent
+  bool load_partial_charges(const std::string &target);
+  bool has_partial_charges() const { return pq_.size() > 0; }
+  const float *partial_charges(int64_t s) const { return pq_.size() ? pq_.data() + na_[s] : nullptr; }
+  /// structure s usable for the charge correlation: >= 3 atoms, every partial charge finite
+  /// (NBO has NaN for failed analyses) and not all equal
+  bool partial_charges_ok(int64_t s) const;
 
   /// System s as an AtomicSystem. Zero cell rows become non-periodic vacuum
   /// vectors so the cell stays invertible for the neighbour-list grid.
@@ -68,6 +76,7 @@ private:
   Mapped<float> x_, c_, energy_, force_;
   Mapped<int32_t> a_;
   std::vector<int32_t> charge_, spin_;
+  Mapped<float> pq_;
 };
 
 /// Neighbour lists of every structure in a split, built once and cached on

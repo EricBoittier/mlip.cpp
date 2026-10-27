@@ -81,6 +81,11 @@ public:
   const int *mesh() const { return groups_.empty() ? zero3_ : groups_[0].mesh; }
   const int *les_mesh() const { return groups_.empty() ? zero3_ : groups_[0].les_mesh; }
   int64_t n_k() const { return groups_.empty() ? 0 : groups_[0].nk; }
+  /// the latent charges of the last MLIPCPP_PLATO_LES built ([Q, n], model units: neutralised or
+  /// shifted to the total charge), or nullptr
+  ggml_tensor *charges() const { return charges_; }
+  /// Pearson correlation per structure of two per-atom rows a, b [1, n]: [1, G]
+  ggml_tensor *pearson(ggml_context *ctx, ggml_tensor *a, ggml_tensor *b) const;
 
 private:
   // periodic structures on one mesh (and one LES mesh): blocks of one spread / FFT / gather
@@ -110,6 +115,7 @@ private:
   std::vector<int32_t> h_sidx_, h_pi_, h_pj_;
   std::vector<float> h_onehot_, h_invc_, h_qpa_, h_aict_, h_omask_;
   ggml_tensor *frac_ = nullptr, *pair_r_ = nullptr; // built once per graph
+  ggml_tensor *charges_ = nullptr;
 
   ggml_tensor *frac(ggml_context *ctx);
   ggml_tensor *pair_r(ggml_context *ctx); // [1, P] distances of the pairs

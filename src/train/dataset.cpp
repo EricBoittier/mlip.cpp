@@ -109,6 +109,26 @@ MemmapSplit::MemmapSplit(const std::string &dir) : dir_(dir) {
   optional("spin_multiplicity", spin_);
 }
 
+bool MemmapSplit::load_partial_charges(const std::string &target) {
+  const std::string path = dir_ + "/" + target + "_charge.bin";
+  if (!std::filesystem::exists(path)) return false;
+  pq_ = Mapped<float>(path);
+  if (pq_.size() != static_cast<size_t>(na_.back()))
+    throw std::runtime_error(path + ": " + std::to_string(pq_.size()) + " values for " + std::to_string(na_.back()) + " atoms");
+  return true;
+}
+
+bool MemmapSplit::partial_charges_ok(int64_t s) const {
+  if (!pq_.size() || n_atoms(s) < 3) return false;
+  const float *p = partial_charges(s);
+  double lo = p[0], hi = p[0];
+  for (int i = 0; i < n_atoms(s); i++) {
+    if (!std::isfinite(p[i])) return false;
+    lo = std::min<double>(lo, p[i]), hi = std::max<double>(hi, p[i]);
+  }
+  return hi - lo > 1e-6;
+}
+
 AtomicSystem MemmapSplit::system(int64_t s) const {
   const float *c = cell(s);
   bool pbc[3];
