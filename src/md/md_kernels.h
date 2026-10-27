@@ -15,6 +15,7 @@ struct Shift {
 };
 
 struct CellList; // build_list's binning buffers (md_kernels.cu)
+struct GridScratch; // the "grid" adaptive cutoff's per-atom probes and per-edge d r / d d (md_kernels.cu)
 
 /// Device state owned by the engine (all pointers are device memory).
 struct State {
@@ -40,6 +41,7 @@ struct State {
   double *f_cons = nullptr, *f_nc = nullptr; // [n, 3]
   int32_t *scalars = nullptr; // [0] overflow (list), [1] max kept, [2] max displacement^2 (float bits)
   CellList *cells = nullptr;  // made by build_list when it bins the atoms; free_cells
+  GridScratch *grid = nullptr; // made by the "grid" radii; free_cells
   // the CUDA stream (cudaStream_t) every function below runs on; nullptr: the
   // legacy default stream. Downloads (overflow, bounding box, list_valid)
   // synchronise this stream only.
@@ -61,6 +63,7 @@ struct Graph {
 struct Cutoff {
   double cutoff = 0, skin = 0;
   double n_target = 0, width = 1; // adaptive (n_target 0: fixed cutoff)
+  bool grid = false;              // metatrain's "grid" method (else "solver"), core/adaptive_cutoff.h
 };
 
 /// Candidates within cutoff + skin of each atom, in (j, shift) order; sets
@@ -73,7 +76,7 @@ void build_list(State &s, const Cutoff &c);
 /// True when the list of the last build_list still holds for s.x: wraps s.x into the
 /// cell as build_list did, and no atom moved more than half the skin since.
 bool list_valid(State &s, double skin);
-void free_cells(State &s);
+void free_cells(State &s); // and the grid scratch
 void prepare_inputs(State &s, const Cutoff &c, const Graph &g); // edges, radii, pack; scalars[1] = max kept
 /// Ragged layout, in two steps around sizing the graph: count_kept sets nkept, s.offsets
 /// (offsets[n] = total kept edges) and scalars[1] = max kept; pack_ragged fills the graph.

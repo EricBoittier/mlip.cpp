@@ -261,10 +261,10 @@ ggml_tensor *find_weight(runtime::GraphModel &m, const std::string &name) {
 } // namespace
 
 AdaptiveCutoff adaptive_cutoff(const runtime::GraphModel &model) {
-  AdaptiveCutoff a{model.num_neighbors_adaptive(), model.cutoff_width_adaptive()};
-  if (a.enabled() && model.adaptive_cutoff_method() != "solver")
-    throw std::runtime_error("adaptive cutoff: training implements the \"solver\" method, the model uses \"" +
-                             model.adaptive_cutoff_method() + "\" (re-export it with a current exporter)");
+  const std::string &method = model.adaptive_cutoff_method();
+  AdaptiveCutoff a{model.num_neighbors_adaptive(), model.cutoff_width_adaptive(), method == "grid"};
+  if (a.enabled() && method != "solver" && method != "grid")
+    throw std::runtime_error("adaptive cutoff: unknown method \"" + method + "\"");
   return a;
 }
 
@@ -279,6 +279,7 @@ std::string cache_path(const std::string &cache_dir, const MemmapSplit &split, f
   const int64_t ns = split.size(), N = split.total_atoms();
   mix(&ns, sizeof ns), mix(&N, sizeof N), mix(&cutoff, sizeof cutoff);
   if (adaptive.enabled()) mix(&adaptive.n_target, sizeof(double)), mix(&adaptive.width, sizeof(double));
+  if (adaptive.enabled() && adaptive.grid) mix("grid", 4);
   mix(split.numbers(0), N * sizeof(int32_t));
   mix(split.positions(0), N * 3 * sizeof(float));
   mix(split.cell(0), ns * 9 * sizeof(float));
@@ -1873,7 +1874,8 @@ void train(const TrainOptions &o) {
   t0 = clock_type::now();
   const AdaptiveCutoff adaptive = adaptive_cutoff(w0.model());
   if (adaptive.enabled())
-    fmt::print("adaptive cutoff: {} neighbours (solver, taper {} A) within {} A\n", adaptive.n_target, adaptive.width, cutoff);
+    fmt::print("adaptive cutoff: {} neighbours ({}, taper {} A) within {} A\n", adaptive.n_target,
+               adaptive.grid ? "grid" : "solver", adaptive.width, cutoff);
   auto nl = [&](const MemmapSplit &s) {
     NeighborCache c = NeighborCache::load_or_build(s, cutoff, cache_path(o.cache_dir, s, cutoff, adaptive),
                                                    o.n_threads, adaptive);

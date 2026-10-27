@@ -142,7 +142,7 @@ int edges(const Args &a) {
       fmt::print("cell {}: {:.4f} {:.4f} {:.4f} pbc {}\n", k, c->matrix[k][0], c->matrix[k][1], c->matrix[k][2], c->periodic[k]);
   fmt::print("E engine {:.6f}  cpu {:.6f}  diff/atom {:.3f} meV; edges engine {} cpu {}\n", E, r.energy,
              1e3 * (E - r.energy) / sys.num_atoms(), eng.n_edges(), nl.num_pairs());
-  // GraphModel's adaptive radii (solver, double, from the full list) and the
+  // GraphModel's adaptive radii (solver or grid, double, from the full list) and the
   // edges it keeps: d <= mean of the two radii
   std::vector<std::vector<double>> dist(sys.num_atoms());
   for (int e = 0; e < nl.num_pairs(); e++) {
@@ -152,8 +152,9 @@ int edges(const Args &a) {
   std::vector<double> rad(sys.num_atoms(), ref.cutoff());
   if (ref.num_neighbors_adaptive() > 0)
     for (int i = 0; i < sys.num_atoms(); i++)
-      rad[i] = adaptive::solve(static_cast<int>(dist[i].size()), [&](int k) { return dist[i][k]; }, ref.cutoff(),
-                               ref.num_neighbors_adaptive(), ref.cutoff_width_adaptive()).r;
+      rad[i] = adaptive::radius(ref.adaptive_cutoff_method() == "grid", static_cast<int>(dist[i].size()),
+                                [&](int k) { return dist[i][k]; }, ref.cutoff(), ref.num_neighbors_adaptive(),
+                                ref.cutoff_width_adaptive());
   std::vector<int> n_keep(sys.num_atoms(), 0);
   for (int e = 0; e < nl.num_pairs(); e++) {
     const auto &v = nl.edge_vectors[e];

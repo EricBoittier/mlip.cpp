@@ -248,3 +248,11 @@ if(TARGET mlipcpp_train)
     target_compile_definitions(test_lr_schedule PRIVATE MLIPCPP_TEST_RESOURCES="${CMAKE_CURRENT_SOURCE_DIR}/resources")
     catch_discover_tests(test_lr_schedule)
 endif()
+
+# PET's "grid" adaptive cutoff against metatrain's golden values (and, with
+# MLIPCPP_TEST_GRID_GGUF, a grid model's cached path)
+add_executable(test_adaptive_grid test_adaptive_grid.cpp)
+target_link_libraries(test_adaptive_grid PRIVATE mlipcpp ggml fmt::fmt Catch2::Catch2WithMain nlohmann_json::nlohmann_json)
+target_include_directories(test_adaptive_grid PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/)
+target_compile_definitions(test_adaptive_grid PRIVATE MLIPCPP_TEST_RESOURCES="${CMAKE_CURRENT_SOURCE_DIR}/resources")
+catch_discover_tests(test_adaptive_grid)

@@ -3,7 +3,7 @@
 // Host side, per call: a full neighbour list (vesin when available), each
 // atom's edges sorted by (neighbour, shift) so the slot order is
 // deterministic, the edge vectors evaluated once per pair (i -> j and j -> i
-// are exact negatives), the "solver" adaptive radii, the kept edges packed
+// are exact negatives), the adaptive radii ("solver" or "grid"), the kept edges packed
 // into [n_atoms, M] slots, and the forces / virial gathered per atom from the
 // edge-vector gradients (no scatter). The per-atom loops run on OpenMP
 // threads. The same layouts as the CUDA MD kernels (src/md/md_kernels.cu).
@@ -233,7 +233,8 @@ void GraphModel::release_cached_resources() {
 
 bool GraphModel::cached_path_supported() const {
   return forces_mode_ && !long_range_ && !plato_lr_.enabled &&
-         (num_neighbors_adaptive_ <= 0.0f || adaptive_cutoff_method_ == "solver");
+         (num_neighbors_adaptive_ <= 0.0f || adaptive_cutoff_method_ == "solver" ||
+          adaptive_cutoff_method_ == "grid");
 }
 
 void GraphModel::build_cached_graph(int n, int M, bool exact_mask, bool backward) {
@@ -680,13 +681,20 @@ ModelResult GraphModel::predict_cached(const AtomicSystem &system, bool compute_
   profile.mark("neighbor_list");
 
   std::vector<adaptive::Radius> radii(n);
+  // "grid": d r_i / d d_e for every edge e of atom i (the solver's comes from radii[i])
+  const bool grid = adaptive && adaptive_cutoff_method_ == "grid";
+  std::vector<double> jac(grid ? E : 0);
   if (adaptive) {
 #pragma omp parallel for num_threads(nt) schedule(dynamic, 16)
     for (int i = 0; i < n; i++) {
       const double *d = edges.d.data() + edges.start[i];
-      radii[i] = adaptive::solve(
-          static_cast<int>(edges.start[i + 1] - edges.start[i]),
-          [&](int k) { return d[k] < cutoff ? d[k] : 1e30; }, cutoff, num_neighbors_adaptive_, width);
+      const int ne = static_cast<int>(edges.start[i + 1] - edges.start[i]);
+      auto dist = [&](int k) { return d[k] < cutoff ? d[k] : 1e30; };
+      if (grid)
+        radii[i].r = adaptive::radius(true, ne, dist, cutoff, num_neighbors_adaptive_, width,
+                                      jac.data() + edges.start[i]);
+      else
+        radii[i] = adaptive::solve(ne, dist, cutoff, num_neighbors_adaptive_, width);
     }
   }
   profile.mark("adaptive_cutoff");
@@ -804,7 +812,7 @@ ModelResult GraphModel::predict_cached(const AtomicSystem &system, bool compute_
       for (int64_t e = edges.start[k]; e < edges.start[k + 1]; e++) {
         const double d = edges.d[e];
         if (!(d < cutoff)) continue;
-        const double coef = dEdr * adaptive::ddist(d, radii[k], width) / d;
+        const double coef = dEdr * (grid ? jac[e] : adaptive::ddist(d, radii[k], width)) / d;
         for (int c = 0; c < 3; c++) chain[3 * e + c] = coef * edges.v[3 * e + c];
         if (periodic) add_virial(k, &edges.v[3 * e], &chain[3 * e]);
       }
@@ -860,7 +868,8 @@ ModelResult GraphModel::predict_cached_device(const AtomicSystem &system, bool c
     const char *e = std::getenv("MLIPCPP_NL_SKIN");
     return e && *e ? std::max(0.0, std::atof(e)) : 0.5;
   }();
-  const md::gpu::Cutoff cut{cutoff_, skin, adaptive ? num_neighbors_adaptive_ : 0.0, cutoff_width_adaptive_};
+  const md::gpu::Cutoff cut{cutoff_, skin, adaptive ? num_neighbors_adaptive_ : 0.0, cutoff_width_adaptive_,
+                            adaptive_cutoff_method_ == "grid"};
 
   // cell and periodic images within the cutoff (as md::Engine::set_system)
   const Cell *cell = system.cell();
@@ -1048,7 +1057,8 @@ GraphModel::DeviceTotals GraphModel::predict_device_step(const DeviceStep &in) {
     return e && *e ? std::max(0.0, std::atof(e)) : 0.5;
   }();
   const double skin = in.skin >= 0 ? in.skin : env_skin;
-  const md::gpu::Cutoff cut{cutoff_, skin, adaptive ? num_neighbors_adaptive_ : 0.0, cutoff_width_adaptive_};
+  const md::gpu::Cutoff cut{cutoff_, skin, adaptive ? num_neighbors_adaptive_ : 0.0, cutoff_width_adaptive_,
+                            adaptive_cutoff_method_ == "grid"};
   const bool periodic = in.cell && (in.pbc[0] || in.pbc[1] || in.pbc[2]);
   const int pbc[3] = {in.pbc[0], in.pbc[1], in.pbc[2]};
   set_device_cell(st, periodic ? in.cell : nullptr, pbc, cutoff_ + skin);
