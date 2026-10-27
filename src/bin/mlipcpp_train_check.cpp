@@ -250,8 +250,9 @@ int main(int argc, char **argv) {
 
   if (profile) {
     // one training step of this batch as micro-batches: wall time, then per op
+    const char *growth_env = std::getenv("MLIPCPP_CHECK_GROWTH"); // (as in the micro-batch check)
     auto mbs = make_microbatches(split, nl, ids, {}, worker.model().species_to_index(), sc,
-                                 worker.model().cutoff(), 5e7, 2.0);
+                                 worker.model().cutoff(), 5e7, growth_env ? std::atof(growth_env) : 2.0);
     for (int rep = 0; rep < 3; rep++) { // warm-up, then timed
       auto t0 = std::chrono::steady_clock::now();
       double build = 0, alloc = 0, upload = 0, compute = 0, download = 0, cpu = 0;
