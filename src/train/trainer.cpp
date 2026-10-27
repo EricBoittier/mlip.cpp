@@ -2280,6 +2280,25 @@ void train(const TrainOptions &o) {
                    1e3 * t_compute / (step + 1), 1e3 * t_sync / (step + 1),
                    double(n_micro) / ((step + 1) * W), w0.cache_size(), w0.compute_buffer_bytes() / 1e9,
                    w0.cache_misses, w0.cache_flushes);
+        // MLIPCPP_LOG_PARAMS=a,b: mean |x| and max |x| of those tensors (GGUF names) at each log line
+        if (const char *lp = std::getenv("MLIPCPP_LOG_PARAMS"); lp && *lp) {
+          std::string names = lp, out;
+          size_t p0 = 0;
+          while (p0 <= names.size()) {
+            const size_t p1 = std::min(names.find(',', p0), names.size());
+            const std::string nm = names.substr(p0, p1 - p0);
+            for (const auto &[wn, t] : w0.model().weights())
+              if (wn == nm) {
+                std::vector<float> v(ggml_nelements(t));
+                ggml_backend_tensor_get(t, v.data(), 0, ggml_nbytes(t));
+                double ma = 0, mx = 0;
+                for (float x : v) ma += std::abs(x), mx = std::max(mx, double(std::abs(x)));
+                out += fmt::format(" {} {:.6g} (max {:.6g})", nm, ma / v.size(), mx);
+              }
+            p0 = p1 + 1;
+          }
+          fmt::print("  params at step {}:{}\n", global_step, out);
+        }
         if (step_pack) {
           std::lock_guard<std::mutex> lock(plan_mu);
           fmt::print("  packing cost model: {:.2f} ms + {:.3g} n(m+1)^2 + {:.3g} n(m+1)\n",
