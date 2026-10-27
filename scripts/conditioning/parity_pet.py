@@ -124,7 +124,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", required=True)
     ap.add_argument("--gguf", required=True)
-    ap.add_argument("--eval", required=True, help="mlipcpp-eval binary")
+    ap.add_argument("--eval", help="mlipcpp-eval binary")
+    ap.add_argument("--mlipcpp-json", help="mlipcpp-eval's output for OUT/frames.xyz, computed elsewhere")
     ap.add_argument("--mta", help="exported metatomic model (.pt)")
     ap.add_argument("--ckpt", help="another checkpoint that must match --model bit for bit")
     ap.add_argument("--backend", default="cpu")
@@ -147,12 +148,17 @@ def main():
     mc, ms = int(sc.max_charge), int(sc.max_spin_multiplicity)
     bad = [(n, a, q, s) for n, a in structures()[:1] for q, s in [(mc + 1, 1), (-mc - 1, 1), (0, 0), (0, ms + 1)]]
     write_frames(out / "frames.xyz", frames + bad)
-    run = subprocess.run([args.eval, args.gguf, str(out / "frames.xyz"), str(out / "mlipcpp.json"),
-                          "--backend", args.backend], capture_output=True, text=True)
-    if run.returncode != 0:
-        print(run.stdout, run.stderr)
-        raise SystemExit("mlipcpp-eval failed")
-    got = json.load(open(out / "mlipcpp.json"))["frames"]
+    if args.mlipcpp_json:  # mlipcpp-eval run elsewhere (e.g. on a GPU node) on OUT/frames.xyz
+        got = json.load(open(args.mlipcpp_json))
+        args.backend = got.get("backend", args.backend)
+        got = got["frames"]
+    else:
+        run = subprocess.run([args.eval, args.gguf, str(out / "frames.xyz"), str(out / "mlipcpp.json"),
+                              "--backend", args.backend], capture_output=True, text=True)
+        if run.returncode != 0:
+            print(run.stdout, run.stderr)
+            raise SystemExit("mlipcpp-eval failed")
+        got = json.load(open(out / "mlipcpp.json"))["frames"]
 
     rows, ok = [], True
     base = {}

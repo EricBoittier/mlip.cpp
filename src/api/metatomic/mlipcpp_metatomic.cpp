@@ -16,7 +16,14 @@
  *   - "dtype": float64 or float32, the dtype of systems and outputs
  *     (default: float64; the computation itself is always float32)
  *   - "interaction_range": override of cutoff x number of message passing
- *     layers, in Angstrom
+ *     layers, in Angstrom (Plato-PET-LR with long range: 1e30, i.e. unbounded)
+ *
+ * Models with charge / spin conditioning (metatrain PET `system_conditioning`)
+ * request the per-system inputs "charge" and "spin_multiplicity" (metatrain's
+ * names; metatomic's ASE calculator fills them from atoms.info["charge"] and
+ * ["spin_multiplicity"] or ["spin"]): the engine attaches them to every system
+ * as custom data, a TensorMap with one block of one float64 value. Missing:
+ * 0 and 1; non-integer or out of the model's range: an error.
  */
 
 #include <metatomic.hpp>
@@ -29,6 +36,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
 #include <locale>
 #include <map>
 #include <memory>
@@ -77,6 +85,7 @@ mlipcpp::Backend parse_backend(const std::string &name) {
 struct GGUFInfo {
   std::string name;
   int message_passing_layers = 1;
+  bool long_range = false; // plato-pet-lr with the mesh coupling or LES
 };
 
 GGUFInfo read_gguf_info(const std::string &path) {
@@ -99,6 +108,18 @@ GGUFInfo read_gguf_info(const std::string &path) {
     if (tensor.rfind("gnn_layers_", 0) == 0) {
       layers.insert(std::stoi(tensor.substr(11)));
     }
+  }
+  // Plato-PET-LR: `layers.<i>.`, and long range unless both the mesh and LES are off
+  auto arch_key = gguf_find_key(ctx, "general.architecture");
+  if (arch_key >= 0 && std::string(gguf_get_val_str(ctx, arch_key)) == "plato-pet-lr") {
+    for (int64_t i = 0; i < gguf_get_n_tensors(ctx); i++) {
+      auto tensor = std::string(gguf_get_tensor_name(ctx, i));
+      if (tensor.rfind("layers.", 0) == 0) layers.insert(std::stoi(tensor.substr(7)));
+    }
+    auto hk = gguf_find_key(ctx, "plato.hypers");
+    auto hy = std::string(hk >= 0 ? gguf_get_val_str(ctx, hk) : "");
+    info.long_range = hy.find("\"mesh_coupling\": true") != std::string::npos ||
+                      hy.find("\"les\": true") != std::string::npos;
   }
   info.message_passing_layers = std::max<int>(1, static_cast<int>(layers.size()));
 
@@ -172,6 +193,7 @@ struct MlipSystem {
   std::vector<float> positions;
   std::array<float, 9> cell = {};
   std::array<bool, 3> pbc = {false, false, false};
+  int charge = 0, spin_multiplicity = 1; // conditioned models
 
   bool periodic() const { return pbc[0] || pbc[1] || pbc[2]; }
 
@@ -273,7 +295,8 @@ public:
     info_ = read_gguf_info(path);
     predictor_ = std::make_unique<mlipcpp::Predictor>(path, model_options);
     if (interaction_range_ <= 0.0) {
-      interaction_range_ = predictor_->cutoff() * info_.message_passing_layers;
+      // long range: every atom interacts with every other (metatomic's JSON has no infinity)
+      interaction_range_ = info_.long_range ? 1e30 : predictor_->cutoff() * info_.message_passing_layers;
     }
   }
 
@@ -316,7 +339,10 @@ public:
   }
 
   std::vector<Quantity> requested_inputs(const std::vector<Quantity> &) const override {
-    return {};
+    if (!predictor_->conditioned()) return {};
+    // metatrain's PET requests both, unitless, per system
+    return {Quantity::builder().name("charge").unit("").sample_kind(SampleKind::System).build(),
+            Quantity::builder().name("spin_multiplicity").unit("").sample_kind(SampleKind::System).build()};
   }
 
   std::vector<metatensor::TensorMap> execute_inner(const std::vector<metatomic::System> &systems,
@@ -326,6 +352,10 @@ public:
     converted.reserve(systems.size());
     for (const auto &system : systems) {
       converted.emplace_back(system, predictor_->cutoff());
+      if (predictor_->conditioned()) {
+        converted.back().charge = read_scalar(system, "charge", 0.0);
+        converted.back().spin_multiplicity = read_scalar(system, "spin_multiplicity", 1.0);
+      }
     }
 
     // the force head runs in the forward pass, which also gives the energy
@@ -374,7 +404,29 @@ private:
     }
   }
 
-  mlipcpp::Result predict(const MlipSystem &system, const mlipcpp::PredictOptions &options) {
+  /// one per-system value of the engine's custom data `name` (default if absent), an integer
+  static int read_scalar(const metatomic::System &system, const std::string &name, double fallback) {
+    double value = fallback;
+    auto known = system.known_custom_data();
+    if (std::find(known.begin(), known.end(), name) != known.end()) {
+      auto tensor = system.custom_data(name);
+      if (tensor.keys().count() != 1) throw metatomic::Error("'" + name + "' must have one block");
+      auto block = tensor.block_by_id(0);
+      auto values = block.values();
+      size_t count = 1;
+      for (auto d : values.shape()) count *= d;
+      if (count != 1) throw metatomic::Error("'" + name + "' must hold one value per system");
+      value = values.data()[0];
+    }
+    if (value != std::round(value) || std::abs(value) > 1e9) {
+      throw metatomic::Error(name + " must be an integer value, got " + std::to_string(value));
+    }
+    return static_cast<int>(std::lround(value));
+  }
+
+  mlipcpp::Result predict(const MlipSystem &system, mlipcpp::PredictOptions options) {
+    options.charge = system.charge;
+    options.spin_multiplicity = system.spin_multiplicity;
     auto n_atoms = static_cast<int32_t>(system.types.size());
     if (system.periodic()) {
       return predictor_->predict(n_atoms, system.positions.data(), system.types.data(),
