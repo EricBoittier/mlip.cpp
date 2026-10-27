@@ -3,7 +3,7 @@
 set -uo pipefail
 O=/capstor/scratch/cscs/boittier/omol25; Q=/capstor/scratch/cscs/boittier/qcell; S=$Q/scripts
 PY=/users/boittier/venvs/agents-torch/bin/python
-for X in Z A B C; do
+for X in Z A B C A-last B-last C-last; do
   R=$O/ft-eval/$X; [ -s $R/val_sel.json ] || continue
   $PY -I $S/eval_omol.py eval $O/sel/omol25_val_sel.npz $R/val_sel.json $R/val_sel.metrics.json --refit $O/sel/omol_atom_refs.json \
     --label "$X OMol25 val selection" --per-structure $R/val_sel.per.npz > /dev/null
@@ -16,7 +16,7 @@ for X in Z A B C; do
       > $R/latent_charge_corr.txt 2>&1 || echo "$X: no latent charges in $L (see $R/latent_charge_corr.txt)"
   fi
 done
-for p in "B A" "C A" "A Z" "B Z" "C Z"; do
+for p in "B A" "C A" "A Z" "B Z" "C Z" "B-last A-last" "C-last A-last"; do
   set -- $p
   for s in val_sel qcell_curves; do
     [ -f $O/ft-eval/$1/$s.per.npz ] && [ -f $O/ft-eval/$2/$s.per.npz ] && \
