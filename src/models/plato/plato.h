@@ -59,7 +59,7 @@ std::vector<float> pme_axis_table(const int mesh[3], int order);
 /// LES settings of a GGUF (resolved): method "ewald" | "pme" | "auto"
 struct LesPme {
   std::string method = "auto";
-  int order = 8, atoms = 512;
+  int order = 8, atoms = 128;
   double spacing = 0.5; // in units of les_sigma
   bool use(int n_atoms) const { return method == "pme" || (method == "auto" && n_atoms >= atoms); }
 };

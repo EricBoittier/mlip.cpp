@@ -308,7 +308,7 @@ bool PlatoModel::load_from_gguf(const std::string &path) {
   les_pme_.method = hy.value("les_method", std::string("auto"));
   les_pme_.order = hy.value("les_pme_order", 8);
   les_pme_.spacing = hy.value("les_pme_spacing", 0.5);
-  les_pme_.atoms = hy.value("les_pme_atoms", 512);
+  les_pme_.atoms = hy.value("les_pme_atoms", 128);
   if (const int64_t k = gguf_find_key(g, "plato.les_method"); k >= 0) les_pme_.method = gguf_get_val_str(g, k);
   if (const char *e = std::getenv("MLIPCPP_PLATO_LES_METHOD"); e && *e) les_pme_.method = e;
   if (!options_.les_method.empty()) les_pme_.method = options_.les_method;
