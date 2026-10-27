@@ -131,7 +131,7 @@ void PetPlatoLR::create(ggml_context *ctx, const PetPlatoLRSpec &spec, const std
       if (!s.periodic)
         for (int i = s.a0; i < s.a1; i++)
           for (int j = s.a0; j < s.a1; j++)
-            if (i != j) h_pi_.push_back(i), h_pj_.push_back(j);
+            if (i < j) h_pi_.push_back(i), h_pj_.push_back(j); // each pair once: the kernels are symmetric
     n_pairs_ = static_cast<int64_t>(h_pi_.size());
     if (n_pairs_ > 0) {
       pair_i_ = input(GGML_TYPE_I32, n_pairs_, 1, 1, "plato_lr.pair_i");
@@ -624,7 +624,9 @@ ggml_tensor *PetPlatoLR::mesh_op(ggml_context *ctx, const GIRNode &node, const s
       ggml_tensor *j0 = ggml_div(ctx, ggml_sin(ctx, kr), kr);
       ggml_tensor *K = ggml_add(ctx, mm_f32(ctx, A, j0),
                                 ggml_div(ctx, ggml_plato_erf(ctx, ggml_scale(ctx, r, 1.0f / (std::sqrt(2.0f) * sigma))), r)); // [C, P]
+      // both directions of each pair (i < j): m_i += K_ij v_j, m_j += K_ij v_i
       acc(ggml_get_rows_back(ctx, ggml_mul(ctx, K, ggml_get_rows(ctx, v, pair_j_)), pair_i_, v));
+      acc(ggml_get_rows_back(ctx, ggml_mul(ctx, K, ggml_get_rows(ctx, v, pair_i_)), pair_j_, v));
     }
   }
   // periodic groups (runtime/plato_graph.cpp's mesh coupling), times the mesh points
@@ -671,7 +673,8 @@ ggml_tensor *PetPlatoLR::les_op(ggml_context *ctx, const GIRNode &node, const st
   if (n_pairs_ > 0) { // open structures: the erf pair sum, per atom
     ggml_tensor *r = pair_r(ctx);
     ggml_tensor *pair = ggml_div(ctx, ggml_plato_erf(ctx, ggml_scale(ctx, r, 1.0f / (std::sqrt(2.0f) * sigma))), r); // [1, P]
-    ggml_tensor *s = ggml_get_rows_back(ctx, ggml_mul(ctx, ggml_get_rows(ctx, q, pair_j_), pair), pair_i_, q);     // [Q, n]
+    ggml_tensor *s = ggml_add(ctx, ggml_get_rows_back(ctx, ggml_mul(ctx, ggml_get_rows(ctx, q, pair_j_), pair), pair_i_, q),
+                              ggml_get_rows_back(ctx, ggml_mul(ctx, ggml_get_rows(ctx, q, pair_i_), pair), pair_j_, q)); // [Q, n]
     acc(ggml_scale(ctx, ggml_sum_rows(ctx, ggml_mul(ctx, q, s)), static_cast<float>(0.5 * KE)));
   }
   if (!groups_.empty()) {
