@@ -1,0 +1,12 @@
+{
+ "gpu": "NVIDIA GeForce RTX 4070 Ti SUPER",
+ "torch": "2.13.0+cu130",
+ "host": "cosmopc27",
+ "systems": "64 bio_dimers test frames + 160-atom periodic diamond cell, float32",
+ "energy_max_abs": 3.0994415283203125e-06,
+ "energy_max_rel": 2.58710929301742e-06,
+ "forces_max_abs": 5.960464477539062e-07,
+ "forces_max_rel_to_max": 1.8111431927536614e-06,
+ "energy_scale": 4.331398963928223,
+ "forces_scale": 0.3290995657444
+}

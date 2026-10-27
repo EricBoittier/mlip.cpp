@@ -1,0 +1,213 @@
+{
+ "meta": {
+  "gpu": "NVIDIA GH200 120GB",
+  "torch": "2.14.1+cu130",
+  "host": "nid006334",
+  "arch": "aarch64",
+  "dbl_naive": "0",
+  "dtype": "float32",
+  "model": "/capstor/scratch/cscs/boittier/agents/pet-fused/out/pet-s.pt",
+  "hypers": {
+   "cutoff": 5.0,
+   "cutoff_width": 0.5,
+   "cutoff_function": "Bump",
+   "d_pet": 64,
+   "d_node": 128,
+   "d_head": 64,
+   "d_feedforward": 128,
+   "num_heads": 4,
+   "num_gnn_layers": 2,
+   "num_attention_layers": 2,
+   "normalization": "RMSNorm",
+   "activation": "SwiGLU",
+   "attention_temperature": 1.0,
+   "transformer_type": "PreLN",
+   "featurizer_type": "feedforward"
+  },
+  "warmup": 3,
+  "iters": 10,
+  "doc": "PET attention backends (fused mlip.cpp op vs SDPA vs manual), float32, CUDA.\n\nModel: PET-S trained on bio_dimers (d_pet 64, 4 heads of 16, 2 GNN x 2 attention\nlayers, cutoff 5 A), the weights of ~/bench/models/pet-s.pt loaded into eager PET\nmodels that differ only in attention_backend.\n\nCases (neighbour lists built beforehand, excluded):\n- infer: energy + forces (one backward), model.eval(); \"auto\" is SDPA here;\n- train: energy + forces loss, backward through the forces (double backward),\n  Adam step, model.train(); \"auto\" is the manual attention here, SDPA cannot.\nSystems: bio_dimers test frames (12-25 atoms, isolated in a 30 A box) at batch\n1 / 8 / 64, and a periodic 160-atom rattled diamond cell (2 x 2 x 5 cubic cells).\nMedian wall time over ITERS calls after WARMUP calls (CUDA-synchronised); peak\nCUDA memory of one call above the memory held before it.\n\n    python bench_pet_fused.py OUT.json\n"
+ },
+ "rows": [
+  {
+   "mode": "infer",
+   "system": "dimers_b1",
+   "backend": "fused",
+   "ms": 18.88359698932618,
+   "peak_mib": 8.77783203125,
+   "atoms": 23,
+   "structures": 1
+  },
+  {
+   "mode": "infer",
+   "system": "dimers_b1",
+   "backend": "sdpa",
+   "ms": 20.69384854985401,
+   "peak_mib": 8.81103515625,
+   "atoms": 23,
+   "structures": 1
+  },
+  {
+   "mode": "infer",
+   "system": "dimers_b1",
+   "backend": "manual",
+   "ms": 22.22487604012713,
+   "peak_mib": 8.99462890625,
+   "atoms": 23,
+   "structures": 1
+  },
+  {
+   "mode": "infer",
+   "system": "dimers_b8",
+   "backend": "fused",
+   "ms": 19.675461982842535,
+   "peak_mib": 53.67626953125,
+   "atoms": 141,
+   "structures": 8
+  },
+  {
+   "mode": "infer",
+   "system": "dimers_b8",
+   "backend": "sdpa",
+   "ms": 20.35880199400708,
+   "peak_mib": 53.85791015625,
+   "atoms": 141,
+   "structures": 8
+  },
+  {
+   "mode": "infer",
+   "system": "dimers_b8",
+   "backend": "manual",
+   "ms": 23.871020588558167,
+   "peak_mib": 55.00048828125,
+   "atoms": 141,
+   "structures": 8
+  },
+  {
+   "mode": "infer",
+   "system": "dimers_b64",
+   "backend": "fused",
+   "ms": 26.305173989385366,
+   "peak_mib": 512.79296875,
+   "atoms": 1224,
+   "structures": 64
+  },
+  {
+   "mode": "infer",
+   "system": "dimers_b64",
+   "backend": "sdpa",
+   "ms": 32.60295954532921,
+   "peak_mib": 513.9921875,
+   "atoms": 1224,
+   "structures": 64
+  },
+  {
+   "mode": "infer",
+   "system": "dimers_b64",
+   "backend": "manual",
+   "ms": 36.37409850489348,
+   "peak_mib": 525.779296875,
+   "atoms": 1224,
+   "structures": 64
+  },
+  {
+   "mode": "infer",
+   "system": "cell160_pbc",
+   "backend": "fused",
+   "ms": 24.64205404976383,
+   "peak_mib": 442.8720703125,
+   "atoms": 160,
+   "structures": 1
+  },
+  {
+   "mode": "infer",
+   "system": "cell160_pbc",
+   "backend": "sdpa",
+   "ms": 22.241452417802066,
+   "peak_mib": 444.7314453125,
+   "atoms": 160,
+   "structures": 1
+  },
+  {
+   "mode": "infer",
+   "system": "cell160_pbc",
+   "backend": "manual",
+   "ms": 25.96652798820287,
+   "peak_mib": 509.5419921875,
+   "atoms": 160,
+   "structures": 1
+  },
+  {
+   "mode": "train",
+   "system": "dimers_b1",
+   "backend": "fused",
+   "ms": 44.35628349892795,
+   "peak_mib": 18.482421875,
+   "atoms": 23,
+   "structures": 1
+  },
+  {
+   "mode": "train",
+   "system": "dimers_b1",
+   "backend": "manual",
+   "ms": 57.57756397360936,
+   "peak_mib": 19.29638671875,
+   "atoms": 23,
+   "structures": 1
+  },
+  {
+   "mode": "train",
+   "system": "dimers_b8",
+   "backend": "fused",
+   "ms": 47.29670996312052,
+   "peak_mib": 126.4072265625,
+   "atoms": 141,
+   "structures": 8
+  },
+  {
+   "mode": "train",
+   "system": "dimers_b8",
+   "backend": "manual",
+   "ms": 59.56253100885078,
+   "peak_mib": 132.10888671875,
+   "atoms": 141,
+   "structures": 8
+  },
+  {
+   "mode": "train",
+   "system": "dimers_b64",
+   "backend": "fused",
+   "ms": 54.8688264680095,
+   "peak_mib": 1217.23974609375,
+   "atoms": 1224,
+   "structures": 64
+  },
+  {
+   "mode": "train",
+   "system": "dimers_b64",
+   "backend": "manual",
+   "ms": 65.58397196931764,
+   "peak_mib": 1273.1220703125,
+   "atoms": 1224,
+   "structures": 64
+  },
+  {
+   "mode": "train",
+   "system": "cell160_pbc",
+   "backend": "fused",
+   "ms": 44.84409251017496,
+   "peak_mib": 1023.17919921875,
+   "atoms": 160,
+   "structures": 1
+  },
+  {
+   "mode": "train",
+   "system": "cell160_pbc",
+   "backend": "manual",
+   "ms": 83.38540850672871,
+   "peak_mib": 1427.4345703125,
+   "atoms": 160,
+   "structures": 1
+  }
+ ]
+}

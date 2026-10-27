@@ -1,0 +1,35 @@
+PARITY torch.float64 eval/sdpa energy: abs 1.066e-14 rel 1.703e-16
+PARITY torch.float64 eval/sdpa forces: abs 8.882e-16 rel 5.336e-16
+PARITY torch.float64 eval/sdpa stress: abs 2.220e-16 rel 3.215e-16
+.PARITY torch.float32 eval/sdpa energy: abs 3.815e-06 rel 6.097e-08
+PARITY torch.float32 eval/sdpa forces: abs 7.153e-07 rel 4.297e-07
+PARITY torch.float32 eval/sdpa stress: abs 1.192e-07 rel 1.726e-07
+.PARITY torch.float64 train/manual energy: abs 1.066e-14 rel 1.703e-16
+PARITY torch.float64 train/manual forces: abs 1.055e-15 rel 6.337e-16
+PARITY torch.float64 train/manual stress: abs 2.220e-16 rel 3.215e-16
+.PARITY torch.float32 train/manual energy: abs 1.144e-05 rel 1.829e-07
+PARITY torch.float32 train/manual forces: abs 3.949e-07 rel 2.373e-07
+PARITY torch.float32 train/manual stress: abs 1.192e-07 rel 1.726e-07
+.PARITY torch.float64 param grads: abs 7.276e-12 rel 8.320e-17
+.PARITY torch.float32 param grads: abs 1.562e-02 rel 1.787e-07
+.../users/boittier/venvs/agents-torch/lib/python3.12/site-packages/torch/jit/_script.py:1643: FutureWarning: `torch.jit.interface` is deprecated. Please use `torch.compile` instead.
+  warnings.warn(
+/users/boittier/venvs/agents-torch/lib/python3.12/site-packages/torch/jit/_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+/users/boittier/venvs/agents-torch/lib/python3.12/site-packages/torch/jit/_serialization.py:176: FutureWarning: `torch.jit.load` is deprecated. Please switch to `torch.export`.
+  warnings.warn(
+PARITY export energy: abs 3.815e-06 rel 6.097e-08
+PARITY export forces: abs 1.326e-06 rel 7.968e-07
+.
+==================================== PASSES ====================================
+=========================== short test summary info ============================
+PASSED src/metatrain/pet/tests/test_fused_attention.py::test_energy_forces_stress[False-dtype0]
+PASSED src/metatrain/pet/tests/test_fused_attention.py::test_energy_forces_stress[False-dtype1]
+PASSED src/metatrain/pet/tests/test_fused_attention.py::test_energy_forces_stress[True-dtype0]
+PASSED src/metatrain/pet/tests/test_fused_attention.py::test_energy_forces_stress[True-dtype1]
+PASSED src/metatrain/pet/tests/test_fused_attention.py::test_training_step_gradients[dtype0]
+PASSED src/metatrain/pet/tests/test_fused_attention.py::test_training_step_gradients[dtype1]
+PASSED src/metatrain/pet/tests/test_fused_attention.py::test_cpu_fallback
+PASSED src/metatrain/pet/tests/test_fused_attention.py::test_unsupported_head_dim_falls_back
+PASSED src/metatrain/pet/tests/test_fused_attention.py::test_export
+9 passed in 18.29s

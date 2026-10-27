@@ -1,0 +1,12 @@
+{
+ "gpu": "NVIDIA GH200 120GB",
+ "torch": "2.14.1+cu130",
+ "host": "nid006334",
+ "systems": "64 bio_dimers test frames + 160-atom periodic diamond cell, float32",
+ "energy_max_abs": 2.5033950805664062e-06,
+ "energy_max_rel": 2.0895881789328996e-06,
+ "forces_max_abs": 3.8743019104003906e-07,
+ "forces_max_rel_to_max": 1.1772425523304264e-06,
+ "energy_scale": 4.3313984870910645,
+ "forces_scale": 0.32909971475601196
+}

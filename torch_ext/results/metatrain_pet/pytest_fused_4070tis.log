@@ -1,0 +1,29 @@
+PARITY torch.float64 eval/sdpa energy: abs 1.066e-14 rel 1.703e-16
+PARITY torch.float64 eval/sdpa forces: abs 9.992e-16 rel 6.003e-16
+PARITY torch.float64 eval/sdpa stress: abs 3.331e-16 rel 4.822e-16
+.PARITY torch.float32 eval/sdpa energy: abs 9.537e-06 rel 1.524e-07
+PARITY torch.float32 eval/sdpa forces: abs 4.768e-07 rel 2.865e-07
+PARITY torch.float32 eval/sdpa stress: abs 1.788e-07 rel 2.589e-07
+.PARITY torch.float64 train/manual energy: abs 1.155e-14 rel 1.845e-16
+PARITY torch.float64 train/manual forces: abs 1.388e-15 rel 8.338e-16
+PARITY torch.float64 train/manual stress: abs 2.220e-16 rel 3.215e-16
+.PARITY torch.float32 train/manual energy: abs 1.907e-06 rel 3.048e-08
+PARITY torch.float32 train/manual forces: abs 5.513e-07 rel 3.313e-07
+PARITY torch.float32 train/manual stress: abs 8.941e-08 rel 1.294e-07
+.PARITY torch.float64 param grads: abs 3.638e-12 rel 4.160e-17
+.PARITY torch.float32 param grads: abs 3.906e-03 rel 4.467e-08
+...PARITY export energy: abs 1.144e-05 rel 1.829e-07
+PARITY export forces: abs 1.311e-06 rel 7.879e-07
+.
+==================================== PASSES ====================================
+=========================== short test summary info ============================
+PASSED src/metatrain/pet/tests/test_fused_attention.py::test_energy_forces_stress[False-dtype0]
+PASSED src/metatrain/pet/tests/test_fused_attention.py::test_energy_forces_stress[False-dtype1]
+PASSED src/metatrain/pet/tests/test_fused_attention.py::test_energy_forces_stress[True-dtype0]
+PASSED src/metatrain/pet/tests/test_fused_attention.py::test_energy_forces_stress[True-dtype1]
+PASSED src/metatrain/pet/tests/test_fused_attention.py::test_training_step_gradients[dtype0]
+PASSED src/metatrain/pet/tests/test_fused_attention.py::test_training_step_gradients[dtype1]
+PASSED src/metatrain/pet/tests/test_fused_attention.py::test_cpu_fallback
+PASSED src/metatrain/pet/tests/test_fused_attention.py::test_unsupported_head_dim_falls_back
+PASSED src/metatrain/pet/tests/test_fused_attention.py::test_export
+9 passed in 8.73s
