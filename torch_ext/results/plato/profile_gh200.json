@@ -1,0 +1,243 @@
+{
+ "gpu": "NVIDIA GH200 120GB",
+ "auto/train32": {
+  "wall_ms": 225.99738102871925,
+  "gpu_kernel_ms": 26.681284999999903,
+  "kernels": 4589,
+  "groups_ms": {
+   "other": 22.992464000000126,
+   "gemm": 3.4085739999997813,
+   "softmax": 0.28024699999999575
+  },
+  "top": [
+   [
+    "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<a",
+    3.052806000000033
+   ],
+   [
+    "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctor_add<fl",
+    2.271969999999652
+   ],
+   [
+    "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<floa",
+    1.9182170000002807
+   ],
+   [
+    "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<a",
+    1.7540279999999984
+   ],
+   [
+    "void (anonymous namespace)::indexing_backward_kernel_small_stride<float>(long co",
+    1.6475989999999874
+   ],
+   [
+    "void at::native::reduce_kernel<128, 4, at::native::ReduceOp<float, at::native::f",
+    1.3178170000000973
+   ],
+   [
+    "void at::native::reduce_kernel<512, 1, at::native::ReduceOp<float, at::native::f",
+    0.8079680000001608
+   ],
+   [
+    "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<a",
+    0.7939369999998962
+   ],
+   [
+    "void gemv2N_kernel<int, int, float, float, float, float, 128, 1, 2, 4, 1, false,",
+    0.7720740000000078
+   ],
+   [
+    "std::enable_if<!(false), void>::type internal::gemvx::kernel<int, int, float, fl",
+    0.6490380000000004
+   ],
+   [
+    "_bmm_outer_product_kernel",
+    0.6110530000000436
+   ],
+   [
+    "sm80_xmma_gemm_f32f32_f32f32_f32_tn_n_tilesize32x32x8_stage3_warpsize1x2x1_ffma_",
+    0.5484969999999739
+   ]
+  ]
+ },
+ "auto/batch64": {
+  "wall_ms": 76.49104099255055,
+  "gpu_kernel_ms": 13.433636999999727,
+  "kernels": 1433,
+  "groups_ms": {
+   "other": 11.407585999999743,
+   "gemm": 1.862697999999984,
+   "softmax": 0.1633530000000046
+  },
+  "top": [
+   [
+    "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctor_add<fl",
+    1.3445669999999827
+   ],
+   [
+    "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<a",
+    1.2688300000000072
+   ],
+   [
+    "void (anonymous namespace)::indexing_backward_kernel_small_stride<float>(long co",
+    1.192221000000005
+   ],
+   [
+    "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<floa",
+    0.6106710000000094
+   ],
+   [
+    "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<a",
+    0.5888209999999435
+   ],
+   [
+    "void gemv2N_kernel<int, int, float, float, float, float, 128, 1, 2, 4, 1, false,",
+    0.47230599999999684
+   ],
+   [
+    "void at::native::reduce_kernel<128, 4, at::native::ReduceOp<float, at::native::f",
+    0.455699000000026
+   ],
+   [
+    "std::enable_if<!(false), void>::type internal::gemvx::kernel<int, int, float, fl",
+    0.4168830000000016
+   ],
+   [
+    "void at::native::(anonymous namespace)::vectorized_layer_norm_kernel<float, floa",
+    0.39714099999999236
+   ],
+   [
+    "_bmm_outer_product_kernel",
+    0.3853969999999972
+   ],
+   [
+    "void regular_fft<30u, EPT<5u, 6u>, 32u, 10u, (padding_t)6, (twiddle_t)0, (loadst",
+    0.3685639999999985
+   ],
+   [
+    "void at::native::vectorized_elementwise_kernel<4, at::native::cos_kernel_cuda(at",
+    0.36242200000000413
+   ]
+  ]
+ },
+ "fused/train32": {
+  "wall_ms": 155.61669308226556,
+  "gpu_kernel_ms": 28.357559000000688,
+  "kernels": 4420,
+  "groups_ms": {
+   "other": 21.967664000000507,
+   "gemm": 1.9447130000000978,
+   "mlipcpp": 4.445182000000074
+  },
+  "top": [
+   [
+    "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<a",
+    2.784842000000037
+   ],
+   [
+    "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctor_add<fl",
+    2.221044000000078
+   ],
+   [
+    "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<floa",
+    1.6681389999998864
+   ],
+   [
+    "void (anonymous namespace)::indexing_backward_kernel_small_stride<float>(long co",
+    1.6358570000000037
+   ],
+   [
+    "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<a",
+    1.4802750000001323
+   ],
+   [
+    "void at::native::reduce_kernel<128, 4, at::native::ReduceOp<float, at::native::f",
+    1.355422000000064
+   ],
+   [
+    "void mlipcpp_attn::v2_bwd_dkv<16, 2>(float const*, float const*, float const*, f",
+    1.2622380000000266
+   ],
+   [
+    "void mlipcpp_attn::dbl_bwd_seq<16, float>(float const*, float const*, float cons",
+    1.1309110000000073
+   ],
+   [
+    "void mlipcpp_attn::bwd_bias_seq<16, 4>(float const*, float const*, float const*,",
+    0.9936340000000055
+   ],
+   [
+    "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<a",
+    0.8535770000000775
+   ],
+   [
+    "void gemv2N_kernel<int, int, float, float, float, float, 128, 1, 2, 4, 1, false,",
+    0.772553000000029
+   ],
+   [
+    "void mlipcpp_attn::v2_bwd_dq<16, 2>(float const*, float const*, float const*, fl",
+    0.7187940000000308
+   ]
+  ]
+ },
+ "fused/batch64": {
+  "wall_ms": 65.23392500821501,
+  "gpu_kernel_ms": 14.385402999999906,
+  "kernels": 1379,
+  "groups_ms": {
+   "other": 10.99955499999993,
+   "gemm": 1.0411509999999853,
+   "mlipcpp": 2.3446969999999894
+  },
+  "top": [
+   [
+    "void at::native::vectorized_elementwise_kernel<4, at::native::CUDAFunctor_add<fl",
+    1.2180450000000183
+   ],
+   [
+    "void (anonymous namespace)::indexing_backward_kernel_small_stride<float>(long co",
+    1.1907810000000099
+   ],
+   [
+    "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<a",
+    1.1792620000000134
+   ],
+   [
+    "void mlipcpp_attn::v2_bwd_dkv<16, 2>(float const*, float const*, float const*, f",
+    0.7385079999999944
+   ],
+   [
+    "void mlipcpp_attn::bwd_bias_seq<16, 4>(float const*, float const*, float const*,",
+    0.6327799999999988
+   ],
+   [
+    "void at::native::elementwise_kernel<128, 2, at::native::gpu_kernel_impl_nocast<a",
+    0.5470559999999987
+   ],
+   [
+    "void at::native::vectorized_elementwise_kernel<4, at::native::BinaryFunctor<floa",
+    0.5461289999999736
+   ],
+   [
+    "void mlipcpp_attn::v2_fwd<16, 4>(float const*, float const*, float*, float*, int",
+    0.4899050000000025
+   ],
+   [
+    "void mlipcpp_attn::v2_bwd_dq<16, 2>(float const*, float const*, float const*, fl",
+    0.48350399999999355
+   ],
+   [
+    "void gemv2N_kernel<int, int, float, float, float, float, 128, 1, 2, 4, 1, false,",
+    0.473330000000009
+   ],
+   [
+    "void at::native::reduce_kernel<128, 4, at::native::ReduceOp<float, at::native::f",
+    0.4310919999999915
+   ],
+   [
+    "std::enable_if<!(false), void>::type internal::gemvx::kernel<int, int, float, fl",
+    0.41534799999999816
+   ]
+  ]
+ }
+}

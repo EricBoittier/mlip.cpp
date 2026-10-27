@@ -1,0 +1,16 @@
+{
+ "dimer": {
+  "E_rel": 4.0366307985095773e-07,
+  "F_rel": 2.820964027705486e-06
+ },
+ "batch8": {
+  "E_rel": 3.0017301355655945e-07,
+  "F_rel": 4.717227966466453e-06
+ },
+ "cell160": {
+  "E_rel": 0.0,
+  "F_rel": 2.665678266566829e-06
+ },
+ "uses_mlipcpp_op": true,
+ "op_registered_after_load": true
+}

@@ -37,8 +37,10 @@ def load(verbose: bool = False) -> str:
             os.path.join(_CSRC, "pet_attn_op.cpp"),
             os.path.join(_CSRC, "pet_attn_kernels.cu"),
         ],
-        extra_cflags=["-O3", "-std=c++17"],
-        extra_cuda_cflags=["-O3", "-std=c++17", "-lineinfo"],
+        # no -std: torch passes the standard its headers need (C++17 up to
+        # torch 2.13, C++20 from 2.14)
+        extra_cflags=["-O3"],
+        extra_cuda_cflags=["-O3", "-lineinfo"],
         build_directory=build_dir,
         is_python_module=False,
         verbose=verbose,
