@@ -312,7 +312,8 @@ std::vector<ggml_tensor *> PetPlatoLR::strains() const {
 }
 
 void PetPlatoLR::upload(const float *pos) const {
-  auto set = [](ggml_tensor *t, const void *d) {
+  auto set = [](ggml_tensor *t, const void *d) { // (reshapes: through their source, which a graph may not use)
+    if (t && t->view_src && ggml_nbytes(t) == ggml_nbytes(t->view_src)) t = t->view_src;
     if (t) ggml_backend_tensor_set(t, d, 0, ggml_nbytes(t));
   };
   set(positions, pos);
