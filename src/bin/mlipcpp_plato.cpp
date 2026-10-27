@@ -89,6 +89,7 @@ int check(int argc, char **argv) {
   for (const auto &v : variants) {
     plato::PlatoOptions o;
     o.backend = be;
+    o.les_method = arg(argc, argv, "--les-method", "");
     o.mesh = v == "full" || v == "no_les";
     o.les = v == "full" || v == "no_mesh";
     models.push_back(std::make_unique<plato::PlatoModel>(o));
@@ -160,6 +161,7 @@ int bench(int argc, char **argv) {
   const bool forces = !flag(argc, argv, "--energy-only");
   plato::PlatoOptions o;
   o.backend = backend_of(arg(argc, argv, "--backend", "auto"));
+  o.les_method = arg(argc, argv, "--les-method", "");
   plato::PlatoModel m(o);
   m.load_from_gguf(model);
   const AtomicSystem s = tile(read_all(xyz).at(std::stoi(arg(argc, argv, "--frame", "0"))), K);
@@ -179,9 +181,11 @@ int bench(int argc, char **argv) {
   };
   const auto &P = m.last_parts();
   std::printf("{\"backend\": \"%s\", \"atoms\": %d, \"edges\": %ld, \"max_len\": %d, \"mesh\": [%d, %d, %d], \"n_k\": %ld, "
+              "\"les_mesh\": [%d, %d, %d], "
               "\"forces\": %s, \"energy\": %.6f, \"ms_total\": %.3f, \"ms_neighbors\": %.3f, \"ms_compute\": %.3f, "
               "\"ms_total_minus_nl\": %.3f, \"ms_min\": %.3f, \"repeat\": %d}\n",
               m.backend_name(), s.num_atoms(), (long)P.edges, P.max_len, P.mesh[0], P.mesh[1], P.mesh[2], (long)P.n_k,
+              P.les_mesh[0], P.les_mesh[1], P.les_mesh[2],
               forces ? "true" : "false", E, med(tot), med(nl), med(comp), med(tot) - med(nl),
               *std::min_element(tot.begin(), tot.end()), N);
   return 0;
@@ -200,6 +204,7 @@ std::unique_ptr<Model> any_model(int argc, char **argv) {
   if (a.rfind("plato", 0) == 0) {
     plato::PlatoOptions o;
     o.backend = be;
+    o.les_method = arg(argc, argv, "--les-method", "");
     auto m = std::make_unique<plato::PlatoModel>(o);
     m->load_from_gguf(argv[2]);
     return m;
@@ -207,12 +212,19 @@ std::unique_ptr<Model> any_model(int argc, char **argv) {
   return load_model(argv[2]);
 }
 
-// energy and forces of every frame as JSON lines
+// energy and forces (and stress, and Plato's LES part) of every frame, tiled K x K x K, as JSON lines
 int dump(int argc, char **argv) {
   auto m = any_model(argc, argv);
-  for (const auto &s : read_all(argv[3])) {
+  const int K = std::stoi(arg(argc, argv, "--tile", "1"));
+  for (const auto &s0 : read_all(argv[3])) {
+    const AtomicSystem s = K > 1 ? tile(s0, K) : s0;
     const ModelResult r = m->predict(s, true);
     json j = {{"n", s.num_atoms()}, {"energy", r.energy}, {"forces", r.forces}};
+    if (r.has_stress) j["stress"] = r.stress;
+    if (auto *pm = dynamic_cast<plato::PlatoModel *>(m.get())) {
+      const auto &P = pm->last_parts();
+      j["les"] = P.les, j["n_k"] = P.n_k, j["les_mesh"] = {P.les_mesh[0], P.les_mesh[1], P.les_mesh[2]};
+    }
     std::printf("%s\n", j.dump().c_str());
   }
   return 0;
@@ -265,7 +277,9 @@ int bench_any(int argc, char **argv) {
 int main(int argc, char **argv) {
   if (argc < 4) {
     std::fprintf(stderr, "usage: mlipcpp-plato check MODEL.gguf REFDIR [--backend B] [--json OUT]\n"
-                         "       mlipcpp-plato bench MODEL.gguf XYZ [--tile K] [--repeat N] [--warmup W] [--backend B]\n");
+                         "       mlipcpp-plato bench MODEL.gguf XYZ [--tile K] [--repeat N] [--warmup W] [--backend B]\n"
+                         "       mlipcpp-plato dump MODEL.gguf XYZ [--tile K] [--backend B]\n"
+                         "  Plato: --les-method ewald|pme|auto (default: the GGUF's, else auto)\n");
     return 2;
   }
   try {

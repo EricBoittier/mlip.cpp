@@ -79,6 +79,12 @@ struct PlatoInputs {
   ggml_tensor *les_k = nullptr;            // F32 [3, nk, G], half-space k vectors with |k| < kcut / sigma
   ggml_tensor *les_n = nullptr;            // F32 [3, nk], 2 pi n (phases 2 pi n . frac)
   ggml_tensor *les_taper = nullptr;        // F32 [1, nk], unused (the window is clamped); kept for callers
+  // LES by smooth PME instead (les_mesh[0] > 0; one charge channel): order-les_order B-spline
+  // spread of q on the mesh, rfftn, ggml_plato_pme with the metric A = K'^T K', K' = (1 - eps) K
+  int les_mesh[3] = {0, 0, 0};
+  int les_order = 8;
+  ggml_tensor *les_K = nullptr;            // F32 [3, 3, G]: column b = 2 pi inv(cell)^T e_b (k of m = e_b)
+  ggml_tensor *les_tab = nullptr;          // F32 [M0 + M1 + M2/2 + 1], plato::pme_axis_table
   ggml_tensor *offdiag = nullptr;          // F32 [n, n], open-system LES (one structure): 1 - I
 };
 

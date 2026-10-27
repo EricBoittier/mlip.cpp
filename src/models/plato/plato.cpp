@@ -172,6 +172,46 @@ int mesh_points(const float *a, double spacing, bool round_fft) {
     for (int f : {p, 5 * p / 4, 3 * p / 2})
       if (f >= m) return f;
 }
+int pme_mesh_points(const float *a, double h, int order) {
+  int m = std::max(order, static_cast<int>(std::floor(row_norm(a) / h + 0.5)) + 1);
+  for (;; m++) {
+    int x = m;
+    for (int f : {2, 3, 5})
+      while (x % f == 0) x /= f;
+    if (x == 1) return m;
+  }
+}
+
+std::vector<float> pme_axis_table(const int mesh[3], int order) {
+  // M_2p(k), k = 0 .. 2p - 1: the centred order-2p B-spline at j = k - p
+  std::vector<double> c = {1.0};
+  for (int n = 1; n < 2 * order; n++) {
+    std::vector<double> nw(n + 1, 0.0);
+    for (int k = 0; k <= n; k++) {
+      const double x = k;
+      if (k < n) nw[k] += x * c[k];
+      if (k >= 1) nw[k] += (n + 1 - x) * c[k - 1];
+      nw[k] /= n;
+    }
+    c = nw;
+  }
+  std::vector<float> out;
+  for (int a = 0; a < 3; a++) {
+    const int M = mesh[a], bins = a < 2 ? M : M / 2 + 1;
+    for (int i = 0; i < bins; i++) {
+      const int m = a < 2 && i > (M - 1) / 2 ? i - M : i;
+      double alias = 0;
+      for (int k = 0; k < 2 * order; k++) alias += c[k] * std::cos(2 * M_PI * m * double(k - order) / M);
+      const double x = M_PI * m / M, sinc = m == 0 ? 1.0 : std::sin(x) / x;
+      double f = std::pow(sinc, 2 * order) / (alias * alias);
+      if (M % 2 == 0 && std::abs(m) == M / 2) f = 0;
+      if (a == 2 && i > 0 && 2 * i < M) f *= 2; // the rfft half spectrum
+      out.push_back(static_cast<float>(f));
+    }
+  }
+  return out;
+}
+
 namespace {
 
 int env_mesh(int out[3]) {
@@ -196,7 +236,7 @@ struct PlatoModel::Graph {
   ggml_tensor *grad_ev = nullptr, *grad_pos = nullptr, *grad_eps = nullptr, *loss_grad = nullptr;
   std::vector<ggml_tensor *> inputs;
   // key
-  int n = 0, max_len = 0, mesh[3] = {0, 0, 0};
+  int n = 0, max_len = 0, mesh[3] = {0, 0, 0}, les_mesh[3] = {0, 0, 0};
   int64_t E = 0, nk = 0;
   bool periodic = false, mesh_on = false, les_on = false;
   ~Graph() {
@@ -265,6 +305,17 @@ bool PlatoModel::load_from_gguf(const std::string &path) {
   spec_.decomposed_layer_norm = options_.decomposed_layer_norm;
   mesh_spacing_ = hy["mesh_spacing"];
   if (!hy["rope"].get<bool>()) throw std::runtime_error("Plato: needs rope");
+  les_pme_.method = hy.value("les_method", std::string("auto"));
+  les_pme_.order = hy.value("les_pme_order", 8);
+  les_pme_.spacing = hy.value("les_pme_spacing", 0.5);
+  les_pme_.atoms = hy.value("les_pme_atoms", 512);
+  if (const int64_t k = gguf_find_key(g, "plato.les_method"); k >= 0) les_pme_.method = gguf_get_val_str(g, k);
+  if (const char *e = std::getenv("MLIPCPP_PLATO_LES_METHOD"); e && *e) les_pme_.method = e;
+  if (!options_.les_method.empty()) les_pme_.method = options_.les_method;
+  if (les_pme_.method != "ewald" && les_pme_.method != "pme" && les_pme_.method != "auto")
+    throw std::runtime_error("Plato: les_method must be ewald, pme or auto, not " + les_pme_.method);
+  if (les_pme_.order % 2 != 0 || les_pme_.order < 4 || les_pme_.order > 12)
+    throw std::runtime_error("Plato: les_pme_order must be even, 4 to 12");
   if (!hy["num_framed_layers"].is_null() && hy["num_framed_layers"].get<int>() != spec_.layers)
     throw std::runtime_error("Plato: num_framed_layers < num_layers is not built");
 
@@ -381,13 +432,17 @@ ModelResult PlatoModel::predict(const AtomicSystem &system, bool compute_forces)
       mesh[a] = options_.fixed_mesh[0] > 0
                     ? options_.fixed_mesh[a]
                     : mesh_points(cell->matrix[a], mesh_spacing_, mesh_round_fft_);
+  int les_mesh[3] = {0, 0, 0};
+  if (les_on && periodic && les_pme_.use(n))
+    for (int a = 0; a < 3; a++) les_mesh[a] = pme_mesh_points(cell->matrix[a], les_pme_.spacing * spec_.les_sigma, les_pme_.order);
   CellConsts &K = consts_;
-  bool same_cell = K.valid && K.periodic == periodic && K.mesh[0] == mesh[0] && K.mesh[1] == mesh[1] && K.mesh[2] == mesh[2];
+  bool same_cell = K.valid && K.periodic == periodic && K.mesh[0] == mesh[0] && K.mesh[1] == mesh[1] && K.mesh[2] == mesh[2] &&
+                   K.les_mesh[0] == les_mesh[0] && K.les_mesh[1] == les_mesh[1] && K.les_mesh[2] == les_mesh[2];
   if (same_cell && periodic) same_cell = std::memcmp(K.cell, &cell->matrix[0][0], sizeof(K.cell)) == 0;
   if (!same_cell) {
     K = CellConsts{};
     K.valid = true, K.periodic = periodic;
-    for (int a = 0; a < 3; a++) K.mesh[a] = mesh[a];
+    for (int a = 0; a < 3; a++) K.mesh[a] = mesh[a], K.les_mesh[a] = les_mesh[a];
     if (periodic) {
       std::memcpy(K.cell, &cell->matrix[0][0], sizeof(K.cell));
       double C[3][3], det = 0;
@@ -419,7 +474,12 @@ ModelResult PlatoModel::predict(const AtomicSystem &system, bool compute_forces)
             K.mesh_deconv[e] = zero ? 0.0f : static_cast<float>(1.0 / dc);
           }
     }
-    if (les_on && periodic) {
+    if (les_on && periodic && les_mesh[0] > 0) {
+      K.les_tab = pme_axis_table(les_mesh, les_pme_.order);
+      K.les_K.resize(9);
+      for (int b = 0; b < 3; b++)
+        for (int q = 0; q < 3; q++) K.les_K[3 * b + q] = static_cast<float>(2 * M_PI * Ci[q][b]);
+    } else if (les_on && periodic) {
       const double kc = spec_.les_kcut / spec_.les_sigma, wd = 1.0 / spec_.les_sigma;
       int nmax[3];
       for (int a = 0; a < 3; a++) nmax[a] = static_cast<int>(std::floor(kc * row_norm(cell->matrix[a]) / (2 * M_PI)));
@@ -447,14 +507,15 @@ ModelResult PlatoModel::predict(const AtomicSystem &system, bool compute_forces)
   Graph *G = graph_.get();
   const bool same = G && G->n == n && G->E == E && G->max_len == max_len && G->periodic == periodic &&
                     G->mesh_on == mesh_on && G->les_on == les_on && G->nk == nk && G->mesh[0] == mesh[0] &&
-                    G->mesh[1] == mesh[1] && G->mesh[2] == mesh[2];
+                    G->mesh[1] == mesh[1] && G->mesh[2] == mesh[2] && G->les_mesh[0] == les_mesh[0] &&
+                    G->les_mesh[1] == les_mesh[1] && G->les_mesh[2] == les_mesh[2];
   parts_.rebuilt = !same;
   if (!same) {
     consts_uploaded_ = false;
     graph_.reset();
     auto g = std::make_unique<Graph>();
     g->n = n, g->E = E, g->max_len = max_len, g->periodic = periodic, g->mesh_on = mesh_on, g->les_on = les_on, g->nk = nk;
-    for (int a = 0; a < 3; a++) g->mesh[a] = mesh[a];
+    for (int a = 0; a < 3; a++) g->mesh[a] = mesh[a], g->les_mesh[a] = les_mesh[a];
     g->ctx = ggml_init({ggml_tensor_overhead() * GRAPH_SIZE * 2 + ggml_graph_overhead_custom(GRAPH_SIZE, true) * 2,
                         nullptr, true});
     ggml_context *ctx = g->ctx;
@@ -489,7 +550,13 @@ ModelResult PlatoModel::predict(const AtomicSystem &system, bool compute_forces)
       in.mesh_k0_pad = input(GGML_TYPE_F32, 1, Mh, "mesh_k0_pad");
       in.mesh_deconv = input(GGML_TYPE_F32, 1, Mh, "mesh_deconv");
     }
-    if (les_on && periodic) {
+    if (les_on && periodic && les_mesh[0] > 0) {
+      for (int a = 0; a < 3; a++) in.les_mesh[a] = les_mesh[a];
+      in.les_order = les_pme_.order;
+      in.les_K = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, 3, 1);
+      ggml_set_name(in.les_K, "les_K"), ggml_set_input(in.les_K), g->inputs.push_back(in.les_K);
+      in.les_tab = input(GGML_TYPE_F32, static_cast<int64_t>(K.les_tab.size()), 0, "les_tab");
+    } else if (les_on && periodic) {
       in.les_k = input(GGML_TYPE_F32, 3, nk, "les_k");
       in.les_n = input(GGML_TYPE_F32, 3, nk, "les_n");
       in.les_taper = input(GGML_TYPE_F32, 1, nk, "les_taper");
@@ -575,6 +642,7 @@ ModelResult PlatoModel::predict(const AtomicSystem &system, bool compute_forces)
     if (!consts_uploaded_) {
       if (in.mesh_k) set(in.mesh_k, K.mesh_k.data()), set(in.mesh_k0_pad, K.mesh_pad.data()), set(in.mesh_deconv, K.mesh_deconv.data());
       if (in.les_k) set(in.les_k, K.les_k.data()), set(in.les_n, K.les_n.data()), set(in.les_taper, K.les_taper.data());
+      if (in.les_K) set(in.les_K, K.les_K.data()), set(in.les_tab, K.les_tab.data());
       consts_uploaded_ = true;
     }
     if (in.offdiag) {
@@ -603,7 +671,7 @@ ModelResult PlatoModel::predict(const AtomicSystem &system, bool compute_forces)
   parts_.chi = energy_scale_ * chi;
   r.energy = static_cast<float>(energy_scale_ * total + composition);
   parts_.short_range = energy_scale_ * sr, parts_.les = energy_scale_ * les, parts_.composition = composition;
-  for (int a = 0; a < 3; a++) parts_.mesh[a] = mesh[a];
+  for (int a = 0; a < 3; a++) parts_.mesh[a] = mesh[a], parts_.les_mesh[a] = les_mesh[a];
   parts_.n_k = nk, parts_.edges = E, parts_.max_len = max_len;
   if (!compute_forces) {
     parts_.read_ms = ms(t3, clk::now());

@@ -16,6 +16,8 @@
 //   hidden weight matrices, each FrameLinear basis kernel a matrix of its own; Adam for the rest (default: Adam).
 //   --max-len N drops the structures with more than N - 1 neighbours of an atom (training and validation):
 //   the ragged attention keeps a sequence in shared memory (the limit depends on head width, frames, GPU).
+//   --les-method ewald|pme|auto: the periodic LES sum (default: the GGUF's, else auto: PME for batches
+//   whose largest structure has les_pme_atoms atoms or more; one PME mesh per micro-batch).
 //   mlipcpp-train-plato --init model.gguf --train data.bin --gradcheck H [--batch-size 8] [weights]: the loss
 //       along the trainer's gradient direction, (L(p + h g/|g|) - L(p - h g/|g|)) / 2h against |g|
 //   mlipcpp-train-plato --init model.gguf --train data.bin --check REF   (REF.json / REF.f64 of
@@ -165,17 +167,18 @@ int64_t round_up(int64_t x, int64_t m) { return (x + m - 1) / m * m; }
 struct Prepared {
   int Greal = 0, G = 0, n_real = 0, n = 0, L = 0;
   int64_t E_real = 0, E = 0, nk = 0;
-  int mesh[3] = {0, 0, 0};
+  int mesh[3] = {0, 0, 0}, les_mesh[3] = {0, 0, 0}; // les_mesh: LES by PME (0: the direct sum)
   double norm_G = 1, norm_N = 1; // structures and atoms of the whole step (the loss means)
   std::vector<const Structure *> structs;
   std::vector<Mat3> rot;
   std::vector<int> a0;               // [Greal + 1]
   std::vector<int32_t> species, sidx, ecs, nbs, cen, ej, rev, off;
-  std::vector<float> ev0, pos0, aict, onehot, invc, invv, mk, mpad, mdec, lk, ln, taper;
+  std::vector<float> ev0, pos0, aict, onehot, invc, invv, mk, mpad, mdec, lk, ln, taper, lK, ltab;
   std::vector<double> Et, Ft;        // scaled targets (rotated frame)
   std::vector<double> St;            // [9 Greal] scaled stress targets (rotated frame), row-major
   std::vector<double> vol;           // [Greal] cell volumes
-  std::tuple<int, int64_t, int, int, int64_t, int, int, int> key() const { return {n, E, L, G, nk, mesh[0], mesh[1], mesh[2]}; }
+  using Key = std::tuple<int, int64_t, int, int, int64_t, int, int, int, int, int, int>;
+  Key key() const { return {n, E, L, G, nk, mesh[0], mesh[1], mesh[2], les_mesh[0], les_mesh[1], les_mesh[2]}; }
 };
 
 struct Context {
@@ -184,6 +187,7 @@ struct Context {
   bool mesh_round_fft;
   const std::map<int, double> &composition;
   const std::map<int, int> &species_index;
+  plato::LesPme les;
   bool shared_filter = true;
 };
 
@@ -263,6 +267,17 @@ Prepared prepare(const Context &cx, const std::vector<const Structure *> &batch,
     mesh_dims(*batch[g], cx.spacing, cx.mesh_round_fft, m);
     if (m[0] != P.mesh[0] || m[1] != P.mesh[1] || m[2] != P.mesh[2]) throw std::runtime_error("a micro-batch needs one mesh size");
   }
+  // LES by PME when the largest structure qualifies; its mesh from the unrotated cells, one per batch
+  int n_max = 0;
+  for (const Structure *s : batch) n_max = std::max(n_max, s->n);
+  if (spec.les && cx.les.use(n_max))
+    for (int g = 0; g < Gr; g++)
+      for (int a = 0; a < 3; a++) {
+        const float row[3] = {float(batch[g]->cell[3 * a]), float(batch[g]->cell[3 * a + 1]), float(batch[g]->cell[3 * a + 2])};
+        const int m = plato::pme_mesh_points(row, cx.les.spacing * spec.les_sigma, cx.les.order);
+        if (g > 0 && m != P.les_mesh[a]) throw std::runtime_error("a micro-batch needs one LES PME mesh size");
+        P.les_mesh[a] = m;
+      }
   P.n_real = P.a0[Gr];
   std::vector<int64_t> e0(Gr + 1, 0);
   for (int g = 0; g < Gr; g++) e0[g + 1] = e0[g] + int64_t(ed[g].j.size());
@@ -358,7 +373,13 @@ Prepared prepare(const Context &cx, const std::vector<const Structure *> &batch,
           P.mpad[q] = q == 0 ? 1.0f : 0.0f, P.mdec[q] = q == 0 ? 0.0f : float(1.0 / dc);
         }
   }
-  if (spec.les) {
+  if (spec.les && P.les_mesh[0] > 0) {
+    P.ltab = plato::pme_axis_table(P.les_mesh, cx.les.order);
+    P.lK.resize(9 * size_t(G));
+    for (int g = 0; g < G; g++)
+      for (int b = 0; b < 3; b++)
+        for (int q = 0; q < 3; q++) P.lK[9 * g + 3 * b + q] = float(2 * M_PI * Cinv[g][3 * q + b]);
+  } else if (spec.les) {
     // the union of the structures' half-space integer sets with |k| < kc; each structure's k beyond
     // kc (from another cell's set, or padding to a multiple of 64 with ln = 0, |k| = 2 kc) has window 0
     const double kc = spec.les_kcut / spec.les_sigma;
@@ -483,7 +504,7 @@ struct Worker {
   ggml_tensor *muon_lr = nullptr;
   std::vector<float> muon_rms;
   int64_t n_muon_values = 0;
-  std::list<std::pair<std::tuple<int, int64_t, int, int, int64_t, int, int, int>, std::unique_ptr<BatchGraph>>> cache;
+  std::list<std::pair<Prepared::Key, std::unique_ptr<BatchGraph>>> cache;
   size_t cache_limit = 12;
   double fd_eps = 5e-3, energy_weight = 1, force_weight = 1, charge_weight = 0, stress_weight = 0;
   double t_build = 0, t_compute = 0, t_host = 0; // ms
@@ -642,7 +663,12 @@ struct Worker {
       in.mesh_k0_pad = input(GGML_TYPE_F32, 1, Mh, 1, "mesh_k0_pad");
       in.mesh_deconv = input(GGML_TYPE_F32, 1, Mh, 1, "mesh_deconv");
     }
-    if (spec.les) {
+    if (spec.les && P.les_mesh[0] > 0) {
+      for (int a = 0; a < 3; a++) in.les_mesh[a] = P.les_mesh[a];
+      in.les_order = model->les_pme().order;
+      in.les_K = input(GGML_TYPE_F32, 3, 3, G, "les_K");
+      in.les_tab = input(GGML_TYPE_F32, int64_t(P.ltab.size()), 1, 1, "les_tab");
+    } else if (spec.les) {
       in.les_k = input(GGML_TYPE_F32, 3, nk, G, "les_k");
       in.les_n = input(GGML_TYPE_F32, 3, nk, 1, "les_n");
       in.les_taper = input(GGML_TYPE_F32, 1, nk, 1, "les_taper");
@@ -736,6 +762,7 @@ struct Worker {
     // the long-range inputs of this batch's cells (shapes from the bucket key)
     if (in.mesh_k) set(in.mesh_k, P.mk.data()), set(in.mesh_k0_pad, P.mpad.data()), set(in.mesh_deconv, P.mdec.data());
     if (in.les_k) set(in.les_k, P.lk.data()), set(in.les_n, P.ln.data()), set(in.les_taper, P.taper.data());
+    if (in.les_K) set(in.les_K, P.lK.data()), set(in.les_tab, P.ltab.data());
     auto run = [&](const std::vector<float> &ev, const std::vector<float> &pos, const std::vector<float> &w, const std::vector<float> &cw,
                    const std::vector<float> &strain, float s) {
       set(in.edge_vectors, ev.data()), set(in.positions, pos.data()), set(in.energy_weights, w.data()), set(bg.loss_grad, &s);
@@ -1060,6 +1087,7 @@ int main(int argc, char **argv) {
     plato::PlatoOptions o;
     o.backend = parse_backend_preference(arg(argc, argv, "--backend", "auto"));
     o.fold_in_graph = true, o.decomposed_layer_norm = true;
+    o.les_method = arg(argc, argv, "--les-method", ""); // ewald | pme | auto (default: the GGUF's, else auto)
     const auto names = param_names(init);
     std::vector<std::unique_ptr<Worker>> workers;
     for (int d = 0; d < W; d++) {
@@ -1093,7 +1121,7 @@ int main(int argc, char **argv) {
       std::printf("--max-len %d: dropped %zu training structures\n", max_len, drop_long(train, max_len, w0.model->spec().cutoff));
     std::printf("%zu training structures, %lld parameters\n", train.size(), (long long)w0.n_values);
     const Context cx{w0.model->spec(), w0.model->energy_scale(), w0.model->mesh_spacing(), w0.model->mesh_round_fft(), w0.model->composition(),
-                     w0.model->species_index()};
+                     w0.model->species_index(), w0.model->les_pme()};
 
     const std::string check = arg(argc, argv, "--check", "");
     if (!check.empty()) {

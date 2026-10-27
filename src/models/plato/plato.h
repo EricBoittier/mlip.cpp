@@ -29,6 +29,10 @@ struct PlatoOptions {
   // MLIPCPP_PLATO_MESH="M" or "M0,M1,M2" sets it too. Off by default (parity).
   int fixed_mesh[3] = {0, 0, 0};
   bool mesh = true, les = true; // the model's own switches (parity of the parts)
+  // periodic LES sum: "ewald" (direct k-sum), "pme" (smooth particle-mesh Ewald) or "auto" (PME
+  // from les_pme_atoms atoms); empty: the GGUF's (hypers les_method, or "plato.les_method"),
+  // else "auto". MLIPCPP_PLATO_LES_METHOD sets it too
+  std::string les_method;
   bool fold_in_graph = false;   // training layout (MLIPCPP_PLATO_FOLD_IN_GRAPH=1)
   bool decomposed_layer_norm = false; // LayerNorms of primitive ops (weight gradients)
 };
@@ -46,6 +50,19 @@ void free_vesin(void *&vesin_state);
 /// form 2^k, 3 2^k or 5 2^k (8, 10, 12, 16, 20, 24, 32, 40, 48, ...) at or above it (GGUF
 /// "plato.mesh_round" = "fft"): fewer distinct meshes over many cells, a finer spacing
 int mesh_points(const float *cell_row, double spacing, bool round_fft = false);
+/// LES PME mesh (metatrain modules/ewald.py pme_mesh): the 2^a 3^b 5^c size at or above
+/// max(order, floor(|a| / h + 1/2) + 1), h = spacing sigma
+int pme_mesh_points(const float *cell_row, double h, int order);
+/// the per-axis factors of ggml_plato_pme: U^2 / (sum_n U^2)^2 (U = sinc^p(pi m / M), the
+/// alias sum of the order-2p B-spline), 0 on Nyquist bins; t2 with the rfft multiplicity
+std::vector<float> pme_axis_table(const int mesh[3], int order);
+/// LES settings of a GGUF (resolved): method "ewald" | "pme" | "auto"
+struct LesPme {
+  std::string method = "auto";
+  int order = 8, atoms = 512;
+  double spacing = 0.5; // in units of les_sigma
+  bool use(int n_atoms) const { return method == "pme" || (method == "auto" && n_atoms >= atoms); }
+};
 
 class PlatoModel : public Model {
 public:
@@ -64,6 +81,7 @@ public:
   struct Parts {
     double short_range = 0, les = 0, chi = 0, composition = 0; // les: Ewald part, chi: electronegativity part
     int mesh[3] = {0, 0, 0};
+    int les_mesh[3] = {0, 0, 0}; // LES PME mesh (0: direct sum)
     int64_t n_k = 0, edges = 0;
     int max_len = 0;
     bool rebuilt = false;
@@ -78,6 +96,8 @@ public:
   double energy_scale() const { return energy_scale_; }
   double mesh_spacing() const { return mesh_spacing_; }
   bool mesh_round_fft() const { return mesh_round_fft_; }
+  const LesPme &les_pme() const { return les_pme_; }
+  LesPme &les_pme() { return les_pme_; }
   const std::map<int, double> &composition() const { return composition_; }
   const std::map<int, int> &species_index() const { return species_index_; }
 
@@ -87,6 +107,7 @@ private:
   runtime::PlatoSpec spec_;
   double energy_scale_ = 1.0, mesh_spacing_ = 1.0;
   bool mesh_round_fft_ = false;
+  LesPme les_pme_;
   std::map<int, double> composition_;
   std::map<int, int> species_index_;
   std::shared_ptr<BackendProvider> backend_;
@@ -102,9 +123,9 @@ private:
   struct CellConsts {
     float cell[9] = {};
     bool valid = false, periodic = false;
-    int mesh[3] = {0, 0, 0};
+    int mesh[3] = {0, 0, 0}, les_mesh[3] = {0, 0, 0};
     double inv[3][3] = {}, volume = 0;
-    std::vector<float> mesh_k, mesh_pad, mesh_deconv, les_k, les_n, les_taper;
+    std::vector<float> mesh_k, mesh_pad, mesh_deconv, les_k, les_n, les_taper, les_K, les_tab;
   } consts_;
   bool consts_uploaded_ = false;
 };

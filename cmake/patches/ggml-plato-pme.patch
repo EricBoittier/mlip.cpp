@@ -1,0 +1,869 @@
+diff --git a/include/ggml.h b/include/ggml.h
+index cff58539..e5ccd2de 100644
+--- a/include/ggml.h
++++ b/include/ggml.h
+@@ -604,6 +604,8 @@ extern "C" {
+         GGML_OP_PLATO_ERF,
+         GGML_OP_PLATO_EWALD,
+         GGML_OP_PLATO_EWALD_BACK,
++        GGML_OP_PLATO_PME,
++        GGML_OP_PLATO_PME_BACK,
+ 
+         GGML_OP_COUNT,
+     };
+@@ -1983,6 +1985,49 @@ extern "C" {
+             struct ggml_tensor  * kn,
+             int                   n_struct);
+ 
++    // ggml_plato_spread_blocked / ggml_plato_gather_blocked with an order-p B-spline
++    // (p even, 4 <= p <= 12): the stencil floor(u) - p/2 + 1 .. floor(u) + p/2 per axis
++    // with the weights M_p(t + p - 1 - s) (order 4: the functions above)
++    GGML_API struct ggml_tensor * ggml_plato_spread_order(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * v,
++            struct ggml_tensor  * frac,
++            struct ggml_tensor  * block,
++            int                   n_blocks,
++            int                   M0,
++            int                   M1,
++            int                   M2,
++            int                   order);
++    GGML_API struct ggml_tensor * ggml_plato_gather_order(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * mesh,
++            struct ggml_tensor  * frac,
++            struct ggml_tensor  * block,
++            int                   C,
++            bool                  deriv,
++            int                   order);
++
++    // PME reciprocal energy of a half spectrum rk [2 (M2/2 + 1), M1, M0, G] (ggml_plato_fft3
++    // mode 0 of G real meshes [M2, M1, M0]): per structure g and plane i0, the partial sum
++    //   e[i0, g] = sum_{i1, i2} t0[i0] t1[i1] t2[i2] phi(k^2) |rk[i2, i1, i0, g]|^2,
++    //   k^2 = m^T A_g m, m = (f(i0, M0), f(i1, M1), i2) the signed frequencies,
++    //   phi(k^2) = w(|k|) exp(-sigma^2 k^2 / 2) / k^2 (0 at k = 0), w the cosine window
++    //   from kc - wd to kc (1 below, 0 above);
++    // metric A [9, G] (row-major, symmetric) or [9, 1] for all, tab [M0 + M1 + M2/2 + 1]
++    // the per-axis factors t0 | t1 | t2 (the rfft multiplicity in t2). Result [M0, G];
++    // differentiable w.r.t. rk and A (GGML_OP_PLATO_PME_BACK).
++    GGML_API struct ggml_tensor * ggml_plato_pme(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * rk,
++            struct ggml_tensor  * metric,
++            struct ggml_tensor  * tab,
++            int                   M0,
++            int                   M1,
++            int                   M2,
++            float                 sigma,
++            float                 kc,
++            float                 wd);
++
+     // the error function, elementwise
+     GGML_API struct ggml_tensor * ggml_plato_erf(
+             struct ggml_context * ctx,
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index fae8dc10..ec015b07 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -1942,6 +1942,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_plato_ewald_back(params, tensor);
+             } break;
++        case GGML_OP_PLATO_PME:
++            {
++                ggml_compute_forward_plato_pme(params, tensor);
++            } break;
++        case GGML_OP_PLATO_PME_BACK:
++            {
++                ggml_compute_forward_plato_pme_back(params, tensor);
++            } break;
+         case GGML_OP_PET_ATTN_RAGGED_BACK:
+             {
+                 ggml_compute_forward_pet_attn_ragged_back(params, tensor);
+@@ -2441,6 +2449,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+         case GGML_OP_PLATO_ERF:
+         case GGML_OP_PLATO_EWALD:
+         case GGML_OP_PLATO_EWALD_BACK:
++        case GGML_OP_PLATO_PME:
++        case GGML_OP_PLATO_PME_BACK:
+         case GGML_OP_PET_LAYER_NORM:
+         case GGML_OP_PET_LAYER_NORM_BACK:
+         case GGML_OP_PET_GLU:
+diff --git a/src/ggml-cpu/ops.cpp b/src/ggml-cpu/ops.cpp
+index cb36bf70..c368b81c 100644
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -12250,30 +12250,53 @@ inline void plato_bspline(float u, int64_t K, int64_t idx[4], float w[4], float
+     for (int k = 0; k < 4; k++) idx[k] = (((i0 + k - 1) % K) + K) % K;
+ }
+ 
++// order-p B-spline weights M_p(t + p - 1 - s) of the stencil floor(u) - p/2 + 1 + s
++// (s = 0 .. p - 1) and their derivatives w.r.t. u; order 4: plato_bspline
++inline void plato_bspline_p(float u, int64_t K, int p, int64_t * idx, float * w, float * dw) {
++    if (p == 4) { plato_bspline(u, K, idx, w, dw); return; }
++    const float fl = floorf(u), t = u - fl;
++    const int64_t i0 = (int64_t) fl;
++    float c[12], prev[12];
++    c[0] = 1.0f;
++    for (int n = 1; n < p; n++) { // c[k] = M_{n+1}(t + k), k = 0 .. n
++        if (n == p - 1) for (int k = 0; k < n; k++) prev[k] = c[k];
++        float nw[12];
++        for (int k = 0; k <= n; k++) {
++            const float x = t + (float) k;
++            float v = 0.0f;
++            if (k < n) v += x*c[k];
++            if (k >= 1) v += ((float) (n + 1) - x)*c[k - 1];
++            nw[k] = v/(float) n;
++        }
++        for (int k = 0; k <= n; k++) c[k] = nw[k];
++    }
++    for (int q = 0; q < p; q++) {
++        const int k = p - 1 - q;
++        w[q] = c[k];
++        dw[q] = (k <= p - 2 ? prev[k] : 0.0f) - (k >= 1 ? prev[k - 1] : 0.0f);
++        idx[q] = (((i0 + q - (p/2 - 1)) % K) + K) % K;
++    }
++}
++
+ struct plato_stencil {
+-    int64_t idx[64];
+-    float w[64], dw[3][64];
+-    void make(const float * frac, int64_t M0, int64_t M1, int64_t M2, bool deriv) {
+-        int64_t i[3][4];
+-        float wt[3][4], dt[3][4];
++    int p = 4;
++    int64_t i[3][12];
++    float w[3][12], d[3][12];
++    void make(const float * frac, int64_t M0, int64_t M1, int64_t M2, int order) {
++        p = order;
+         const int64_t K[3] = {M0, M1, M2};
+         for (int a = 0; a < 3; a++) {
+-            plato_bspline(frac[a]*(float) K[a], K[a], i[a], wt[a], dt[a]);
+-            for (int k = 0; k < 4; k++) dt[a][k] *= (float) K[a];
+-        }
+-        for (int x = 0; x < 4; x++) for (int y = 0; y < 4; y++) for (int z = 0; z < 4; z++) {
+-            const int s = (x*4 + y)*4 + z;
+-            idx[s] = (i[0][x]*M1 + i[1][y])*M2 + i[2][z];
+-            w[s] = wt[0][x]*wt[1][y]*wt[2][z];
+-            if (deriv) {
+-                dw[0][s] = dt[0][x]*wt[1][y]*wt[2][z];
+-                dw[1][s] = wt[0][x]*dt[1][y]*wt[2][z];
+-                dw[2][s] = wt[0][x]*wt[1][y]*dt[2][z];
+-            }
++            plato_bspline_p(frac[a]*(float) K[a], K[a], p, i[a], w[a], d[a]);
++            for (int k = 0; k < p; k++) d[a][k] *= (float) K[a];
+         }
+     }
+ };
+ 
++inline int plato_order(const ggml_tensor * t, int slot) {
++    const int o = ggml_get_op_params_i32(t, slot);
++    return o ? o : 4;
++}
++
+ } // namespace
+ 
+ void ggml_compute_forward_plato_spread(const ggml_compute_params * params, ggml_tensor * dst) {
+@@ -12281,17 +12304,32 @@ void ggml_compute_forward_plato_spread(const ggml_compute_params * params, ggml_
+     const int32_t * blk = dst->src[2] ? (const int32_t *) dst->src[2]->data : nullptr;
+     const int64_t C = dst->src[0]->ne[0], n = ggml_nrows(dst->src[1]), CT = dst->ne[3];
+     const int64_t M2 = dst->ne[0], M1 = dst->ne[1], M0 = dst->ne[2], M = M0*M1*M2;
++    const int order = plato_order(dst, 4);
+     float * rho = (float *) dst->data;
+     plato_stencil st;
+-    for (int64_t ct = params->ith; ct < CT; ct += params->nth) { // a channel per thread: no races
++    // a channel per thread, or with fewer channels than threads every thread on all channels
++    // for its own planes i0 in [lo, hi): no races either way
++    const int nth = params->nth, ith = params->ith;
++    const bool slabs = CT < nth;
++    const int64_t lo = slabs ? M0*ith/nth : 0, hi = slabs ? M0*(ith + 1)/nth : M0;
++    for (int64_t ct = slabs ? 0 : ith; ct < CT; ct += slabs ? 1 : nth) {
+         float * r = rho + ct*M;
+-        memset(r, 0, M*sizeof(float));
++        if (hi > lo) memset(r + lo*M1*M2, 0, (hi - lo)*M1*M2*sizeof(float));
+         const int64_t b = ct / C, c = ct % C;
+         for (int64_t a = 0; a < n; a++) {
+             if ((blk ? blk[a] : 0) != b) continue;
+-            st.make(frac + 3*a, M0, M1, M2, false);
++            st.make(frac + 3*a, M0, M1, M2, order);
+             const float va = v[a*C + c];
+-            for (int s = 0; s < 64; s++) r[st.idx[s]] += st.w[s]*va;
++            const int p = st.p;
++            for (int x = 0; x < p; x++) {
++                const int64_t i0 = st.i[0][x];
++                if (i0 < lo || i0 >= hi) continue;
++                for (int y = 0; y < p; y++) {
++                    float * row = r + (i0*M1 + st.i[1][y])*M2;
++                    const float wxy = st.w[0][x]*st.w[1][y]*va;
++                    for (int z = 0; z < p; z++) row[st.i[2][z]] += wxy*st.w[2][z];
++                }
++            }
+         }
+     }
+ }
+@@ -12304,28 +12342,130 @@ void ggml_compute_forward_plato_gather(const ggml_compute_params * params, ggml_
+     const int64_t n = ggml_nrows(dst->src[1]);
+     const bool deriv = ggml_get_op_params_i32(dst, 0) != 0;
+     const int64_t C = ggml_get_op_params_i32(dst, 1);
++    const int order = plato_order(dst, 2);
+     float * out = (float *) dst->data;
+     plato_stencil st;
+     for (int64_t a = params->ith; a < n; a += params->nth) {
+-        st.make(frac + 3*a, M0, M1, M2, deriv);
++        st.make(frac + 3*a, M0, M1, M2, order);
++        const int p = st.p;
+         const int64_t c0 = (blk ? blk[a] : 0)*C;
+         for (int64_t c = 0; c < C; c++) {
+             const float * m = phi + (c0 + c)*M;
+-            if (!deriv) {
+-                float acc = 0.0f;
+-                for (int s = 0; s < 64; s++) acc += st.w[s]*m[st.idx[s]];
+-                out[a*C + c] = acc;
+-            } else {
+-                for (int k = 0; k < 3; k++) {
+-                    float acc = 0.0f;
+-                    for (int s = 0; s < 64; s++) acc += st.dw[k][s]*m[st.idx[s]];
+-                    out[(a*3 + k)*C + c] = acc;
++            float acc = 0.0f, g0 = 0.0f, g1 = 0.0f, g2 = 0.0f;
++            for (int x = 0; x < p; x++)
++                for (int y = 0; y < p; y++) {
++                    const float * row = m + (st.i[0][x]*M1 + st.i[1][y])*M2;
++                    float s = 0.0f, sd = 0.0f;
++                    for (int z = 0; z < p; z++) {
++                        const float v = row[st.i[2][z]];
++                        s += st.w[2][z]*v;
++                        if (deriv) sd += st.d[2][z]*v;
++                    }
++                    if (!deriv) acc += st.w[0][x]*st.w[1][y]*s;
++                    else {
++                        g0 += st.d[0][x]*st.w[1][y]*s;
++                        g1 += st.w[0][x]*st.d[1][y]*s;
++                        g2 += st.w[0][x]*st.w[1][y]*sd;
++                    }
+                 }
+-            }
++            if (!deriv) out[a*C + c] = acc;
++            else out[(a*3 + 0)*C + c] = g0, out[(a*3 + 1)*C + c] = g1, out[(a*3 + 2)*C + c] = g2;
+         }
+     }
+ }
+ 
++namespace {
++
++// phi(k^2) = w(|k|) exp(-sigma^2 k^2 / 2) / k^2 and d phi / d k^2 (ggml_plato_pme)
++inline void plato_pme_phi(double k2, double s2, double kc, double wd, double & phi, double & dphi) {
++    phi = 0.0, dphi = 0.0;
++    if (k2 <= 0.0) return;
++    const double k = std::sqrt(k2), x = (k - (kc - wd))/wd;
++    if (x >= 1.0) return;
++    double w = 1.0, dw = 0.0; // d w / d |k|
++    if (x > 0.0) w = 0.5*(1.0 + std::cos(M_PI*x)), dw = -0.5*M_PI*std::sin(M_PI*x)/wd;
++    const double e = std::exp(-0.5*s2*k2)/k2;
++    phi = w*e;
++    dphi = dw/(2.0*k)*e - w*e*(0.5*s2 + 1.0/k2);
++}
++
++struct plato_pme_args {
++    int64_t M0, M1, M2, Mh, G;
++    double s2, kc, wd;
++    bool shared;
++    plato_pme_args(const ggml_tensor * op, const ggml_tensor * rk, const ggml_tensor * A) {
++        const int32_t * ip = (const int32_t *) op->op_params;
++        float fp[3];
++        memcpy(fp, ip + 3, sizeof(fp));
++        M0 = ip[0], M1 = ip[1], M2 = ip[2], Mh = M2/2 + 1, G = rk->ne[3];
++        s2 = double(fp[0])*fp[0], kc = fp[1], wd = fp[2];
++        shared = ggml_nelements(A) == 9;
++    }
++};
++
++inline int64_t plato_freq(int64_t i, int64_t M) { return i <= (M - 1)/2 ? i : i - M; }
++
++} // namespace
++
++void ggml_compute_forward_plato_pme(const ggml_compute_params * params, ggml_tensor * dst) {
++    const ggml_tensor * rk = dst->src[0];
++    const plato_pme_args P(dst, rk, dst->src[1]);
++    const float * x = (const float *) rk->data, * Af = (const float *) dst->src[1]->data, * tab = (const float *) dst->src[2]->data;
++    float * out = (float *) dst->data;
++    for (int64_t u = params->ith; u < P.M0*P.G; u += params->nth) {
++        const int64_t i0 = u % P.M0, g = u / P.M0;
++        const float * A = Af + (P.shared ? 0 : 9*g);
++        const double m0 = (double) plato_freq(i0, P.M0), t0 = tab[i0];
++        double acc = 0.0;
++        for (int64_t i1 = 0; i1 < P.M1; i1++) {
++            const double m1 = (double) plato_freq(i1, P.M1), t01 = t0*tab[P.M0 + i1];
++            const float * row = x + 2*P.Mh*(i1 + P.M1*(i0 + P.M0*g));
++            for (int64_t i2 = 0; i2 < P.Mh; i2++) {
++                const double m2 = (double) i2;
++                const double k2 = A[0]*m0*m0 + A[4]*m1*m1 + A[8]*m2*m2 + (A[1] + A[3])*m0*m1 + (A[2] + A[6])*m0*m2 + (A[5] + A[7])*m1*m2;
++                double phi, dphi;
++                plato_pme_phi(k2, P.s2, P.kc, P.wd, phi, dphi);
++                if (phi == 0.0) continue;
++                const double re = row[2*i2], im = row[2*i2 + 1];
++                acc += t01*tab[P.M0 + P.M1 + i2]*phi*(re*re + im*im);
++            }
++        }
++        out[g*P.M0 + i0] = (float) acc;
++    }
++}
++
++void ggml_compute_forward_plato_pme_back(const ggml_compute_params * params, ggml_tensor * dst) {
++    const ggml_tensor * rk = dst->src[0];
++    const plato_pme_args P(dst, rk, dst->src[1]);
++    const float * x = (const float *) rk->data, * Af = (const float *) dst->src[1]->data, * tab = (const float *) dst->src[2]->data;
++    const float * de = (const float *) dst->src[3]->data;
++    float * drk = (float *) dst->data, * dA = drk + ggml_nelements(rk);
++    for (int64_t u = params->ith; u < P.M0*P.G; u += params->nth) {
++        const int64_t i0 = u % P.M0, g = u / P.M0;
++        const float * A = Af + (P.shared ? 0 : 9*g);
++        const double m0 = (double) plato_freq(i0, P.M0), t0 = tab[i0], d = de[g*P.M0 + i0];
++        double a[6] = {0, 0, 0, 0, 0, 0}; // 00 11 22 01 02 12
++        for (int64_t i1 = 0; i1 < P.M1; i1++) {
++            const double m1 = (double) plato_freq(i1, P.M1), t01 = t0*tab[P.M0 + i1];
++            const int64_t o = 2*P.Mh*(i1 + P.M1*(i0 + P.M0*g));
++            for (int64_t i2 = 0; i2 < P.Mh; i2++) {
++                const double m2 = (double) i2;
++                const double k2 = A[0]*m0*m0 + A[4]*m1*m1 + A[8]*m2*m2 + (A[1] + A[3])*m0*m1 + (A[2] + A[6])*m0*m2 + (A[5] + A[7])*m1*m2;
++                double phi, dphi;
++                plato_pme_phi(k2, P.s2, P.kc, P.wd, phi, dphi);
++                const double re = x[o + 2*i2], im = x[o + 2*i2 + 1], f = d*t01*tab[P.M0 + P.M1 + i2];
++                drk[o + 2*i2] = (float) (2.0*f*phi*re), drk[o + 2*i2 + 1] = (float) (2.0*f*phi*im);
++                if (dphi == 0.0) continue;
++                const double c = f*dphi*(re*re + im*im);
++                a[0] += c*m0*m0, a[1] += c*m1*m1, a[2] += c*m2*m2, a[3] += c*m0*m1, a[4] += c*m0*m2, a[5] += c*m1*m2;
++            }
++        }
++        float * o9 = dA + 9*(g*P.M0 + i0); // d / d A_ab, symmetric halves
++        o9[0] = (float) a[0], o9[4] = (float) a[1], o9[8] = (float) a[2];
++        o9[1] = o9[3] = (float) a[3], o9[2] = o9[6] = (float) a[4], o9[5] = o9[7] = (float) a[5];
++    }
++}
++
+ void ggml_compute_forward_plato_erf(const ggml_compute_params * params, ggml_tensor * dst) {
+     GGML_ASSERT(ggml_is_contiguous(dst->src[0]));
+     const float * x = (const float *) dst->src[0]->data;
+diff --git a/src/ggml-cpu/ops.h b/src/ggml-cpu/ops.h
+index 20f7de48..1d6cdc30 100644
+--- a/src/ggml-cpu/ops.h
++++ b/src/ggml-cpu/ops.h
+@@ -77,6 +77,8 @@ void ggml_compute_forward_plato_gather(const struct ggml_compute_params * params
+ void ggml_compute_forward_plato_erf(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_plato_ewald(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_plato_ewald_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_plato_pme(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_plato_pme_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_pet_attn_ragged_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_pet_layer_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_pet_glu(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index 866b45c3..bc48efd2 100644
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -2794,6 +2794,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+         case GGML_OP_PLATO_EWALD_BACK:
+             ggml_cuda_op_plato_ewald_back(ctx, dst);
+             break;
++        case GGML_OP_PLATO_PME:
++            ggml_cuda_op_plato_pme(ctx, dst);
++            break;
++        case GGML_OP_PLATO_PME_BACK:
++            ggml_cuda_op_plato_pme_back(ctx, dst);
++            break;
+         case GGML_OP_PET_ATTN_RAGGED:
+             ggml_cuda_op_pet_attn_ragged(ctx, dst);
+             break;
+@@ -5307,6 +5313,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+         case GGML_OP_PLATO_ERF:
+         case GGML_OP_PLATO_EWALD:
+         case GGML_OP_PLATO_EWALD_BACK:
++        case GGML_OP_PLATO_PME:
++        case GGML_OP_PLATO_PME_BACK:
+             return ggml_cuda_plato_supported(op);
+         case GGML_OP_PET_LAYER_NORM:
+         case GGML_OP_PET_LAYER_NORM_BACK:
+diff --git a/src/ggml-cuda/plato.cu b/src/ggml-cuda/plato.cu
+index fc412fd9..1b861824 100644
+--- a/src/ggml-cuda/plato.cu
++++ b/src/ggml-cuda/plato.cu
+@@ -531,6 +531,208 @@ __global__ void plato_erf_k(const float * __restrict__ x, float * __restrict__ y
+ 
+ int plato_blocks(int64_t n, int t) { return (int) ((n + t - 1) / t); }
+ 
++// order-P B-spline (P even, 6..12): weights M_P(t + P - 1 - s) of the points floor(u) - P/2 + 1 + s
++template <int P>
++__device__ __forceinline__ void plato_bspline_p_cu(float u, int K, int * idx, float * w, float * dw) {
++    const float fl = floorf(u), t = u - fl;
++    const int i0 = (int) fl;
++    float c[P], prev[P];
++    c[0] = 1.0f;
++#pragma unroll
++    for (int n = 1; n < P; n++) {
++        if (n == P - 1) {
++#pragma unroll
++            for (int k = 0; k < P - 1; k++) prev[k] = c[k];
++        }
++        c[n] = 0.0f;
++#pragma unroll
++        for (int k = n; k >= 0; k--) { // in place, high to low
++            const float x = t + (float) k;
++            float v = k < n ? x * c[k] : 0.0f;
++            if (k >= 1) v += ((float) (n + 1) - x) * c[k - 1];
++            c[k] = v / (float) n;
++        }
++    }
++#pragma unroll
++    for (int q = 0; q < P; q++) {
++        const int k = P - 1 - q;
++        w[q] = c[k];
++        if (dw) dw[q] = (k <= P - 2 ? prev[k] : 0.0f) - (k >= 1 ? prev[k - 1] : 0.0f);
++        idx[q] = (((i0 + q - (P / 2 - 1)) % K) + K) % K;
++    }
++}
++
++// a thread per (atom, x, y), the z line in a loop
++template <int P>
++__global__ void plato_spread_p_k(const float * __restrict__ v, const float * __restrict__ frac, const int * __restrict__ blk,
++                                 float * __restrict__ rho, int n, int C, int M0, int M1, int M2) {
++    const int64_t e = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (e >= (int64_t) n * P * P) return;
++    const int a = (int) (e / (P * P)), s = (int) (e % (P * P)), x = s / P, y = s % P;
++    int ix[P], iy[P], iz[P];
++    float wx[P], wy[P], wz[P];
++    plato_bspline_p_cu<P>(frac[3 * a + 0] * (float) M0, M0, ix, wx, nullptr);
++    plato_bspline_p_cu<P>(frac[3 * a + 1] * (float) M1, M1, iy, wy, nullptr);
++    plato_bspline_p_cu<P>(frac[3 * a + 2] * (float) M2, M2, iz, wz, nullptr);
++    const float wxy = wx[x] * wy[y];
++    const int64_t row = ((int64_t) ix[x] * M1 + iy[y]) * M2, M = (int64_t) M0 * M1 * M2;
++    const int64_t c0 = (int64_t) (blk ? blk[a] : 0) * C;
++    for (int c = 0; c < C; c++) {
++        float * r = rho + (c0 + c) * M + row;
++        const float va = wxy * v[(int64_t) a * C + c];
++#pragma unroll
++        for (int z = 0; z < P; z++) atomicAdd(r + iz[z], va * wz[z]);
++    }
++}
++
++// a thread per (atom, channel)
++template <int P>
++__global__ void plato_gather_p_k(const float * __restrict__ phi, const float * __restrict__ frac, const int * __restrict__ blk,
++                                 float * __restrict__ out, int n, int C, int M0, int M1, int M2, int deriv) {
++    const int64_t e = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (e >= (int64_t) n * C) return;
++    const int a = (int) (e / C), c = (int) (e % C);
++    int ix[P], iy[P], iz[P];
++    float wx[P], wy[P], wz[P], dx[P], dy[P], dz[P];
++    plato_bspline_p_cu<P>(frac[3 * a + 0] * (float) M0, M0, ix, wx, dx);
++    plato_bspline_p_cu<P>(frac[3 * a + 1] * (float) M1, M1, iy, wy, dy);
++    plato_bspline_p_cu<P>(frac[3 * a + 2] * (float) M2, M2, iz, wz, dz);
++    const float * m = phi + ((int64_t) (blk ? blk[a] : 0) * C + c) * M0 * M1 * M2;
++    float acc = 0.0f, g0 = 0.0f, g1 = 0.0f, g2 = 0.0f;
++    for (int x = 0; x < P; x++)
++        for (int y = 0; y < P; y++) {
++            const float * row = m + ((int64_t) ix[x] * M1 + iy[y]) * M2;
++            float sw = 0.0f, sd = 0.0f;
++#pragma unroll
++            for (int z = 0; z < P; z++) {
++                const float p = row[iz[z]];
++                sw += wz[z] * p;
++                sd += dz[z] * p;
++            }
++            if (!deriv) acc += wx[x] * wy[y] * sw;
++            else {
++                g0 += dx[x] * wy[y] * sw;
++                g1 += wx[x] * dy[y] * sw;
++                g2 += wx[x] * wy[y] * sd;
++            }
++        }
++    if (!deriv) out[(int64_t) a * C + c] = acc;
++    else {
++        out[((int64_t) a * 3 + 0) * C + c] = g0 * (float) M0;
++        out[((int64_t) a * 3 + 1) * C + c] = g1 * (float) M1;
++        out[((int64_t) a * 3 + 2) * C + c] = g2 * (float) M2;
++    }
++}
++
++// ggml_plato_pme: phi(k^2) and d phi / d k^2 (as the CPU), in float with the sums in double
++__device__ __forceinline__ void plato_pme_phi_cu(float k2, float s2, float kc, float wd, float & phi, float & dphi) {
++    phi = 0.0f, dphi = 0.0f;
++    if (k2 <= 0.0f) return;
++    const float k = sqrtf(k2), x = (k - (kc - wd)) / wd;
++    if (x >= 1.0f) return;
++    float w = 1.0f, dw = 0.0f;
++    if (x > 0.0f) {
++        float sn, cs;
++        sincospif(x, &sn, &cs);
++        w = 0.5f * (1.0f + cs), dw = -0.5f * (float) M_PI * sn / wd;
++    }
++    const float e = expf(-0.5f * s2 * k2) / k2;
++    phi = w * e;
++    dphi = dw / (2.0f * k) * e - w * e * (0.5f * s2 + 1.0f / k2);
++}
++
++struct plato_pme_cu {
++    int M0, M1, M2, Mh, G;
++    float s2, kc, wd;
++    int shared;
++};
++
++__device__ __forceinline__ int plato_freq_cu(int i, int M) { return i <= (M - 1) / 2 ? i : i - M; }
++
++template <int NV>
++__device__ __forceinline__ void plato_block_sum(double (&v)[NV]) { // result in thread 0
++    __shared__ double red[NV][32];
++    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
++#pragma unroll
++    for (int j = 0; j < NV; j++) {
++        for (int o = 16; o > 0; o >>= 1) v[j] += __shfl_xor_sync(0xffffffff, v[j], o);
++        if (lane == 0) red[j][warp] = v[j];
++    }
++    __syncthreads();
++    if (warp == 0) {
++#pragma unroll
++        for (int j = 0; j < NV; j++) {
++            double x = lane < (int) (blockDim.x / 32) ? red[j][lane] : 0.0;
++            for (int o = 16; o > 0; o >>= 1) x += __shfl_xor_sync(0xffffffff, x, o);
++            v[j] = x;
++        }
++    }
++}
++
++// a block per (plane i0, structure g)
++__global__ void plato_pme_k(const float2 * __restrict__ rk, const float * __restrict__ Af, const float * __restrict__ tab,
++                            float * __restrict__ out, plato_pme_cu P) {
++    const int i0 = blockIdx.x, g = blockIdx.y;
++    const float * A = Af + (P.shared ? 0 : 9 * g);
++    const float m0 = (float) plato_freq_cu(i0, P.M0), t0 = tab[i0];
++    const float a00 = A[0] * m0 * m0, a01 = (A[1] + A[3]) * m0, a02 = (A[2] + A[6]) * m0, a11 = A[4], a12 = A[5] + A[7], a22 = A[8];
++    const float2 * plane = rk + (int64_t) P.Mh * P.M1 * (i0 + (int64_t) P.M0 * g);
++    double acc[1] = {0.0};
++    for (int e = threadIdx.x; e < P.M1 * P.Mh; e += blockDim.x) {
++        const int i1 = e / P.Mh, i2 = e % P.Mh;
++        const float m1 = (float) plato_freq_cu(i1, P.M1), m2 = (float) i2;
++        const float k2 = a00 + a11 * m1 * m1 + a22 * m2 * m2 + a01 * m1 + a02 * m2 + a12 * m1 * m2;
++        float phi, dphi;
++        plato_pme_phi_cu(k2, P.s2, P.kc, P.wd, phi, dphi);
++        if (phi == 0.0f) continue;
++        const float2 z = plane[e];
++        acc[0] += (double) (t0 * tab[P.M0 + i1] * tab[P.M0 + P.M1 + i2] * phi * (z.x * z.x + z.y * z.y));
++    }
++    plato_block_sum<1>(acc);
++    if (threadIdx.x == 0) out[(int64_t) g * P.M0 + i0] = (float) acc[0];
++}
++
++__global__ void plato_pme_back_k(const float2 * __restrict__ rk, const float * __restrict__ Af, const float * __restrict__ tab,
++                                 const float * __restrict__ de, float2 * __restrict__ drk, float * __restrict__ dA, plato_pme_cu P) {
++    const int i0 = blockIdx.x, g = blockIdx.y;
++    const float * A = Af + (P.shared ? 0 : 9 * g);
++    const float m0 = (float) plato_freq_cu(i0, P.M0), t0 = tab[i0], d = de[(int64_t) g * P.M0 + i0];
++    const float a00 = A[0] * m0 * m0, a01 = (A[1] + A[3]) * m0, a02 = (A[2] + A[6]) * m0, a11 = A[4], a12 = A[5] + A[7], a22 = A[8];
++    const int64_t o = (int64_t) P.Mh * P.M1 * (i0 + (int64_t) P.M0 * g);
++    double acc[6] = {0, 0, 0, 0, 0, 0};
++    for (int e = threadIdx.x; e < P.M1 * P.Mh; e += blockDim.x) {
++        const int i1 = e / P.Mh, i2 = e % P.Mh;
++        const float m1 = (float) plato_freq_cu(i1, P.M1), m2 = (float) i2;
++        const float k2 = a00 + a11 * m1 * m1 + a22 * m2 * m2 + a01 * m1 + a02 * m2 + a12 * m1 * m2;
++        float phi, dphi;
++        plato_pme_phi_cu(k2, P.s2, P.kc, P.wd, phi, dphi);
++        const float2 z = rk[o + e];
++        const float f = d * t0 * tab[P.M0 + i1] * tab[P.M0 + P.M1 + i2];
++        drk[o + e] = make_float2(2.0f * f * phi * z.x, 2.0f * f * phi * z.y);
++        if (dphi == 0.0f) continue;
++        const double c = (double) (f * dphi * (z.x * z.x + z.y * z.y));
++        acc[0] += c * m0 * m0, acc[1] += c * m1 * m1, acc[2] += c * m2 * m2;
++        acc[3] += c * m0 * m1, acc[4] += c * m0 * m2, acc[5] += c * m1 * m2;
++    }
++    plato_block_sum<6>(acc);
++    if (threadIdx.x == 0) {
++        float * o9 = dA + 9 * ((int64_t) g * P.M0 + i0);
++        o9[0] = (float) acc[0], o9[4] = (float) acc[1], o9[8] = (float) acc[2];
++        o9[1] = o9[3] = (float) acc[3], o9[2] = o9[6] = (float) acc[4], o9[5] = o9[7] = (float) acc[5];
++    }
++}
++
++plato_pme_cu plato_pme_get(const ggml_tensor * op) {
++    const int32_t * ip = (const int32_t *) op->op_params;
++    float fp[3];
++    memcpy(fp, ip + 3, sizeof(fp));
++    plato_pme_cu P;
++    P.M0 = ip[0], P.M1 = ip[1], P.M2 = ip[2], P.Mh = ip[2] / 2 + 1, P.G = (int) op->src[0]->ne[3];
++    P.s2 = fp[0] * fp[0], P.kc = fp[1], P.wd = fp[2];
++    P.shared = ggml_nelements(op->src[1]) == 9;
++    return P;
++}
++
+ } // namespace
+ 
+ bool ggml_cuda_plato_supported(const ggml_tensor * op) {
+@@ -550,6 +752,8 @@ bool ggml_cuda_plato_supported(const ggml_tensor * op) {
+         case GGML_OP_PLATO_ERF:
+         case GGML_OP_PLATO_EWALD:
+         case GGML_OP_PLATO_EWALD_BACK:
++        case GGML_OP_PLATO_PME:
++        case GGML_OP_PLATO_PME_BACK:
+             return op->src[0]->type == GGML_TYPE_F32;
+         default:
+             return false;
+@@ -609,9 +813,18 @@ void ggml_cuda_op_plato_spread(ggml_backend_cuda_context & ctx, ggml_tensor * ds
+     cudaStream_t st = ctx.stream();
+     CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), st));
+     if (n == 0) return;
+-    plato_spread_k<<<plato_blocks((int64_t) n * 64, 256), 256, 0, st>>>(
+-        (const float *) dst->src[0]->data, (const float *) dst->src[1]->data,
+-        dst->src[2] ? (const int *) dst->src[2]->data : nullptr, (float *) dst->data, n, C, M0, M1, M2);
++    const int order = ggml_get_op_params_i32(dst, 4) ? ggml_get_op_params_i32(dst, 4) : 4;
++    const float * v = (const float *) dst->src[0]->data, * fr = (const float *) dst->src[1]->data;
++    const int * blk = dst->src[2] ? (const int *) dst->src[2]->data : nullptr;
++    float * rho = (float *) dst->data;
++    switch (order) {
++        case 4: plato_spread_k<<<plato_blocks((int64_t) n * 64, 256), 256, 0, st>>>(v, fr, blk, rho, n, C, M0, M1, M2); break;
++        case 6: plato_spread_p_k<6><<<plato_blocks((int64_t) n * 36, 256), 256, 0, st>>>(v, fr, blk, rho, n, C, M0, M1, M2); break;
++        case 8: plato_spread_p_k<8><<<plato_blocks((int64_t) n * 64, 256), 256, 0, st>>>(v, fr, blk, rho, n, C, M0, M1, M2); break;
++        case 10: plato_spread_p_k<10><<<plato_blocks((int64_t) n * 100, 256), 256, 0, st>>>(v, fr, blk, rho, n, C, M0, M1, M2); break;
++        case 12: plato_spread_p_k<12><<<plato_blocks((int64_t) n * 144, 256), 256, 0, st>>>(v, fr, blk, rho, n, C, M0, M1, M2); break;
++        default: GGML_ABORT("plato_spread: order");
++    }
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
+@@ -620,9 +833,20 @@ void ggml_cuda_op_plato_gather(ggml_backend_cuda_context & ctx, ggml_tensor * ds
+     const int M2 = (int) mesh->ne[0], M1 = (int) mesh->ne[1], M0 = (int) mesh->ne[2], C = ggml_get_op_params_i32(dst, 1);
+     const int n = (int) ggml_nrows(dst->src[1]);
+     if (n == 0) return;
+-    plato_gather_k<<<plato_blocks((int64_t) n * C, 128), 128, 0, ctx.stream()>>>(
+-        (const float *) mesh->data, (const float *) dst->src[1]->data, dst->src[2] ? (const int *) dst->src[2]->data : nullptr,
+-        (float *) dst->data, n, C, M0, M1, M2, ggml_get_op_params_i32(dst, 0));
++    const int order = ggml_get_op_params_i32(dst, 2) ? ggml_get_op_params_i32(dst, 2) : 4, dv = ggml_get_op_params_i32(dst, 0);
++    const float * ph = (const float *) mesh->data, * fr = (const float *) dst->src[1]->data;
++    const int * blk = dst->src[2] ? (const int *) dst->src[2]->data : nullptr;
++    float * out = (float *) dst->data;
++    const int nb = plato_blocks((int64_t) n * C, 128);
++    cudaStream_t st = ctx.stream();
++    switch (order) {
++        case 4: plato_gather_k<<<nb, 128, 0, st>>>(ph, fr, blk, out, n, C, M0, M1, M2, dv); break;
++        case 6: plato_gather_p_k<6><<<nb, 128, 0, st>>>(ph, fr, blk, out, n, C, M0, M1, M2, dv); break;
++        case 8: plato_gather_p_k<8><<<nb, 128, 0, st>>>(ph, fr, blk, out, n, C, M0, M1, M2, dv); break;
++        case 10: plato_gather_p_k<10><<<nb, 128, 0, st>>>(ph, fr, blk, out, n, C, M0, M1, M2, dv); break;
++        case 12: plato_gather_p_k<12><<<nb, 128, 0, st>>>(ph, fr, blk, out, n, C, M0, M1, M2, dv); break;
++        default: GGML_ABORT("plato_gather: order");
++    }
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
+@@ -650,3 +874,18 @@ void ggml_cuda_op_plato_ewald_back(ggml_backend_cuda_context & ctx, ggml_tensor
+         (const float *) dst->src[3]->data, (const float *) res->data, (const float *) dst->src[5]->data, dq, dq + n, n, nk, G);
+     CUDA_CHECK(cudaGetLastError());
+ }
++
++void ggml_cuda_op_plato_pme(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const plato_pme_cu P = plato_pme_get(dst);
++    plato_pme_k<<<dim3(P.M0, P.G), 256, 0, ctx.stream()>>>((const float2 *) dst->src[0]->data, (const float *) dst->src[1]->data,
++        (const float *) dst->src[2]->data, (float *) dst->data, P);
++    CUDA_CHECK(cudaGetLastError());
++}
++
++void ggml_cuda_op_plato_pme_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const plato_pme_cu P = plato_pme_get(dst);
++    float * drk = (float *) dst->data;
++    plato_pme_back_k<<<dim3(P.M0, P.G), 256, 0, ctx.stream()>>>((const float2 *) dst->src[0]->data, (const float *) dst->src[1]->data,
++        (const float *) dst->src[2]->data, (const float *) dst->src[3]->data, (float2 *) drk, drk + ggml_nelements(dst->src[0]), P);
++    CUDA_CHECK(cudaGetLastError());
++}
+diff --git a/src/ggml-cuda/plato.cuh b/src/ggml-cuda/plato.cuh
+index 3708c745..d8eb676a 100644
+--- a/src/ggml-cuda/plato.cuh
++++ b/src/ggml-cuda/plato.cuh
+@@ -11,3 +11,5 @@ void ggml_cuda_op_plato_gather(ggml_backend_cuda_context & ctx, ggml_tensor * ds
+ void ggml_cuda_op_plato_erf(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ void ggml_cuda_op_plato_ewald(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ void ggml_cuda_op_plato_ewald_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++void ggml_cuda_op_plato_pme(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++void ggml_cuda_op_plato_pme_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+diff --git a/src/ggml.c b/src/ggml.c
+index bb85cf96..ee2a311b 100644
+--- a/src/ggml.c
++++ b/src/ggml.c
+@@ -1091,9 +1091,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "PLATO_ERF",
+     "PLATO_EWALD",
+     "PLATO_EWALD_BACK",
++    "PLATO_PME",
++    "PLATO_PME_BACK",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 123, "GGML_OP_COUNT != 123");
++static_assert(GGML_OP_COUNT == 125, "GGML_OP_COUNT != 125");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1229,9 +1231,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "erf(x)",
+     "plato_ewald(frac,q,g,kn)",
+     "plato_ewald_back(frac,q,g,kn,r,dr)",
++    "plato_pme(rk,A,tab)",
++    "plato_pme_back(rk,A,tab,de)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 123, "GGML_OP_COUNT != 123");
++static_assert(GGML_OP_COUNT == 125, "GGML_OP_COUNT != 125");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -4472,11 +4476,25 @@ struct ggml_tensor * ggml_plato_spread_blocked(
+         int                   M0,
+         int                   M1,
+         int                   M2) {
++    return ggml_plato_spread_order(ctx, v, frac, block, n_blocks, M0, M1, M2, 4);
++}
++
++struct ggml_tensor * ggml_plato_spread_order(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * v,
++        struct ggml_tensor  * frac,
++        struct ggml_tensor  * block,
++        int                   n_blocks,
++        int                   M0,
++        int                   M1,
++        int                   M2,
++        int                   order) {
++    GGML_ASSERT(order >= 4 && order <= 12 && order % 2 == 0);
+     GGML_ASSERT(v->type == GGML_TYPE_F32 && frac->type == GGML_TYPE_F32 && ggml_is_contiguous(v) && ggml_is_contiguous(frac));
+     GGML_ASSERT(frac->ne[0] == 3 && ggml_nrows(frac) == ggml_nrows(v) && M0 >= 4 && M1 >= 4 && M2 >= 4 && n_blocks >= 1);
+     GGML_ASSERT(!block || (block->type == GGML_TYPE_I32 && ggml_nelements(block) == ggml_nrows(v) && ggml_is_contiguous(block)));
+     struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, M2, M1, M0, v->ne[0]*n_blocks);
+-    int32_t params[4] = { M0, M1, M2, n_blocks };
++    int32_t params[5] = { M0, M1, M2, n_blocks, order };
+     ggml_set_op_params(result, params, sizeof(params));
+     result->op     = GGML_OP_PLATO_SPREAD;
+     result->src[0] = v;
+@@ -4502,13 +4520,25 @@ struct ggml_tensor * ggml_plato_gather_blocked(
+         struct ggml_tensor  * block,
+         int                   C,
+         bool                  deriv) {
++    return ggml_plato_gather_order(ctx, mesh, frac, block, C, deriv, 4);
++}
++
++struct ggml_tensor * ggml_plato_gather_order(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * mesh,
++        struct ggml_tensor  * frac,
++        struct ggml_tensor  * block,
++        int                   C,
++        bool                  deriv,
++        int                   order) {
++    GGML_ASSERT(order >= 4 && order <= 12 && order % 2 == 0);
+     GGML_ASSERT(mesh->type == GGML_TYPE_F32 && frac->type == GGML_TYPE_F32 && ggml_is_contiguous(mesh) && ggml_is_contiguous(frac));
+     GGML_ASSERT(frac->ne[0] == 3 && mesh->ne[0] >= 4 && mesh->ne[1] >= 4 && mesh->ne[2] >= 4 && C >= 1 && mesh->ne[3] % C == 0);
+     GGML_ASSERT(!block || (block->type == GGML_TYPE_I32 && ggml_nelements(block) == ggml_nrows(frac) && ggml_is_contiguous(block)));
+     GGML_ASSERT(block || C == mesh->ne[3]);
+     const int64_t n = ggml_nrows(frac);
+     struct ggml_tensor * result = deriv ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, C, 3, n) : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, n);
+-    int32_t params[2] = { deriv ? 1 : 0, C };
++    int32_t params[3] = { deriv ? 1 : 0, C, order };
+     ggml_set_op_params(result, params, sizeof(params));
+     result->op     = GGML_OP_PLATO_GATHER;
+     result->src[0] = mesh;
+@@ -4547,6 +4577,38 @@ struct ggml_tensor * ggml_plato_ewald(
+     return result;
+ }
+ 
++struct ggml_tensor * ggml_plato_pme(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * rk,
++        struct ggml_tensor  * metric,
++        struct ggml_tensor  * tab,
++        int                   M0,
++        int                   M1,
++        int                   M2,
++        float                 sigma,
++        float                 kc,
++        float                 wd) {
++    GGML_ASSERT(rk->type == GGML_TYPE_F32 && metric->type == GGML_TYPE_F32 && tab->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_contiguous(rk) && ggml_is_contiguous(metric) && ggml_is_contiguous(tab));
++    const int64_t Mh = M2/2 + 1;
++    GGML_ASSERT(rk->ne[0] == 2*Mh && rk->ne[1] == M1 && rk->ne[2] == M0);
++    GGML_ASSERT(ggml_nelements(tab) == M0 + M1 + Mh);
++    const int64_t G = rk->ne[3];
++    GGML_ASSERT(ggml_nelements(metric) == 9*G || ggml_nelements(metric) == 9);
++    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, M0, G);
++    int32_t ip[3] = { M0, M1, M2 };
++    float fp[3] = { sigma, kc, wd };
++    int32_t params[6];
++    memcpy(params, ip, sizeof(ip));
++    memcpy(params + 3, fp, sizeof(fp));
++    ggml_set_op_params(result, params, sizeof(params));
++    result->op     = GGML_OP_PLATO_PME;
++    result->src[0] = rk;
++    result->src[1] = metric;
++    result->src[2] = tab;
++    return result;
++}
++
+ struct ggml_tensor * ggml_plato_erf(
+         struct ggml_context * ctx,
+         struct ggml_tensor  * a) {
+@@ -7684,11 +7746,12 @@ static void ggml_compute_backward(
+             struct ggml_tensor * g = ggml_is_contiguous(grad) ? grad : ggml_cont(ctx, grad);
+             struct ggml_tensor * blk = tensor->src[2];
+             const int64_t C = src0->ne[0], n = ggml_nrows(src1);
++            const int order = ggml_get_op_params_i32(tensor, 4) ? ggml_get_op_params_i32(tensor, 4) : 4;
+             if (src0_needs_grads) {
+-                ggml_add_or_set(ctx, cgraph, isrc0, ggml_reshape(ctx, ggml_plato_gather_blocked(ctx, g, src1, blk, (int) C, false), src0));
++                ggml_add_or_set(ctx, cgraph, isrc0, ggml_reshape(ctx, ggml_plato_gather_order(ctx, g, src1, blk, (int) C, false, order), src0));
+             }
+             if (src1_needs_grads) {
+-                struct ggml_tensor * dg = ggml_plato_gather_blocked(ctx, g, src1, blk, (int) C, true); // [C, 3, n]
++                struct ggml_tensor * dg = ggml_plato_gather_order(ctx, g, src1, blk, (int) C, true, order); // [C, 3, n]
+                 struct ggml_tensor * t  = ggml_mul(ctx, dg, ggml_reshape_3d(ctx, src0, C, 1, n));
+                 ggml_add_or_set(ctx, cgraph, isrc1, ggml_reshape(ctx, ggml_sum_rows(ctx, t), src1));
+             }
+@@ -7698,12 +7761,13 @@ static void ggml_compute_backward(
+             struct ggml_tensor * g = ggml_is_contiguous(grad) ? grad : ggml_cont(ctx, grad);
+             struct ggml_tensor * blk = tensor->src[2];
+             const int64_t C = ggml_get_op_params_i32(tensor, 1), n = ggml_nrows(src1);
++            const int order = ggml_get_op_params_i32(tensor, 2) ? ggml_get_op_params_i32(tensor, 2) : 4;
+             if (src0_needs_grads) {
+-                ggml_add_or_set(ctx, cgraph, isrc0, ggml_plato_spread_blocked(ctx, g, src1, blk, (int) (src0->ne[3]/C),
+-                    src0->ne[2], src0->ne[1], src0->ne[0]));
++                ggml_add_or_set(ctx, cgraph, isrc0, ggml_plato_spread_order(ctx, g, src1, blk, (int) (src0->ne[3]/C),
++                    src0->ne[2], src0->ne[1], src0->ne[0], order));
+             }
+             if (src1_needs_grads) {
+-                struct ggml_tensor * dm = ggml_plato_gather_blocked(ctx, src0, src1, blk, (int) C, true); // [C, 3, n]
++                struct ggml_tensor * dm = ggml_plato_gather_order(ctx, src0, src1, blk, (int) C, true, order); // [C, 3, n]
+                 struct ggml_tensor * t  = ggml_mul(ctx, dm, ggml_reshape_3d(ctx, g, C, 1, n));
+                 ggml_add_or_set(ctx, cgraph, isrc1, ggml_reshape(ctx, ggml_sum_rows(ctx, t), src1));
+             }
+@@ -7729,6 +7793,32 @@ static void ggml_compute_backward(
+                 }
+             }
+         } break;
++        case GGML_OP_PLATO_PME: {
++            if (src0_needs_grads || src1_needs_grads) {
++                // one buffer: d rk (the shape of rk), then the partial d A [9, M0, G]
++                struct ggml_tensor * g = ggml_is_contiguous(grad) ? grad : ggml_cont(ctx, grad);
++                const int64_t nr = ggml_nelements(src0), M0 = src0->ne[2], G = src0->ne[3];
++                struct ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nr + 9*M0*G);
++                memcpy(b->op_params, tensor->op_params, 6*sizeof(int32_t));
++                b->op     = GGML_OP_PLATO_PME_BACK;
++                b->src[0] = src0;
++                b->src[1] = src1;
++                b->src[2] = tensor->src[2];
++                b->src[3] = g;
++                if (src0_needs_grads) {
++                    ggml_add_or_set(ctx, cgraph, isrc0, ggml_reshape(ctx, ggml_view_1d(ctx, b, nr, 0), src0));
++                }
++                if (src1_needs_grads) {
++                    // sum the planes: [9, M0, G] -> [M0, 9, G] -> [1, 9, G]
++                    struct ggml_tensor * dA = ggml_view_3d(ctx, b, 9, M0, G, 9*sizeof(float), 9*M0*sizeof(float), nr*sizeof(float));
++                    dA = ggml_sum_rows(ctx, ggml_cont(ctx, ggml_permute(ctx, dA, 1, 0, 2, 3)));
++                    if (ggml_nelements(src1) == 9 && G > 1) {
++                        dA = ggml_sum_rows(ctx, ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_2d(ctx, dA, 9, G), 1, 0, 2, 3)));
++                    }
++                    ggml_add_or_set(ctx, cgraph, isrc1, ggml_reshape(ctx, dA, src1));
++                }
++            }
++        } break;
+         case GGML_OP_PLATO_ERF: {
+             if (src0_needs_grads) {
+                 // 2/sqrt(pi) exp(-x^2)
