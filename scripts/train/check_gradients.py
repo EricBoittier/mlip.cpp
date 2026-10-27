@@ -154,16 +154,20 @@ def main():
             f_target.append(split["f"][lo:hi] / np.array([fscale[int(z)] for z in types])[:, None])
             f_phys.append(split["f"][lo:hi])
 
-        out = model(systems, {"energy": ModelOutput(sample_kind="atom"),
-                              "non_conservative_force": ModelOutput(sample_kind="atom")})
+        nc_head = "non_conservative_force" in model.outputs  # energy-only models: conservative forces only
+        requested = {"energy": ModelOutput(sample_kind="atom")}
+        if nc_head:
+            requested["non_conservative_force"] = ModelOutput(sample_kind="atom")
+        out = model(systems, requested)
         e_atom = out["energy"].block().values.reshape(-1)
-        f_atom = out["non_conservative_force"].block().values.reshape(-1, 3)
+        f_atom = out["non_conservative_force"].block().values.reshape(-1, 3) if nc_head else None
         counts = [len(s) for s in systems]
         e_pa = torch.stack([chunk.sum() / len(chunk) for chunk in torch.split(e_atom, counts)])
         if os.environ.get("CHECK_GRADIENTS_DEBUG"):
             print("e_pa", e_pa.tolist(), "n", counts)
         loss_e = ((e_pa - torch.tensor(e_target, dtype=dtype)) ** 2).mean()
-        loss_f = ((f_atom - torch.tensor(np.concatenate(f_target), dtype=dtype)) ** 2).mean()
+        loss_f = ((f_atom - torch.tensor(np.concatenate(f_target), dtype=dtype)) ** 2).mean() if nc_head \
+            else torch.zeros((), dtype=dtype)
         if cons:
             # -dE/dx of the scaled energy against F / s_E, kept differentiable
             grads = torch.autograd.grad(e_atom.sum(), [s.positions for s in systems], create_graph=True)
@@ -194,7 +198,7 @@ def main():
         p = get_model_params(pet)
         wrapper = PETFullModel(pet, n_atoms=7, max_neighbors=11, d_pet=p["d_pet"], forces=True,
                                cutoff=p["cutoff"], cutoff_width=p["cutoff_width"],
-                               cutoff_function=p["cutoff_function"], nc_forces=True)
+                               cutoff_function=p["cutoff_function"], nc_forces="non_conservative_force" in m.outputs)
         out = {n.replace(".", "_"): t for n, t in wrapper.named_parameters()}
         plato = getattr(wrapper, "plato", None)
         mesh = plato.__dict__.get("_mesh_module") if plato is not None else None

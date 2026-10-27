@@ -311,8 +311,7 @@ Worker::Worker(const std::string &gguf, int device, size_t cache_graphs) : cache
   model_.load_from_gguf(gguf);
   if (!model_.forces_mode())
     throw std::runtime_error(gguf + ": training needs a forces-mode export");
-  if (!model_.nc_forces() && !model_.plato_lr().enabled)
-    throw std::runtime_error(gguf + ": training needs an export with --nc-forces");
+  // energy-only exports (no --nc-forces) train with conservative forces only (Worker::run)
   if (model_.param_names().empty())
     throw std::runtime_error(gguf + ": no train.param_names; re-export with export_pet_gguf.py");
   for (const auto &name : model_.param_names()) {
@@ -560,7 +559,8 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
     ggml_set_param(edges), ggml_set_param(cv);
     for (ggml_tensor *p : params_) p->flags &= ~GGML_TENSOR_FLAG_PARAM;
     g->out = interp.build(ctx);
-    ggml_set_output(g->out);
+    ggml_set_output(g->out); // (an energy-only export's [n]: the source of the view below, kept too)
+    if (ggml_n_dims(g->out) == 1) g->out = ggml_reshape_2d(ctx, g->out, 1, n), ggml_set_output(g->out);
     ggml_tensor *E = ggml_sum(ctx, ggml_cont(ctx, ggml_view_2d(ctx, g->out, 1, n, g->out->nb[1], 0)));
     g->gf = ggml_new_graph_custom(ctx, graph_size, true);
     ggml_build_forward_expand(g->gf, g->out);
@@ -603,6 +603,7 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
 
     // out: [n_atoms, 4] = (energy | force) per atom; ggml ne = (4, n)
     ggml_tensor *out = interp.build(ctx);
+    if (ggml_n_dims(out) == 1) out = ggml_reshape_2d(ctx, out, 1, n); // energy-only export: [n]
     ggml_tensor *energy = ggml_reshape_2d(
         ctx, ggml_cont(ctx, ggml_view_2d(ctx, out, 1, n, out->nb[1], 0)), n, 1);
     // energy-only exports (conservative training): no direct force head, its loss terms are 0

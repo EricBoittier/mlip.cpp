@@ -100,7 +100,8 @@ public:
   // over 2h, which ggml's backward pass then differentiates in the parameters
   // (exact for the quadratic structure-factor sums; O(h^2) in the coordinates, so the
   // tangents should be O(1): the caller normalises them). Linear parts are exact.
-  float fd_h = 1e-2f;
+  // MLIPCPP_JVP_FD_H overrides the step
+  float fd_h = [] { const char *e = std::getenv("MLIPCPP_JVP_FD_H"); return e && *e ? std::strtof(e, nullptr) : 2e-3f; }();
   // a copy of node x with some sources replaced
   ggml_tensor *clone(ggml_tensor *x, ggml_tensor *s0, ggml_tensor *s1) {
     ggml_tensor *y = ggml_new_tensor(c, x->type, GGML_MAX_DIMS, x->ne);
