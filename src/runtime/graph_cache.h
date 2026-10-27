@@ -67,6 +67,7 @@ struct CachedGraph {
   // Plato-PET-LR: the long-range ops' inputs (positions, cell constants) and dE / d positions, strain
   std::unique_ptr<PetPlatoLR> plato;
   ggml_tensor *grad_pos = nullptr, *grad_eps = nullptr;
+  ggml_tensor *latent_q = nullptr; // [Q, n] latent charges (model units), an output
   // predict_device_step: 1 when every node runs on the compute backend, so the
   // graph goes to it directly and asynchronously (-1: not checked yet)
   int direct = -1;

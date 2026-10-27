@@ -312,6 +312,7 @@ void GraphModel::build_cached_graph(int n, int M, bool exact_mask, bool backward
   if (!out) throw std::runtime_error("GraphModel: cannot build the model graph");
   if (g->plato) // (after the build: it makes some inputs of its own)
     for (ggml_tensor *t : g->plato->tensors()) inputs.push_back(t);
+  if (g->plato && g->plato->charges()) ggml_set_output(g->latent_q = g->plato->charges());
   // [1, n] contiguous outputs (a view of `out` would not keep the allocator
   // from reusing its memory in the backward pass)
   g->energy = nc_forces_ ? ggml_cont(ctx, ggml_view_2d(ctx, out, 1, n, out->nb[1], 0)) : ggml_cont(ctx, out);
@@ -677,6 +678,19 @@ void GraphModel::read_cached_outputs(const AtomicSystem &system, ModelResult &re
   result.has_nc_forces = true;
 }
 
+void GraphModel::read_latent_charges(ggml_tensor *q, ModelResult &result) {
+  if (plato_charge_unit_ == 0.0f) {
+    plato_charge_unit_ = 1.0f;
+    for (const auto &[name, t] : weights())
+      if (name == "plato_les_charge_unit") ggml_backend_tensor_get(t, &plato_charge_unit_, 0, sizeof(float));
+  }
+  const int64_t Q = q->ne[0], n = q->ne[1];
+  std::vector<float> v(ggml_nelements(q));
+  ggml_backend_tensor_get(q, v.data(), 0, ggml_nbytes(q));
+  result.latent_charges.resize(n);
+  for (int64_t i = 0; i < n; i++) result.latent_charges[i] = v[i * Q] * plato_charge_unit_;
+}
+
 ModelResult GraphModel::predict_cached(const AtomicSystem &system, bool compute_forces) {
   const int n = system.num_atoms();
   const int32_t *Z = system.atomic_numbers();
@@ -809,6 +823,7 @@ ModelResult GraphModel::predict_cached(const AtomicSystem &system, bool compute_
 
   ModelResult result;
   read_cached_outputs(system, result);
+  if (g.latent_q) read_latent_charges(g.latent_q, result);
 
   const Cell *cell = system.cell();
   const bool periodic = cell && (cell->periodic[0] || cell->periodic[1] || cell->periodic[2]);
@@ -1000,6 +1015,7 @@ ModelResult GraphModel::predict_cached_device(const AtomicSystem &system, bool c
 
   ModelResult result;
   read_cached_outputs(system, result);
+  if (g.latent_q) read_latent_charges(g.latent_q, result);
   const bool periodic = cell && (cell->periodic[0] || cell->periodic[1] || cell->periodic[2]);
   if (compute_forces) {
     md::gpu::conservative_forces(st, cut, gg, energy_scale_);

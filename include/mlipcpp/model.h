@@ -14,6 +14,9 @@ struct ModelResult {
   std::vector<float> stress; // [6] in Voigt notation (xx, yy, zz, yz, xz, xy)
 
   std::vector<float> nc_forces; // [n_atoms * 3], direct force head
+  // Plato-PET-LR with LES: the latent charges per atom (e: model units times charge_unit,
+  // after the neutralisation / total-charge shift), first channel; empty otherwise
+  std::vector<float> latent_charges;
 
   bool has_forces = false;
   bool has_stress = false;

@@ -1148,6 +1148,8 @@ ModelResult GraphModel::predict_single(
     ggml_set_output(nc_output);
   }
   ggml_set_output(output);
+  ggml_tensor *latent_q = plato ? plato->charges() : nullptr;
+  if (latent_q) ggml_set_output(latent_q);
 
   ggml_cgraph *cgraph = nullptr;
 
@@ -1280,6 +1282,8 @@ ModelResult GraphModel::predict_single(
 
   // --- Extract results ---
   ModelResult result;
+
+  if (latent_q) read_latent_charges(latent_q, result);
 
   // Get atomic energies
   std::vector<float> atomic_energies(n_atoms);

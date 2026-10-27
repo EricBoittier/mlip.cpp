@@ -48,6 +48,8 @@ struct Result {
   float energy = 0.0f;
   std::vector<float> forces; ///< [n_atoms * 3] flattened (fx, fy, fz)
   std::vector<float> stress; ///< [6] Voigt notation (xx, yy, zz, yz, xz, xy)
+  /// Plato-PET-LR models with LES: latent charges per atom (e, first channel); empty otherwise
+  std::vector<float> latent_charges;
 
   bool has_forces() const { return !forces.empty(); }
   bool has_stress() const { return !stress.empty(); }

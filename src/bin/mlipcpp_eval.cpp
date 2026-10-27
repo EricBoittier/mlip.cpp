@@ -12,7 +12,8 @@
  * Charge and spin multiplicity per frame come from the frame's charge= and
  * spin_multiplicity= (or spin=) keys, else 0 and 1; --charge / --spin
  * override them for every frame. Stress (Voigt xx yy zz yz xz xy, eV/A^3) for
- * frames with a Lattice. A frame whose charge or spin the model rejects gets
+ * frames with a Lattice. Plato-PET-LR models with LES also write "latent_charges" (e per
+ * atom, first channel, after the neutralisation / total-charge shift). A frame whose charge or spin the model rejects gets
  * {"error": "..."} instead of results.
  */
 
@@ -123,6 +124,7 @@ int main(int argc, char *argv[]) {
         f["energy"] = r.energy;
         f["forces"] = r.forces;
         if (r.has_stress()) f["stress"] = r.stress;
+        if (!r.latent_charges.empty()) f["latent_charges"] = r.latent_charges; // Plato-PET-LR LES (e)
       } catch (const std::exception &e) {
         f["error"] = e.what();
       }

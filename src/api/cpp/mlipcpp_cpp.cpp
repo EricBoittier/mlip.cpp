@@ -184,6 +184,7 @@ struct Predictor::Impl {
     if (internal_result.has_stress) {
       result.stress = std::move(internal_result.stress);
     }
+    result.latent_charges = std::move(internal_result.latent_charges);
     return result;
   }
 
