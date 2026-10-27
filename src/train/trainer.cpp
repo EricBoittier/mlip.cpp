@@ -2190,7 +2190,7 @@ void train(const TrainOptions &o) {
   }
 
   int64_t global_step = state.step;
-  if (jsonl && o.resume.empty()) log_line(0, evaluate(val_split, nl_val, ids_val), ""); // the initial model
+  if (jsonl && o.resume.empty()) log_line(-1, evaluate(val_split, nl_val, ids_val), ",\"init\":true"); // the initial model (epoch -1: before any training)
   const auto t_run = clock_type::now();
   for (int epoch = static_cast<int>(state.epoch); epoch < o.epochs && global_step != o.max_steps; epoch++) {
     const bool logging = log_file && epoch < o.log_errors_epochs;
