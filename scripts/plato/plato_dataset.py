@@ -10,6 +10,12 @@ uint8 has_stress, uint8 has_molecules, f64 energy, f64 forces[n][3] if has_force
 if has_stress (ASE sign, eV/A^3), then if has_molecules: int32 split (first atom of the second
 molecule), f64 formal charge of the first and of the second molecule.
 
+Version 2 (b"PLATOD2\0", charge / spin conditioning): the same, plus int32 charge and int32
+spin multiplicity (2S+1) right after the four flag bytes of every structure. Written when a
+structure has info["charge"] or info["spin_multiplicity"] (or OMol's info["spin"]), or with
+--conditioning on (missing values: 0 and 1); version 1 otherwise (--conditioning off: always).
+mlipcpp-train-plato reads both.
+
 --molecules reads split / charges (indexB, chargeA, chargeB) from a file with the same
 structures in the same order (the LOREM archive's bio_dimers files); atoms must match.
 
@@ -34,6 +40,8 @@ def main():
     ap.add_argument("--stress", default="stress")
     ap.add_argument("--molecules", default=None)
     ap.add_argument("--fit-baseline", default=None)
+    ap.add_argument("--conditioning", choices=["auto", "on", "off"], default="auto",
+                    help="write charge / spin multiplicity (format version 2)")
     a = ap.parse_args()
     if a.xyz.endswith((".jsonl", ".jsonl.gz")):
         return from_jsonl(a)
@@ -47,8 +55,17 @@ def main():
             if (x.numbers != y.numbers).any() or np.abs(x.positions - y.positions).max() > 1e-6:
                 raise SystemExit(f"structure {k} differs between {a.xyz} and {a.molecules}")
             mols[k] = (int(y.info["indexB"]), float(y.info["chargeA"]), float(y.info["chargeB"]))
+    def charge_spin(info):
+        q = info.get("charge", 0)
+        s = info.get("spin_multiplicity", info.get("spin", 1))
+        if float(q) != round(float(q)) or float(s) != round(float(s)):
+            raise SystemExit(f"charge {q} / spin multiplicity {s}: not integers")
+        return int(round(float(q))), int(round(float(s)))
+
+    v2 = a.conditioning == "on" or (a.conditioning == "auto" and any(
+        k in at.info for at in frames for k in ("charge", "spin_multiplicity", "spin")))
     with open(a.out, "wb") as f:
-        f.write(b"PLATOD1\0" + struct.pack("<q", len(frames)))
+        f.write((b"PLATOD2\0" if v2 else b"PLATOD1\0") + struct.pack("<q", len(frames)))
         for at, mol in zip(frames, mols):
             n = len(at)
             E = at.info.get(a.energy)
@@ -62,6 +79,8 @@ def main():
             f.write(np.asarray(at.positions, "<f8").tobytes())
             f.write(np.asarray(at.cell.array, "<f8").tobytes())
             f.write(struct.pack("<BBBB", pbc, F is not None, S is not None, mol is not None))
+            if v2:
+                f.write(struct.pack("<ii", *charge_spin(at.info)))
             f.write(struct.pack("<d", float(E)))
             if F is not None:
                 f.write(np.asarray(F, "<f8").tobytes())
@@ -72,16 +91,18 @@ def main():
                 f.write(np.asarray(S, "<f8").reshape(9).tobytes())
             if mol is not None:
                 f.write(struct.pack("<idd", *mol))
-    print(f"{a.out}: {len(frames)} structures")
+    print(f"{a.out}: {len(frames)} structures (format {2 if v2 else 1})")
 
 
-def write_structure(f, numbers, positions, cell, pbc, energy, forces=None, stress=None, mol=None):
+def write_structure(f, numbers, positions, cell, pbc, energy, forces=None, stress=None, mol=None, charge_spin=None):
     n = len(numbers)
     f.write(struct.pack("<i", n))
     f.write(np.asarray(numbers, "<i4").tobytes())
     f.write(np.asarray(positions, "<f8").reshape(n, 3).tobytes())
     f.write(np.asarray(cell, "<f8").reshape(3, 3).tobytes())
     f.write(struct.pack("<BBBB", pbc, forces is not None, stress is not None, mol is not None))
+    if charge_spin is not None:  # format version 2
+        f.write(struct.pack("<ii", *charge_spin))
     f.write(struct.pack("<d", float(energy)))
     if forces is not None:
         f.write(np.asarray(forces, "<f8").reshape(n, 3).tobytes())
@@ -98,14 +119,17 @@ def from_jsonl(a):
     opener = gzip.open if a.xyz.endswith(".gz") else open
     counts, energies, natoms, count = [], [], [], 0
     with open(a.out, "wb") as f, opener(a.xyz, "rt") as src:
-        f.write(b"PLATOD1\0" + struct.pack("<q", 0))  # the count is written at the end
+        v2 = a.conditioning == "on"  # one pass: the version must be known up front
+        f.write((b"PLATOD2\0" if v2 else b"PLATOD1\0") + struct.pack("<q", 0))  # the count is written at the end
         for line in src:
             r = json.loads(line)
             at = r["atoms"]
             pbc = bool(np.all(at["pbc"]))
             S = r.get("stress")
             S = None if S is None else np.asarray(S, float).reshape(3, 3)
-            write_structure(f, at["numbers"], at["positions"], at["cell"], pbc, r["energy"], r.get("forces"), S)
+            cs = (int(r.get("charge", 0)), int(r.get("spin_multiplicity", r.get("spin", 1)))) if v2 else None
+            write_structure(f, at["numbers"], at["positions"], at["cell"], pbc, r["energy"], r.get("forces"), S,
+                            charge_spin=cs)
             if a.fit_baseline:
                 counts.append(np.bincount(at["numbers"], minlength=119))
                 energies.append(float(r["energy"]))

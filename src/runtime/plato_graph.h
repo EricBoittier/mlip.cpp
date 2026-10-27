@@ -30,6 +30,13 @@ struct PlatoSpec {
   // feat/plato-chi-frozen): chi = chi0[Z] + dchi, dchi = b tanh(head(h)) when b > 0
   bool chi = false;
   float chi_bound = 0.0f;
+  // charge / spin conditioning (metatrain's PET SystemConditioningEmbedding on Plato,
+  // hypers system_conditioning / max_charge / max_spin_multiplicity): the projected
+  // embedding of the structure's charge and spin multiplicity, added to the centre
+  // tokens after every layer (before the mesh coupling of layer couple_at), weights
+  // system_conditioning.{charge_embedding,spin_multiplicity_embedding,project.0,project.2}
+  bool conditioning = false;
+  int max_charge = 10, max_spin_multiplicity = 10;
   std::vector<float> frame_w;        // [F]
   std::vector<double> frame_R;       // [F][3][3], R_f
   std::vector<double> omega;         // [d/h/2][3]
@@ -53,6 +60,8 @@ struct PlatoInputs {
   ggml_tensor *zero_ang = nullptr;         // F32 [d/h/2 F, n], zeros (the centres' RoPE angles)
   ggml_tensor *rbf0 = nullptr;             // F32 [n_rbf], the radial basis of the centre token (d = 1e-6)
   ggml_tensor *rel_identity = nullptr;     // F32 [9] (fold_in_graph)
+  ggml_tensor *charge_index = nullptr;     // I32 [n] (conditioning): charge + max_charge of the atom's structure
+  ggml_tensor *spin_index = nullptr;       // I32 [n] (conditioning): 2S+1 - 1
   // structures of the batch: atoms of structure g are consecutive
   int n_struct = 1;
   // every structure of the batch with the same |k| sets and no strain derivative

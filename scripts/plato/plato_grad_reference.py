@@ -17,8 +17,16 @@ import metatomic.torch  # noqa: F401
 import numpy as np
 import torch
 from metatomic.torch import ModelOutput, System, systems_to_torch
-from metatrain.utils.io import load_model
 from metatrain.utils.neighbor_lists import get_system_with_neighbor_lists
+
+from plato_conditioning import load_plato_model as load_model  # also with charge / spin conditioning
+
+
+def scalar_tmap(value, name, dtype):
+    from metatensor.torch import Labels, TensorBlock, TensorMap
+    return TensorMap(Labels.single(), [TensorBlock(
+        values=torch.tensor([[float(value)]], dtype=dtype), samples=Labels("system", torch.tensor([[0]])),
+        components=[], properties=Labels(name, torch.tensor([[0]])))])
 
 
 def main():
@@ -49,6 +57,10 @@ def main():
         s = systems_to_torch(at, dtype=dt)
         pos = s.positions.detach().requires_grad_(True)
         s = System(types=s.types, positions=pos, cell=s.cell, pbc=s.pbc)
+        # charge / spin (conditioned models; the dataset's info, as plato_dataset.py writes it)
+        s.add_data("charge", scalar_tmap(at.info.get("charge", 0), "charge", dt))
+        s.add_data("spin_multiplicity", scalar_tmap(at.info.get("spin_multiplicity", at.info.get("spin", 1)),
+                                                    "spin_multiplicity", dt))
         systems.append(get_system_with_neighbor_lists(s, model.requested_neighbor_lists()))
         E_t.append((at.info[a.energy_key] - sum(comp.get(int(z), 0.0) for z in at.numbers)) / scale)
         F_t.append(torch.tensor(at.arrays[a.forces_key], dtype=dt) / scale)

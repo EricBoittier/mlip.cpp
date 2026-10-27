@@ -61,9 +61,12 @@ def main():
                     help="mlip.cpp mesh sizes rounded up to 2^k, 3 2^k, 5 2^k (plato.mesh_round); PyTorch does not round")
     args = ap.parse_args()
 
-    from metatrain.utils.io import load_model
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from plato_conditioning import load_plato_model  # charge / spin conditioning (mlip.cpp extension)
 
-    model = load_model(args.checkpoint)
+    model = load_plato_model(args.checkpoint)
     ckpt = torch.load(args.checkpoint, weights_only=False, map_location="cpu")
     if ckpt["architecture_name"] != "experimental.plato_pet_lr":
         raise ValueError(f"not a plato_pet_lr checkpoint: {ckpt['architecture_name']}")
@@ -87,6 +90,10 @@ def main():
     if args.mesh_round:
         w.add_string("plato.mesh_round", args.mesh_round)
     w.add_float32("plato.cutoff", float(hypers["cutoff"]))
+    if hypers.get("system_conditioning"):  # also in plato.hypers; here for tools that read keys only
+        w.add_int32("plato.system_conditioning", 1)
+        w.add_int32("plato.max_charge", int(hypers["max_charge"]))
+        w.add_int32("plato.max_spin_multiplicity", int(hypers["max_spin_multiplicity"]))
     names = []
     # the checkpoint's own tensors (load_model casts a few float64 buffers to float32)
     state = ckpt["best_model_state_dict"] or ckpt["model_state_dict"]

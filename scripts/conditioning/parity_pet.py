@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Charge / spin conditioning parity of a pet-graph GGUF (mlip.cpp) against metatrain
+"""Charge / spin conditioning parity of a pet-graph (or, --arch plato, plato-pet-lr) GGUF
+(mlip.cpp) against metatrain
 (float64, autograd) and metatomic (the exported AtomisticModel through its ASE
 calculator, float32), on isolated and periodic structures for several (charge, spin
 multiplicity) pairs, plus the out-of-range errors.
@@ -81,9 +82,12 @@ def scalar_tmap(value, name):
         properties=Labels(name, torch.tensor([[0]])))])
 
 
-def metatrain_eval(model, a, q, s):
+def metatrain_eval(model, a, q, s, symmetric=True):
     """(energy, forces, stress) of metatrain's model in float64 by autograd; the
-    stress as 1/V dE/d(strain)."""
+    stress as 1/V dE/d(strain), of a symmetric strain (PET, as metatrain / mlip.cpp's
+    pet-graph), or (symmetric=False) of a general one, its upper triangle (Plato, as
+    scripts/plato/plato_reference.py: the frames make the model only approximately
+    rotation invariant, so dE/d(strain) is not symmetric)."""
     from metatomic.torch import ModelOutput, System
     from metatrain.utils.neighbor_lists import get_system_with_neighbor_lists
 
@@ -91,7 +95,7 @@ def metatrain_eval(model, a, q, s):
     periodic = bool(a.pbc.any())
     cell = torch.tensor(a.cell.array if periodic else np.zeros((3, 3)), dtype=torch.float64)
     strain = torch.zeros(3, 3, dtype=torch.float64, requires_grad=True)
-    sym = 0.5 * (strain + strain.T)
+    sym = 0.5 * (strain + strain.T) if symmetric else strain
     system = System(types=torch.tensor(a.numbers, dtype=torch.int32), positions=pos + pos @ sym,
                     cell=cell + cell @ sym, pbc=torch.tensor([periodic] * 3))
     system.add_data("charge", scalar_tmap(q, "charge"))
@@ -125,14 +129,20 @@ def main():
     ap.add_argument("--mta", help="exported metatomic model (.pt)")
     ap.add_argument("--ckpt", help="another checkpoint that must match --model bit for bit")
     ap.add_argument("--backend", default="cpu")
+    ap.add_argument("--arch", choices=["pet", "plato"], default="pet")
     ap.add_argument("--out", default="parity-pet")
     ap.add_argument("--json", help="write the table here")
     args = ap.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
-    model = load_local_model(args.model).to(torch.float64).eval()
-    rt = load_local_model(args.ckpt).to(torch.float64).eval() if args.ckpt else None
+    if args.arch == "plato":  # plato_pet_lr with scripts/plato/plato_conditioning.py
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plato"))
+        from plato_conditioning import load_plato_model as load
+    else:
+        load = load_local_model
+    model = load(args.model).to(torch.float64).eval()
+    rt = load(args.ckpt).to(torch.float64).eval() if args.ckpt else None
     frames = [(n, a, q, s) for n, a in structures() for q, s in PAIRS]
     bad = [(n, a, q, s) for n, a in structures()[:1] for q, s in BAD]
     write_frames(out / "frames.xyz", frames + bad)
@@ -148,7 +158,7 @@ def main():
     print(f"{'structure':10s} {'q':>3s} {'2S+1':>4s} {'E_mtt (eV)':>14s} {'E(q,s)-E(0,1)':>14s} "
           f"{'|dE| mlipcpp':>13s} {'max|dF|':>10s} {'max|dS|':>10s} {'|dE| mta':>10s} {'max|dF| mta':>11s}")
     for (name, a, q, s), g in zip(frames, got):
-        e, f, st = metatrain_eval(model, a, q, s)
+        e, f, st = metatrain_eval(model, a, q, s, symmetric=args.arch == "pet")
         if (q, s) == (0, 1):
             base[name] = e
         de = abs(g["energy"] - e)
@@ -162,7 +172,7 @@ def main():
             row["df_metatomic"] = float(np.abs(fm - f).max())
             row["de_mlipcpp_vs_metatomic"] = abs(g["energy"] - em)
         if rt is not None:
-            e2, f2, _ = metatrain_eval(rt, a, q, s)
+            e2, f2, _ = metatrain_eval(rt, a, q, s, symmetric=args.arch == "pet")
             row["roundtrip_bitwise"] = bool(e2 == e and np.array_equal(f2, f))
             ok &= row["roundtrip_bitwise"]
         ok &= de / len(a) < TOL_E and df < TOL_F

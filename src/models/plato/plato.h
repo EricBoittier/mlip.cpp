@@ -4,6 +4,7 @@
 // one ggml graph and its backward pass (runtime/plato_graph.h).
 
 #include "core/backend.h"
+#include "core/conditioning.h"
 #include "mlipcpp/model.h"
 #include "runtime/plato_graph.h"
 
@@ -57,6 +58,10 @@ public:
   ModelResult predict(const AtomicSystem &system, bool compute_forces) override;
   std::string model_type() const override { return "plato-pet-lr"; }
   float cutoff() const override { return spec_.cutoff; }
+  bool conditioned() const override { return spec_.conditioning; }
+  int max_charge() const override { return spec_.max_charge; }
+  int max_spin_multiplicity() const override { return spec_.max_spin_multiplicity; }
+  Conditioning conditioning() const { return {spec_.conditioning, spec_.max_charge, spec_.max_spin_multiplicity}; }
 
   PlatoOptions &options() { return options_; }
   const runtime::PlatoSpec &spec() const { return spec_; }

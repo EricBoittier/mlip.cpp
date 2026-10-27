@@ -260,6 +260,9 @@ bool PlatoModel::load_from_gguf(const std::string &path) {
   spec_.les = hy["les"].get<bool>() && options_.les;
   spec_.chi = spec_.les && hy.value("electronegativity", std::string("none")) == "linear";
   spec_.chi_bound = hy.value("dchi_bound", 0.0f);
+  spec_.conditioning = hy.value("system_conditioning", false);
+  spec_.max_charge = hy.value("max_charge", 10);
+  spec_.max_spin_multiplicity = hy.value("max_spin_multiplicity", 10);
   spec_.n_types = idx;
   spec_.fold_in_graph = options_.fold_in_graph;
   spec_.decomposed_layer_norm = options_.decomposed_layer_norm;
@@ -477,6 +480,10 @@ ModelResult PlatoModel::predict(const AtomicSystem &system, bool compute_forces)
     in.zero_ang = input(GGML_TYPE_F32, hdF, n, "zero_ang");
     in.rbf0 = input(GGML_TYPE_F32, spec_.n_rbf, 0, "rbf0");
     in.rel_identity = input(GGML_TYPE_F32, 9, 0, "rel_identity");
+    if (spec_.conditioning) {
+      in.charge_index = input(GGML_TYPE_I32, n, 0, "charge_index");
+      in.spin_index = input(GGML_TYPE_I32, n, 0, "spin_index");
+    }
     in.positions = input(GGML_TYPE_F32, 3, n, "positions");
     in.strain = input(GGML_TYPE_F32, 3, 3, "strain");
     in.atom_inv_cell_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, 3, n);
@@ -553,6 +560,11 @@ ModelResult PlatoModel::predict(const AtomicSystem &system, bool compute_forces)
     set(in.species, species.data()), set(in.edge_center_species, ecs.data()), set(in.neighbor_species, nbs.data());
     set(in.centers, cen.data()), set(in.reverse, rev.data()), set(in.offsets, off.data());
     set(in.edge_vectors, ed.v.data());
+    if (spec_.conditioning) {
+      const auto [ci, si] = conditioning().rows(system.charge(), system.spin_multiplicity());
+      std::vector<int32_t> c(n, ci), s(n, si);
+      set(in.charge_index, c.data()), set(in.spin_index, s.data());
+    }
     std::vector<float> zeros(ggml_nelements(in.zero_ang), 0.0f);
     set(in.zero_ang, zeros.data());
     std::vector<float> rbf0(spec_.n_rbf);

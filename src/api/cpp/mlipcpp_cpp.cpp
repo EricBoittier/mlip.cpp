@@ -10,6 +10,7 @@
 #include "mlipcpp/model.h"
 #include "mlipcpp/system.h"
 #include "models/pet/pet.h"
+#include "models/plato/plato.h"
 #include "runtime/graph_model.h"
 
 #include <ggml-backend.h>
@@ -158,6 +159,15 @@ struct Predictor::Impl {
       model_type_str = "PET-Graph";
       nc_forces = graph_model->nc_forces();
       model = std::move(graph_model);
+    } else if (arch == "plato-pet-lr") {
+      plato::PlatoOptions po;
+      po.backend = to_internal(options.backend);
+      auto plato_model = std::make_unique<plato::PlatoModel>(po);
+      plato_model->load_from_gguf(path);
+      for (const auto &[z, i] : plato_model->species_index()) atomic_types.push_back(z);
+      std::sort(atomic_types.begin(), atomic_types.end());
+      model_type_str = "Plato-PET-LR";
+      model = std::move(plato_model);
     } else {
       throw std::runtime_error("Unsupported model architecture: " + arch);
     }

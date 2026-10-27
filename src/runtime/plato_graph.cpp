@@ -128,6 +128,16 @@ PlatoOutputs build_plato(ggml_context *ctx, const PlatoSpec &spec, const std::ma
     frac = ggml_reshape_2d(ctx, mm_f32(ctx, in.atom_inv_cell_t, ggml_reshape_3d(ctx, in.positions, 3, 1, n)), 3, n);
   const int64_t G = in.n_struct;
 
+  // charge / spin conditioning: project(cat(charge_emb, spin_emb)) per atom, [d, n]
+  ggml_tensor *cond = nullptr;
+  if (spec.conditioning) {
+    if (!in.charge_index || !in.spin_index) throw std::runtime_error("Plato: conditioning needs charge / spin inputs");
+    ggml_tensor *c = ggml_get_rows(ctx, b.weight("system_conditioning.charge_embedding.weight"), in.charge_index);
+    ggml_tensor *s = ggml_get_rows(ctx, b.weight("system_conditioning.spin_multiplicity_embedding.weight"), in.spin_index);
+    cond = b.linear(ggml_silu(ctx, b.linear(ggml_concat(ctx, c, s, 0), "system_conditioning.project.0")),
+                    "system_conditioning.project.2");
+  }
+
   const float scale = 1.0f / std::sqrt(static_cast<float>(ch));
   for (int l = 0; l < spec.layers; l++) {
     const std::string p = "layers." + std::to_string(l) + ".";
@@ -139,6 +149,7 @@ PlatoOutputs build_plato(ggml_context *ctx, const PlatoSpec &spec, const std::ma
                                      spec.frame_w.data());
     x = ggml_add(ctx, x, b.frame_linear(o, p + "proj"));
     tok = ggml_add(ctx, x, b.frame_linear(ggml_silu(ctx, b.frame_linear(b.layer_norm(x, p + "n2"), p + "mlp1")), p + "mlp2"));
+    if (cond) tok = ggml_concat(ctx, ggml_add(ctx, b.cols(tok, 0, n), cond), b.cols(tok, n, E), 1);
 
     if (l == spec.couple_at && spec.mesh && periodic) {
       const int M0 = in.mesh_size[0], M1 = in.mesh_size[1], M2 = in.mesh_size[2];

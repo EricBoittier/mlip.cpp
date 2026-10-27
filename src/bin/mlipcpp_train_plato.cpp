@@ -38,6 +38,7 @@
 // parallel replicas with an NCCL all-reduce of the gradient (MLIPCPP_NCCL builds).
 // Schedules: metatrain's (warmup + cosine) or LOREM's (constant for --decay-after
 // epochs, then linear to --min-lr). Data: scripts/plato/plato_dataset.py.
+#include "core/conditioning.h"
 #include "models/plato/plato.h"
 
 #include <ggml-alloc.h>
@@ -91,6 +92,7 @@ struct Structure {
   bool has_molecules = false; // two molecules: atoms [0, split) and [split, n), formal charges QA, QB
   int split = 0;
   double QA = 0, QB = 0;
+  int charge = 0, spin_multiplicity = 1; // conditioning (dataset v2; v1: 0, 1)
 };
 
 std::vector<Structure> read_dataset(const std::string &path) {
@@ -98,7 +100,10 @@ std::vector<Structure> read_dataset(const std::string &path) {
   if (!f) throw std::runtime_error("cannot read " + path);
   char magic[8];
   f.read(magic, 8);
-  if (std::memcmp(magic, "PLATOD1", 7) != 0) throw std::runtime_error(path + ": not a plato dataset");
+  // PLATOD1, or PLATOD2: + int32 charge, int32 spin multiplicity per structure, after the flags
+  if (std::memcmp(magic, "PLATOD", 6) != 0 || (magic[6] != '1' && magic[6] != '2'))
+    throw std::runtime_error(path + ": not a plato dataset (PLATOD1 / PLATOD2)");
+  const int version = magic[6] - '0';
   int64_t count = 0;
   f.read(reinterpret_cast<char *>(&count), 8);
   std::vector<Structure> out(count);
@@ -111,6 +116,11 @@ std::vector<Structure> read_dataset(const std::string &path) {
     uint8_t fl[4];
     f.read(reinterpret_cast<char *>(fl), 4);
     s.pbc = fl[0], s.has_forces = fl[1], s.has_stress = fl[2], s.has_molecules = fl[3];
+    if (version >= 2) {
+      int32_t cs[2];
+      f.read(reinterpret_cast<char *>(cs), 8);
+      s.charge = cs[0], s.spin_multiplicity = cs[1];
+    }
     f.read(reinterpret_cast<char *>(&s.energy), 8);
     if (s.has_forces) s.F.resize(3 * s.n), f.read(reinterpret_cast<char *>(s.F.data()), 8 * 3 * s.n);
     if (s.has_stress) f.read(reinterpret_cast<char *>(s.stress), 72);
@@ -171,6 +181,7 @@ struct Prepared {
   std::vector<Mat3> rot;
   std::vector<int> a0;               // [Greal + 1]
   std::vector<int32_t> species, sidx, ecs, nbs, cen, ej, rev, off;
+  std::vector<int32_t> cq, cs;       // conditioning: table rows of each atom's structure (padding: neutral singlet)
   std::vector<float> ev0, pos0, aict, onehot, invc, invv, mk, mpad, mdec, lk, ln, taper;
   std::vector<double> Et, Ft;        // scaled targets (rotated frame)
   std::vector<double> St;            // [9 Greal] scaled stress targets (rotated frame), row-major
@@ -185,6 +196,7 @@ struct Context {
   const std::map<int, double> &composition;
   const std::map<int, int> &species_index;
   bool shared_filter = true;
+  Conditioning cond = {}; // charge / spin conditioning of the model
 };
 
 // drop the structures whose longest attention sequence (1 + neighbours within the cutoff) exceeds
@@ -287,6 +299,10 @@ Prepared prepare(const Context &cx, const std::vector<const Structure *> &batch,
     inverse3(Cr[g].data(), Cinv[g].data(), det);
     if (g < Gr) P.vol[g] = std::abs(det);
   }
+  if (cx.cond.enabled) {
+    const auto [q0, s0] = cx.cond.rows(0, 1);
+    P.cq.assign(n, q0), P.cs.assign(n, s0);
+  }
   P.species.assign(n, 0), P.sidx.assign(n, Gr), P.ecs.resize(E), P.nbs.resize(E), P.cen.resize(E), P.ej.resize(E);
   P.rev.resize(T), P.off.resize(n + 1);
   P.ev0.resize(3 * E), P.pos0.assign(3 * size_t(n), 0.0f), P.aict.resize(9 * size_t(n)), P.onehot.assign(size_t(n) * G, 0.0f);
@@ -301,6 +317,7 @@ Prepared prepare(const Context &cx, const std::vector<const Structure *> &batch,
       auto it = cx.species_index.find(s.Z[i]);
       if (it == cx.species_index.end()) throw std::runtime_error("unknown species");
       P.species[A] = it->second, P.sidx[A] = g, P.rev[A] = A;
+      if (cx.cond.enabled) std::tie(P.cq[A], P.cs[A]) = cx.cond.rows(s.charge, s.spin_multiplicity);
       P.onehot[size_t(g) * n + A] = 1.0f;
       for (int c = 0; c < 3; c++) P.pos0[3 * A + c] = X[g][3 * i + c];
       for (int j = 0; j < 3; j++)
@@ -627,6 +644,10 @@ struct Worker {
     in.zero_ang = input(GGML_TYPE_F32, hdF, n, 1, "zero_ang");
     in.rbf0 = input(GGML_TYPE_F32, spec.n_rbf, 1, 1, "rbf0");
     in.rel_identity = input(GGML_TYPE_F32, 9, 1, 1, "rel_identity");
+    if (spec.conditioning) {
+      in.charge_index = input(GGML_TYPE_I32, n, 1, 1, "charge_index");
+      in.spin_index = input(GGML_TYPE_I32, n, 1, 1, "spin_index");
+    }
     in.struct_index = input(GGML_TYPE_I32, n, 1, 1, "struct_index");
     in.energy_weights = input(GGML_TYPE_F32, 1, G, 1, "energy_weights");
     if (spec.les) in.charge_weights = input(GGML_TYPE_F32, n, 1, 1, "charge_weights");
@@ -733,6 +754,7 @@ struct Worker {
     set(in.neighbor_species, P.nbs.data()), set(in.centers, P.cen.data()), set(in.reverse, P.rev.data()), set(in.offsets, P.off.data());
     set(in.atom_inv_cell_t, P.aict.data()), set(in.onehot, P.onehot.data()), set(in.inv_count, P.invc.data());
     set(in.inv_volume, P.invv.data());
+    if (in.charge_index) set(in.charge_index, P.cq.data()), set(in.spin_index, P.cs.data());
     // the long-range inputs of this batch's cells (shapes from the bucket key)
     if (in.mesh_k) set(in.mesh_k, P.mk.data()), set(in.mesh_k0_pad, P.mpad.data()), set(in.mesh_deconv, P.mdec.data());
     if (in.les_k) set(in.les_k, P.lk.data()), set(in.les_n, P.ln.data()), set(in.les_taper, P.taper.data());
@@ -1093,7 +1115,24 @@ int main(int argc, char **argv) {
       std::printf("--max-len %d: dropped %zu training structures\n", max_len, drop_long(train, max_len, w0.model->spec().cutoff));
     std::printf("%zu training structures, %lld parameters\n", train.size(), (long long)w0.n_values);
     const Context cx{w0.model->spec(), w0.model->energy_scale(), w0.model->mesh_spacing(), w0.model->mesh_round_fft(), w0.model->composition(),
-                     w0.model->species_index()};
+                     w0.model->species_index(), true, w0.model->conditioning()};
+    // charge / spin: every training structure in the model's range (an error now, not mid-run)
+    if (cx.cond.enabled) {
+      int qmin = 0, qmax = 0, smin = 1, smax = 1;
+      for (const Structure &s : train) {
+        cx.cond.check(s.charge, s.spin_multiplicity);
+        qmin = std::min(qmin, s.charge), qmax = std::max(qmax, s.charge);
+        smin = std::min(smin, s.spin_multiplicity), smax = std::max(smax, s.spin_multiplicity);
+      }
+      std::printf("conditioning: charge in [%d, %d], spin multiplicity in [%d, %d] (model: |q| <= %d, 2S+1 <= %d)\n", qmin, qmax,
+                  smin, smax, cx.cond.max_charge, cx.cond.max_spin_multiplicity);
+    } else {
+      for (const Structure &s : train)
+        if (s.charge != 0 || s.spin_multiplicity != 1) {
+          std::printf("warning: the data has charge / spin multiplicity, the model is not conditioned on them\n");
+          break;
+        }
+    }
 
     const std::string check = arg(argc, argv, "--check", "");
     if (!check.empty()) {
@@ -1131,6 +1170,9 @@ int main(int argc, char **argv) {
         }
         num += n2, den += d2;
         worst.emplace_back(n2, name);
+        if (name.rfind("system_conditioning.", 0) == 0) // charge / spin conditioning: always shown
+          std::printf("  %-48s |g_torch| %.4e, relative error %.3e\n", name.c_str(), std::sqrt(d2),
+                      d2 > 0 ? std::sqrt(n2 / d2) : std::sqrt(n2));
       }
       for (auto &x : worst) x.first = std::sqrt(x.first / den);
       std::sort(worst.rbegin(), worst.rend());

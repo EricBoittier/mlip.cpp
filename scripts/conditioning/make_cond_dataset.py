@@ -49,10 +49,10 @@ def energy_forces(a, q, s):
     return e, f
 
 
-def make(n, rng, max_q, max_s):
+def make(n, rng, max_q, max_s, periodic_only=False):
     out = []
     for k in range(n):
-        if k % 4 == 3:  # periodic box of 2-3 molecules
+        if periodic_only or k % 4 == 3:  # periodic box of 2-3 molecules
             a = ase.Atoms()
             for j in range(2 + k % 2):
                 m = ase.build.molecule(MOLS[rng.integers(len(MOLS))])
@@ -85,19 +85,20 @@ def main():
     ap.add_argument("--max-charge", type=int, default=2)
     ap.add_argument("--max-spin", type=int, default=3)
     ap.add_argument("--plato", action="store_true", help="also the Plato .bin splits (plato_dataset.py)")
+    ap.add_argument("--periodic-only", action="store_true", help="only periodic boxes (mlipcpp-train-plato trains on those)")
     args = ap.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(args.seed)
     here = Path(__file__).resolve().parents[1]
     for split, n in (("train", args.n), ("val", max(8, args.n // 4)), ("test", max(8, args.n // 4))):
-        frames = make(n, rng, args.max_charge, args.max_spin)
+        frames = make(n, rng, args.max_charge, args.max_spin, args.periodic_only)
         ase.io.write(out / f"{split}.xyz", frames, format="extxyz")
         subprocess.run([sys.executable, str(here / "train/xyz_to_memmap.py"), str(out / f"{split}.xyz"),
                         str(out / split), "--energy-key", "e_ref", "--forces-key", "f_ref"], check=True)
         if args.plato:
             subprocess.run([sys.executable, str(here / "plato/plato_dataset.py"), str(out / f"{split}.xyz"),
-                            str(out / f"{split}.bin")], check=True)
+                            str(out / f"{split}.bin"), "--energy", "e_ref", "--forces", "f_ref"], check=True)
 
 
 if __name__ == "__main__":

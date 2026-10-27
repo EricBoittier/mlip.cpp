@@ -53,8 +53,18 @@ def build_model(meta):
     # hypers of an older checkpoint version: the model's own upgrade path
     ck = {"model_ckpt_version": int(meta.get("plato.checkpoint_version", PlatoPETLR.__checkpoint_version__)),
           "model_data": {"model_hypers": json.loads(meta["plato.hypers"])}}
+    # charge / spin conditioning (plato_conditioning.py): built without, then attached
+    hy = ck["model_data"]["model_hypers"]
+    cond = {k: hy.pop(k) for k in ("system_conditioning", "max_charge", "max_spin_multiplicity") if k in hy}
     PlatoPETLR.upgrade_checkpoint(ck)
-    return PlatoPETLR(ck["model_data"]["model_hypers"], ds)
+    model = PlatoPETLR(ck["model_data"]["model_hypers"], ds)
+    if cond.get("system_conditioning"):
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from plato_conditioning import attach_conditioning
+        attach_conditioning(model, cond.get("max_charge", 10), cond.get("max_spin_multiplicity", 10))
+    return model
 
 
 def main():
