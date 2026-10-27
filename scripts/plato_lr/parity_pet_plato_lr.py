@@ -88,6 +88,10 @@ def main():
     ap.add_argument("--json")
     ap.add_argument("--set", choices=["molecules", "crystals", "all"], default="all")
     ap.add_argument("--pairs", default="0,1;1,2;-1,2", help="(charge, 2S+1) pairs, ';'-separated")
+    ap.add_argument("--exact-padding", action="store_true",
+                    help="padded neighbour slots masked exactly on both sides (metatrain: attention epsilon "
+                         "1e-300 in float64; mlip.cpp: MLIPCPP_PAD_EXACT=1): PET's finite -34.5 bias lets the "
+                         "padded slots leak into the frame RoPE attention, so the outputs depend on their contents")
     ap.add_argument("--write-only", action="store_true", help="write OUT/frames.xyz and stop")
     args = ap.parse_args()
     out = Path(args.out)
@@ -100,6 +104,11 @@ def main():
             a.cell = a.cell.array.astype(np.float32).astype(np.float64)
     pairs = [tuple(int(x) for x in p.split(",")) for p in args.pairs.split(";")]
     model = load_local_model(args.model).to(torch.float64).eval()
+    if args.exact_padding:
+        from metatrain.pet.modules.transformer import AttentionBlock
+        for mod in model.modules():
+            if isinstance(mod, AttentionBlock):
+                mod.epsilon = 1e-300
     if getattr(model, "system_conditioning", None) is None and getattr(model.backend, "les", None) is None:
         pairs = [(0, 1)]
     frames = [(n, a, q, s) for n, a in structs for q, s in pairs]
@@ -111,8 +120,10 @@ def main():
         args.backend = got.get("backend", args.backend)
         got = got["frames"]
     else:
+        import os
+        env = dict(os.environ, **({"MLIPCPP_PAD_EXACT": "1"} if args.exact_padding else {}))
         run = subprocess.run([args.eval, args.gguf, str(out / "frames.xyz"), str(out / "mlipcpp.json"),
-                              "--backend", args.backend], capture_output=True, text=True)
+                              "--backend", args.backend], capture_output=True, text=True, env=env)
         if run.returncode != 0:
             print(run.stdout, run.stderr)
             raise SystemExit("mlipcpp-eval failed")
