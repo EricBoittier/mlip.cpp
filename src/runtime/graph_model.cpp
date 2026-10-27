@@ -1213,6 +1213,11 @@ ModelResult GraphModel::predict_single(
   }
 
   interp_.init_constants();
+  if (plato && plato->needs_neighbor_index()) {
+    std::vector<int32_t> nbr(neighbor_atoms_vec.begin(), neighbor_atoms_vec.end());
+    for (auto &j : nbr) j = std::max(j, 0);
+    plato->set_neighbor_index(std::move(nbr));
+  }
   if (plato) plato->upload(system.positions()); // again: the inputs made while building
   profile.mark("build_allocate");
 

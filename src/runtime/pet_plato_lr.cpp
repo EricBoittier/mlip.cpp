@@ -78,6 +78,8 @@ PetPlatoLRSpec PetPlatoLRSpec::from_gguf(const GGUFLoader &L) {
   s.les_sigma = L.get_float32("pet.plato_lr.les_sigma", 1.0f);
   s.les_kcut = L.get_float32("pet.plato_lr.les_kcut", 6.0f);
   s.total_charge_constraint = L.get_int32("pet.plato_lr.total_charge_constraint", 0) != 0;
+  s.les_tail_sigma = L.get_float32("pet.plato_lr.les_tail_sigma", 0.0f);
+  s.les_tail_subtract_cutoff = L.get_int32("pet.plato_lr.les_tail_subtract_cutoff", 0) != 0;
   s.les_method = L.get_string("pet.plato_lr.les_method", "auto");
   s.les_pme_atoms = L.get_int32("pet.plato_lr.les_pme_atoms", 128);
   if (const char *e = std::getenv("MLIPCPP_PLATO_LES_METHOD"); e && *e) s.les_method = e;
@@ -90,7 +92,7 @@ void PetPlatoLR::create(ggml_context *ctx, const PetPlatoLRSpec &spec, const std
                         int n_atoms, bool grad) {
   spec_ = spec, st_ = structures, n_ = n_atoms;
   all_.clear(), groups_.clear();
-  frac_ = pair_r_ = charges_ = key_log_keep_ = nullptr;
+  frac_ = pair_r_ = charges_ = key_log_keep_ = nbr_ = nullptr;
   lazy_i32_.clear(), lazy_f32_.clear();
   swap_halves_ = rope_sign_ = slot_mask_ = nullptr;
   strain = nullptr, pair_i_ = pair_j_ = nullptr, atom_inv_cell_t_ = nullptr, open_mask_ = nullptr;
@@ -160,7 +162,8 @@ void PetPlatoLR::create(ggml_context *ctx, const PetPlatoLRSpec &spec, const std
   for (const auto &s : st_) max_atoms = std::max(max_atoms, s.a1 - s.a0);
   const bool pme = spec_.les && (spec_.les_method == "pme" || (spec_.les_method == "auto" && max_atoms >= spec_.les_pme_atoms));
   if (pme && spec_.num_charges != 1) throw std::runtime_error("Plato-PET-LR: LES PME needs one charge channel");
-  const double h_pme = spec_.les_pme_spacing * spec_.les_sigma;
+  const double h_pme = spec_.les_pme_spacing * spec_.les_energy_sigma();
+  if (std::getenv("MLIPCPP_PLATO_LR_DEBUG")) std::fprintf(stderr, "PetPlatoLR: les %d method %s pme %d\n", int(spec_.les), spec_.les_method.c_str(), int(pme));
   for (int g = 0; g < G; g++) {
     if (!st_[g].periodic) continue;
     double Ci[3][3], det;
@@ -239,7 +242,7 @@ void PetPlatoLR::create(ggml_context *ctx, const PetPlatoLRSpec &spec, const std
       q.les_K = input(GGML_TYPE_F32, 3, 3, Gq, "plato_lr.les_K");
       q.les_tab = input(GGML_TYPE_F32, static_cast<int64_t>(q.h_tab.size()), 1, 1, "plato_lr.les_tab");
     } else if (spec_.les) { // the union over the group of the integer k sets (each structure's window drops the rest)
-      const double kc = spec_.les_kcut / spec_.les_sigma;
+      const double kc = spec_.les_kcut / spec_.les_energy_sigma();
       int nmax[3] = {0, 0, 0};
       for (int g : q.structs)
         for (int a = 0; a < 3; a++) nmax[a] = std::max(nmax[a], static_cast<int>(std::floor(kc * rnorm(g, a) / (2 * M_PI))));
@@ -326,6 +329,11 @@ void PetPlatoLR::upload(const float *pos) const {
   if (open_mask_) set(open_mask_, h_omask_.data());
   if (atom_inv_cell_t_) set(atom_inv_cell_t_, h_aict_.data());
   for (const auto &[t, v] : lazy_i32_) set(t, v.data());
+  if (nbr_) {
+    if (h_nbr_.size() != static_cast<size_t>(ggml_nelements(nbr_)))
+      throw std::runtime_error("Plato-PET-LR: the LES cutoff subtraction needs the slots' neighbour atoms");
+    set(nbr_, h_nbr_.data());
+  }
   for (const auto &[t, v] : lazy_f32_) set(t, v.data());
   for (const Group &q : groups_) {
     std::vector<float> z(ggml_nelements(q.strain), 0.0f);
@@ -343,6 +351,7 @@ ggml_tensor *PetPlatoLR::build(ggml_context *ctx, const GIRNode &node, const std
   if (node.op == "MLIPCPP_EDGE_GROUP_SUM") return edge_sum(ctx, in);
   if (node.op == "MLIPCPP_PLATO_MESH") return mesh_op(ctx, node, in);
   if (node.op == "MLIPCPP_PLATO_LES") return les_op(ctx, node, in);
+  if (node.op == "MLIPCPP_LES_CUTOFF_SUB") return les_sub(ctx, node, in);
   throw std::runtime_error("Plato-PET-LR: unknown graph op " + node.op);
 }
 
@@ -655,19 +664,48 @@ ggml_tensor *PetPlatoLR::mesh_op(ggml_context *ctx, const GIRNode &node, const s
 }
 
 // q [Q, n], charge_unit [1] -> [n]
+// neutral per structure (or the structure's total charge / charge_unit): q [Q, n]
+ggml_tensor *PetPlatoLR::les_shift(ggml_context *ctx, ggml_tensor *q, ggml_tensor *charge_unit, bool tcc) {
+  ggml_tensor *qt = ggml_cont(ctx, ggml_transpose(ctx, q));                                                    // [n, Q]
+  ggml_tensor *mean = ggml_mul(ctx, ggml_cont(ctx, ggml_transpose(ctx, mm_f32(ctx, onehot_, qt))), inv_count_); // [Q, G]
+  q = ggml_sub(ctx, q, ggml_get_rows(ctx, mean, struct_index_));
+  if (tcc) q = ggml_add(ctx, q, ggml_div(ctx, charge_per_atom_, ggml_repeat(ctx, charge_unit, charge_per_atom_)));
+  return q;
+}
+
+// the LES tail's within-cutoff part per atom: q [Q, n], d [M, n], f_c [M, n], charge_unit -> [n],
+//   1/2 KE sum_c q_ic sum_s q_{nbr(i, s) c} erf(d_is / (sqrt 2 sigma)) / d_is f_c,is
+ggml_tensor *PetPlatoLR::les_sub(ggml_context *ctx, const GIRNode &node, const std::vector<ggml_tensor *> &in) {
+  if (in.size() != 4) throw std::runtime_error("LES_CUTOFF_SUB: 4 inputs");
+  const float sigma = static_cast<float>(param_num(node, "sigma", spec_.les_energy_sigma()));
+  const bool tcc = param_num(node, "total_charge_constraint", spec_.total_charge_constraint) != 0;
+  ggml_tensor *q = les_shift(ctx, cont(ctx, in[0]), in[3], tcc);
+  ggml_tensor *d = cont(ctx, in[1]), *fc = cont(ctx, in[2]);
+  const int64_t Q = q->ne[0], n = q->ne[1], M = d->ne[0], S = M * n;
+  if (d->ne[1] != n || ggml_nelements(fc) != S) throw std::runtime_error("LES_CUTOFF_SUB: slot shapes");
+  if (!nbr_) {
+    nbr_ = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, S);
+    ggml_set_name(nbr_, "les_neighbor_index");
+    ggml_set_input(nbr_);
+    all_.push_back(nbr_);
+  }
+  ggml_tensor *dd = ggml_reshape_2d(ctx, d, 1, S), *ff = ggml_reshape_2d(ctx, fc, 1, S);
+  ggml_tensor *w = ggml_mul(ctx, ggml_div(ctx, ggml_plato_erf(ctx, ggml_scale(ctx, dd, 1.0f / (std::sqrt(2.0f) * sigma))), dd), ff); // [1, S]
+  ggml_tensor *t = ggml_reshape_3d(ctx, ggml_mul(ctx, ggml_get_rows(ctx, q, nbr_), w), Q, M, n);                            // [Q, M, n]
+  ggml_tensor *s = ggml_reshape_2d(ctx, ggml_sum_rows(ctx, ggml_cont(ctx, ggml_permute(ctx, t, 1, 0, 2, 3))), Q, n);         // [Q, n]
+  return ggml_reshape_1d(ctx, ggml_scale(ctx, ggml_sum_rows(ctx, ggml_mul(ctx, q, s)), static_cast<float>(0.5 * KE)), n);
+}
+
 ggml_tensor *PetPlatoLR::les_op(ggml_context *ctx, const GIRNode &node, const std::vector<ggml_tensor *> &in) {
   if (in.size() != 2) throw std::runtime_error("PLATO_LES: 2 inputs");
   ggml_tensor *q = cont(ctx, in[0]);
   const int64_t Q = q->ne[0], n = q->ne[1];
-  const float sigma = static_cast<float>(param_num(node, "sigma", spec_.les_sigma));
+  const float sigma = static_cast<float>(param_num(node, "sigma", spec_.les_energy_sigma()));
   const float kcut = static_cast<float>(param_num(node, "kcut", spec_.les_kcut));
   const bool tcc = param_num(node, "total_charge_constraint", spec_.total_charge_constraint) != 0;
-  // neutral per structure (or the structure's total charge / charge_unit)
-  ggml_tensor *qt = ggml_cont(ctx, ggml_transpose(ctx, q));                                                    // [n, Q]
-  ggml_tensor *mean = ggml_mul(ctx, ggml_cont(ctx, ggml_transpose(ctx, mm_f32(ctx, onehot_, qt))), inv_count_); // [Q, G]
-  q = ggml_sub(ctx, q, ggml_get_rows(ctx, mean, struct_index_));
-  if (tcc) q = ggml_add(ctx, q, ggml_div(ctx, charge_per_atom_, ggml_repeat(ctx, in[1], charge_per_atom_)));
+  q = les_shift(ctx, q, in[1], tcc);
   charges_ = q;
+  ggml_tensor *qt = nullptr;
   ggml_tensor *e = nullptr; // [1, n]
   auto acc = [&](ggml_tensor *t) { e = e ? ggml_add(ctx, e, t) : t; };
   if (n_pairs_ > 0) { // open structures: the erf pair sum, per atom

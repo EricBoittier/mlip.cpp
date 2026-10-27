@@ -126,6 +126,28 @@ def _(q, charge_unit, sigma, kcut, total_charge_constraint):
     return q.new_empty(q.shape[0])
 
 
+@torch.library.custom_op("mlipcpp::les_cutoff_sub", mutates_args=())
+def les_cutoff_sub(q: torch.Tensor, edge_distances: torch.Tensor, cutoff_factors: torch.Tensor,
+                   charge_unit: torch.Tensor, sigma: float, total_charge_constraint: int) -> torch.Tensor:
+    """The LES tail's within-cutoff part per atom, 1/2 KE q_i sum_slots q_j erf(d / sqrt2 s) / d f_c
+    (n,), of the shifted latent charges; the neighbour atom of each slot is the C++ side's
+    (CONTEXT["neighbor_index"] (n, M) here)."""
+    if "neighbor_index" not in CONTEXT:
+        return q.new_zeros(q.shape[0])
+    shift = q.mean(0)
+    if total_charge_constraint:
+        shift = shift - float(CONTEXT.get("charge", 0.0)) / charge_unit.to(q.dtype) / q.shape[0]
+    qs = q - shift
+    w = torch.erf(edge_distances / (math.sqrt(2.0) * sigma)) / edge_distances * cutoff_factors
+    qj = qs[CONTEXT["neighbor_index"]]
+    return 0.5 * 14.399645 * (qs[:, None, :] * qj * w[:, :, None]).sum((1, 2))
+
+
+@les_cutoff_sub.register_fake
+def _(q, edge_distances, cutoff_factors, charge_unit, sigma, total_charge_constraint):
+    return q.new_empty(q.shape[0])
+
+
 # ---------------------------------------------------------------- module patches
 
 
@@ -194,6 +216,8 @@ def plato_lr_hypers(pet_model) -> Optional[dict]:
         les=les is not None, num_charges=int(les.charge_head["node"][0][2].out_features) if les is not None else 0,
         les_sigma=float(les.sigma) if les is not None else 0.0, les_kcut=float(les.kcut) if les is not None else 0.0,
         total_charge_constraint=bool(les.total_charge_constraint) if les is not None else False,
+        les_tail_sigma=float(getattr(les, "tail_sigma", 0.0)) if les is not None else 0.0,
+        les_tail_subtract_cutoff=bool(getattr(les, "tail_subtract_cutoff", False)) if les is not None else False,
     )
 
 
@@ -263,7 +287,7 @@ class PlatoLRParts(torch.nn.Module):
         return self.mesh_gate * self.mesh_up(m)
 
     def les_energy(self, nodes: List[torch.Tensor], edges: List[torch.Tensor], padding_mask: torch.Tensor,
-                   cutoff_factors: torch.Tensor) -> torch.Tensor:
+                   cutoff_factors: torch.Tensor, edge_distances: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Gated per-atom LES energies (n,); padding_mask True = padded (the wrapper's
         convention)."""
         q = None
@@ -273,8 +297,12 @@ class PlatoLRParts(torch.nn.Module):
             qi = nh(nodes[i]) + (qe * cutoff_factors.unsqueeze(-1)).sum(1)
             q = qi if q is None else q + qi
         h = self.h
-        e = torch.ops.mlipcpp.plato_les(q, self.les_charge_unit, float(h["les_sigma"]), float(h["les_kcut"]),
+        sigma = float(h["les_tail_sigma"]) if h.get("les_tail_sigma", 0.0) > 0 else float(h["les_sigma"])
+        e = torch.ops.mlipcpp.plato_les(q, self.les_charge_unit, sigma, float(h["les_kcut"]),
                                         int(h["total_charge_constraint"]))
+        if h.get("les_tail_subtract_cutoff", False):  # the part inside the neighbour list (padded slots: f_c = 0)
+            e = e - torch.ops.mlipcpp.les_cutoff_sub(q, edge_distances, cutoff_factors, self.les_charge_unit,
+                                                     sigma, int(h["total_charge_constraint"]))
         return self.les_gate * e
 
     def sync_back(self) -> None:
@@ -321,3 +349,6 @@ def gguf_metadata(writer, h: dict) -> None:
         writer.add_float32("pet.plato_lr.les_sigma", float(h["les_sigma"]))
         writer.add_float32("pet.plato_lr.les_kcut", float(h["les_kcut"]))
         writer.add_int32("pet.plato_lr.total_charge_constraint", int(h["total_charge_constraint"]))
+        if h.get("les_tail_sigma", 0.0) > 0:  # absent: today's LES
+            writer.add_float32("pet.plato_lr.les_tail_sigma", float(h["les_tail_sigma"]))
+            writer.add_int32("pet.plato_lr.les_tail_subtract_cutoff", int(h["les_tail_subtract_cutoff"]))

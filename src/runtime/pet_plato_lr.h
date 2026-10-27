@@ -41,6 +41,10 @@ struct PetPlatoLRSpec {
   int n_frames = 1, couple_at = -1, mesh_channels = 0, n_quad = 0, num_charges = 0;
   float mesh_spacing = 1.0f, mesh_sigma = 1.5f, les_sigma = 1.0f, les_kcut = 6.0f;
   bool mesh_realspace = true, total_charge_constraint = false;
+  // LES tail: the LES width (0: les_sigma) and the within-cutoff subtraction (MLIPCPP_LES_CUTOFF_SUB)
+  float les_tail_sigma = 0.0f;
+  bool les_tail_subtract_cutoff = false;
+  float les_energy_sigma() const { return les_tail_sigma > 0 ? les_tail_sigma : les_sigma; }
   // periodic LES: "ewald" | "pme" | "auto" (PME from les_pme_atoms atoms per structure);
   // GGUF "pet.plato_lr.les_method", MLIPCPP_PLATO_LES_METHOD overrides
   std::string les_method = "auto";
@@ -82,6 +86,10 @@ public:
   /// the frame attention as one ggml_plato_attn on the ragged token order (inference graphs: the
   /// op has a backward pass but no forward-mode rule); MLIPCPP_PLATO_ATTN=0 keeps ggml_pet_attn
   void set_fused_frames(bool on) { fused_frames_ = on; }
+  /// the neighbour atom of every slot [n][max_neighbors] (padded slots: any atom; their cutoff
+  /// factor is 0), for MLIPCPP_LES_CUTOFF_SUB; set before upload(), every call
+  void set_neighbor_index(std::vector<int32_t> nbr) { h_nbr_ = std::move(nbr); }
+  bool needs_neighbor_index() const { return spec_.les_tail_subtract_cutoff; }
 
   ggml_tensor *positions = nullptr; // F32 [3, n]
   ggml_tensor *strain = nullptr;    // F32 [3, 3, G_p] of the first periodic group (one structure: its strain), or nullptr
@@ -141,6 +149,10 @@ private:
   ggml_tensor *edge_sum(ggml_context *ctx, const std::vector<ggml_tensor *> &in);
   ggml_tensor *mesh_op(ggml_context *ctx, const GIRNode &node, const std::vector<ggml_tensor *> &in);
   ggml_tensor *les_op(ggml_context *ctx, const GIRNode &node, const std::vector<ggml_tensor *> &in);
+  ggml_tensor *les_sub(ggml_context *ctx, const GIRNode &node, const std::vector<ggml_tensor *> &in);
+  ggml_tensor *les_shift(ggml_context *ctx, ggml_tensor *q, ggml_tensor *charge_unit, bool tcc);
+  std::vector<int32_t> h_nbr_;
+  ggml_tensor *nbr_ = nullptr;
   ggml_tensor *inv_volume(ggml_context *ctx, const Group &g); // (1 - tr eps) / V, [1, G_g]
 };
 

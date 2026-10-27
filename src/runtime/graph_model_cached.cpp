@@ -721,7 +721,8 @@ ModelResult GraphModel::predict_cached(const AtomicSystem &system, bool compute_
   }
 #ifdef MLIPCPP_HAVE_CUDA_INPUTS
   static const bool host_inputs = std::getenv("MLIPCPP_HOST_INPUTS") != nullptr;
-  if (!host_inputs && std::string_view(ggml_backend_name(compute_backend_)).rfind("CUDA", 0) == 0)
+  if (!host_inputs && !plato_lr_.les_tail_subtract_cutoff && // (the slots' neighbour atoms are needed on the host)
+      std::string_view(ggml_backend_name(compute_backend_)).rfind("CUDA", 0) == 0)
     return predict_cached_device(system, compute_forces, species);
 #endif
 
@@ -809,6 +810,13 @@ ModelResult GraphModel::predict_cached(const AtomicSystem &system, bool compute_
   ggml_backend_tensor_set(g.reverse, rev.data(), 0, ggml_nbytes(g.reverse));
   ggml_backend_tensor_set(g.cutoff_values, cv.data(), 0, ggml_nbytes(g.cutoff_values));
   upload_conditioning(g, system.charge(), system.spin_multiplicity());
+  if (g.plato && g.plato->needs_neighbor_index()) {
+    std::vector<int32_t> nbr(size_t(n) * M, 0);
+    for (int i = 0; i < n; i++)
+      for (int64_t e = edges.start[i]; e < edges.start[i + 1]; e++)
+        if (slot[e] >= 0) nbr[size_t(i) * M + slot[e]] = edges.j[e];
+    g.plato->set_neighbor_index(std::move(nbr));
+  }
   if (g.plato) g.plato->upload(system.positions());
   if (ragged) {
     std::vector<int32_t> off(first.begin(), first.end());

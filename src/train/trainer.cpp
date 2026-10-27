@@ -792,6 +792,11 @@ void Worker::upload_inputs(StepGraph &g, const Batch &b, const std::vector<float
     if (g.qw->buffer) ggml_backend_tensor_set(g.qw, &w, 0, sizeof(float));
   }
   if (g.plato) {
+    if (g.plato->needs_neighbor_index()) {
+      std::vector<int32_t> nbr(b.neighbor_atom.begin(), b.neighbor_atom.end());
+      for (auto &j : nbr) j = std::max(j, 0);
+      g.plato->set_neighbor_index(std::move(nbr));
+    }
     g.plato->upload(b.positions.data());
     if (g.dx) {
       if (plato_dx_.size() != size_t(3) * b.n_atoms) throw std::logic_error("upload_inputs: position tangent");
