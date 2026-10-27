@@ -31,14 +31,16 @@ def load(verbose: bool = False) -> str:
         "MLIPCPP_TORCH_BUILD", os.path.join(os.path.dirname(_HERE), "build")
     )
     os.makedirs(build_dir, exist_ok=True)
+    # torch >= 2.14 headers require C++20 (ATen.h #error, std::strong_ordering)
+    std = "-std=c++20" if tuple(int(x) for x in torch.__version__.split(".")[:2]) >= (2, 14) else "-std=c++17"
     _load(
         name="mlipcpp_torch",
         sources=[
             os.path.join(_CSRC, "pet_attn_op.cpp"),
             os.path.join(_CSRC, "pet_attn_kernels.cu"),
         ],
-        extra_cflags=["-O3", "-std=c++17"],
-        extra_cuda_cflags=["-O3", "-std=c++17", "-lineinfo"],
+        extra_cflags=["-O3", std],
+        extra_cuda_cflags=["-O3", std, "-lineinfo"],
         build_directory=build_dir,
         is_python_module=False,
         verbose=verbose,
