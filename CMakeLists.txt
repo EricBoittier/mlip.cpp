@@ -304,6 +304,9 @@ else()
         # tangent) with one block per (sequence, head) and its L x L matrices in shared memory
         # (L <= 76 at d = 32); GGML_PET_JVP_ROWS=1: the per-row kernels
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-pet-attn-jvp-back-smem.patch"
+        # PET_ATTN_JVP_BACK's result as [D, 3, L, 2 N] (the qkv gradient, then the dqkv one):
+        # both are contiguous views, not the copies of the slots of a [D, 6, L, N] (CPU + CUDA)
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-pet-attn-jvp-back-halves.patch"
     )
     # the source cache is keyed by the ggml tag and the patches' contents:
     # CPM's default key hashes the arguments, i.e. the patch paths, so every

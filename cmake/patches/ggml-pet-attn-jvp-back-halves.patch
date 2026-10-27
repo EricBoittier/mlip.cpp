@@ -1,0 +1,129 @@
+--- a/include/ggml.h
++++ b/include/ggml.h
+@@ -2079,7 +2079,7 @@
+             float                 scale);
+ 
+     // gradients of ggml_pet_attn_jvp's result (given `grad` of it) w.r.t. qkv
+-    // and dqkv: [D, 6, L, N], slots q, k, v, dq, dk, dv
++    // and dqkv: [D, 3, L, 2 N], the qkv gradient (sequences 0..N-1), then dqkv's (N..2N-1)
+     GGML_API struct ggml_tensor * ggml_pet_attn_jvp_back(
+             struct ggml_context * ctx,
+             struct ggml_tensor  * jvp,
+--- a/src/ggml.c
++++ b/src/ggml.c
+@@ -4797,7 +4797,7 @@
+ 
+     struct ggml_tensor * result = bias
+         ? ggml_new_tensor_4d(ctx, GGML_TYPE_F32, qkv->ne[2], qkv->ne[2], 2, qkv->ne[3])
+-        : ggml_new_tensor_4d(ctx, GGML_TYPE_F32, qkv->ne[0], 6, qkv->ne[2], qkv->ne[3]);
++        : ggml_new_tensor_4d(ctx, GGML_TYPE_F32, qkv->ne[0], 3, qkv->ne[2], 2*qkv->ne[3]); // qkv's, then dqkv's
+ 
+     ggml_set_op_params(result, jvp->op_params, 2*sizeof(int32_t));
+ 
+@@ -7864,12 +7864,14 @@
+             const size_t isrc3 = src3 ? ggml_hash_find(hash_set, src3) : (size_t) -1;
+             const bool src3_needs_grads = src3 && isrc3 != GGML_HASHSET_FULL && ggml_bitset_get(hash_set->used, isrc3) && grads_needed[isrc3];
+             if (src0_needs_grads || src2_needs_grads) {
+-                struct ggml_tensor * g = ggml_pet_attn_jvp_back(ctx, tensor, ggml_is_contiguous(grad) ? grad : ggml_cont(ctx, grad)); // [D, 6, L, N]
++                struct ggml_tensor * g = ggml_pet_attn_jvp_back(ctx, tensor, ggml_is_contiguous(grad) ? grad : ggml_cont(ctx, grad)); // [D, 3, L, 2 N]
+                 for (int s = 0; s < 2; s++) {
+                     if (!(s ? src2_needs_grads : src0_needs_grads)) continue;
+-                    struct ggml_tensor * part = ggml_view_4d(ctx, g, g->ne[0], 3, g->ne[2], g->ne[3],
+-                                                             g->nb[1], g->nb[2], g->nb[3], 3*s*g->nb[1]);
+-                    ggml_add_or_set(ctx, cgraph, s ? isrc2 : isrc0, ggml_cont(ctx, part));
++                    // the qkv and dqkv gradients are the two contiguous halves: views, no copies
++                    const int64_t N = g->ne[3]/2;
++                    struct ggml_tensor * part = ggml_view_4d(ctx, g, g->ne[0], 3, g->ne[2], N,
++                                                             g->nb[1], g->nb[2], g->nb[3], s*N*g->nb[3]);
++                    ggml_add_or_set(ctx, cgraph, s ? isrc2 : isrc0, part);
+                 }
+             }
+             if (src1_needs_grads || src3_needs_grads) {
+--- a/src/ggml-cpu/ops.cpp
++++ b/src/ggml-cpu/ops.cpp
+@@ -11519,7 +11519,7 @@
+     }
+ }
+ 
+-// slots q, k, v, dq, dk, dv of dst [D, 6, L, N]
++// slots q, k, v of dst [D, 3, L, 2 N] (sequences 0..N-1), then dq, dk, dv (N..2N-1)
+ void ggml_compute_forward_pet_attn_jvp_back(const ggml_compute_params * params, ggml_tensor * dst) {
+     const ggml_tensor * qkv = dst->src[0], * bias = dst->src[1], * grad = dst->src[2];
+     const ggml_tensor * dqkv = dst->src[3], * dbias = dst->src[4];
+@@ -11529,7 +11529,7 @@
+ 
+     std::vector<float> P(L), dS(L), Gam(L), Sig(L);
+     for (int64_t n = params->ith; n < N; n += params->nth) {
+-        auto out = [&](int64_t i, int slot) { return (float *) ((char *) dst->data + n*dst->nb[3] + i*dst->nb[2] + slot*dst->nb[1]); };
++        auto out = [&](int64_t i, int slot) { return (float *) ((char *) dst->data + ((slot/3)*N + n)*dst->nb[3] + i*dst->nb[2] + (slot%3)*dst->nb[1]); };
+         for (int64_t i = 0; i < L; i++)
+             for (int slot = 0; slot < 6; slot++) memset(out(i, slot), 0, D*sizeof(float));
+         for (int h = 0; h < H; h++) {
+--- a/src/ggml-cuda/pet-attn.cu
++++ b/src/ggml-cuda/pet-attn.cu
+@@ -1366,7 +1366,7 @@
+ }
+ 
+ // rows: the statistics of every (sequence, head, row), and with grads the
+-// query-side gradients (q, dq: slots 0, 3 of dst [D, 6, L, N])
++// query-side gradients (q, dq: slot 0 of the halves of dst [D, 3, L, 2N])
+ template <int d>
+ __global__ void pet_attn_jvp_bwd_rows(const float * __restrict__ qkv, const float * __restrict__ bias,
+                                       const float * __restrict__ grad, const float * __restrict__ dqkv,
+@@ -1399,12 +1399,12 @@
+ #pragma unroll
+         for (int c = 0; c < d; c++) gq[c] += scale*(Sig*k[c] + (dk ? Gam*dk[c] : 0.0f)), gdq[c] += scale*Gam*k[c];
+     }
+-    float * out = dst + ((n*L + i)*6)*D + h*d;
++    float * out = dst + ((n*L + i)*3)*D + h*d, * dout = out + N*L*3*D; // [D, 3, L, 2N]: qkv's, then dqkv's
+ #pragma unroll
+-    for (int c = 0; c < d; c++) out[c] = gq[c], out[3*D + c] = gdq[c];
++    for (int c = 0; c < d; c++) out[c] = gq[c], dout[c] = gdq[c];
+ }
+ 
+-// keys: k, v, dk, dv (slots 1, 2, 4, 5), one thread per (sequence, head, key)
++// keys: k, v, dk, dv (slots 1, 2 of both halves), one thread per (sequence, head, key)
+ template <int d>
+ __global__ void pet_attn_jvp_bwd_keys(const float * __restrict__ qkv, const float * __restrict__ bias,
+                                       const float * __restrict__ grad, const float * __restrict__ dqkv,
+@@ -1438,9 +1438,9 @@
+             gdv[c] += P*G[c];
+         }
+     }
+-    float * out = dst + ((n*L + j)*6)*D + h*d;
++    float * out = dst + ((n*L + j)*3)*D + h*d, * dout = out + N*L*3*D;
+ #pragma unroll
+-    for (int c = 0; c < d; c++) out[D + c] = gk[c], out[2*D + c] = gv[c], out[4*D + c] = gdk[c], out[5*D + c] = gdv[c];
++    for (int c = 0; c < d; c++) out[D + c] = gk[c], out[2*D + c] = gv[c], dout[D + c] = gdk[c], dout[2*D + c] = gdv[c];
+ }
+ 
+ // bias and dbias gradients (planes 0, 1 of dst [L, L, 2, N]), summed over the
+@@ -1481,7 +1481,7 @@
+ __global__ void pet_attn_jvp_bwd_smem(const float * __restrict__ qkv, const float * __restrict__ bias,
+                                       const float * __restrict__ grad, const float * __restrict__ dqkv,
+                                       const float * __restrict__ dbias, float * __restrict__ dst,
+-                                      const int H, const int L, const float scale) {
++                                      const int H, const int L, const int64_t N, const float scale) {
+     extern __shared__ float sm[];
+     constexpr int dp = d + 1; // padded rows: the cell loops read X[j][c] across j
+     const int64_t n = blockIdx.x / H;
+@@ -1569,8 +1569,8 @@
+             gv  += Wm[i*L + r]*Gc;
+             gdv += Pm[i*L + r]*Gc;
+         }
+-        float * out = dst + ((n*L + r)*6)*D + h*d + c;
+-        out[0] = gq, out[D] = gk, out[2*D] = gv, out[3*D] = gdq, out[4*D] = gdk, out[5*D] = gdv;
++        float * out = dst + ((n*L + r)*3)*D + h*d + c, * dout = out + N*L*3*D; // [D, 3, L, 2N]
++        out[0] = gq, out[D] = gk, out[2*D] = gv, dout[0] = gdq, dout[D] = gdk, dout[2*D] = gdv;
+     }
+ }
+ 
+@@ -1603,7 +1603,7 @@
+                 CUDA_CHECK(cudaFuncSetAttribute(pet_attn_jvp_bwd_smem<d>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
+             }
+             pet_attn_jvp_bwd_smem<d><<<(unsigned) (N*H), 128, smem, stream>>>(ptr(0), ptr(1), ptr(2), ptr(3), ptr(4),
+-                                                                              (float *) dst->data, H, L, scale);
++                                                                              (float *) dst->data, H, L, N, scale);
+             CUDA_CHECK(cudaGetLastError());
+             return;
+         }
