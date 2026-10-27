@@ -297,6 +297,9 @@ else()
         # energy of a half spectrum with its gradient w.r.t. the spectrum and the cell metric
         # (GGML_OP_PLATO_PME / _BACK); CPU + CUDA
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-plato-pme.patch"
+        # CUDA GET_ROWS of narrow F32/F16 rows (2 ne00 <= 256): several rows per block instead of a
+        # 256-thread block per row with ne00 threads active (Plato-PET-LR's [16, ...] RoPE gathers)
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-get-rows-narrow.patch"
     )
     # the source cache is keyed by the ggml tag and the patches' contents:
     # CPM's default key hashes the arguments, i.e. the patch paths, so every
