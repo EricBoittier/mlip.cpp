@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <functional>
 #include <map>
 #include <memory>
@@ -272,6 +273,18 @@ private:
     // FORCES: dE/dx; MIXED: the position tangent and the scale of the normalised tangents
     std::unique_ptr<runtime::PetPlatoLR> plato;
     ggml_tensor *grad_x = nullptr, *dx = nullptr, *jvp_scale = nullptr;
+    // MIXED with the shared forward (MLIPCPP_SHARED_FORWARD, default on): stage 1, the FORCES
+    // graph gforces (forward + backward to the edge vectors, cutoff values and positions) on
+    // the same forward tensors as gf, then stage 2, gf's remaining nodes (loss, tangent,
+    // backward to the weights). sched (both, in order) is what is allocated and computed (as
+    // the two views): the forward values stay live from stage 1 into stage 2 instead of
+    // being computed again.
+    ggml_cgraph *gforces = nullptr, *sched = nullptr;
+    std::unique_ptr<ggml_cgraph> stage1, stage2; // views of sched (~StepGraph: trainer.cpp)
+    int n_forces_forward = 0;
+    // gforces' and gf's forward nodes, sorted (profile labels)
+    std::vector<const ggml_tensor *> forces_forward, mixed_forward;
+    std::vector<std::pair<ggml_tensor *, float>> constants_extra; // stage 1's loss seed
     // charge correlation: inputs (partial charges, structures taking part, weight x norm) and r [1, G]
     ggml_tensor *qref = nullptr, *qok = nullptr, *qw = nullptr, *charge_r = nullptr, *charge_loss = nullptr;
     ~StepGraph();
@@ -285,7 +298,12 @@ private:
   StepGraph &cached_graph(int n, int m, int S, Mode mode);
   void upload_inputs(StepGraph &g, const Batch &b, const std::vector<float> *dv = nullptr,
                      const std::vector<float> *dc = nullptr);
-  void compute(StepGraph &g);
+  /// computes `which` (default g.gf) of g
+  void compute(StepGraph &g, ggml_cgraph *which = nullptr);
+  bool shared_forward_ = [] {
+    const char *e = std::getenv("MLIPCPP_SHARED_FORWARD");
+    return !e || std::string(e) != "0";
+  }();
   StepStats run_conservative(const Batch &b, double energy_scale, bool backward);
 
   std::map<std::tuple<int, int, int, int>, std::unique_ptr<StepGraph>> cache_;

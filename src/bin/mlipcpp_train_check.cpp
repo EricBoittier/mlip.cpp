@@ -129,8 +129,10 @@ int main(int argc, char **argv) {
 
   // micro-batching must reproduce the full-batch loss and gradients
   if (!node_grads_on) {
+    // MLIPCPP_CHECK_GROWTH: the neighbour-count ratio that opens a new micro-batch (1e9: one pass)
+    const char *growth_env = std::getenv("MLIPCPP_CHECK_GROWTH");
     auto mbs = make_microbatches(split, nl, ids, {}, worker.model().species_to_index(), sc,
-                                 worker.model().cutoff(), 5e7, 2.0);
+                                 worker.model().cutoff(), 5e7, growth_env ? std::atof(growth_env) : 2.0);
     double loss = 0;
     worker.zero_grads(); // micro-batch gradients accumulate on the device
     for (const Batch &mb : mbs) loss += worker.run(mb, sc.energy_scale, true).loss;

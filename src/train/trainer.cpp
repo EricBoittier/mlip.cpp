@@ -540,6 +540,7 @@ void Worker::plato_create(StepGraph &g, ggml_context *ctx, int n, bool grad) {
 
 std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode mode, bool cached) {
   const bool backward = mode != FORWARD;
+  const bool shared = mode == MIXED && shared_forward_; // + the FORCES graph on the same forward
   // the tangent graph and its reverse pass: several times the loss graph
   const size_t graph_size = mode == MIXED ? 8 * GRAPH_SIZE : GRAPH_SIZE;
   auto g = std::make_unique<StepGraph>();
@@ -555,7 +556,7 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
   size_t &ctx_bytes = ctx_bytes_[mode];
   const bool measure = ctx_bytes == 0;
   g->ctx = ggml_init({measure ? ggml_tensor_overhead() * graph_size * 2 +
-                                    ggml_graph_overhead_custom(graph_size, true)
+                                    ggml_graph_overhead_custom(graph_size, true) * (shared ? 4 : 1)
                               : ctx_bytes,
                       nullptr, /*no_alloc=*/true});
   ggml_context *ctx = g->ctx;
@@ -580,7 +581,7 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
     interp.set_input("spin_index", in(GGML_TYPE_I32, {n}, "spin_index"));
   }
   if (model_.plato_lr().enabled) {
-    plato_create(*g, ctx, n, mode == FORCES);
+    plato_create(*g, ctx, n, mode == FORCES || shared);
     g->plato->set_padding_mask(padding_mask);
     interp.custom_op = [p = g->plato.get()](ggml_context *c, const runtime::GIRNode &node,
                                             const std::vector<ggml_tensor *> &in) { return p->build(c, node, in); };
@@ -675,6 +676,41 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
       if (g->jvp_scale) J = ggml_mul(ctx, J, g->jvp_scale); // the tangents were normalised
       loss = ggml_sub(ctx, loss, J);
     }
+    if (shared) {
+      // stage 1, FORCES on these forward tensors: dE/d(edge vectors, cutoff values,
+      // positions) of E = sum of the atomic energies, the weights not differentiated
+      g->out = out;
+      ggml_set_output(out);
+      if (out->view_src) ggml_set_output(out->view_src); // (an energy-only export's [n], reshaped)
+      ggml_tensor *E = ggml_sum(ctx, energy);
+      // (flags before the expansion: ggml makes params nodes, the others leafs)
+      for (ggml_tensor *p : params_) p->flags &= ~GGML_TENSOR_FLAG_PARAM;
+      ggml_set_param(edges), ggml_set_param(cv);
+      g->gforces = ggml_new_graph_custom(ctx, graph_size, true);
+      ggml_build_forward_expand(g->gforces, out);
+      ggml_build_forward_expand(g->gforces, E);
+      if (g->charge_r) ggml_build_forward_expand(g->gforces, g->charge_r);
+      g->n_forces_forward = ggml_graph_n_nodes(g->gforces);
+      ggml_set_loss(E);
+      ggml_build_backward_expand(ctx, g->gforces, nullptr);
+      g->grad_v = ggml_graph_get_grad(g->gforces, edges);
+      g->grad_c = ggml_graph_get_grad(g->gforces, cv);
+      if (g->plato) g->grad_x = ggml_graph_get_grad(g->gforces, g->plato->positions);
+      if (!g->grad_v) throw std::runtime_error("conservative forces: E does not depend on the edge vectors");
+      for (ggml_tensor *t : {g->grad_v, g->grad_c, g->grad_x})
+        if (t) ggml_set_output(t);
+      ggml_tensor *seed = ggml_graph_get_grad_acc(g->gforces, E);
+      ggml_set_input(seed);
+      g->constants_extra.emplace_back(seed, 1.0f);
+      // stage 2 differentiates the weights only (the tangents are its inputs)
+      E->flags &= ~GGML_TENSOR_FLAG_LOSS;
+      edges->flags &= ~GGML_TENSOR_FLAG_PARAM, cv->flags &= ~GGML_TENSOR_FLAG_PARAM;
+      if (g->plato) {
+        g->plato->positions->flags &= ~GGML_TENSOR_FLAG_PARAM;
+        for (ggml_tensor *t : g->plato->strains()) t->flags &= ~GGML_TENSOR_FLAG_PARAM;
+      }
+      for (ggml_tensor *p : params_) ggml_set_param(p);
+    }
     // physical force squared error, for the metrics (not differentiated)
     ggml_tensor *se_f = ggml_sum(ctx, ggml_sqr(ctx, ggml_mul(ctx, d_force, force_scale)));
     g->stats = ggml_concat(ctx, ggml_concat(ctx, ggml_concat(ctx, loss, loss_e, 0), loss_f, 0), se_f, 0);
@@ -701,9 +737,26 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
       g->loss_grad = ggml_graph_get_grad_acc(g->gf, loss);
       ggml_set_input(g->loss_grad);
     }
+    if (shared) {
+      // the schedule: stage 1's nodes, then gf's others (stage 2), expanded node by node (both
+      // are in topological order) so that its use counts cover both stages: ggml-cuda fuses a
+      // node into its consumer (and skips writing it) when its use count is 1, and a forward
+      // value read again in stage 2 must not be fused away in stage 1. The stages are views.
+      g->sched = ggml_new_graph_custom(ctx, 2 * graph_size, false);
+      for (int i = 0; i < ggml_graph_n_nodes(g->gforces); i++) ggml_build_forward_expand(g->sched, ggml_graph_node(g->gforces, i));
+      const int n1 = ggml_graph_n_nodes(g->sched);
+      for (int i = 0; i < ggml_graph_n_nodes(g->gf); i++) ggml_build_forward_expand(g->sched, ggml_graph_node(g->gf, i));
+      g->stage1 = std::make_unique<ggml_cgraph>(ggml_graph_view(g->sched, 0, n1));
+      g->stage2 = std::make_unique<ggml_cgraph>(ggml_graph_view(g->sched, n1, ggml_graph_n_nodes(g->sched)));
+      for (int i = 0; i < g->n_forces_forward; i++) g->forces_forward.push_back(ggml_graph_node(g->gforces, i));
+      std::sort(g->forces_forward.begin(), g->forces_forward.end());
+      for (int i = 0; i < g->n_forward; i++) g->mixed_forward.push_back(ggml_graph_node(g->gf, i));
+      std::sort(g->mixed_forward.begin(), g->mixed_forward.end());
+    }
   }
   g->constants = interp.take_constants();
   if (g->loss_grad) g->constants.emplace_back(g->loss_grad, 1.0f);
+  g->constants.insert(g->constants.end(), g->constants_extra.begin(), g->constants_extra.end());
   for (auto &c : g->constants) ggml_set_input(c.first);
 
   if (cached) {
@@ -750,7 +803,7 @@ Worker::StepGraph &Worker::cached_graph(int n, int m, int S, Mode mode) {
   // all cached graphs share the compute buffer (they run one at a time); when
   // it has to grow, the old buffer is freed and every other graph dangles
   const size_t before = compute_buffer_bytes();
-  if (!ggml_gallocr_alloc_graph(galloc_, g->gf))
+  if (!ggml_gallocr_alloc_graph(galloc_, g->sched ? g->sched : g->gf))
     throw std::runtime_error(fmt::format("cannot allocate the graph ({} atoms x {} neighbours)", n, m));
   if (compute_buffer_bytes() != before && !cache_.empty()) cache_.clear(), cache_flushes++;
   g->last_use = ++clock_;
@@ -825,16 +878,16 @@ Worker::StepGraph &Worker::graph(int n, int m, int S, Mode mode, std::unique_ptr
   once = build_graph(n, m, S, mode, false);
   t_build += seconds_since(t0);
   t0 = clock_type::now();
-  if (!ggml_gallocr_alloc_graph(galloc_, once->gf))
+  if (!ggml_gallocr_alloc_graph(galloc_, once->sched ? once->sched : once->gf))
     throw std::runtime_error(fmt::format("cannot allocate the graph ({} atoms x {} neighbours)", n, m));
   fill_constants(once->constants);
   t_alloc += seconds_since(t0);
   return *once;
 }
 
-void Worker::compute(StepGraph &g) {
+void Worker::compute(StepGraph &g, ggml_cgraph *which) {
   auto t0 = clock_type::now();
-  ggml_cgraph *gf = g.gf;
+  ggml_cgraph *gf = which ? which : g.gf;
   if (profile) {
     const std::string kind = g.mode == FORCES ? "F." : g.mode == MIXED ? "M." : "";
     for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
@@ -844,7 +897,14 @@ void Worker::compute(StepGraph &g) {
         throw std::runtime_error("graph compute failed");
       ggml_backend_synchronize(model_.backend());
       const ggml_tensor *node = ggml_graph_node(gf, i);
-      const std::string phase = kind + (i >= g.n_forward ? "bwd" : g.jvp_mark && node > g.jvp_mark ? "tan" : "fwd");
+      std::string phase;
+      if (g.sched && gf == g.stage1.get())
+        phase = std::string("F.") + (std::binary_search(g.forces_forward.begin(), g.forces_forward.end(), node) ? "fwd" : "bwd");
+      else if (g.sched && gf != g.gf)
+        phase = std::string("M.") + (!std::binary_search(g.mixed_forward.begin(), g.mixed_forward.end(), node) ? "bwd"
+                                     : g.jvp_mark && node > g.jvp_mark                                       ? "tan"
+                                                                                                             : "fwd");
+      else phase = kind + (i >= g.n_forward ? "bwd" : g.jvp_mark && node > g.jvp_mark ? "tan" : "fwd");
       auto &s = profile_ops[phase + ":" + ggml_op_desc(node)];
       auto [f, b] = node_cost(node);
       const double ms = 1e3 * seconds_since(tn);
@@ -880,7 +940,7 @@ void Worker::compute(StepGraph &g) {
     throw std::runtime_error("graph compute failed");
   }
   t_compute += seconds_since(t0);
-  if (after_compute) after_compute(g.gf);
+  if (after_compute && !(g.sched && gf == g.stage1.get())) after_compute(g.gf);
 }
 
 StepStats Worker::run(const Batch &b, double energy_scale, bool backward) {
@@ -936,13 +996,21 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
   const bool nc = model_.nc_forces();
   const int ow = nc ? 4 : 1; // graph output columns: (energy | direct force) or energy
 
-  // 1. forward + backward to the edge vectors and cutoff values
+  // 1. forward + backward to the edge vectors and cutoff values; with the shared
+  // forward, stage 1 of the MIXED graph (its tangent inputs are uploaded after 3.)
+  const bool shared = backward && shared_forward_;
   std::unique_ptr<StepGraph> once;
-  StepGraph &gf = graph(n, m, S, FORCES, once);
+  StepGraph &gf = graph(n, m, S, shared ? MIXED : FORCES, once);
   auto t0 = clock_type::now();
-  upload_inputs(gf, b);
+  if (shared) {
+    std::vector<float> zv(3 * static_cast<size_t>(n) * m, 0.0f), zc(static_cast<size_t>(n) * m, 0.0f);
+    if (gf.dx) plato_dx_.assign(3 * static_cast<size_t>(n), 0.0f), plato_jvp_scale_ = 1.0f;
+    upload_inputs(gf, b, &zv, &zc);
+  } else {
+    upload_inputs(gf, b);
+  }
   t_upload += seconds_since(t0);
-  compute(gf);
+  compute(gf, shared ? gf.stage1.get() : nullptr);
   t0 = clock_type::now();
   std::vector<float> out(ow * static_cast<size_t>(n)), gv(3 * static_cast<size_t>(n) * m), gc, gx;
   ggml_backend_tensor_get(gf.out, out.data(), 0, out.size() * sizeof(float));
@@ -959,7 +1027,7 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
     gx.resize(3 * static_cast<size_t>(n));
     ggml_backend_tensor_get(gf.grad_x, gx.data(), 0, gx.size() * sizeof(float));
   }
-  once.reset();
+  if (!shared) once.reset();
   t_download += seconds_since(t0);
   const auto t_host = clock_type::now();
 
@@ -1071,6 +1139,21 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
     plato_jvp_scale_ = static_cast<float>(umax);
   }
   t_cpu = seconds_since(t_host);
+  if (shared) { // stage 2: the tangents, then the rest of the MIXED graph
+    t0 = clock_type::now();
+    ggml_tensor *tv = gf.inputs[gf.inputs.size() - 2], *tc = gf.inputs.back();
+    if (ggml_nbytes(tv) != dv.size() * sizeof(float) || ggml_nbytes(tc) != dc.size() * sizeof(float))
+      throw std::logic_error("run_conservative: tangent inputs");
+    ggml_backend_tensor_set(tv, dv.data(), 0, ggml_nbytes(tv));
+    ggml_backend_tensor_set(tc, dc.data(), 0, ggml_nbytes(tc));
+    if (gf.dx) {
+      ggml_backend_tensor_set(gf.dx, plato_dx_.data(), 0, ggml_nbytes(gf.dx));
+      ggml_backend_tensor_set(gf.jvp_scale, &plato_jvp_scale_, 0, sizeof(float));
+    }
+    t_upload += seconds_since(t0);
+    compute(gf, gf.stage2.get());
+    return st;
+  }
   StepGraph &gm = graph(n, m, S, MIXED, once);
   t0 = clock_type::now();
   upload_inputs(gm, b, &dv, &dc);
