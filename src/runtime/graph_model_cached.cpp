@@ -690,11 +690,6 @@ ModelResult GraphModel::predict_cached(const AtomicSystem &system, bool compute_
       throw std::runtime_error("Atomic number " + std::to_string(Z[i]) + " not in species map");
     species[i] = it->second;
   }
-#ifdef MLIPCPP_HAVE_CUDA_INPUTS
-  static const bool host_inputs = std::getenv("MLIPCPP_HOST_INPUTS") != nullptr;
-  if (!host_inputs && !plato_lr_.enabled && std::string_view(ggml_backend_name(compute_backend_)).rfind("CUDA", 0) == 0)
-    return predict_cached_device(system, compute_forces, species);
-#endif
   if (plato_lr_.enabled) { // the structure of the long-range ops (cell, total charge)
     PetPlatoLRStructure st;
     st.a1 = n;
@@ -709,6 +704,11 @@ ModelResult GraphModel::predict_cached(const AtomicSystem &system, bool compute_
     st.charge = system.charge();
     plato_st_ = {st};
   }
+#ifdef MLIPCPP_HAVE_CUDA_INPUTS
+  static const bool host_inputs = std::getenv("MLIPCPP_HOST_INPUTS") != nullptr;
+  if (!host_inputs && std::string_view(ggml_backend_name(compute_backend_)).rfind("CUDA", 0) == 0)
+    return predict_cached_device(system, compute_forces, species);
+#endif
 
   GraphProfile profile;
   const HostEdges edges = host_edges(system, cutoff, nt, vesin_);
@@ -992,6 +992,7 @@ ModelResult GraphModel::predict_cached_device(const AtomicSystem &system, bool c
   if (no_edges) compute_forces = false;
   CachedGraph &g = *cached_;
   upload_conditioning(g, system.charge(), system.spin_multiplicity());
+  if (g.plato) g.plato->upload(system.positions());
   if (backend_provider_->compute(compute_forces ? g.graph : g.forward) != GGML_STATUS_SUCCESS)
     throw std::runtime_error("Graph computation failed");
   profile.mark("compute");
@@ -1003,13 +1004,24 @@ ModelResult GraphModel::predict_cached_device(const AtomicSystem &system, bool c
     md::gpu::conservative_forces(st, cut, gg, energy_scale_);
     std::vector<double> F(3 * size_t(n));
     download(F.data(), st.f_cons, F.size());
+    std::array<double, 6> w_plato{};
+    if (g.grad_pos) { // Plato-PET-LR: -dE/dx and dE/d strain of the long-range ops
+      std::vector<float> gp(3 * size_t(n));
+      ggml_backend_tensor_get(g.grad_pos, gp.data(), 0, gp.size() * sizeof(float));
+      for (size_t k = 0; k < F.size(); k++) F[k] -= energy_scale_ * gp[k];
+    }
+    if (g.grad_eps && periodic) {
+      float q[9];
+      ggml_backend_tensor_get(g.grad_eps, q, 0, sizeof q);
+      w_plato = {q[0], q[4], q[8], 0.5 * (q[5] + q[7]), 0.5 * (q[2] + q[6]), 0.5 * (q[1] + q[3])};
+    }
     result.forces.assign(F.begin(), F.end());
     result.has_forces = true;
     if (periodic) {
       md::gpu::virial(st, cut, gg, d.virial);
       std::vector<double> v(6 * size_t(n));
       download(v.data(), d.virial, v.size());
-      std::array<double, 6> w{};
+      std::array<double, 6> w = w_plato;
       for (int i = 0; i < n; i++)
         for (int c = 0; c < 6; c++) w[c] += v[6 * i + c];
       set_stress(*cell, energy_scale_, w, result);
