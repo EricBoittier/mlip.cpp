@@ -1,0 +1,11 @@
+{
+  "base_lr": 1e-4, "min_lr": 1e-6, "shape": "cosine", "warmup_epochs": 0,
+  "groups": [
+    {"name": "nc_head", "match": ["*non_conservative_force*"], "lr_mult": 0.0},
+    {"name": "gates", "match": ["*_gate"], "warmup_epochs": 1},
+    {"name": "new", "match": ["backend.les.", "backend.mesh.", "rope_omega", "edge_embedder.vec."], "warmup_epochs": 2},
+    {"name": "heads", "match": ["backend.node_heads.", "backend.edge_heads.", "backend.node_last_layers.", "backend.edge_last_layers."], "lr_mult": 0.3},
+    {"name": "backbone", "lr_mult": 0.1, "freeze_epochs": 1}
+  ],
+  "default_group": "backbone"
+}

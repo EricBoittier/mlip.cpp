@@ -102,7 +102,8 @@ def load_weights(model, tensors, param_names):
     p = get_model_params(pet)
     wrapper = PETFullModel(pet, n_atoms=7, max_neighbors=11, d_pet=p["d_pet"], forces=True,
                            cutoff=p["cutoff"], cutoff_width=p["cutoff_width"],
-                           cutoff_function=p["cutoff_function"], nc_forces=True)
+                           cutoff_function=p["cutoff_function"],
+                           nc_forces="non_conservative_force" in pet.node_heads)
     named = {n.replace(".", "_"): t for n, t in wrapper.named_parameters()}
     missing = [n for n in param_names if n not in named or n not in tensors]
     if missing:
@@ -115,6 +116,8 @@ def load_weights(model, tensors, param_names):
             if src.size != t.numel():
                 raise ValueError(f"{name}: {src.size} values in the GGUF, {t.numel()} in the model")
             t.copy_(torch.from_numpy(src.reshape(tuple(t.shape)).copy()))
+        if getattr(wrapper, "plato_lr", None) is not None:
+            wrapper.plato.sync_back()  # the folded mesh projections into the FrameLinears
     return len(param_names), untrained
 
 
