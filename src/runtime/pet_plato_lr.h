@@ -71,6 +71,9 @@ public:
   void upload(const float *positions) const;
   /// the MLIPCPP_* op of `node`
   ggml_tensor *build(ggml_context *ctx, const GIRNode &node, const std::vector<ggml_tensor *> &inputs);
+  /// the graph's padding mask [max_neighbors, n] (1 = padded): the frame RoPE attention masks the
+  /// padded keys exactly (-inf), as metatrain's FrameRoPEAttention (feat/pet-plato-lr 9362e3df)
+  void set_padding_mask(ggml_tensor *pm) { padding_mask_ = pm; }
 
   ggml_tensor *positions = nullptr; // F32 [3, n]
   ggml_tensor *strain = nullptr;    // F32 [3, 3, G_p] of the first periodic group (one structure: its strain), or nullptr
@@ -115,7 +118,7 @@ private:
   std::vector<int32_t> h_sidx_, h_pi_, h_pj_;
   std::vector<float> h_onehot_, h_invc_, h_qpa_, h_aict_, h_omask_;
   ggml_tensor *frac_ = nullptr, *pair_r_ = nullptr; // built once per graph
-  ggml_tensor *charges_ = nullptr;
+  ggml_tensor *charges_ = nullptr, *padding_mask_ = nullptr, *key_log_keep_ = nullptr;
 
   ggml_tensor *frac(ggml_context *ctx);
   ggml_tensor *pair_r(ggml_context *ctx); // [1, P] distances of the pairs

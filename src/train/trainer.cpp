@@ -569,7 +569,8 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
   interp.set_input("neighbor_species", in(GGML_TYPE_I32, {m, n}, "neighbor_species"));
   ggml_tensor *edges = in(GGML_TYPE_F32, {3, m, n}, "edge_vectors");
   interp.set_input("edge_vectors", edges);
-  interp.set_input("padding_mask", in(GGML_TYPE_F32, {m, n}, "padding_mask"));
+  ggml_tensor *padding_mask = in(GGML_TYPE_F32, {m, n}, "padding_mask");
+  interp.set_input("padding_mask", padding_mask);
   interp.set_input("reverse_neighbor_index",
                    in(GGML_TYPE_I32, {int64_t(n) * m}, "reverse_neighbor_index"));
   ggml_tensor *cv = in(GGML_TYPE_F32, {m, n}, "cutoff_values");
@@ -580,6 +581,7 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
   }
   if (model_.plato_lr().enabled) {
     plato_create(*g, ctx, n, mode == FORCES);
+    g->plato->set_padding_mask(padding_mask);
     interp.custom_op = [p = g->plato.get()](ggml_context *c, const runtime::GIRNode &node,
                                             const std::vector<ggml_tensor *> &in) { return p->build(c, node, in); };
   }

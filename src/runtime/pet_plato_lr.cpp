@@ -89,7 +89,7 @@ void PetPlatoLR::create(ggml_context *ctx, const PetPlatoLRSpec &spec, const std
                         int n_atoms, bool grad) {
   spec_ = spec, st_ = structures, n_ = n_atoms;
   all_.clear(), groups_.clear();
-  frac_ = pair_r_ = charges_ = nullptr;
+  frac_ = pair_r_ = charges_ = key_log_keep_ = nullptr;
   strain = nullptr, pair_i_ = pair_j_ = nullptr, atom_inv_cell_t_ = nullptr, open_mask_ = nullptr;
   n_pairs_ = 0, any_open_ = false;
   const int G = static_cast<int>(st_.size());
@@ -334,6 +334,16 @@ ggml_tensor *PetPlatoLR::rope_attn(ggml_context *ctx, const GIRNode &node, const
   const int F = static_cast<int>(frames->ne[2]);
   const float scale = static_cast<float>(param_num(node, "scale", 1.0 / std::sqrt(double(Ch))));
   ggml_tensor *pos = ggml_reshape_2d(ctx, cont(ctx, in[4]), 3, L * N);
+  if (padding_mask_ && padding_mask_->ne[0] + 1 == L && padding_mask_->ne[1] == N &&
+      !std::getenv("MLIPCPP_PLATO_FRAME_PAD_FINITE")) {
+    // log(1 - padded) per key, the centre kept: -inf on the padded keys (no gradient)
+    if (!key_log_keep_) {
+      ggml_tensor *center = ggml_fill(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, N), 1.0f);
+      ggml_tensor *keep = ggml_concat(ctx, center, ggml_scale_bias(ctx, padding_mask_, -1.0f, 1.0f), 0); // [L, N]
+      key_log_keep_ = ggml_reshape_4d(ctx, ggml_log(ctx, keep), L, 1, 1, N);
+    }
+    bias = ggml_add(ctx, bias, key_log_keep_);
+  }
   // [Ch, L, H, N] -> [D, 1, L, N] (heads of a token together, as ggml_pet_attn reads them)
   auto tokens = [&](ggml_tensor *x) { return ggml_reshape_4d(ctx, ggml_cont(ctx, ggml_permute(ctx, x, 0, 2, 1, 3)), D, 1, L, N); };
   ggml_tensor *vt = tokens(v);

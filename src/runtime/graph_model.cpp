@@ -1074,6 +1074,7 @@ ModelResult GraphModel::predict_single(
   interp_.set_input("neighbor_species", neighbor_species_t);
   interp_.set_input("edge_vectors", edge_vectors_t);
   interp_.set_input("padding_mask", padding_mask_t);
+  if (plato) plato->set_padding_mask(padding_mask_t);
   interp_.set_input("reverse_neighbor_index", reverse_neighbor_index_t);
 
   // Register mode-specific inputs
