@@ -9,6 +9,9 @@ reversed torch shape, so a torch ``Linear`` weight ``[out, in]`` is the ggml
 ``mul_mat`` operand ``[in, out]``. The hypers and the dataset info are stored as JSON,
 the composition energies and the energy scale also as float64 metadata for the C++
 side. ``gguf_to_plato_ckpt.py`` inverts this (bit-identical tensors).
+``plato.mesh_normalization`` is the ``mesh_normalization`` hyper (checkpoint v6;
+``per_point`` for older checkpoints and metatrain versions without it); mlip.cpp
+reads a GGUF without the key as ``per_point``.
 
 mlip.cpp folds each ``FrameLinear`` with one token frame (``frame_mode: attention``)
 into a plain linear map at load time; the raw ``W`` / ``phi`` stay the parameters, so
@@ -86,6 +89,10 @@ def main():
     w.add_key_value("plato.energy_scale", scale, gguf.GGUFValueType.FLOAT64)
     if args.mesh_round:
         w.add_string("plato.mesh_round", args.mesh_round)
+    mesh_norm = hypers.get("mesh_normalization", "per_point")
+    if mesh_norm not in ("physical", "per_point"):
+        raise ValueError(f"unknown mesh_normalization {mesh_norm}")
+    w.add_string("plato.mesh_normalization", mesh_norm)
     w.add_float32("plato.cutoff", float(hypers["cutoff"]))
     names = []
     # the checkpoint's own tensors (load_model casts a few float64 buffers to float32)
@@ -105,7 +112,7 @@ def main():
     w.write_tensors_to_file()
     w.close()
     print(f"{args.output}: {len(names)} tensors ({len(trainable)} trainable), scale {scale:.6g}, "
-          f"composition {comp}")
+          f"composition {comp}, mesh normalization {mesh_norm}")
 
 
 if __name__ == "__main__":

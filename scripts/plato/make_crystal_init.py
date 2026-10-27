@@ -6,6 +6,9 @@ into the GGUF at export (export_plato_gguf.py --baseline), not into the checkpoi
     python scripts/plato/make_crystal_init.py template.ckpt baseline.json init.ckpt --seed 0 \
         [--frames identity|D2|T] [--set d_model=128 --set num_layers=4 ...]
     python scripts/plato/export_plato_gguf.py init.ckpt --baseline baseline.json -o init.gguf
+
+With a metatrain that has the mesh_normalization hyper (checkpoint v6) the new model is
+physical whatever the template's (--set mesh_normalization=per_point for the old coupling).
 """
 import argparse
 import json
@@ -36,6 +39,8 @@ def main():
     hypers.update(ck["model_data"]["model_hypers"])
     if a.frames:
         hypers["frames"] = a.frames
+    if "mesh_normalization" in hypers:  # a new model: physical (--set mesh_normalization=per_point)
+        hypers["mesh_normalization"] = "physical"
     for kv in a.set:
         k, v = kv.split("=", 1)
         if k not in hypers:

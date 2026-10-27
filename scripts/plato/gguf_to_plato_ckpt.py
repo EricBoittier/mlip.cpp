@@ -54,7 +54,18 @@ def build_model(meta):
     ck = {"model_ckpt_version": int(meta.get("plato.checkpoint_version", PlatoPETLR.__checkpoint_version__)),
           "model_data": {"model_hypers": json.loads(meta["plato.hypers"])}}
     PlatoPETLR.upgrade_checkpoint(ck)
-    return PlatoPETLR(ck["model_data"]["model_hypers"], ds)
+    hypers = ck["model_data"]["model_hypers"]
+    # plato.mesh_normalization (mlipcpp-train-plato --mesh-normalization may set it on a GGUF whose
+    # hypers predate it); without it the upgraded hypers' (per_point up to checkpoint v5)
+    norm = meta.get("plato.mesh_normalization")
+    if norm is not None:
+        if "mesh_normalization" not in hypers:
+            if norm != "per_point":
+                raise SystemExit(f"plato.mesh_normalization {norm}: needs a metatrain with the "
+                                 "mesh_normalization hyper (plato_pet_lr checkpoint v6)")
+        else:
+            hypers["mesh_normalization"] = norm
+    return PlatoPETLR(hypers, ds)
 
 
 def main():

@@ -12,6 +12,8 @@ electronegativity term (metatrain branch feat/plato-chi-frozen: checkpoint v4).
 --frames replaces the frame group (identity: the same model without frames; frame_mode stays
 attention, which with one frame is plain RoPE attention).
 --random-dchi s draws the last layer of the dchi head with std s (it starts at zero).
+--mesh-normalization: physical (default for fresh weights) or per_point; with --keep-weights the
+source's (a v5 or older source is per_point). Needs metatrain's checkpoint v6 (the hyper).
 charge_unit = sqrt(energy scale), as metatrain's trainer sets it when a run starts.
 """
 import argparse
@@ -32,6 +34,7 @@ def main():
     ap.add_argument("--keep-weights", action="store_true")
     ap.add_argument("--random-dchi", type=float, default=0.0)
     ap.add_argument("--frames", default=None)
+    ap.add_argument("--mesh-normalization", choices=["physical", "per_point"], default=None)
     a = ap.parse_args()
     from metatrain.experimental.plato_pet_lr.model import PlatoPETLR
     from metatrain.experimental.plato_pet_lr.trainer import Trainer
@@ -45,6 +48,11 @@ def main():
         hypers.update(electronegativity=a.electronegativity, chi0_trainable=not a.chi0_frozen, dchi_bound=a.dchi_bound)
     if a.frames:
         hypers.update(frames=a.frames)
+    if "mesh_normalization" in hypers:  # metatrain with the hyper (checkpoint v6)
+        if a.mesh_normalization or not a.keep_weights:
+            hypers.update(mesh_normalization=a.mesh_normalization or "physical")
+    elif a.mesh_normalization not in (None, "per_point"):
+        raise SystemExit("--mesh-normalization physical needs metatrain's plato_pet_lr checkpoint v6")
     torch.manual_seed(a.seed)
     model = PlatoPETLR(hypers, ck["model_data"]["dataset_info"])
     state = model.state_dict()
@@ -66,7 +74,7 @@ def main():
                scheduler_state_dict=None, best_metric=None, best_optimizer_state_dict=None, epoch=None, best_epoch=None)
     torch.save(out, a.out)
     print(f"{a.out}: seed {a.seed}, {'source weights' if a.keep_weights else 'fresh weights'}, "
-          f"frames {hypers.get('frames')}, electronegativity {hypers.get('electronegativity', 'none')}, charge unit {math.sqrt(scale):.4f}")
+          f"frames {hypers.get('frames')}, mesh normalization {hypers.get('mesh_normalization', 'per_point')}, electronegativity {hypers.get('electronegativity', 'none')}, charge unit {math.sqrt(scale):.4f}")
 
 
 if __name__ == "__main__":
