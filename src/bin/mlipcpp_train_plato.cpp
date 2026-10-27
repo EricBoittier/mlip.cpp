@@ -21,6 +21,14 @@
 //   --lr-schedule FILE.json: per-group learning rates (src/train/lr_schedule.h; replaces --lr, --warmup, --schedule,
 //   --decay-after, --min-lr and --optimizer; groups matched on the state-dict names); --dump-lr-schedule N prints the
 //   groups' lr of the first N steps as JSON and stops (with --dump-steps-per-epoch S: without data or model).
+//   --mesh-normalization physical|per_point: the mesh coupling's normalisation (metatrain hyper
+//   mesh_normalization; physical: the Ewald potential, per_point: it over the number of mesh points).
+//   Default: the GGUF's plato.mesh_normalization (or its hypers'); a GGUF without it is per_point
+//   (every model up to checkpoint v5). New models: export_plato_gguf.py writes the key (fresh
+//   inits of make_init.py / make_crystal_init.py are physical); the flag can also set it on an
+//   untrained GGUF without the key. It must agree with a GGUF that states one, and is refused
+//   with --resume or on a GGUF mlipcpp-train-plato already trained when the GGUF does not state it.
+//   Every GGUF written carries the key.
 //   mlipcpp-train-plato --init model.gguf --train data.bin --gradcheck H [--batch-size 8] [weights]: the loss
 //       along the trainer's gradient direction, (L(p + h g/|g|) - L(p - h g/|g|)) / 2h against |g|
 //   mlipcpp-train-plato --init model.gguf --train data.bin --check REF   (REF.json / REF.f64 of
@@ -999,6 +1007,7 @@ void save_gguf(const std::string &source, const std::string &path, const Worker 
   gguf_set_kv(out, in);
   for (int64_t i = 0; i < gguf_get_n_tensors(in); ++i) gguf_add_tensor(out, ggml_get_tensor(data, gguf_get_tensor_name(in, i)));
   gguf_set_val_str(out, "train.mlipcpp_plato", info.dump().c_str());
+  gguf_set_val_str(out, "plato.mesh_normalization", w.model->mesh_normalization().c_str());
   const std::string tmp = path + ".tmp";
   const bool ok = gguf_write_to_file(out, tmp.c_str(), false);
   gguf_free(out), gguf_free(in), ggml_free(data);
@@ -1130,6 +1139,24 @@ int main(int argc, char **argv) {
     o.backend = parse_backend_preference(arg(argc, argv, "--backend", "auto"));
     o.fold_in_graph = true, o.decomposed_layer_norm = true;
     o.les_method = arg(argc, argv, "--les-method", ""); // ewald | pme | auto (default: the GGUF's, else auto)
+    o.mesh_normalization = arg(argc, argv, "--mesh-normalization", "");
+    if (!o.mesh_normalization.empty()) {
+      if (o.mesh_normalization != "physical" && o.mesh_normalization != "per_point")
+        throw std::runtime_error("--mesh-normalization physical|per_point");
+      gguf_context *g = gguf_init_from_file(init.c_str(), {true, nullptr});
+      if (!g) throw std::runtime_error("cannot read " + init);
+      const int64_t kh = gguf_find_key(g, "plato.hypers");
+      const bool stated = gguf_find_key(g, "plato.mesh_normalization") >= 0 ||
+                          (kh >= 0 && nlohmann::json::parse(gguf_get_val_str(g, kh)).contains("mesh_normalization"));
+      // trained: by mlipcpp-train-plato, or a metatrain checkpoint with an epoch (plato.source)
+      const int64_t ks = gguf_find_key(g, "plato.source");
+      const bool trained = gguf_find_key(g, "train.mlipcpp_plato") >= 0 ||
+                           (ks >= 0 && !nlohmann::json::parse(gguf_get_val_str(g, ks)).value("epoch", nlohmann::json()).is_null());
+      gguf_free(g);
+      if (!stated && (trained || !arg(argc, argv, "--resume", "").empty()))
+        throw std::runtime_error("--mesh-normalization: " + init + " does not state one and has been trained (per_point); "
+                                 "it can only be set on a new model");
+    }
     const auto names = param_names(init);
     std::vector<std::unique_ptr<Worker>> workers;
     for (int d = 0; d < W; d++) {
@@ -1151,7 +1178,8 @@ int main(int argc, char **argv) {
       workers.push_back(std::move(w));
     }
     Worker &w0 = *workers[0];
-    std::printf("backend %s x %d\n", w0.model->backend_name(), W);
+    std::printf("backend %s x %d, mesh normalization %s%s\n", w0.model->backend_name(), W, w0.model->mesh_normalization().c_str(),
+                w0.model->mesh_normalization_stated() || !o.mesh_normalization.empty() ? "" : " (not in the GGUF)");
     if (w0.muon)
       std::printf("optimizer: Muon on %zu tensors (%lld of %lld values), momentum %g, lr scale %g, %d NS steps; Adam for the rest\n",
                   w0.muon_rms.size(), (long long)w0.n_muon_values, (long long)w0.n_values, w0.muon_momentum, w0.muon_lr_scale, w0.muon_ns_steps);

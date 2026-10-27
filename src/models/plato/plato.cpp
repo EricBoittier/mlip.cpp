@@ -307,6 +307,27 @@ bool PlatoModel::load_from_gguf(const std::string &path) {
   spec_.fold_in_graph = options_.fold_in_graph;
   spec_.decomposed_layer_norm = options_.decomposed_layer_norm;
   mesh_spacing_ = hy["mesh_spacing"];
+  {
+    // plato.mesh_normalization, else the hypers' (a v6 checkpoint through an older exporter),
+    // else per_point: every GGUF from before the setting (checkpoint v5 and older)
+    std::string norm;
+    if (const int64_t k = gguf_find_key(g, "plato.mesh_normalization"); k >= 0) norm = gguf_get_val_str(g, k);
+    const std::string hnorm = hy.value("mesh_normalization", std::string());
+    if (!norm.empty() && !hnorm.empty() && norm != hnorm)
+      throw std::runtime_error("Plato: plato.mesh_normalization " + norm + " but the hypers say " + hnorm);
+    if (norm.empty()) norm = hnorm;
+    mesh_normalization_stated_ = !norm.empty();
+    const std::string &want = options_.mesh_normalization;
+    if (!want.empty()) {
+      if (mesh_normalization_stated_ && want != norm)
+        throw std::runtime_error("Plato: mesh_normalization " + want + " requested, the GGUF is " + norm);
+      norm = want;
+    }
+    if (norm.empty()) norm = "per_point";
+    if (norm != "physical" && norm != "per_point") throw std::runtime_error("Plato: unknown mesh_normalization " + norm);
+    mesh_normalization_ = norm;
+    spec_.mesh_physical = norm == "physical";
+  }
   if (!hy["rope"].get<bool>()) throw std::runtime_error("Plato: needs rope");
   les_pme_.method = hy.value("les_method", std::string("auto"));
   les_pme_.order = hy.value("les_pme_order", 8);

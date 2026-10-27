@@ -26,6 +26,10 @@ struct PlatoSpec {
   int couple_at = 1, mesh_channels = 8, n_types = 0;
   float cutoff = 5.0f, mesh_sigma = 1.5f, les_sigma = 1.0f, les_kcut = 6.0f, ln_eps = 1e-5f;
   bool mesh = true, les = true;
+  // mesh_normalization (GGUF plato.mesh_normalization): physical, the mesh potential is the
+  // Ewald reciprocal potential (the filter times M = M0 M1 M2, undoing the 1 / M of the
+  // inverse FFT); per_point (false, every GGUF without the key): that potential over M
+  bool mesh_physical = false;
   // electronegativity term E_chi = sum_i chi_i q_i on the first charge channel (metatrain
   // feat/plato-chi-frozen): chi = chi0[Z] + dchi, dchi = b tanh(head(h)) when b > 0
   bool chi = false;

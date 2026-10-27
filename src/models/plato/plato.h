@@ -36,6 +36,10 @@ struct PlatoOptions {
   std::string les_method;
   bool fold_in_graph = false;   // training layout (MLIPCPP_PLATO_FOLD_IN_GRAPH=1)
   bool decomposed_layer_norm = false; // LayerNorms of primitive ops (weight gradients)
+  // "physical" | "per_point": required mesh normalisation (mlipcpp-train-plato
+  // --mesh-normalization); empty: the GGUF's. A GGUF that states one must agree;
+  // one that does not (written before the setting existed) is per_point unless set here
+  std::string mesh_normalization;
 };
 
 /// full neighbour list grouped by centre and sorted, with reverse edges
@@ -103,6 +107,9 @@ public:
   bool mesh_round_fft() const { return mesh_round_fft_; }
   const LesPme &les_pme() const { return les_pme_; }
   LesPme &les_pme() { return les_pme_; }
+  /// "physical" or "per_point" (spec().mesh_physical); stated: the GGUF names it
+  const std::string &mesh_normalization() const { return mesh_normalization_; }
+  bool mesh_normalization_stated() const { return mesh_normalization_stated_; }
   const std::map<int, double> &composition() const { return composition_; }
   const std::map<int, int> &species_index() const { return species_index_; }
 
@@ -113,6 +120,8 @@ private:
   double energy_scale_ = 1.0, mesh_spacing_ = 1.0;
   bool mesh_round_fft_ = false;
   LesPme les_pme_;
+  std::string mesh_normalization_ = "per_point";
+  bool mesh_normalization_stated_ = false;
   std::map<int, double> composition_;
   std::map<int, int> species_index_;
   std::shared_ptr<BackendProvider> backend_;

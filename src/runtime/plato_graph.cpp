@@ -160,14 +160,16 @@ PlatoOutputs build_plato(ggml_context *ctx, const PlatoSpec &spec, const std::ma
       ggml_tensor *rho = G > 1 ? ggml_plato_spread_blocked(ctx, v, frac, in.struct_index, (int) G, M0, M1, M2)
                                : ggml_plato_spread(ctx, v, frac, M0, M1, M2);           // [M2, M1, M0, C G]
       ggml_tensor *rk = ggml_plato_fft3(ctx, rho, 0, M0, M1, M2);                         // [2 Mh2, M1, M0, C G]
-      // the filter 4 pi / V exp(-sigma^2 k^2 / 2) / k^2 (1 + filt(|k|)) / deconv, under strain, per structure
+      // the filter 4 pi / V exp(-sigma^2 k^2 / 2) / k^2 (1 + filt(|k|)) / deconv, under strain, per structure;
+      // physical: times M (the inverse FFT divides by M)
+      const float pref = spec.mesh_physical ? float(4.0 * M_PI * double(M0) * M1 * M2) : 4.0f * M_PI;
       ggml_tensor *k = b.strained(in.mesh_k);                                    // [3, Mh, G]
       ggml_tensor *k2 = ggml_sum_rows(ctx, ggml_sqr(ctx, k));                    // [1, Mh, G]
       ggml_tensor *k2s = ggml_add(ctx, k2, in.mesh_k0_pad);                      // 1 at k = 0
       const float s2 = spec.mesh_sigma * spec.mesh_sigma;
       ggml_tensor *base = ggml_div(ctx, ggml_exp(ctx, ggml_scale(ctx, k2, -0.5f * s2)), k2s);
       base = ggml_mul(ctx, ggml_mul(ctx, base, in.mesh_deconv),
-                      ggml_reshape_3d(ctx, ggml_scale(ctx, b.inv_volume(), 4.0f * M_PI), 1, 1, in.strain->ne[2]));
+                      ggml_reshape_3d(ctx, ggml_scale(ctx, b.inv_volume(), pref), 1, 1, in.strain->ne[2]));
       ggml_tensor *filt = b.linear(ggml_silu(ctx, b.linear(ggml_sqrt(ctx, k2s), "coupling.filt.0")), "coupling.filt.2"); // [C, Mh, G]
       ggml_tensor *g = ggml_mul(ctx, ggml_scale_bias(ctx, filt, 1.0f, 1.0f), base);                                     // [C, Mh, G]
       const int64_t Gf = g->ne[2];                                                                                       // G, or 1 (shared)

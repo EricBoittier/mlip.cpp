@@ -57,7 +57,18 @@ def build_model(meta):
     hy = ck["model_data"]["model_hypers"]
     cond = {k: hy.pop(k) for k in ("system_conditioning", "max_charge", "max_spin_multiplicity") if k in hy}
     PlatoPETLR.upgrade_checkpoint(ck)
-    model = PlatoPETLR(ck["model_data"]["model_hypers"], ds)
+    hypers = ck["model_data"]["model_hypers"]
+    # plato.mesh_normalization (mlipcpp-train-plato --mesh-normalization may set it on a GGUF whose
+    # hypers predate it); without it the upgraded hypers' (per_point up to checkpoint v5)
+    norm = meta.get("plato.mesh_normalization")
+    if norm is not None:
+        if "mesh_normalization" not in hypers:
+            if norm != "per_point":
+                raise SystemExit(f"plato.mesh_normalization {norm}: needs a metatrain with the "
+                                 "mesh_normalization hyper (plato_pet_lr checkpoint v6)")
+        else:
+            hypers["mesh_normalization"] = norm
+    model = PlatoPETLR(hypers, ds)
     if cond.get("system_conditioning"):
         import sys
         from pathlib import Path
