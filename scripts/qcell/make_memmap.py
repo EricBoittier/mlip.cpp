@@ -30,6 +30,9 @@ def main():
     ap.add_argument("--xyz", default=None)
     ap.add_argument("--sample", type=int, default=0)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--partial-charges", default=None,
+                    help="prep_omol25_val.py *_partial_charges.npz: also mulliken_charge.bin / lowdin_charge.bin "
+                         "(f32 [n_atoms], NaN where absent) next to the memmap")
     a = ap.parse_args()
     d = np.load(a.npz)
     n, Z, R, F, E = d["n"], d["Z"], d["R"], d["F"], d["E"]
@@ -67,6 +70,14 @@ def main():
         xf.close()
     q[sel].astype(np.float32).reshape(-1, 1).tofile(out / "charge.bin")
     s[sel].astype(np.float32).reshape(-1, 1).tofile(out / "spin_multiplicity.bin")
+    if a.partial_charges:
+        pc = np.load(a.partial_charges)
+        assert (pc["n"] == n).all()
+        idx = np.concatenate([np.arange(off[k], off[k + 1]) for k in sel])
+        for key, fn in (("mulliken_charges", "mulliken_charge.bin"), ("lowdin_charges", "lowdin_charge.bin"),
+                        ("nbo_charges", "nbo_charge.bin")):
+            if key in pc.files and pc["has_" + key][sel].any():
+                pc[key][idx].astype(np.float32).tofile(out / fn)
     np.save(out / "ns.npy", np.int64(len(sel)))
     np.save(out / "na.npy", np.concatenate([[0], np.cumsum(n[sel])]).astype(np.int64))
     print(f"{out}: {len(sel)} structures, {int(n[sel].sum())} atoms, charge [{q[sel].min()}, {q[sel].max()}], "

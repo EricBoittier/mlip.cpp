@@ -97,6 +97,12 @@ def main():
     sm = d["spin_multiplicity"]
     for s in np.unique(sm):
         strata[f"spin_multiplicity={int(s)}"] = sm == s
+    if "domain" in keys:
+        for g in np.unique(d["domain"]):
+            for nm, m in (("q0", q == 0), ("|q|=1", np.abs(q) == 1), ("|q|>=2", np.abs(q) >= 2)):
+                strata[f"domain={g} {nm}"] = (d["domain"] == g) & m
+            for nm, m in (("mult1", sm == 1), ("mult2", sm == 2), ("mult>=3", sm >= 3)):
+                strata[f"domain={g} {nm}"] = (d["domain"] == g) & m
     for lo, hi in ((0, 30), (30, 100), (100, 1000)):
         strata[f"atoms {lo}-{hi}"] = (n >= lo) & (n < hi)
     if "min_inter" in keys:
@@ -109,6 +115,12 @@ def main():
             for c in ("nn", "cn", "cc"):
                 for k, m in bins.items():
                     strata[f"dimer {c} {k}"] = (dc == c) & m
+        if "max_comp_lowdin" in keys:  # OMol25 selection: charged fragment >= 8 A from the rest
+            sep = (d["ncomp"] >= 2) & (mi >= 8) & np.isfinite(mi) & (d["max_comp_lowdin"] >= 0.5)
+            strata["separated (>=8 A, charged fragment)"] = sep
+            if "domain" in keys:
+                for g in np.unique(d["domain"]):
+                    strata[f"separated domain={g}"] = sep & (d["domain"] == g)
         strata["no pair within 5 A"] = d["min_pair"] >= 5
         strata["no pair within 8 A"] = d["min_pair"] >= 8
     r = {"label": a.label, "pred": a.pred, "npz": a.npz, "refit": a.refit, "strata": {}}

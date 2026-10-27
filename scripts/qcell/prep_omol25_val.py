@@ -1,9 +1,10 @@
-"""OMol25 validation split (val.tar.gz, ase-db LMDB shards) -> a stratified charged / open-shell
+"""OMol25 validation (or train_4M: same steps, --quota / --sep-quota) split (val.tar.gz, ase-db LMDB shards) -> a stratified charged / open-shell
 evaluation set for PET-OMol-S / PET-OMol-LR. Only the public val split is read.
 
     python -I prep_omol25_val.py scan  VALDIR META.npz [--procs 32]
     python -I prep_omol25_val.py select META.npz SEL.json [--seed 0]
     python -I prep_omol25_val.py write VALDIR META.npz SEL.json OUT.npz
+    python -I prep_omol25_val.py refit-sample META.npz SEL.json REFIT_SEL.json [--seed 1]
 
 scan: per row of every *.aselmdb shard: shard, row id, data_id (domain), charge, spin, num_electrons,
 num_atoms, s_squared, unrestricted, and from positions: components of the covalent graph (1.2 x ASE
@@ -13,13 +14,15 @@ charge sum of the components that are > 8 A from all others).
 spin check: info["spin"] is the multiplicity 2S+1 if num_electrons and spin - 1 have the same
 parity for every row (reported).
 select (seed): domains grouped as biomolecules / electrolytes / metal_complexes / neutral_control
-(every other data_id, neutral singlets only). For the first three, charged or open-shell rows only;
+(community data_ids ani2x, geom_orca6, orbnet_denali, spice; neutral singlets only); reactivity is not used. For the first three, charged or open-shell rows only;
 per domain up to 300 "separated" rows (>= 2 components, min intermolecular distance >= 8 A and a
 component with |Lowdin charge| >= 0.5), then the rest of the quota (1000 per domain, 600 control)
 spread evenly over (charge class 0 / +-1 / |q|>=2) x (multiplicity 1 / 2 / >=3) x (atoms <30 / 30-100
 / >=100) cells, uniform within a cell.
 write: the selected rows as arrays (n, Z, R, F, E, charge, spin_multiplicity, domain, data_id, shard,
-row, tags) in the layout of prep_qcell_omol.py, for make_memmap.py and eval_omol.py.
+row, tags, nl_energy, num_electrons, unrestricted, s_squared, source) in the layout of prep_qcell_omol.py,
+for make_memmap.py and eval_omol.py, and OUT_partial_charges.npz: per-atom mulliken / lowdin / nbo charges
+(NaN and has_<key> False where absent), for evaluating latent charges only.
 """
 import argparse
 import glob
@@ -33,7 +36,9 @@ import numpy as np
 from ase.data import covalent_radii
 
 NOBOND = {2, 3, 10, 11, 12, 18, 19, 20, 36, 37, 38, 54, 55, 56, 86}
-GROUPS = {"biomolecules": "biomolecules", "elytes": "electrolytes", "metal_complexes": "metal_complexes"}
+GROUPS = {"biomolecules": "biomolecules", "elytes": "electrolytes", "metal_complexes": "metal_complexes",
+          "ani2x": "neutral_control", "geom_orca6": "neutral_control", "orbnet_denali": "neutral_control",
+          "spice": "neutral_control"}  # reactivity: not selected
 
 
 def comps(Z, R):
@@ -77,9 +82,7 @@ def scan_shard(path):
     out = []
     for row in db.select():
         Z = np.asarray(row.numbers); R = np.asarray(row.positions)
-        d = row.data if hasattr(row, "data") else {}
-        kv = row.key_value_pairs
-        info = {**kv, **d}
+        info = {**row.key_value_pairs, **row.data}  # OMol25 keeps atoms.info in row.data
         lab, c, mi, mp, far = comps(Z, R)
         lw = info.get("lowdin_charges")
         qc = np.zeros(c)
@@ -89,16 +92,19 @@ def scan_shard(path):
         out.append((os.path.basename(path), int(row.id), str(info.get("data_id")), int(info.get("charge")),
                     int(info.get("spin")), int(info.get("num_electrons", -1)), len(Z), float(info.get("s_squared", np.nan)),
                     bool(info.get("unrestricted", False)), c, mi, mp, float(np.abs(qc).max()) if c else 0.0,
-                    float(qc[far].sum()) if far.any() else 0.0, int(far.sum())))
+                    float(qc[far].sum()) if far.any() else 0.0, int(far.sum()), int(info.get("num_ecp_electrons", 0)),
+                    int(Z.sum())))
     return out
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["scan", "select", "write"])
+    ap.add_argument("mode", choices=["scan", "select", "write", "refit-sample"])
     ap.add_argument("args", nargs="+")
     ap.add_argument("--procs", type=int, default=32)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--quota", type=int, default=1000, help="select: per charged domain (control: 0.6 x)")
+    ap.add_argument("--sep-quota", type=int, default=300, help="select: separated rows per charged domain")
     a = ap.parse_args()
     if a.mode == "scan":
         valdir, meta = a.args
@@ -108,32 +114,39 @@ def main():
             rows = [r for part in p.imap(scan_shard, shards) for r in part]
         cols = list(zip(*rows))
         names = ["shard", "row", "data_id", "charge", "spin", "num_electrons", "natoms", "s_squared", "unrestricted",
-                 "ncomp", "min_inter", "min_pair", "max_comp_lowdin", "far_comp_lowdin", "n_far_comp"]
+                 "ncomp", "min_inter", "min_pair", "max_comp_lowdin", "far_comp_lowdin", "n_far_comp", "num_ecp_electrons", "zsum"]
         np.savez(meta, **{k: np.array(v) for k, v in zip(names, cols)})
-        sp, ne = np.array(cols[4]), np.array(cols[5])
+        sp, ne, q, zs = np.array(cols[4]), np.array(cols[5]), np.array(cols[3]), np.array(cols[16])
+        ecp = np.array(cols[15])
         ok = (ne >= 0) & ((ne % 2) == ((sp - 1) % 2))
+        unr, s2 = np.array(cols[8]), np.array(cols[7])
+        S = (sp - 1) / 2
         print(json.dumps({"rows": len(rows), "spin_parity_consistent_as_multiplicity": int(ok.sum()),
                           "rows_with_num_electrons": int((ne >= 0).sum()),
+                          "num_electrons_plus_ecp_eq_zsum_minus_charge": int((ne + ecp == zs - q).sum()),
+                          "unrestricted_rows": int(unr.sum()),
+                          "unrestricted_median_abs_s2_minus_S(S+1)": float(np.median(np.abs(s2[unr] - (S * (S + 1))[unr]))) if unr.any() else None,
                           "data_id": {k: int(v) for k, v in zip(*np.unique(cols[2], return_counts=True))}}))
     elif a.mode == "select":
         meta, out = a.args
         m = np.load(meta)
         rng = np.random.default_rng(a.seed)
         did, q, sp, na = m["data_id"], m["charge"], m["spin"], m["natoms"]
-        grp = np.array([GROUPS.get(x, "neutral_control") for x in did])
+        grp = np.array([GROUPS.get(x, "other") for x in did])
         qc = np.where(q == 0, 0, np.where(np.abs(q) == 1, 1, 2))
         sc = np.where(sp == 1, 1, np.where(sp == 2, 2, 3))
         nc = np.where(na < 30, 0, np.where(na < 100, 1, 2))
         sep = (m["ncomp"] >= 2) & (m["min_inter"] >= 8) & np.isfinite(m["min_inter"]) & (m["max_comp_lowdin"] >= 0.5)
         chosen, recipe = [], {}
-        for g, quota in (("biomolecules", 1000), ("electrolytes", 1000), ("metal_complexes", 1000), ("neutral_control", 600)):
+        Qd, Qc = a.quota, int(round(0.6 * a.quota))
+        for g, quota in (("biomolecules", Qd), ("electrolytes", Qd), ("metal_complexes", Qd), ("neutral_control", Qc)):
             if g == "neutral_control":
                 pool = np.nonzero((grp == g) & (q == 0) & (sp == 1))[0]
                 take_sep = np.zeros(0, int)
             else:
                 pool = np.nonzero((grp == g) & ((q != 0) | (sp != 1)))[0]
                 s = pool[sep[pool]]
-                take_sep = rng.choice(s, min(300, len(s)), replace=False) if len(s) else np.zeros(0, int)
+                take_sep = rng.choice(s, min(a.sep_quota, len(s)), replace=False) if len(s) else np.zeros(0, int)
             rest = np.setdiff1d(pool, take_sep)
             cells = defaultdict(list)
             for k in rest:
@@ -150,7 +163,8 @@ def main():
                     if t:
                         idx = rng.choice(len(av), t, replace=False)
                         picked += [av[i] for i in idx]
-                        cells[c] = [av[i] for i in range(len(av)) if i not in set(idx.tolist())]
+                        drop = set(idx.tolist())
+                        cells[c] = [av[i] for i in range(len(av)) if i not in drop]
                         left -= t
                     if cells[c]:
                         nxt.append(c)
@@ -164,6 +178,15 @@ def main():
                                                               for (a_, b_, c_) in sorted({(qc[k], sc[k], nc[k]) for k in sel})}}
         json.dump({"seed": a.seed, "indices": sorted(int(k) for k in chosen), "recipe": recipe}, open(out, "w"), indent=1)
         print(json.dumps(recipe))
+    elif a.mode == "refit-sample":
+        meta, chosen, out = a.args  # N random val rows outside the selection (seed): composition refit only
+        m = np.load(meta)
+        sel = set(json.load(open(chosen))["indices"])
+        rest = np.array([k for k in range(len(m["natoms"])) if k not in sel])
+        pick = np.random.default_rng(a.seed).choice(rest, 5000, replace=False)
+        json.dump({"seed": a.seed, "indices": sorted(int(k) for k in pick), "recipe": "5000 val rows not in the selection"},
+                  open(out, "w"))
+        print(out, len(pick))
     else:
         valdir, meta, selp, out = a.args
         m = np.load(meta)
@@ -177,19 +200,35 @@ def main():
             db = open_db(paths[sh])
             for k in ks:
                 row = db._get_row(int(m["row"][k]))
+                info = row.data
+                pc = {}
+                for key in ("mulliken_charges", "lowdin_charges", "nbo_charges"):
+                    if info.get(key) is not None:
+                        pc[key] = np.asarray(info[key], float).reshape(-1)
                 rows[k] = (np.asarray(row.numbers, np.int32), np.asarray(row.positions, float), np.asarray(row.forces, float),
-                           float(row.energy))
+                           float(row.energy), pc, float(info.get("nl_energy", np.nan)), int(info.get("num_electrons", -1)),
+                           bool(info.get("unrestricted", False)), float(info.get("s_squared", np.nan)), str(info.get("source")))
         ks = sel
         Z = [rows[k][0] for k in ks]
-        grp = np.array([GROUPS.get(str(m["data_id"][k]), "neutral_control") for k in ks])
+        grp = np.array([GROUPS.get(str(m["data_id"][k]), "other") for k in ks])
         lab = [comps(rows[k][0], rows[k][1])[0] for k in ks]
         np.savez(out, n=np.array([len(z) for z in Z]), Z=np.concatenate(Z), R=np.concatenate([rows[k][1] for k in ks]),
                  F=np.concatenate([rows[k][2] for k in ks]), E=np.array([rows[k][3] for k in ks]),
                  comp=np.concatenate(lab).astype(np.int16),
                  charge=m["charge"][ks], spin_multiplicity=m["spin"][ks], domain=grp, data_id=m["data_id"][ks],
                  shard=m["shard"][ks], row=m["row"][ks], ncomp=m["ncomp"][ks], min_inter=m["min_inter"][ks],
-                 min_pair=m["min_pair"][ks], max_comp_lowdin=m["max_comp_lowdin"][ks], far_comp_lowdin=m["far_comp_lowdin"][ks])
-        print(out, len(ks))
+                 min_pair=m["min_pair"][ks], max_comp_lowdin=m["max_comp_lowdin"][ks], far_comp_lowdin=m["far_comp_lowdin"][ks],
+                 nl_energy=np.array([rows[k][5] for k in ks]), num_electrons=np.array([rows[k][6] for k in ks]),
+                 unrestricted=np.array([rows[k][7] for k in ks]), s_squared=np.array([rows[k][8] for k in ks]),
+                 source=np.array([rows[k][9] for k in ks]))
+        # per-atom partial charges (evaluation only), flattened in the same atom order; has_<key> per structure
+        pcs = {}
+        for key in ("mulliken_charges", "lowdin_charges", "nbo_charges"):
+            has = np.array([key in rows[k][4] for k in ks])
+            pcs["has_" + key] = has
+            pcs[key] = np.concatenate([rows[k][4][key] if key in rows[k][4] else np.full(len(rows[k][0]), np.nan) for k in ks])
+        np.savez(out[:-4] + "_partial_charges.npz", n=np.array([len(z) for z in Z]), **pcs)
+        print(out, len(ks), {k: int(v.sum()) for k, v in pcs.items() if k.startswith("has_")})
 
 
 if __name__ == "__main__":
