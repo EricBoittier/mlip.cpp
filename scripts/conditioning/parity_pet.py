@@ -30,7 +30,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from export_pytorch.export_pet_full import load_local_model  # noqa: E402
 
 PAIRS = [(0, 1), (1, 2), (-1, 2), (2, 3), (-2, 1), (0, 3), (3, 4), (-3, 4)]
-BAD = [(4, 1), (-4, 1), (0, 0), (0, 5)]  # with max_charge 3, max_spin_multiplicity 4
 TOL_E, TOL_F = 2e-4, 2e-3  # eV/atom, eV/A (float32 mlip.cpp vs float64 metatrain)
 
 
@@ -144,7 +143,9 @@ def main():
     model = load(args.model).to(torch.float64).eval()
     rt = load(args.ckpt).to(torch.float64).eval() if args.ckpt else None
     frames = [(n, a, q, s) for n, a in structures() for q, s in PAIRS]
-    bad = [(n, a, q, s) for n, a in structures()[:1] for q, s in BAD]
+    sc = model.system_conditioning  # out of the model's tables: an error on both sides
+    mc, ms = int(sc.max_charge), int(sc.max_spin_multiplicity)
+    bad = [(n, a, q, s) for n, a in structures()[:1] for q, s in [(mc + 1, 1), (-mc - 1, 1), (0, 0), (0, ms + 1)]]
     write_frames(out / "frames.xyz", frames + bad)
     run = subprocess.run([args.eval, args.gguf, str(out / "frames.xyz"), str(out / "mlipcpp.json"),
                           "--backend", args.backend], capture_output=True, text=True)
