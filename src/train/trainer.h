@@ -247,6 +247,7 @@ private:
   uint64_t clock_ = 0;
   size_t ctx_bytes_[4] = {0, 0, 0, 0};  // graph context size per Mode; measured on the first build
   std::vector<uint8_t> staging_;   // host side of the input blob
+  std::vector<int32_t> cond_rows_[2]; // charge / spin table rows of the batch's atoms (conditioned models)
 
   runtime::GraphModel model_;
   std::vector<ggml_tensor *> params_;

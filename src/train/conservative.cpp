@@ -270,7 +270,10 @@ struct ConservativeTrainer::Impl {
   }
 };
 ConservativeTrainer::ConservativeTrainer(runtime::GraphModel &m)
-    : impl(std::make_unique<Impl>(m)) {}
+    : impl(m.conditioning().enabled
+               ? throw std::runtime_error("mlipcpp-train-lr: charge / spin conditioned models are not supported "
+                                          "(use mlipcpp-train)")
+               : std::make_unique<Impl>(m)) {}
 ConservativeTrainer::~ConservativeTrainer() = default;
 ConservativeResult
 ConservativeTrainer::evaluate(const std::vector<AtomicSystem> &systems,

@@ -55,6 +55,9 @@ struct Batch {
   std::vector<float> force_scale;   // [n_atoms]: s_Z, for physical metrics (0: padding)
   std::vector<float> force_mask;    // [n_atoms]: 1 real atom, 0 padding atom
   std::vector<int32_t> n_per_system;
+  // charge and spin multiplicity of each atom's structure (padding atoms: 0, 1),
+  // the conditioned model's table rows are made from them at upload
+  std::vector<int32_t> atom_charge, atom_spin; // [n_atoms]
 
   // Loss normalisation: 1/S and 1/(3N) of the *whole* step batch, so that
   // micro-batch losses (and gradients) sum to the full-batch ones.

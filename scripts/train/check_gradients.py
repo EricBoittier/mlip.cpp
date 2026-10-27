@@ -42,7 +42,12 @@ from export_pytorch.export_pet_full import load_local_model  # noqa: E402
 
 def read_split(d: Path):
     na = np.load(d / "na.npy")
+    # charge / spin conditioning (metatrain extra_data; absent: 0 and 1)
+    opt = lambda name, default: (np.fromfile(d / f"{name}.bin", np.float32).reshape(-1)
+                                 if (d / f"{name}.bin").exists() else np.full(len(na) - 1, default, np.float32))
     return dict(
+        charge=opt("charge", 0.0),
+        spin_multiplicity=opt("spin_multiplicity", 1.0),
         na=na,
         x=np.fromfile(d / "x.bin", np.float32).reshape(-1, 3),
         a=np.fromfile(d / "a.bin", np.int32),
@@ -50,6 +55,13 @@ def read_split(d: Path):
         e=np.fromfile(d / "energy.bin", np.float32),
         f=np.fromfile(d / "non_conservative_force.bin", np.float32).reshape(-1, 3),
     )
+
+
+def scalar_tmap(value, name, dtype):
+    from metatensor.torch import Labels, TensorBlock, TensorMap
+    return TensorMap(Labels.single(), [TensorBlock(
+        values=torch.tensor([[value]], dtype=dtype), samples=Labels("system", torch.tensor([[0]])),
+        components=[], properties=Labels(name, torch.tensor([[0]])))])
 
 
 def use_mlipcpp_padding(exact=False):
@@ -130,6 +142,8 @@ def main():
             cell = torch.tensor(split["c"][s], dtype=dtype)
             positions = torch.tensor(split["x"][lo:hi], dtype=dtype, requires_grad=cons is not None)
             system = System(types=types, positions=positions, cell=cell, pbc=(cell != 0).any(dim=1))
+            for key in ("charge", "spin_multiplicity"):
+                system.add_data(key, scalar_tmap(float(split[key][s]), key, dtype))
             systems.append(get_system_with_neighbor_lists(system, nl_options))
             n = hi - lo
             e_target.append((split["e"][s] - sum(comp[int(z)] for z in types)) / (s_e * n))
@@ -195,6 +209,8 @@ def main():
             rel32 = rel_err(flat(by_name32[entry["name"]]), g_ref)
             worst32 = max(worst32, rel32)
             allowed = max(allowed, args.spread_factor * rel32)
+        if "system_conditioning" in entry["name"]:  # charge / spin conditioning: always shown
+            print(f"  {entry['name']}: |g| {np.linalg.norm(g_ref):.4e}, relative error {rel:.2e}")
         if rel > allowed:
             failures.append((entry["name"], rel, allowed, np.linalg.norm(g_ref)))
     print(f"{len(meta['params'])} tensors, worst relative gradient error {worst:.2e}"

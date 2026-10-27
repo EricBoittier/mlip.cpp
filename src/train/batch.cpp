@@ -160,6 +160,8 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
   b.force_mask.assign(n, 0.0f);
   b.n_per_system.assign(b.n_systems, 0);
   b.species.assign(n, 0);
+  b.atom_charge.assign(n, 0);
+  b.atom_spin.assign(n, 1);
   // padding atoms: no neighbours, so every slot is padded and points to itself
   for (int a = n_real; a < n; a++)
     for (int j = 0; j < m; j++) b.reverse_neighbor_index[a * m + j] = a * m + j;
@@ -179,6 +181,8 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
     for (int i = 0; i < ns; i++) {
       const int a = offset + i;
       b.species[a] = index_of(Z[i]);
+      b.atom_charge[a] = split.charge(s);
+      b.atom_spin[a] = split.spin_multiplicity(s);
       b.atom_weight[static_cast<size_t>(k) * n + a] = 1.0f / ns;
       const double fs = scaling.fscale(Z[i]);
       b.force_scale[a] = static_cast<float>(fs);

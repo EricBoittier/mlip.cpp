@@ -512,6 +512,10 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
                    in(GGML_TYPE_I32, {int64_t(n) * m}, "reverse_neighbor_index"));
   ggml_tensor *cv = in(GGML_TYPE_F32, {m, n}, "cutoff_values");
   interp.set_input("cutoff_values", cv);
+  if (model_.conditioning().enabled) { // table rows of each atom's structure
+    interp.set_input("charge_index", in(GGML_TYPE_I32, {n}, "charge_index"));
+    interp.set_input("spin_index", in(GGML_TYPE_I32, {n}, "spin_index"));
+  }
   if (mode == FORCES) {
     // dE/d(edge vectors, cutoff values) of E = sum of the atomic energies;
     // the weights are not differentiated (their flags restored after)
@@ -667,6 +671,12 @@ void Worker::upload_inputs(StepGraph &g, const Batch &b, const std::vector<float
   std::vector<std::pair<const void *, size_t>> src = {
       span(b.species),        span(b.neighbor_species), span(b.edge_vectors),
       span(b.padding_mask),   span(b.reverse_neighbor_index), span(b.cutoff_values)};
+  if (const Conditioning &cond = model_.conditioning(); cond.enabled) {
+    cond_rows_[0].resize(b.atom_charge.size()), cond_rows_[1].resize(b.atom_charge.size());
+    for (size_t a = 0; a < b.atom_charge.size(); a++)
+      std::tie(cond_rows_[0][a], cond_rows_[1][a]) = cond.rows(b.atom_charge[a], b.atom_spin[a]);
+    src.insert(src.end(), {span(cond_rows_[0]), span(cond_rows_[1])});
+  }
   if (g.inputs.size() > src.size())
     src.insert(src.end(), {span(b.atom_weight), span(b.energy_target), span(b.force_target),
                            span(b.force_mask), span(b.force_scale), {norms, sizeof norms}});
@@ -1652,6 +1662,23 @@ void train(const TrainOptions &o) {
   fmt::print("model: {} parameters in {} tensors, cutoff {} A, {} worker(s) on {}\n",
              w0.n_params(), w0.params().size(), cutoff, workers.size(),
              ggml_backend_name(w0.model().backend()));
+  // charge / spin conditioning: every structure's values in the model's range
+  // (an error now rather than mid-run), or a warning when the data has them
+  // and the model does not read them
+  if (const Conditioning &cond = w0.model().conditioning(); cond.enabled) {
+    for (const MemmapSplit *s : {&train_split, &val_split, &test_split}) {
+      int qmin = 0, qmax = 0, smin = 1, smax = 1;
+      for (int64_t k = 0; k < s->size(); k++) {
+        cond.check(s->charge(k), s->spin_multiplicity(k));
+        qmin = std::min(qmin, s->charge(k)), qmax = std::max(qmax, s->charge(k));
+        smin = std::min(smin, s->spin_multiplicity(k)), smax = std::max(smax, s->spin_multiplicity(k));
+      }
+      fmt::print("conditioning ({}): charge in [{}, {}], spin multiplicity in [{}, {}]{}\n", s->dir(), qmin, qmax,
+                 smin, smax, s->has_conditioning_data() ? "" : " (no charge.bin / spin_multiplicity.bin)");
+    }
+  } else if (train_split.has_conditioning_data()) {
+    fmt::print("warning: the data has charge / spin multiplicity, the model is not conditioned on them\n");
+  }
 
   // --epochs 0 evaluates a trained model with the baselines stored in it
   const bool eval_only = o.epochs == 0;
