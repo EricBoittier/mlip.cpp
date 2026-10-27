@@ -1,0 +1,46 @@
+{
+ "base_lr": 3e-05,
+ "min_lr": 1e-06,
+ "shape": "cosine",
+ "warmup_epochs": 0.25,
+ "groups": [
+  {
+   "name": "nc_head",
+   "match": [
+    "*non_conservative_force*"
+   ],
+   "lr_mult": 0.0
+  },
+  {
+   "name": "gates",
+   "match": [
+    "*_gate"
+   ],
+   "lr_mult": 1.0
+  },
+  {
+   "name": "new",
+   "match": [
+    "backend.les.",
+    "backend.mesh.",
+    "rope_omega",
+    "edge_embedder.vec."
+   ]
+  },
+  {
+   "name": "heads",
+   "match": [
+    "backend.node_heads.",
+    "backend.edge_heads.",
+    "backend.node_last_layers.",
+    "backend.edge_last_layers."
+   ],
+   "lr_mult": 0.3
+  },
+  {
+   "name": "backbone",
+   "lr_mult": 0.1
+  }
+ ],
+ "default_group": "backbone"
+}
