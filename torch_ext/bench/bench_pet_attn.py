@@ -44,12 +44,25 @@ def sdpa(qkv, bias, H, scale):
     return o.transpose(1, 2).reshape(N, L, -1)
 
 
-def custom_ggml_jvp(qkv, bias, H, scale):  # double backward through ggml's JVP kernels
-    os.environ["MLIPCPP_ATTN_DBL_NAIVE"] = "1"
-    return custom(qkv, bias, H, scale)
+# variants of the op: environment overrides of the kernel choice (read at
+# every call), and the modes where they differ from the default
+ENV_KEYS = ("MLIPCPP_ATTN_DBL", "MLIPCPP_ATTN_DBL_NAIVE", "MLIPCPP_ATTN_BIAS")
+VARIANTS = {
+    "mlipcpp": ({}, ("fwd", "fb", "force")),  # automatic dispatch
+    "mlipcpp_tiled": ({"MLIPCPP_ATTN_DBL": "tiled"}, ("force",)),
+    "mlipcpp_fused": ({"MLIPCPP_ATTN_DBL": "fused"}, ("force",)),  # errors where it does not fit
+    "mlipcpp_ggmljvp": ({"MLIPCPP_ATTN_DBL": "jvp"}, ("force",)),
+    "mlipcpp_biasrows": ({"MLIPCPP_ATTN_BIAS": "rows"}, ("fb", "force")),
+}
+METHODS = {name: custom for name in VARIANTS}
+METHODS.update(manual=manual, sdpa=sdpa)
 
 
-METHODS = {"mlipcpp": custom, "mlipcpp_ggmljvp": custom_ggml_jvp, "manual": manual, "sdpa": sdpa}
+def set_env(name):
+    env = VARIANTS.get(name, ({}, None))[0]
+    for k in ENV_KEYS:
+        os.environ.pop(k, None)
+    os.environ.update(env)
 
 
 def make_step(fn, mode, qkv, bias, u, wq, wb, H, scale):
@@ -100,10 +113,12 @@ def run_case(N, L, H, d, reps):
     out = []
     for mode in ["fwd", "fb", "force"]:
         for name, fn in METHODS.items():
-            if name == "mlipcpp_ggmljvp" and mode != "force":
+            if name in VARIANTS and mode not in VARIANTS[name][1]:
                 continue
-            os.environ["MLIPCPP_ATTN_DBL_NAIVE"] = "0"
-            rec = dict(N=N, L=L, H=H, d=d, mode=mode, method=name)
+            if name == "sdpa" and mode == "force":
+                continue  # no double backward in torch SDPA
+            set_env(name)
+            rec = dict(N=N, L=L, H=H, d=d, mode=mode, method=name, tokens=N * L)
             try:
                 step = make_step(fn, mode, qkv, bias, u, wq, wb, H, scale)
                 torch.cuda.synchronize()
@@ -118,6 +133,7 @@ def run_case(N, L, H, d, reps):
                 rec["error"] = f"{type(e).__name__}: {str(e).splitlines()[0][:120]}"
             for t in (qkv, bias, u):
                 t.grad = None
+            set_env("mlipcpp")
             out.append(rec)
             print(json.dumps(rec), flush=True)
     return out
@@ -127,16 +143,27 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="bench.json")
     ap.add_argument("--reps", type=int, default=30)
+    ap.add_argument("--long", action="store_true",
+                    help="long sequences (L 64-256, ~650x32 and ~10000x32 tokens) instead of the default table")
+    ap.add_argument("--heads", default="4x16,8x16", help="--long: head shapes HxD")
     args = ap.parse_args()
-    cases = [
-        # bio_dimers batch of 32 dimers (~650 atoms), per-centre sequences
-        (650, 24, 4, 16), (650, 32, 4, 32), (650, 32, 8, 16), (650, 40, 8, 32),
-        # 10k-atom periodic system
-        (10000, 32, 4, 32), (10000, 40, 8, 32),
-    ]
+    if args.long:
+        cases = []
+        for hd in args.heads.split(","):
+            H, d = (int(x) for x in hd.split("x"))
+            for tokens in (650 * 32, 10000 * 32):
+                for L in (64, 97, 128, 192, 256):
+                    cases.append((max(1, round(tokens / L)), L, H, d))
+    else:
+        cases = [
+            # bio_dimers batch of 32 dimers (~650 atoms), per-centre sequences
+            (650, 24, 4, 16), (650, 32, 4, 32), (650, 32, 8, 16), (650, 40, 8, 32),
+            # 10k-atom periodic system
+            (10000, 32, 4, 32), (10000, 40, 8, 32),
+        ]
     res = []
     for c in cases:
-        res += run_case(*c, reps=args.reps)
+        res += run_case(*c, reps=args.reps if c[0] * c[1] < 100000 else max(5, args.reps // 3))
     with open(args.out, "w") as f:
         json.dump(dict(gpu=torch.cuda.get_device_name(), torch=torch.__version__, results=res), f, indent=1)
 

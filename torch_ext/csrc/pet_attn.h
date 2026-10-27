@@ -54,6 +54,22 @@ void double_backward(const T *qkv, const T *bias, const T *go, const T *glse,
                      cudaStream_t stream);
 template <typename T> bool double_backward_fused_ok(int L, int d);
 
+// tiled double backward (any L, shared memory independent of L): the same
+// outputs as double_backward; `stats` holds dbl_tiled_stats_bytes(N*L*H) of
+// per-row statistics (written by the first kernel, read by the second)
+template <typename T>
+void double_backward_tiled(const T *qkv, const T *bias, const T *go, const T *glse, const T *tqkv,
+                           const T *tbias, void *stats, T *to, T *tlse, T *gx, T *gb, int64_t N, int L, int H,
+                           int d, double scale, cudaStream_t stream);
+size_t dbl_tiled_stats_bytes(int64_t rows, bool dbl);
+
+// which double backward to run for (L, d): the fused per-sequence kernel where
+// it fits (and L <= its measured break-even), else the tiled kernels.
+// MLIPCPP_ATTN_DBL = auto | fused | tiled | jvp forces one (jvp: the ggml JVP
+// kernels, debug only; MLIPCPP_ATTN_DBL_NAIVE=1 is the old spelling of jvp).
+enum { DBL_FUSED = 0, DBL_TILED = 1, DBL_JVP = 2 };
+template <typename T> int double_backward_path(int L, int d);
+
 size_t jvp_stats_bytes(int64_t rows, bool dbl);
 
 bool head_dim_supported(int d);

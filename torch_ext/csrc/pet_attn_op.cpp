@@ -10,8 +10,11 @@
 //   backward       = pet_attention_backward (fused kernels, P recomputed from lse)
 //   double backward = pet_attention_jvp (grad w.r.t. the incoming gradient) and
 //                    pet_attention_jvp_backward (grad w.r.t. qkv and bias), i.e.
-//   d/dx <w, J(x)^T u> = d/dx <u, J(x) w>, so the forward-mode kernels of
-//   mlip.cpp give the second derivatives without storing any L x L matrix.
+//   d/dx <w, J(x)^T u> = d/dx <u, J(x) w>, computed by
+//   pet_attention_double_backward: the fused per-sequence kernel where the
+//   sequence fits in shared memory, else the tiled (flash-style) kernels; the
+//   forward-mode (ggml JVP) kernels of mlip.cpp remain as a debug path
+//   (MLIPCPP_ATTN_DBL = auto | fused | tiled | jvp). Nothing L x L is stored.
 // Third derivatives are not implemented (an error is raised).
 // Meta kernels make the ops traceable by torch.compile / FakeTensor.
 #include "pet_attn.h"
@@ -180,13 +183,19 @@ pet_attention_double_backward_cuda(const Tensor &qkv_, const Tensor &bias_, cons
   Tensor to = at::empty({s.N, s.L, s.D}, qkv.options());
   Tensor tlse = at::empty({s.N, s.L, s.H}, qkv.options());
   auto stream = c10::cuda::getCurrentCUDAStream().stream();
-  bool fused = false;
+  int path = mlipcpp_attn::DBL_TILED;
   AT_DISPATCH_FLOATING_TYPES(qkv.scalar_type(), "pet_attention_double_backward", [&] {
-    fused = mlipcpp_attn::double_backward_fused_ok<scalar_t>((int)s.L, (int)s.d);
+    path = mlipcpp_attn::double_backward_path<scalar_t>((int)s.L, (int)s.d);
   });
-  if (fused) {
-    Tensor gx = at::empty(qkv_.sizes(), qkv.options());
-    Tensor gb = at::empty(bias_.sizes(), bias.options());
+  if (path == mlipcpp_attn::DBL_JVP) {
+    // debug path: the ggml JVP kernels (one thread per row, nothing L x L stored)
+    auto [to2, tlse2] = pet_attention_jvp_cuda(qkv_, bias_, tqkv_, tbias_, heads, scale);
+    auto r = pet_attention_jvp_backward_cuda(qkv_, bias_, go_, glse_, tqkv_, tbias_, heads, scale);
+    return {to2, tlse2, std::get<0>(r), std::get<1>(r)};
+  }
+  Tensor gx = at::empty(qkv_.sizes(), qkv.options());
+  Tensor gb = at::empty(bias_.sizes(), bias.options());
+  if (path == mlipcpp_attn::DBL_FUSED) {
     AT_DISPATCH_FLOATING_TYPES(qkv.scalar_type(), "pet_attention_double_backward", [&] {
       mlipcpp_attn::double_backward<scalar_t>(ptr<scalar_t>(qkv), ptr<scalar_t>(bias), ptr<scalar_t>(go),
                                               ptr<scalar_t>(glse), ptr<scalar_t>(tqkv), ptr<scalar_t>(tbias),
@@ -196,10 +205,19 @@ pet_attention_double_backward_cuda(const Tensor &qkv_, const Tensor &bias_, cons
     });
     return {to, tlse, gx, gb};
   }
-  // long sequences: the ggml JVP kernels (one thread per row, nothing L x L stored)
-  auto [to2, tlse2] = pet_attention_jvp_cuda(qkv_, bias_, tqkv_, tbias_, heads, scale);
-  auto r = pet_attention_jvp_backward_cuda(qkv_, bias_, go_, glse_, tqkv_, tbias_, heads, scale);
-  return {to2, tlse2, std::get<0>(r), std::get<1>(r)};
+  // tiled (any L): per-row statistics in a workspace, then rows and keys kernels
+  const bool dbl = qkv.scalar_type() == at::kDouble;
+  Tensor stats = at::empty({(int64_t)mlipcpp_attn::dbl_tiled_stats_bytes(s.N * s.L * s.H, dbl)},
+                           qkv.options().dtype(at::kByte));
+  AT_DISPATCH_FLOATING_TYPES(qkv.scalar_type(), "pet_attention_double_backward", [&] {
+    mlipcpp_attn::double_backward_tiled<scalar_t>(ptr<scalar_t>(qkv), ptr<scalar_t>(bias), ptr<scalar_t>(go),
+                                                  ptr<scalar_t>(glse), ptr<scalar_t>(tqkv), ptr<scalar_t>(tbias),
+                                                  stats.data_ptr(), to.data_ptr<scalar_t>(),
+                                                  tlse.data_ptr<scalar_t>(), gx.data_ptr<scalar_t>(),
+                                                  gb.data_ptr<scalar_t>(), s.N, (int)s.L, (int)s.H, (int)s.d, scale,
+                                                  stream);
+  });
+  return {to, tlse, gx, gb};
 }
 
 // ---- Meta (shape-only) kernels: FakeTensor / torch.compile ------------------

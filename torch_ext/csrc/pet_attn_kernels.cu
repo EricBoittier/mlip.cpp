@@ -368,7 +368,7 @@ __global__ void v2_bwd_dq(const float *__restrict__ qkv,
                           const float *__restrict__ LSE,
                           const float *__restrict__ GO,
                           const float *__restrict__ GL, float *__restrict__ dst,
-                          const int H, const int L, const int TP, const int TS,
+                          float *__restrict__ dbias, const int H, const int L, const int TP, const int TS,
                           const float scale) {
   extern __shared__ float4 sm4[];
   float *sm = reinterpret_cast<float *>(sm4);
@@ -380,6 +380,9 @@ __global__ void v2_bwd_dq(const float *__restrict__ qkv,
   const int64_t n = blockIdx.x;
   const int q0 = blockIdx.y * TP, t = threadIdx.x, h = t % H, g = t / H;
   const float *base = qkv + n * L * 3 * D;
+  // lanes of this thread's warp (the last warp of the block may be partial)
+  const int wl = min(32, (int)blockDim.x - (t & ~31));
+  const unsigned lanes = wl == 32 ? 0xffffffffu : (1u << wl) - 1u;
 
   float q[R][d], dO[R][d], dq[R][d], Di[R], lse[R];
 #pragma unroll
@@ -421,6 +424,21 @@ __global__ void v2_bwd_dq(const float *__restrict__ qkv,
         const float ds = p * (dp - Di[r]);
 #pragma unroll
         for (int c = 0; c < d; c++) dq[r][c] += ds * kr[c];
+        if (dbias) {
+          // dbias_ij = sum_h ds: the H heads of a row are H adjacent lanes
+          // (H a power of two <= 32); butterfly sum, then the head-0 lane
+          // overwrites the bias entry the row's lanes have just read
+          float sum = ds;
+          for (int o = 1; o < H; o <<= 1) sum += __shfl_xor_sync(lanes, sum, o);
+          if (h == 0) Bs[(g + r * G) * TS + kk] = sum;
+        }
+      }
+    }
+    if (dbias) {
+      __syncthreads();
+      for (int e = t; e < TP * nk; e += blockDim.x) {
+        const int a = e / nk, kk = e % nk;
+        if (q0 + a < L) dbias[(n * L + q0 + a) * L + k0 + kk] = Bs[a * TS + kk];
       }
     }
     __syncthreads();
@@ -972,6 +990,369 @@ __global__ void __launch_bounds__(256)
 }
 
 // ---------------------------------------------------------------------------
+// Tiled double backward (flash-attention style, any L): the same outputs as
+// dbl_bwd_seq with shared memory O(tile * D), independent of L. Per head h,
+// query row i and key j (u = (G, g) = (go, glse), w = (tq, tk, tv, tbias)):
+//   S  = scale q_i.k_j + b_ij          P = exp(S - lse_i)
+//   dS = scale (tq_i.k_j + q_i.tk_j) + tb_ij
+//   gv = G_i.v_j     gdv = G_i.tv_j
+//   c_i  = sum_j P dS              (= tlse)
+//   Dr_i = sum_j P gv              (= G_i.o_i)
+//   E_i  = sum_j P (dS (gv - Dr + g) - c gv + gdv)
+//        = Cov_P(dS, gv) - c Dr + g c + sum_j P gdv
+//   W = P (dS - c)   Gamma = P (gv - Dr + g)   Sigma = P (dS a - c gv + gdv - E)
+//   to_i = sum_j W v_j + P tv_j        gq_i = scale sum_j Sigma k_j + Gamma tk_j
+//   gk_j = scale sum_i Sigma q_i + Gamma tq_i     gv_j = sum_i W G_i
+//   gb_ij = sum_h Sigma
+// Three sweeps over the (i, j) pairs, each recomputing the five dot products
+// from the staged tiles (nothing L x L is stored):
+//   rows kernel, pass 1: per (row, head) the online statistics lse, c, Dr,
+//     sum P gdv and the P-weighted co-moment of (dS, gv) (weighted Welford with
+//     the online-softmax rescaling, so E is formed from a centred covariance as
+//     in dbl_bwd_seq, not from the cancelling sum P dS gv - c Dr), saved to
+//     `stats` [N, L, H];
+//   rows kernel, pass 2: to, tlse, gq and gb (Sigma of the block's heads
+//     summed through a shared [rows x heads][keys] tile, deterministic);
+//   keys kernel: gk, gv, reading the saved row statistics.
+// One thread per (row or key, head), a block holds TQ (TK) positions x H heads
+// and streams the other side through shared memory in tiles, like v1.
+
+template <typename T> struct dbl_stat { T lse, c, Dr, E; };
+
+// shared rows are padded to d + VW (VW = 16 bytes of T) and read with 128-bit loads
+template <typename T> struct vec16;
+template <> struct vec16<float> { using type = float4; static constexpr int n = 4; };
+template <> struct vec16<double> { using type = double2; static constexpr int n = 2; };
+
+template <int d, typename T> __device__ __forceinline__ void ldv(const T *__restrict__ p, T (&r)[d]) {
+  using V = typename vec16<T>::type;
+  constexpr int W = vec16<T>::n;
+#pragma unroll
+  for (int c = 0; c < d; c += W) {
+    const V v = *reinterpret_cast<const V *>(p + c);
+    if constexpr (W == 4) r[c] = v.x, r[c + 1] = v.y, r[c + 2] = v.z, r[c + 3] = v.w;
+    else r[c] = v.x, r[c + 1] = v.y;
+  }
+}
+
+// nr rows of D values (global row stride `stride`, may be null: zeros) into
+// shared [nr][H][P]; 128-bit copies when aligned
+template <typename T>
+__device__ __forceinline__ void stage_tile(T *__restrict__ dst, const T *__restrict__ src, const int64_t stride,
+                                           const int nr, const int D, const int d, const int P, const int t,
+                                           const int nt) {
+  using V = typename vec16<T>::type;
+  constexpr int W = vec16<T>::n;
+  const int H = D / d;
+  if (!src) {
+    for (int e = t; e < nr * D; e += nt) {
+      const int r = e / D, c = e % D;
+      dst[(r * H + c / d) * P + c % d] = T(0);
+    }
+  } else if (stride % W == 0 && reinterpret_cast<uintptr_t>(src) % 16 == 0) {
+    const int DW = D / W;
+    for (int e = t; e < nr * DW; e += nt) {
+      const int r = e / DW, c = (e % DW) * W;
+      *reinterpret_cast<V *>(dst + (r * H + c / d) * P + c % d) = *reinterpret_cast<const V *>(src + r * stride + c);
+    }
+  } else {
+    for (int e = t; e < nr * D; e += nt) {
+      const int r = e / D, c = e % D;
+      dst[(r * H + c / d) * P + c % d] = src[r * stride + c];
+    }
+  }
+}
+
+template <int d, typename T>
+__device__ __forceinline__ void dbl_dots(const T (&q)[d], const T (&dq)[d], const T (&G)[d], const T (&kr)[d],
+                                         const T (&dkr)[d], const T (&vr)[d], const T (&dvr)[d], T &s, T &ds, T &gv,
+                                         T &gdv) {
+  s = ds = gv = gdv = 0;
+#pragma unroll
+  for (int c = 0; c < d; c++) {
+    s += q[c] * kr[c];
+    ds += dq[c] * kr[c] + q[c] * dkr[c];
+    gv += G[c] * vr[c];
+    gdv += G[c] * dvr[c];
+  }
+}
+
+template <int d, typename T>
+__global__ void __launch_bounds__(128)
+    dbl_tiled_rows(const T *__restrict__ qkv, const T *__restrict__ bias, const T *__restrict__ GO,
+                   const T *__restrict__ GL, const T *__restrict__ tqkv, const T *__restrict__ tbias,
+                   dbl_stat<T> *__restrict__ stats, T *__restrict__ to, T *__restrict__ tlse,
+                   T *__restrict__ gx, T *__restrict__ gb, const int H, const int L, const int TQ,
+                   const int TK, const T scale) {
+  extern __shared__ __align__(16) unsigned char smraw[];
+  T *sm = reinterpret_cast<T *>(smraw);
+  const int D = H * d, P = d + vec16<T>::n, KS = TK + 1;
+  T *Ks = sm, *Vs = Ks + TK * H * P, *dKs = Vs + TK * H * P, *dVs = dKs + TK * H * P;
+  T *Bs = dVs + TK * H * P, *dBs = Bs + TQ * TK, *Sg = dBs + TQ * TK; // Sg [TQ * H][KS]
+
+  const int64_t n = blockIdx.x;
+  const int q0 = blockIdx.y * TQ, t = threadIdx.x, h = t % H, qi = t / H, i = q0 + qi, nt = blockDim.x;
+  const bool active = i < L;
+  const T *x = qkv + n * L * 3 * D, *tx = tqkv ? tqkv + n * L * 3 * D : nullptr;
+  const int64_t row = n * L + (active ? i : 0);
+
+  T q[d], dq[d], G[d];
+#pragma unroll
+  for (int c = 0; c < d; c++) {
+    q[c] = active ? x[(int64_t)i * 3 * D + h * d + c] : T(0);
+    dq[c] = active && tx ? tx[(int64_t)i * 3 * D + h * d + c] : T(0);
+    G[c] = active ? GO[row * D + h * d + c] : T(0);
+  }
+  const T g = GL && active ? GL[row * H + h] : T(0);
+
+  auto stage = [&](int k0, int nk) {
+    const int64_t r0 = (int64_t)k0 * 3 * D + D;
+    stage_tile(Ks, x + r0, 3 * D, nk, D, d, P, t, nt);
+    stage_tile(Vs, x + r0 + D, 3 * D, nk, D, d, P, t, nt);
+    stage_tile(dKs, tx ? tx + r0 : nullptr, 3 * D, nk, D, d, P, t, nt);
+    stage_tile(dVs, tx ? tx + r0 + D : nullptr, 3 * D, nk, D, d, P, t, nt);
+    for (int e = t; e < TQ * nk; e += nt) {
+      const int a = e / nk, kk = e % nk;
+      const bool ok = q0 + a < L;
+      const int64_t o = (n * L + q0 + a) * L + k0 + kk;
+      Bs[a * TK + kk] = ok ? bias[o] : T(0);
+      dBs[a * TK + kk] = ok && tbias ? tbias[o] : T(0);
+    }
+  };
+
+  // pass 1: online statistics
+  T m = -INFINITY, Wsum = 0, mc = 0, my = 0, mb = 0, C = 0;
+  for (int k0 = 0; k0 < L; k0 += TK) {
+    const int nk = min(TK, L - k0);
+    stage(k0, nk);
+    __syncthreads();
+    if (active) {
+      for (int kk = 0; kk < nk; kk++) {
+        const int o = (kk * H + h) * P;
+        T kr[d], dkr[d], vr[d], dvr[d], s, ds, gv, gdv;
+        ldv<d>(Ks + o, kr), ldv<d>(dKs + o, dkr), ldv<d>(Vs + o, vr), ldv<d>(dVs + o, dvr);
+        dbl_dots<d, T>(q, dq, G, kr, dkr, vr, dvr, s, ds, gv, gdv);
+        s = scale * s + Bs[qi * TK + kk];
+        if (s > m) {
+          const T corr = ex(m - s);
+          Wsum *= corr, C *= corr, m = s;
+        }
+        const T e = s == -INFINITY ? T(0) : ex(s - m);
+        if (e != T(0)) {
+          ds = scale * ds + dBs[qi * TK + kk];
+          const T Wn = Wsum + e, f = e / Wn, dx = ds - mc;
+          mc += f * dx, my += f * (gv - my), mb += f * (gdv - mb);
+          C += e * dx * (gv - my);
+          Wsum = Wn;
+        }
+      }
+    }
+    __syncthreads();
+  }
+  dbl_stat<T> st;
+  if (Wsum > T(0)) {
+    st.lse = m + lg(Wsum), st.c = mc, st.Dr = my;
+    st.E = C / Wsum - mc * my + g * mc + mb;
+  } else { // every key masked: no gradient through this row
+    st.lse = INFINITY, st.c = st.Dr = st.E = 0;
+  }
+  if (active) {
+    stats[row * H + h] = st;
+    tlse[row * H + h] = st.c;
+  }
+
+  // pass 2: to, gq, gb
+  T ato[d], agq[d];
+#pragma unroll
+  for (int c = 0; c < d; c++) ato[c] = agq[c] = 0;
+  for (int k0 = 0; k0 < L; k0 += TK) {
+    const int nk = min(TK, L - k0);
+    stage(k0, nk);
+    __syncthreads();
+    for (int kk = 0; kk < nk; kk++) {
+      T sig = 0;
+      if (active) {
+        const int o = (kk * H + h) * P;
+        T kr[d], dkr[d], vr[d], dvr[d], s, ds, gv, gdv;
+        ldv<d>(Ks + o, kr), ldv<d>(dKs + o, dkr), ldv<d>(Vs + o, vr), ldv<d>(dVs + o, dvr);
+        dbl_dots<d, T>(q, dq, G, kr, dkr, vr, dvr, s, ds, gv, gdv);
+        const T p = ex(scale * s + Bs[qi * TK + kk] - st.lse);
+        if (p != T(0)) {
+          ds = scale * ds + dBs[qi * TK + kk];
+          const T a = gv - st.Dr + g;
+          const T w = p * (ds - st.c), gam = p * a;
+          sig = p * (ds * a - st.c * gv + gdv - st.E);
+#pragma unroll
+          for (int c = 0; c < d; c++) {
+            ato[c] += w * vr[c] + p * dvr[c];
+            agq[c] += sig * kr[c] + gam * dkr[c];
+          }
+        }
+      }
+      Sg[t * KS + kk] = sig;
+    }
+    __syncthreads();
+    if (gb) {
+      for (int e = t; e < TQ * nk; e += nt) {
+        const int a = e / nk, kk = e % nk;
+        if (q0 + a >= L) continue;
+        T acc = 0;
+        for (int hh = 0; hh < H; hh++) acc += Sg[(a * H + hh) * KS + kk];
+        gb[(n * L + q0 + a) * L + k0 + kk] = acc;
+      }
+    }
+    __syncthreads();
+  }
+  if (active) {
+#pragma unroll
+    for (int c = 0; c < d; c++) {
+      to[row * D + h * d + c] = ato[c];
+      gx[row * 3 * D + h * d + c] = scale * agq[c];
+    }
+  }
+}
+
+template <int d, typename T>
+__global__ void __launch_bounds__(128)
+    dbl_tiled_keys(const T *__restrict__ qkv, const T *__restrict__ bias, const T *__restrict__ GO,
+                   const T *__restrict__ GL, const T *__restrict__ tqkv, const T *__restrict__ tbias,
+                   const dbl_stat<T> *__restrict__ stats, T *__restrict__ gx, const int H, const int L,
+                   const int TK, const int TQ, const T scale) {
+  extern __shared__ __align__(16) unsigned char smraw[];
+  dbl_stat<T> *St = reinterpret_cast<dbl_stat<T> *>(smraw); // [TQ * H]
+  T *sm = reinterpret_cast<T *>(St + TQ * H);
+  const int D = H * d, P = d + vec16<T>::n;
+  T *Qs = sm, *dQs = Qs + TQ * H * P, *Gs = dQs + TQ * H * P;
+  T *Bs = Gs + TQ * H * P, *dBs = Bs + TQ * TK, *Gl = dBs + TQ * TK;
+
+  const int64_t n = blockIdx.x;
+  const int k0 = blockIdx.y * TK, t = threadIdx.x, h = t % H, kj = t / H, j = k0 + kj, nt = blockDim.x;
+  const int nk = min(TK, L - k0);
+  const bool active = j < L;
+  const T *x = qkv + n * L * 3 * D, *tx = tqkv ? tqkv + n * L * 3 * D : nullptr;
+
+  T k[d], dk[d], v[d], dv[d], gk[d], gvv[d];
+#pragma unroll
+  for (int c = 0; c < d; c++) {
+    const int64_t o = (int64_t)j * 3 * D + D + h * d + c;
+    k[c] = active ? x[o] : T(0), v[c] = active ? x[o + D] : T(0);
+    dk[c] = active && tx ? tx[o] : T(0), dv[c] = active && tx ? tx[o + D] : T(0);
+    gk[c] = gvv[c] = 0;
+  }
+
+  for (int q0 = 0; q0 < L; q0 += TQ) {
+    const int nq = min(TQ, L - q0);
+    stage_tile(Qs, x + (int64_t)q0 * 3 * D, 3 * D, nq, D, d, P, t, nt);
+    stage_tile(dQs, tx ? tx + (int64_t)q0 * 3 * D : nullptr, 3 * D, nq, D, d, P, t, nt);
+    stage_tile(Gs, GO + (n * L + q0) * D, D, nq, D, d, P, t, nt);
+    for (int e = t; e < nq * nk; e += nt) {
+      const int qq = e / nk, a = e % nk;
+      const int64_t o = (n * L + q0 + qq) * L + k0 + a;
+      Bs[qq * TK + a] = bias[o], dBs[qq * TK + a] = tbias ? tbias[o] : T(0);
+    }
+    for (int e = t; e < nq * H; e += nt) {
+      St[e] = stats[(n * L + q0) * H + e];
+      Gl[e] = GL ? GL[(n * L + q0) * H + e] : T(0);
+    }
+    __syncthreads();
+    if (active) {
+      for (int qq = 0; qq < nq; qq++) {
+        const int o = (qq * H + h) * P;
+        T qr[d], dqr[d], Gr[d], s, ds, gv, gdv;
+        ldv<d>(Qs + o, qr), ldv<d>(dQs + o, dqr), ldv<d>(Gs + o, Gr);
+        const dbl_stat<T> st = St[qq * H + h];
+        dbl_dots<d, T>(k, dk, Gr, qr, dqr, v, dv, s, ds, gv, gdv); // k.q, dk.q + k.dq, G.v, G.dv
+        const T p = ex(scale * s + Bs[qq * TK + kj] - st.lse);
+        if (p == T(0)) continue;
+        ds = scale * ds + dBs[qq * TK + kj];
+        const T a = gv - st.Dr + Gl[qq * H + h];
+        const T w = p * (ds - st.c), gam = p * a, sig = p * (ds * a - st.c * gv + gdv - st.E);
+#pragma unroll
+        for (int c = 0; c < d; c++) {
+          gk[c] += sig * qr[c] + gam * dqr[c];
+          gvv[c] += w * Gr[c];
+        }
+      }
+    }
+    __syncthreads();
+  }
+  if (active) {
+    T *out = gx + (n * L + j) * 3 * D + h * d;
+#pragma unroll
+    for (int c = 0; c < d; c++) out[D + c] = scale * gk[c], out[2 * D + c] = gvv[c];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// first-backward bias gradient, tiled (any L): a block owns TQ query rows of a
+// sequence and walks the key tiles; per (key tile, head) the head's q, dO rows
+// and k, v rows are staged in shared memory (d + 1 padded) and each thread
+// accumulates PT cells (i, j) of dbias over the heads in registers.
+template <int d, typename T, int PT>
+__global__ void __launch_bounds__(256)
+    bwd_bias_tiled(const T *__restrict__ qkv, const T *__restrict__ bias, const T *__restrict__ O,
+                   const T *__restrict__ LSE, const T *__restrict__ GO, const T *__restrict__ GL,
+                   T *__restrict__ dbias, const int H, const int L, const int TQ, const int TK, const T scale) {
+  extern __shared__ __align__(16) unsigned char smraw[];
+  T *sm = reinterpret_cast<T *>(smraw);
+  constexpr int P = d + 1;
+  const int D = H * d, t = threadIdx.x, nt = blockDim.x;
+  T *Qs = sm, *Gs = Qs + TQ * P, *Ks = Gs + TQ * P, *Vs = Ks + TK * P, *Ls = Vs + TK * P, *Dis = Ls + TQ * H;
+  const int64_t n = blockIdx.x;
+  const int q0 = blockIdx.y * TQ, nq = min(TQ, L - q0);
+  const T *x = qkv + n * L * 3 * D;
+  for (int e = t; e < nq * H; e += nt) {
+    const int a = e / H, hh = e % H;
+    const int64_t row = n * L + q0 + a;
+    const T *o = O + row * D + hh * d, *g = GO + row * D + hh * d;
+    T s = 0;
+#pragma unroll
+    for (int c = 0; c < d; c++) s += o[c] * g[c];
+    Ls[e] = LSE[row * H + hh];
+    Dis[e] = GL ? s - GL[row * H + hh] : s;
+  }
+  for (int k0 = 0; k0 < L; k0 += TK) {
+    const int nk = min(TK, L - k0);
+    T acc[PT], bb[PT];
+#pragma unroll
+    for (int p = 0; p < PT; p++) {
+      const int e = t + p * nt, a = e / TK, kk = e % TK;
+      acc[p] = 0;
+      bb[p] = a < nq && kk < nk ? bias[(n * L + q0 + a) * L + k0 + kk] : T(0);
+    }
+    for (int h = 0; h < H; h++) {
+      __syncthreads();
+      for (int e = t; e < nq * d; e += nt) {
+        const int a = e / d, c = e % d;
+        Qs[a * P + c] = x[(int64_t)(q0 + a) * 3 * D + h * d + c];
+        Gs[a * P + c] = GO[(n * L + q0 + a) * D + h * d + c];
+      }
+      for (int e = t; e < nk * d; e += nt) {
+        const int kk = e / d, c = e % d;
+        const int64_t src = (int64_t)(k0 + kk) * 3 * D + D + h * d + c;
+        Ks[kk * P + c] = x[src], Vs[kk * P + c] = x[src + D];
+      }
+      __syncthreads();
+#pragma unroll
+      for (int p = 0; p < PT; p++) {
+        const int e = t + p * nt, a = e / TK, kk = e % TK;
+        if (a >= nq || kk >= nk) continue;
+        T s = 0, dp = 0;
+#pragma unroll
+        for (int c = 0; c < d; c++) s += Qs[a * P + c] * Ks[kk * P + c], dp += Gs[a * P + c] * Vs[kk * P + c];
+        const T pr = ex(scale * s + bb[p] - Ls[a * H + h]);
+        if (pr != T(0)) acc[p] += pr * (dp - Dis[a * H + h]);
+      }
+    }
+#pragma unroll
+    for (int p = 0; p < PT; p++) {
+      const int e = t + p * nt, a = e / TK, kk = e % TK;
+      if (a < nq && kk < nk) dbias[(n * L + q0 + a) * L + k0 + kk] = acc[p];
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // host side
 
 bool head_dim_supported(int d) { return d == 8 || d == 16 || d == 32 || d == 64; }
@@ -1019,6 +1400,43 @@ static void check_grid(int64_t N) {
   if (N > INT_MAX) throw std::runtime_error("mlipcpp pet_attn: too many sequences");
 }
 
+// which kernel computes the first-backward bias gradient:
+//   0 = bwd_bias_seq (F32 v2 path, L*L <= 4096 and the sequence fits 48 KiB),
+//   1 = bwd_bias_rows (one block per query row; the pre-tiled fallback),
+//   2 = bwd_bias_tiled (any L, any dtype / head count),
+//   3 = inside v2_bwd_dq (F32 v2 path, heads a power of two <= 32, any L): the
+//       per-head ds the dq kernel computes anyway, summed over the heads with
+//       warp shuffles, no extra pass over the L x L pairs.
+// MLIPCPP_ATTN_BIAS = seq | rows | tiled | dq forces one (seq, dq only where
+// they apply).
+template <typename T> static size_t bias_tiled_smem(int TB, int H, int d) {
+  return (4 * (size_t)TB * (d + 1) + 2 * (size_t)TB * H) * sizeof(T);
+}
+template <typename T> static int bias_grad_path(int L, int H, int d, int variant) {
+  const size_t smem_seq = (4 * (size_t)L * (d + 1) + 2 * (size_t)L) * sizeof(float);
+  const bool seq_ok = std::is_same<T, float>::value && variant == 0 && smem_seq <= MAX_SMEM &&
+                      (int64_t)L * L <= 16 * 256;
+  const bool v2 = std::is_same<T, float>::value && variant == 0;
+  const bool dq_ok = v2 && H <= 32 && (H & (H - 1)) == 0;
+  const char *e = std::getenv("MLIPCPP_ATTN_BIAS");
+  if (e && *e) {
+    const std::string v(e);
+    if (v == "dq") {
+      if (!dq_ok) throw std::runtime_error("mlipcpp pet_attn: MLIPCPP_ATTN_BIAS=dq does not apply to this shape");
+      return 3;
+    }
+    if (v == "rows") return 1;
+    if (v == "tiled") return 2;
+    if (v == "seq") {
+      if (!seq_ok) throw std::runtime_error("mlipcpp pet_attn: MLIPCPP_ATTN_BIAS=seq does not apply to this shape");
+      return 0;
+    }
+    if (v != "auto")
+      throw std::runtime_error("mlipcpp pet_attn: MLIPCPP_ATTN_BIAS must be auto, seq, rows, tiled or dq");
+  }
+  return dq_ok ? 3 : seq_ok ? 0 : 2;
+}
+
 template <typename T>
 void forward(const T *qkv, const T *bias, T *o, T *lse, int64_t N, int L, int H,
              int d, double scale, cudaStream_t stream, int variant) {
@@ -1050,13 +1468,16 @@ void backward(const T *qkv, const T *bias, const T *o, const T *lse, const T *go
   check_grid(N);
   with_d(d, [&](auto dc) {
     constexpr int D_ = decltype(dc)::value;
+    const int bpath = dbias ? bias_grad_path<T>(L, H, D_, variant) : -1;
+    if (bpath == 3 && !dqkv) throw std::runtime_error("mlipcpp pet_attn: MLIPCPP_ATTN_BIAS=dq needs dqkv");
     if (dqkv) {
       if (std::is_same<T, float>::value && variant == 0) {
         constexpr int RB = 32 / D_ > 1 ? 32 / D_ : 1;
         const v2_shape sq = v2_shape_of(H, D_, RB, L, false), sk = v2_shape_of(H, D_, RB, L, true);
         v2_bwd_dq<D_, RB><<<dim3((unsigned)N, (L + sq.TP - 1) / sq.TP), sq.TP / RB * H, sq.smem, stream>>>(
             (const float *)qkv, (const float *)bias, (const float *)o, (const float *)lse, (const float *)go,
-            (const float *)glse, (float *)dqkv, H, L, sq.TP, sq.TS, (float)scale);
+            (const float *)glse, (float *)dqkv, bpath == 3 ? (float *)dbias : nullptr, H, L, sq.TP, sq.TS,
+            (float)scale);
         v2_bwd_dkv<D_, RB><<<dim3((unsigned)N, (L + sk.TP - 1) / sk.TP), sk.TP / RB * H, sk.smem, stream>>>(
             (const float *)qkv, (const float *)bias, (const float *)o, (const float *)lse, (const float *)go,
             (const float *)glse, (float *)dqkv, H, L, sk.TP, sk.TS, (float)scale);
@@ -1070,10 +1491,11 @@ void backward(const T *qkv, const T *bias, const T *o, const T *lse, const T *go
       }
       PA_CHECK(cudaGetLastError());
     }
-    if (dbias) {
+    if (dbias && bpath != 3) {
       const size_t smem_seq = (4 * (size_t)L * (D_ + 1) + 2 * (size_t)L) * sizeof(float);
       const int64_t LL = (int64_t)L * L;
-      if (std::is_same<T, float>::value && variant == 0 && smem_seq <= MAX_SMEM && LL <= 16 * 256) {
+      const int path = bpath;
+      if (path == 0) {
         auto launch = [&](auto kernel) {
           kernel<<<(unsigned)N, 256, smem_seq, stream>>>((const float *)qkv, (const float *)bias, (const float *)o,
                                                          (const float *)lse, (const float *)go, (const float *)glse,
@@ -1082,13 +1504,27 @@ void backward(const T *qkv, const T *bias, const T *o, const T *lse, const T *go
         if (LL <= 4 * 256) launch(bwd_bias_seq<D_, 4>);
         else if (LL <= 8 * 256) launch(bwd_bias_seq<D_, 8>);
         else launch(bwd_bias_seq<D_, 16>);
-      } else {
+      } else if (path == 1) {
         const size_t smem = (2 * (size_t)H * D_ + 2 * H) * sizeof(T);
         if (smem > MAX_SMEM || L > 65535)
           throw std::runtime_error("mlipcpp pet_attn: bias gradient shape not supported (L > 65535 or H*d too large)");
         const int threads = std::min(128, (L + 31) / 32 * 32);
         bwd_bias_rows<D_, T><<<dim3((unsigned)N, (unsigned)L), threads, smem, stream>>>(
             qkv, bias, o, lse, go, glse, dbias, H, L, (T)scale);
+      } else {
+        // 32 x 32 cells per tile (4 per thread), 16 x 16 when the staged rows
+        // would not fit (float64 with d = 64)
+        const int TB = bias_tiled_smem<T>(32, H, D_) <= (size_t)MAX_SMEM ? 32 : 16;
+        const size_t smem = bias_tiled_smem<T>(TB, H, D_);
+        if (smem > MAX_SMEM || (L + TB - 1) / TB > 65535)
+          throw std::runtime_error("mlipcpp pet_attn: bias gradient shape not supported (H too large or L too long)");
+        const dim3 grid((unsigned)N, (L + TB - 1) / TB);
+        if (TB == 32)
+          bwd_bias_tiled<D_, T, 4><<<grid, 256, smem, stream>>>(qkv, bias, o, lse, go, glse, dbias, H, L, 32, 32,
+                                                                 (T)scale);
+        else
+          bwd_bias_tiled<D_, T, 1><<<grid, 256, smem, stream>>>(qkv, bias, o, lse, go, glse, dbias, H, L, 16, 16,
+                                                                 (T)scale);
       }
       PA_CHECK(cudaGetLastError());
     }
@@ -1149,9 +1585,75 @@ static int smem_optin() {
 }
 
 template <typename T> bool double_backward_fused_ok(int L, int d) {
-  const char *e = std::getenv("MLIPCPP_ATTN_DBL_NAIVE");
-  if (e && std::atoi(e) != 0) return false;
   return dbl_bwd_smem<T>(L, d) <= (size_t)smem_optin();
+}
+
+// Largest L for which the automatic choice keeps dbl_bwd_seq (when it fits):
+// measured on the RTX 4070 Ti SUPER, see results/; MLIPCPP_ATTN_DBL_FUSED_MAX_L
+// overrides.
+static constexpr int DBL_FUSED_MAX_L = 1 << 30;
+
+template <typename T> int double_backward_path(int L, int d) {
+  const bool fits = double_backward_fused_ok<T>(L, d);
+  const char *naive = std::getenv("MLIPCPP_ATTN_DBL_NAIVE");
+  if (naive && std::atoi(naive) != 0) return DBL_JVP;
+  const char *e = std::getenv("MLIPCPP_ATTN_DBL");
+  if (e && *e) {
+    const std::string v(e);
+    if (v == "tiled") return DBL_TILED;
+    if (v == "jvp" || v == "ggml" || v == "naive") return DBL_JVP;
+    if (v == "fused") {
+      if (!fits)
+        throw std::runtime_error("mlipcpp pet_attn: MLIPCPP_ATTN_DBL=fused but the sequence does not fit in shared "
+                                 "memory (L = " + std::to_string(L) + ")");
+      return DBL_FUSED;
+    }
+    if (v != "auto") throw std::runtime_error("mlipcpp pet_attn: MLIPCPP_ATTN_DBL must be auto, fused, tiled or jvp");
+  }
+  int max_l = DBL_FUSED_MAX_L;
+  if (const char *m = std::getenv("MLIPCPP_ATTN_DBL_FUSED_MAX_L")) max_l = std::atoi(m);
+  return fits && L <= max_l ? DBL_FUSED : DBL_TILED;
+}
+
+size_t dbl_tiled_stats_bytes(int64_t rows, bool dbl) {
+  return (size_t)rows * (dbl ? sizeof(dbl_stat<double>) : sizeof(dbl_stat<float>));
+}
+
+// tile shapes of the two tiled kernels: TQ rows x H heads threads (rows) or
+// TK keys x H heads (keys); the streamed tile shrinks until 48 KiB fit
+template <typename T> static size_t dbl_rows_smem(int H, int d, int TQ, int TK) {
+  return (4 * (size_t)TK * H * (d + vec16<T>::n) + 2 * (size_t)TQ * TK + (size_t)TQ * H * (TK + 1)) * sizeof(T);
+}
+template <typename T> static size_t dbl_keys_smem(int H, int d, int TK, int TQ) {
+  return (size_t)TQ * H * sizeof(dbl_stat<T>) +
+         (3 * (size_t)TQ * H * (d + vec16<T>::n) + 2 * (size_t)TQ * TK + (size_t)TQ * H) * sizeof(T);
+}
+
+template <typename T>
+void double_backward_tiled(const T *qkv, const T *bias, const T *go, const T *glse, const T *tqkv,
+                           const T *tbias, void *stats_, T *to, T *tlse, T *gx, T *gb, int64_t N, int L, int H,
+                           int d, double scale, cudaStream_t stream) {
+  if (N == 0 || L == 0) return;
+  check_grid(N);
+  if (H > 1024) throw std::runtime_error("mlipcpp pet_attn: tiled double backward needs heads <= 1024");
+  auto *stats = (dbl_stat<T> *)stats_;
+  const int P1 = std::max(1, 128 / H); // positions per block (both kernels)
+  int TK = 32, TQ = 32;
+  while (TK > 1 && (TK / 2 >= L || dbl_rows_smem<T>(H, d, P1, TK) > MAX_SMEM)) TK /= 2;
+  while (TQ > 1 && (TQ / 2 >= L || dbl_keys_smem<T>(H, d, P1, TQ) > MAX_SMEM)) TQ /= 2;
+  const size_t sm_r = dbl_rows_smem<T>(H, d, P1, TK), sm_k = dbl_keys_smem<T>(H, d, P1, TQ);
+  if (sm_r > MAX_SMEM || sm_k > MAX_SMEM)
+    throw std::runtime_error("mlipcpp pet_attn: H*d too large for the tiled double backward");
+  if ((L + P1 - 1) / P1 > 65535) throw std::runtime_error("mlipcpp pet_attn: sequence too long");
+  const dim3 grid((unsigned)N, (L + P1 - 1) / P1), block(P1 * H);
+  with_d(d, [&](auto dc) {
+    constexpr int D_ = decltype(dc)::value;
+    dbl_tiled_rows<D_, T><<<grid, block, sm_r, stream>>>(qkv, bias, go, glse, tqkv, tbias, stats, to, tlse, gx, gb,
+                                                        H, L, P1, TK, (T)scale);
+    dbl_tiled_keys<D_, T><<<grid, block, sm_k, stream>>>(qkv, bias, go, glse, tqkv, tbias, stats, gx, H, L, P1, TQ,
+                                                        (T)scale);
+  });
+  PA_CHECK(cudaGetLastError());
 }
 
 template <typename T>
@@ -1186,7 +1688,11 @@ void double_backward(const T *qkv, const T *bias, const T *go, const T *glse, co
                                 void *, T *, T *, int64_t, int, int, int, double, cudaStream_t);   \
   template void double_backward<T>(const T *, const T *, const T *, const T *, const T *, const T *, \
                                    T *, T *, T *, T *, int64_t, int, int, int, double, cudaStream_t); \
-  template bool double_backward_fused_ok<T>(int, int);
+  template bool double_backward_fused_ok<T>(int, int);                                              \
+  template int double_backward_path<T>(int, int);                                                   \
+  template void double_backward_tiled<T>(const T *, const T *, const T *, const T *, const T *,     \
+                                         const T *, void *, T *, T *, T *, T *, int64_t, int, int, int, \
+                                         double, cudaStream_t);
 INST(float)
 INST(double)
 

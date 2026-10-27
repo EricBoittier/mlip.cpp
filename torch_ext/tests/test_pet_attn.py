@@ -60,9 +60,12 @@ def derivs(fn, qkv, bias, mask, H, scale, u, ul, wq, wb):
 NAMES = ["o", "lse", "dqkv", "dbias", "d2/dqkv", "d2/dbias", "d2/du", "d2/dulse"]
 
 
-def compare(tag, N, L, H, d, n_valid=None, mask_mode="ninf", tol32=2e-4, v1=False, naive=False):
+def compare(tag, N, L, H, d, n_valid=None, mask_mode="ninf", tol32=2e-4, v1=False, naive=False, dbl="auto",
+            first_key_masked=False, bias_path="auto"):
     scale = 1.0 / math.sqrt(d)
     qkv, bias, mask = make(N, L, H, d, torch.float64, n_valid, mask_mode)
+    if first_key_masked:
+        mask[:, :, 0] = -math.inf
     u = torch.randn(N, L, H * d, dtype=torch.float64, device=dev)
     ul = torch.randn(N, L, H, dtype=torch.float64, device=dev)
     wq = torch.randn_like(qkv)
@@ -74,20 +77,28 @@ def compare(tag, N, L, H, d, n_valid=None, mask_mode="ninf", tol32=2e-4, v1=Fals
     ref = derivs(mt.reference_attention, qkv, bias, mask, H, scale, u, ul, wq, wb)
     os.environ["MLIPCPP_ATTN_V1"] = "1" if v1 else "0"
     os.environ["MLIPCPP_ATTN_DBL_NAIVE"] = "1" if naive else "0"
+    os.environ["MLIPCPP_ATTN_DBL"] = dbl
+    # seq and dq are float32 (v2) paths: the float64 run keeps the default
+    os.environ["MLIPCPP_ATTN_BIAS"] = "auto" if bias_path in ("seq", "dq") else bias_path
     if naive:
         tag += " (ggml JVP kernels)"
+    elif dbl != "auto":
+        tag += f" ({dbl})"
     got64 = derivs(op, qkv, bias, mask, H, scale, u, ul, wq, wb)
     c = lambda t: t.float()
+    os.environ["MLIPCPP_ATTN_BIAS"] = bias_path
     got32 = derivs(op, c(qkv), c(bias), c(mask), H, scale, c(u), c(ul), c(wq), c(wb))
     os.environ["MLIPCPP_ATTN_V1"] = "0"
     os.environ["MLIPCPP_ATTN_DBL_NAIVE"] = "0"
+    os.environ["MLIPCPP_ATTN_DBL"] = "auto"
+    os.environ["MLIPCPP_ATTN_BIAS"] = "auto"
     for name, r, g64, g32 in zip(NAMES, ref, got64, got32):
         assert torch.isfinite(g32).all() and torch.isfinite(g64).all(), (tag, name)
         report(f"{tag} f64 {name}", rel(g64, r), 1e-11)
         report(f"{tag} f32{' v1' if v1 else ''} {name}", rel(g32.double(), r), tol32)
 
 
-def gradchecks(N, L, H, d, n_valid=None):
+def gradchecks(N, L, H, d, n_valid=None, dbl="auto", fast=False):
     scale = 1.0 / math.sqrt(d)
     qkv, bias, mask = make(N, L, H, d, torch.float64, n_valid)
     qkv.requires_grad_()
@@ -96,9 +107,13 @@ def gradchecks(N, L, H, d, n_valid=None):
     def f(qkv, bias):
         return op(qkv, bias + mask, H, scale)
 
-    tag = f"N{N} L{L} H{H} d{d}" + (" padded" if n_valid else "")
-    ok1 = torch.autograd.gradcheck(f, (qkv, bias), eps=1e-6, atol=1e-7, rtol=1e-5)
-    ok2 = torch.autograd.gradgradcheck(f, (qkv, bias), eps=1e-6, atol=1e-7, rtol=1e-5)
+    tag = f"N{N} L{L} H{H} d{d}" + (" padded" if n_valid else "") + (f" ({dbl})" if dbl != "auto" else "")
+    tag += " fast_mode" if fast else ""
+    os.environ["MLIPCPP_ATTN_DBL"] = dbl
+    kw = dict(eps=1e-6, atol=1e-7, rtol=1e-5, fast_mode=fast)
+    ok1 = torch.autograd.gradcheck(f, (qkv, bias), **kw)
+    ok2 = torch.autograd.gradgradcheck(f, (qkv, bias), **kw)
+    os.environ["MLIPCPP_ATTN_DBL"] = "auto"
     report(f"gradcheck {tag}", 0.0 if ok1 else 1.0, 0.0)
     report(f"gradgradcheck {tag}", 0.0 if ok2 else 1.0, 0.0)
 
@@ -123,6 +138,62 @@ compare("long L70 H4 d16 (bias rows kernel)", 4, 70, 4, 16)
 compare("long L120 H4 d32 (no fused dbl bwd)", 2, 120, 4, 32)
 compare("dense L40 H8 d32", 16, 40, 8, 32, naive=True)
 compare("padded -inf L37 H4 d32", 6, 37, 4, 32, n_valid=[37, 20, 9, 1, 30, 2], naive=True)
+
+# --- tiled double backward (any L): gradgradcheck at long sequences ---
+# float64 fused kernel: fits up to L ~ 50 (99 KiB) / ~ 75 (227 KiB) with d = 8,
+# so L >= 97 runs tiled in auto mode; fast_mode (random projections of the
+# Jacobians) above L = 40, where the full numerical Jacobian of the L x L bias
+# would take too long
+gradchecks(2, 40, 2, 8, n_valid=[40, 23], dbl="tiled")
+gradchecks(2, 40, 2, 8, n_valid=[40, 23], dbl="fused")
+gradchecks(2, 97, 2, 8, n_valid=[97, 61], fast=True)
+gradchecks(1, 160, 2, 8, fast=True)
+gradchecks(2, 300, 1, 8, n_valid=[300, 211], fast=True)
+
+# --- tiled double backward against the float64 reference ---
+for d_ in (8, 16, 32, 64):
+    H_ = 4 if d_ < 64 else 2
+    compare(f"tiled L97 H{H_} d{d_}", 3, 97, H_, d_, dbl="tiled")
+compare("tiled L40 H8 d16", 8, 40, 8, 16, dbl="tiled")
+compare("tiled L160 H8 d16 padded -inf", 4, 160, 8, 16, n_valid=[160, 97, 33, 1], dbl="tiled")
+compare("tiled L160 H8 d16 padded -1e4", 4, 160, 8, 16, n_valid=[160, 97, 33, 1], mask_mode="neg", dbl="tiled")
+compare("tiled L300 H4 d16 padded -inf", 2, 300, 4, 16, n_valid=[300, 150], dbl="tiled")
+compare("tiled L97 H4 d16 first key -inf", 3, 97, 4, 16, first_key_masked=True, dbl="tiled")
+compare("fused L33 H4 d16 first key -inf", 3, 33, 4, 16, first_key_masked=True, dbl="fused")
+compare("tiled L33 H4 d16 first key -inf", 3, 33, 4, 16, first_key_masked=True, dbl="tiled")
+compare("auto L256 H8 d16 padded -inf", 2, 256, 8, 16, n_valid=[256, 130])
+# first-backward bias gradient paths at long L (tiled is the default above L = 64)
+compare("bias rows L97 H4 d16", 3, 97, 4, 16, bias_path="rows")
+compare("bias tiled L50 H4 d16", 3, 50, 4, 16, bias_path="tiled")
+compare("bias tiled L130 H2 d64 padded", 3, 130, 2, 64, n_valid=[130, 70, 3], bias_path="tiled")
+compare("bias seq L40 H8 d16", 4, 40, 8, 16, bias_path="seq")
+compare("bias dq L40 H8 d16 padded", 4, 40, 8, 16, n_valid=[40, 30, 2, 1], bias_path="dq")
+compare("bias dq L200 H32 d8", 2, 200, 32, 8, bias_path="dq")
+compare("auto L70 H3 d16 (tiled bias, 3 heads)", 3, 70, 3, 16)
+compare("auto L23 H1 d32", 5, 23, 1, 32)
+
+# --- tiled vs fused double backward where both run (float32 and float64) ---
+def dbl_outputs(dtype, mode, N, L, H, d, n_valid):
+    torch.manual_seed(5)
+    qkv, bias, mask = make(N, L, H, d, dtype, n_valid)
+    go = torch.randn(N, L, H * d, dtype=dtype, device=dev)
+    gl = torch.randn(N, L, H, dtype=dtype, device=dev)
+    tq, tb = torch.randn_like(qkv), torch.randn_like(bias)
+    os.environ["MLIPCPP_ATTN_DBL"] = mode
+    r = torch.ops.mlipcpp.pet_attention_double_backward(qkv, bias + mask, go, gl, tq, tb, H, 1 / math.sqrt(d))
+    os.environ["MLIPCPP_ATTN_DBL"] = "auto"
+    return r
+
+
+for dtype, tol in ((torch.float64, 1e-12), (torch.float32, 2e-5)):
+    for N_, L_, H_, d_, nv in ((8, 24, 4, 16, None), (6, 33, 4, 32, [33, 20, 9, 1, 30, 2]), (4, 48, 8, 16, None),
+                               (4, 40, 2, 64, None)):
+        if dtype == torch.float64 and (L_ > 40 or d_ > 32):
+            continue  # float64 fused kernel does not fit on 99 KiB GPUs
+        a = dbl_outputs(dtype, "fused", N_, L_, H_, d_, nv)
+        b = dbl_outputs(dtype, "tiled", N_, L_, H_, d_, nv)
+        for name, x, y in zip(["to", "tlse", "gqkv", "gbias"], a, b):
+            report(f"tiled vs fused {str(dtype)[6:]} L{L_} H{H_} d{d_} {name}", rel(y.double(), x.double()), tol)
 
 # --- the mask at -inf on the FIRST key (online softmax starts at -inf) ---
 qkv, bias, mask = make(2, 6, 2, 8, torch.float32)
