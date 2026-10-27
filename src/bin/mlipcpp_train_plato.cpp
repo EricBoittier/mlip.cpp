@@ -16,6 +16,11 @@
 //   hidden weight matrices, each FrameLinear basis kernel a matrix of its own; Adam for the rest (default: Adam).
 //   --max-len N drops the structures with more than N - 1 neighbours of an atom (training and validation):
 //   the ragged attention keeps a sequence in shared memory (the limit depends on head width, frames, GPU).
+//   --bucket-growth G (> 1): geometric shape buckets, edges round_up(1024 G^k, 1024), atoms round_up(128 G^k, 128),
+//   attention length a multiple of 8 (default: multiples of 1024 / 128 / 4), for datasets whose micro-batches
+//   spread over a wide range of sizes (QCell: 2 to 400 atoms per structure); padding costs at most a factor G.
+//   --share-graph-buffer: the cached graphs (--graph-cache N, default 12) share one compute buffer instead of one
+//   each, so memory is the largest graph's, not the sum (the cache is flushed when the buffer grows).
 //   mlipcpp-train-plato --init model.gguf --train data.bin --gradcheck H [--batch-size 8] [weights]: the loss
 //       along the trainer's gradient direction, (L(p + h g/|g|) - L(p - h g/|g|)) / 2h against |g|
 //   mlipcpp-train-plato --init model.gguf --train data.bin --check REF   (REF.json / REF.f64 of
@@ -159,6 +164,14 @@ void inverse3(const double *A, double *I, double &det) {
 
 int64_t round_up(int64_t x, int64_t m) { return (x + m - 1) / m * m; }
 
+// the smallest multiple of m of the form round_up(m g^k, m), k = 0, 1, ..., that is >= x (g > 1):
+// geometric shape buckets, so datasets with a wide spread of batch sizes build a few graphs
+int64_t round_up_geometric(int64_t x, int64_t m, double g) {
+  double v = double(m);
+  while (round_up(int64_t(std::ceil(v)), m) < x) v *= g;
+  return round_up(int64_t(std::ceil(v)), m);
+}
+
 // ---------------------------------------------------------------------------
 // one micro-batch on the host, padded to its shape bucket
 
@@ -185,6 +198,7 @@ struct Context {
   const std::map<int, double> &composition;
   const std::map<int, int> &species_index;
   bool shared_filter = true;
+  double bucket_growth = 0; // > 1: geometric edge / atom buckets (--bucket-growth), else multiples of 1024 / 128
 };
 
 // drop the structures whose longest attention sequence (1 + neighbours within the cutoff) exceeds
@@ -268,10 +282,12 @@ Prepared prepare(const Context &cx, const std::vector<const Structure *> &batch,
   for (int g = 0; g < Gr; g++) e0[g + 1] = e0[g] + int64_t(ed[g].j.size());
   P.E_real = e0[Gr];
   // bucket: padding edges on padding atoms (each at most L - 1), one more structure
-  P.L = int(std::max<int64_t>(8, round_up(L, 4)));
-  P.E = round_up(std::max<int64_t>(P.E_real, 1), 1024);
+  const bool geo = cx.bucket_growth > 1;
+  P.L = int(std::max<int64_t>(8, round_up(L, geo ? 8 : 4)));
+  P.E = geo ? round_up_geometric(std::max<int64_t>(P.E_real, 1), 1024, cx.bucket_growth)
+            : round_up(std::max<int64_t>(P.E_real, 1), 1024);
   const int64_t pad_e = P.E - P.E_real, need = 1 + (pad_e + P.L - 2) / (P.L - 1);
-  P.n = int(round_up(P.n_real + need, 128));
+  P.n = int(geo ? round_up_geometric(P.n_real + need, 128, cx.bucket_growth) : round_up(P.n_real + need, 128));
   const int n = P.n, G = P.G;
   const int64_t E = P.E, T = n + E;
 
@@ -427,7 +443,7 @@ struct BatchGraph {
   ggml_context *ctx = nullptr;
   ggml_cgraph *graph = nullptr;
   ggml_backend_buffer_t ibuf = nullptr;
-  ggml_gallocr_t galloc = nullptr;
+  ggml_gallocr_t galloc = nullptr; // own compute buffer (nullptr with Worker::shared_galloc)
   PlatoInputs in;
   runtime::PlatoOutputs out;
   ggml_tensor *g_ev = nullptr, *g_pos = nullptr, *g_strain = nullptr, *loss_grad = nullptr;
@@ -485,6 +501,10 @@ struct Worker {
   int64_t n_muon_values = 0;
   std::list<std::pair<std::tuple<int, int64_t, int, int, int64_t, int, int, int>, std::unique_ptr<BatchGraph>>> cache;
   size_t cache_limit = 12;
+  // --share-graph-buffer: every cached graph allocated in one compute buffer (they run one at a time),
+  // as mlipcpp-train's Worker; when it grows the other graphs' tensors dangle and the cache is flushed
+  ggml_gallocr_t shared_galloc = nullptr;
+  int64_t cache_flushes = 0;
   double fd_eps = 5e-3, energy_weight = 1, force_weight = 1, charge_weight = 0, stress_weight = 0;
   double t_build = 0, t_compute = 0, t_host = 0; // ms
   int64_t builds = 0;
@@ -558,6 +578,7 @@ struct Worker {
   ggml_context *ctx_mv_ = nullptr;
   ~Worker() {
     cache.clear();
+    if (shared_galloc) ggml_gallocr_free(shared_galloc);
     if (step_galloc) ggml_gallocr_free(step_galloc);
     if (step_inputs) ggml_backend_buffer_free(step_inputs);
     if (acc_buf) ggml_backend_buffer_free(acc_buf);
@@ -677,8 +698,14 @@ struct Worker {
     bg->ibuf = ggml_backend_buft_alloc_buffer(buft, size);
     char *base = static_cast<char *>(ggml_backend_buffer_get_base(bg->ibuf));
     for (size_t k = 0; k < inputs.size(); k++) ggml_backend_tensor_alloc(bg->ibuf, inputs[k], base + offs[k]);
-    bg->galloc = ggml_gallocr_new(buft);
-    if (!ggml_gallocr_alloc_graph(bg->galloc, bg->graph)) throw std::runtime_error("cannot allocate the training graph");
+    if (shared_galloc) {
+      const size_t before = ggml_gallocr_get_buffer_size(shared_galloc, 0);
+      if (!ggml_gallocr_alloc_graph(shared_galloc, bg->graph)) throw std::runtime_error("cannot allocate the training graph");
+      if (ggml_gallocr_get_buffer_size(shared_galloc, 0) != before && !cache.empty()) cache.clear(), cache_flushes++;
+    } else {
+      bg->galloc = ggml_gallocr_new(buft);
+      if (!ggml_gallocr_alloc_graph(bg->galloc, bg->graph)) throw std::runtime_error("cannot allocate the training graph");
+    }
     // inputs that are the same for every batch of the bucket
     std::vector<float> zeros(ggml_nelements(in.zero_ang), 0.0f);
     ggml_backend_tensor_set(in.zero_ang, zeros.data(), 0, ggml_nbytes(in.zero_ang));
@@ -1078,6 +1105,7 @@ int main(int argc, char **argv) {
       w->charge_weight = std::stod(arg(argc, argv, "--charge-weight", "0"));
       w->stress_weight = std::stod(arg(argc, argv, "--stress-weight", "0"));
       w->cache_limit = std::stoul(arg(argc, argv, "--graph-cache", "12"));
+      if (flag(argc, argv, "--share-graph-buffer")) w->shared_galloc = ggml_gallocr_new(w->model->backend()->buffer_type());
       workers.push_back(std::move(w));
     }
     Worker &w0 = *workers[0];
@@ -1093,7 +1121,11 @@ int main(int argc, char **argv) {
       std::printf("--max-len %d: dropped %zu training structures\n", max_len, drop_long(train, max_len, w0.model->spec().cutoff));
     std::printf("%zu training structures, %lld parameters\n", train.size(), (long long)w0.n_values);
     const Context cx{w0.model->spec(), w0.model->energy_scale(), w0.model->mesh_spacing(), w0.model->mesh_round_fft(), w0.model->composition(),
-                     w0.model->species_index()};
+                     w0.model->species_index(), true, std::stod(arg(argc, argv, "--bucket-growth", "0"))};
+    if (cx.bucket_growth > 1 || w0.shared_galloc)
+      std::printf("shape buckets: %s (growth %g); graph compute buffer: %s, graph cache %zu\n",
+                  cx.bucket_growth > 1 ? "geometric" : "multiples of 1024 edges / 128 atoms", cx.bucket_growth,
+                  w0.shared_galloc ? "shared" : "per graph", w0.cache_limit);
 
     const std::string check = arg(argc, argv, "--check", "");
     if (!check.empty()) {
@@ -1413,9 +1445,9 @@ int main(int argc, char **argv) {
       const auto tv = clk::now();
       if (do_val) m = validate();
       const double val_s = std::chrono::duration<double>(clk::now() - tv).count();
-      std::printf("epoch %d: train loss %.6g (E %.4g F %.4g), %.1f s (host wait %.1f, build %.1f, inputs %.1f, compute %.1f s; %lld graphs built), lr %.3g",
+      std::printf("epoch %d: train loss %.6g (E %.4g F %.4g), %.1f s (host wait %.1f, build %.1f, inputs %.1f, compute %.1f s; %lld graphs built, %lld cache flushes), lr %.3g",
                   ep, lt / nb, le / nb, lf / nb, wall, wait_ms / 1e3, w0.t_build / 1e3,
-                  w0.t_host / 1e3, w0.t_compute / 1e3, (long long)w0.builds, lr_at(st.step));
+                  w0.t_host / 1e3, w0.t_compute / 1e3, (long long)w0.builds, (long long)w0.cache_flushes, lr_at(st.step));
       if (do_val)
         std::printf(", val E MAE %.4f meV/atom, F MAE %.4f meV/A, loss %.6g, R2 E %.4f%% F %.4f%% (%.1f s)", 1e3 * m[0], 1e3 * m[1],
                     m[2], m[3], m[4], val_s);
