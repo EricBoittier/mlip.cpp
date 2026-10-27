@@ -280,6 +280,8 @@ typedef struct {
   bool compute_stress;  /**< Whether to compute stress tensor (default: false) */
   bool use_nc_forces;   /**< Use non-conservative forces from forward pass heads
                              (faster, but forces are not gradient of energy) */
+  int32_t charge;            /**< total charge, e (default 0); conditioned models only */
+  int32_t spin_multiplicity; /**< 2S+1 (default 1); conditioned models only */
 } mlipcpp_predict_options_t;
 
 /**
@@ -291,8 +293,19 @@ typedef struct {
  * - compute_forces: true
  * - compute_stress: false
  * - use_nc_forces: false
+ * - charge: 0, spin_multiplicity: 1
  */
 mlipcpp_error_t mlipcpp_predict_options_default(mlipcpp_predict_options_t *options);
+
+/**
+ * @brief Charge / spin conditioning of the model
+ * @param conditioned set to whether the model reads the charge and spin
+ *        multiplicity of mlipcpp_predict_options_t
+ * @param max_charge, max_spin_multiplicity the accepted ranges, [-max_charge,
+ *        max_charge] and [1, max_spin_multiplicity] (may be NULL)
+ */
+mlipcpp_error_t mlipcpp_model_get_conditioning(mlipcpp_model_t model, bool *conditioned,
+                                               int32_t *max_charge, int32_t *max_spin_multiplicity);
 
 /* ============================================================================
  * Prediction
@@ -500,6 +513,8 @@ typedef struct {
   bool rebuild_neighbors;           /**< the atoms may have been reordered or remapped since the last call */
   double skin;                      /**< Verlet skin of mlip.cpp's list, Angstrom (< 0: MLIPCPP_NL_SKIN, or 0.5) */
   bool compute_virial;
+  int32_t charge;                   /**< total charge (conditioned models; default 0) */
+  int32_t spin_multiplicity;        /**< 2S+1 (conditioned models; default 1) */
 } mlipcpp_device_system_t;
 
 /**

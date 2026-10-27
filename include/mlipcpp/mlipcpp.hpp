@@ -113,6 +113,11 @@ struct PredictOptions {
    * Default false uses the autograd-based virial path.
    */
   bool fd_stress = false;
+  /// Total charge (e) and spin multiplicity (2S+1) of the system, read by
+  /// models with charge / spin conditioning (Predictor::conditioned()); out of
+  /// the model's range is an error. Other models ignore them.
+  int charge = 0;
+  int spin_multiplicity = 1;
 };
 
 /**
@@ -178,6 +183,16 @@ public:
    * usable with PredictOptions::use_nc_forces
    */
   bool has_nc_forces() const;
+
+  /**
+   * @brief Whether the model is conditioned on the total charge and spin
+   * multiplicity (PredictOptions::charge, spin_multiplicity), and the ranges
+   * it accepts: charge in [-max_charge(), max_charge()], 2S+1 in
+   * [1, max_spin_multiplicity()]
+   */
+  bool conditioned() const;
+  int max_charge() const;
+  int max_spin_multiplicity() const;
 
   /**
    * @brief Predict energy and optionally forces for a non-periodic system

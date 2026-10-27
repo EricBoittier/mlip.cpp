@@ -392,6 +392,11 @@ bool GraphModel::load_from_gguf(const std::string &path) {
   cutoff_width_adaptive_ = loader.get_float32("pet.cutoff_width_adaptive", cutoff_width_);
   adaptive_cutoff_method_ = loader.get_string("pet.adaptive_cutoff_method", "grid");
   num_heads_ = loader.get_int32("pet.num_heads", 0);
+  conditioning_.enabled = loader.get_int32("pet.system_conditioning", 0) != 0;
+  conditioning_.max_charge = loader.get_int32("pet.max_charge", 10);
+  conditioning_.max_spin_multiplicity = loader.get_int32("pet.max_spin_multiplicity", 10);
+  state_dict_names_ = json::parse(loader.get_string("train.state_dict_names", "{}"))
+                          .get<std::map<std::string, std::string>>();
 
   const auto lr_solver = loader.get_string("pet.long_range.solver", "");
   if (!lr_solver.empty() && lr_solver != "direct-ewald" && lr_solver != "p3m") {
@@ -869,6 +874,15 @@ ModelResult GraphModel::predict_single(
       ggml_set_param(coulomb_t);
   }
 
+  // charge / spin conditioning: the table rows of the structure, per atom
+  ggml_tensor *charge_index_t = nullptr, *spin_index_t = nullptr;
+  if (conditioning_.enabled) {
+    charge_index_t = ggml_new_tensor_1d(input_ctx, GGML_TYPE_I32, n_atoms);
+    ggml_set_name(charge_index_t, "charge_index");
+    spin_index_t = ggml_new_tensor_1d(input_ctx, GGML_TYPE_I32, n_atoms);
+    ggml_set_name(spin_index_t, "spin_index");
+  }
+
   // Mode-specific inputs
   ggml_tensor *edge_distances_t = nullptr;
   ggml_tensor *cutoff_factors_t = nullptr;
@@ -1014,6 +1028,15 @@ ModelResult GraphModel::predict_single(
     ggml_backend_tensor_set(coulomb_t, coulomb.matrix.data(), 0,
                             coulomb.matrix.size() * sizeof(float));
     interp_.set_input("coulomb_matrix", coulomb_t);
+  }
+
+  if (conditioning_.enabled) {
+    const auto [ci, si] = conditioning_.rows(system.charge(), system.spin_multiplicity());
+    std::vector<int32_t> c(n_atoms, ci), sp(n_atoms, si);
+    ggml_backend_tensor_set(charge_index_t, c.data(), 0, c.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(spin_index_t, sp.data(), 0, sp.size() * sizeof(int32_t));
+    interp_.set_input("charge_index", charge_index_t);
+    interp_.set_input("spin_index", spin_index_t);
   }
 
   // Register common inputs

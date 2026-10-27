@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/backend.h"
+#include "core/conditioning.h"
 #include "core/coulomb.h"
 #include "graph_interpreter.h"
 #include "pet_ragged.h"
@@ -50,6 +51,9 @@ public:
   ModelResult predict(const AtomicSystem &system, bool compute_forces) override;
   std::string model_type() const override { return "graph"; }
   float cutoff() const override { return cutoff_; }
+  bool conditioned() const override { return conditioning_.enabled; }
+  int max_charge() const override { return conditioning_.max_charge; }
+  int max_spin_multiplicity() const override { return conditioning_.max_spin_multiplicity; }
 
   /**
    * Load model from GGUF file.
@@ -108,6 +112,7 @@ public:
     bool rebuild = false;                 // the atoms may have been reordered or remapped
     double skin = -1;                     // Verlet skin (A); < 0: MLIPCPP_NL_SKIN or 0.5
     bool virial = false;
+    int charge = 0, spin_multiplicity = 1; // conditioned models (GGUF pet.system_conditioning)
   };
   struct DeviceTotals {
     double energy = 0;
@@ -152,6 +157,12 @@ public:
   /// Names of the trainable tensors (GGUF "train.param_names"; buffers and
   /// constants excluded). Empty for exports that predate it.
   const std::vector<std::string> &param_names() const { return param_names_; }
+  /// GGUF tensor name -> metatrain state-dict name ("train.state_dict_names";
+  /// empty for exports that predate it)
+  const std::map<std::string, std::string> &state_dict_names() const { return state_dict_names_; }
+  /// charge / spin conditioning (GGUF pet.system_conditioning): the graph has the
+  /// inputs "charge_index" and "spin_index" (I32 [n_atoms], table rows)
+  const Conditioning &conditioning() const { return conditioning_; }
 
   /**
    * Run inference and invoke `cb` after the graph compute completes, while
@@ -181,6 +192,8 @@ private:
   std::string gguf_path_;
   std::vector<std::string> weight_names_;
   std::vector<std::string> param_names_;
+  std::map<std::string, std::string> state_dict_names_;
+  Conditioning conditioning_;
   float num_neighbors_adaptive_ = 0.0f;
   float cutoff_width_adaptive_ = 0.0f;
   std::string adaptive_cutoff_method_ = "grid";
@@ -236,6 +249,8 @@ private:
   bool fit_cached_graph(int n_atoms, int max_kept);
   // energy and non-conservative forces of the last compute of cached_
   void read_cached_outputs(const AtomicSystem &system, ModelResult &result) const;
+  // the conditioning inputs of g for (charge, spin multiplicity), when they changed
+  void upload_conditioning(CachedGraph &g, int charge, int spin_multiplicity) const;
   struct CachedGraphDeleter {
     void operator()(CachedGraph *graph) const;
   };

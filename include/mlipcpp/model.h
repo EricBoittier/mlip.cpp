@@ -37,6 +37,13 @@ public:
   /// Get model metadata
   virtual std::string model_type() const = 0;
   virtual float cutoff() const = 0;
+
+  /// Charge / spin conditioning: whether the model reads AtomicSystem::charge()
+  /// and spin_multiplicity(), and the ranges it accepts ([-max_charge,
+  /// max_charge], [1, max_spin_multiplicity]; others are an error)
+  virtual bool conditioned() const { return false; }
+  virtual int max_charge() const { return 0; }
+  virtual int max_spin_multiplicity() const { return 0; }
 };
 
 /// Load a model from GGUF file

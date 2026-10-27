@@ -29,9 +29,15 @@ against the C header only.
 
 ```
 units       metal
-pair_style  mlipcpp pet-mad-s-v1.6.0.gguf [backend auto|cpu|cuda|...]
+pair_style  mlipcpp pet-mad-s-v1.6.0.gguf [backend auto|cpu|cuda|...] [charge Q] [spin 2S+1]
 pair_coeff  * * Pd                     # an element per atom type
 ```
+
+`charge` and `spin` (the total charge and spin multiplicity of the whole box,
+defaults 0 and 1) are for models conditioned on them (metatrain PET with
+`system_conditioning: true`); given to another model, or out of the model's
+range, they are an error. One value for the whole simulation (no per-molecule
+charges).
 
 One MPI rank. Each step the owned atoms, LAMMPS's box (as the cell) and its
 periodicity go to mlip.cpp, which builds its own neighbour list (on the GPU,

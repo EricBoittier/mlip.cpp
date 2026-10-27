@@ -300,6 +300,24 @@ def add_coulomb_input(inputs, names, shapes, n_atoms):
             shapes[:3] + (shapes[3] + ({0: atom_dim, 1: atom_dim},),))
 
 
+def add_conditioning_inputs(inputs, names, shapes, n_atoms):
+    """Append the per-atom rows of the charge and spin tables (conditioned PETs)."""
+    atom_dim = shapes[0][0]
+    zeros = torch.zeros(n_atoms, dtype=torch.long)
+    return (inputs + (zeros, zeros.clone()), names + ["charge_index", "spin_index"],
+            shapes[:3] + (shapes[3] + ({0: atom_dim}, {0: atom_dim}),))
+
+
+def state_dict_names(wrapper, pet):
+    """GGUF tensor name -> metatrain state-dict name of the same parameter (by
+    identity), for per-group learning rates (mlipcpp-train --lr-schedule)."""
+    outer = getattr(pet, '_outer_model', [pet])[0]
+    by_id = {}
+    for name, p in outer.named_parameters():  # first (registered) name of shared ones
+        by_id.setdefault(id(p), name)
+    return {n.replace(".", "_"): by_id[id(p)] for n, p in wrapper.named_parameters() if id(p) in by_id}
+
+
 def metatrain_baselines(model):
     """Fitted composition (Z -> eV), energy scale and per-species
     non-conservative force scales of a metatrain >= 2026.5 PET (outer model,
@@ -404,6 +422,9 @@ def main():
     if wrapper.long_range:
         example_inputs, input_names, dynamic_shapes = add_coulomb_input(
             example_inputs, input_names, dynamic_shapes, n_atoms)
+    if wrapper.conditioning:
+        example_inputs, input_names, dynamic_shapes = add_conditioning_inputs(
+            example_inputs, input_names, dynamic_shapes, n_atoms)
 
     # Export via torch.export
     print("\nExporting graph via torch.export...")
@@ -415,6 +436,8 @@ def main():
             "species": "i32",
             "neighbor_species": "i32",
             "reverse_neighbor_index": "i32",
+            "charge_index": "i32",
+            "spin_index": "i32",
         },
         dynamic_shapes=dynamic_shapes,
         strict=False,
@@ -484,6 +507,11 @@ def main():
             writer.add_int32("pet.long_range.interpolation_nodes", 5)
         writer.add_float32("pet.long_range.smearing", float(calculator.potential.smearing))
         writer.add_float32("pet.long_range.wavelength", float(calculator.mesh_spacing if args.long_range_solver == "p3m" else calculator.lr_wavelength))
+    if wrapper.conditioning:
+        # charge in [-max_charge, max_charge], 2S+1 in [1, max_spin_multiplicity]
+        writer.add_int32("pet.system_conditioning", 1)
+        writer.add_int32("pet.max_charge", wrapper.max_charge)
+        writer.add_int32("pet.max_spin_multiplicity", wrapper.max_spin_multiplicity)
     if nc_force_scales:
         writer.add_array_int32("pet.nc_force_scale_keys", list(nc_force_scales))
         writer.add_array_float32("pet.nc_force_scale_values", list(nc_force_scales.values()))
@@ -508,6 +536,7 @@ def main():
     # Computation graph as JSON string
     writer.add_string("graph.json", graph_json)
     writer.add_string("train.param_names", json.dumps(param_names))
+    writer.add_string("train.state_dict_names", json.dumps(state_dict_names(wrapper, pet)))
 
     # Weight shapes as JSON (for loader to reconstruct tensors)
     weight_shapes = {name: list(t.shape) for name, t in weights.items()}

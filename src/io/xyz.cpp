@@ -1,3 +1,4 @@
+#include "core/conditioning.h"
 #include "mlipcpp/io.h"
 #include <algorithm>
 #include <cctype>
@@ -69,6 +70,28 @@ bool parse_exyz_lattice(const std::string &comment_line, double cell[3][3]) {
   return true;
 }
 
+bool parse_exyz_number(const std::string &comment_line, const std::string &key, double &value) {
+  // key=value or key="value", the key at the start of the line or after a space
+  for (size_t pos = comment_line.find(key + "="); pos != std::string::npos;
+       pos = comment_line.find(key + "=", pos + 1)) {
+    if (pos > 0 && !std::isspace(static_cast<unsigned char>(comment_line[pos - 1]))) continue;
+    size_t start = pos + key.size() + 1;
+    if (start < comment_line.size() && comment_line[start] == '"') start++;
+    std::istringstream iss(comment_line.substr(start));
+    if (!(iss >> value)) throw std::runtime_error("XYZ: cannot parse " + key + "= in: " + comment_line);
+    return true;
+  }
+  return false;
+}
+
+void read_exyz_conditioning(const std::string &comment_line, AtomicSystem &system) {
+  double v = 0;
+  if (parse_exyz_number(comment_line, "charge", v)) system.set_charge(integer_value(v, "charge"));
+  // ASE / metatomic: spin_multiplicity, else spin (OMol's key, also 2S+1)
+  if (parse_exyz_number(comment_line, "spin_multiplicity", v) || parse_exyz_number(comment_line, "spin", v))
+    system.set_spin_multiplicity(integer_value(v, "spin_multiplicity"));
+}
+
 AtomicSystem read_xyz(std::istream &stream) {
   std::string line;
 
@@ -129,13 +152,15 @@ AtomicSystem read_xyz(std::istream &stream) {
     // Convert to float positions
     std::vector<float> positions_f(positions.begin(), positions.end());
 
-    return AtomicSystem(n_atoms, positions_f.data(), atomic_numbers.data(),
-                        &cell_obj);
+    AtomicSystem system(n_atoms, positions_f.data(), atomic_numbers.data(), &cell_obj);
+    read_exyz_conditioning(comment, system);
+    return system;
   } else {
     // No cell - non-periodic
     std::vector<float> positions_f(positions.begin(), positions.end());
-    return AtomicSystem(n_atoms, positions_f.data(), atomic_numbers.data(),
-                        nullptr);
+    AtomicSystem system(n_atoms, positions_f.data(), atomic_numbers.data(), nullptr);
+    read_exyz_conditioning(comment, system);
+    return system;
   }
 }
 

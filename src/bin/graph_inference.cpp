@@ -15,6 +15,7 @@
 #include "models/pet/pet.h"
 #include "runtime/graph_model.h"
 
+#include <optional>
 #include <chrono>
 #include <cstring>
 #include <iomanip>
@@ -38,7 +39,11 @@ void print_usage(const char *prog) {
             << "                    intended as a validation oracle); implies\n"
             << "                    --stress and --forces\n"
             << "  --backend <name>  auto|cpu|metal|webgpu|cuda|hip|vulkan "
-               "(default: auto)\n";
+               "(default: auto)\n"
+            << "  --charge Q        total charge (conditioned models; default:\n"
+            << "                    the xyz's charge=, else 0)\n"
+            << "  --spin S          spin multiplicity 2S+1 (default: the xyz's\n"
+            << "                    spin_multiplicity= or spin=, else 1)\n";
 }
 
 } // namespace
@@ -55,6 +60,7 @@ int main(int argc, char *argv[]) {
   bool compute_stress = false;
   bool fd_stress = false;
   std::string backend_name = "auto";
+  std::optional<int> charge, spin;
 
   for (int i = 3; i < argc; i++) {
     std::string arg = argv[i];
@@ -69,6 +75,10 @@ int main(int argc, char *argv[]) {
       fd_stress = true;
     } else if (arg == "--backend" && i + 1 < argc) {
       backend_name = argv[++i];
+    } else if (arg == "--charge" && i + 1 < argc) {
+      charge = std::stoi(argv[++i]);
+    } else if (arg == "--spin" && i + 1 < argc) {
+      spin = std::stoi(argv[++i]);
     } else {
       std::cerr << "Unknown option: " << arg << "\n";
       print_usage(argv[0]);
@@ -102,6 +112,12 @@ int main(int argc, char *argv[]) {
     }
 
     AtomicSystem system = io::read_xyz(xyz_path);
+    if (charge) system.set_charge(*charge);
+    if (spin) system.set_spin_multiplicity(*spin);
+    if (model->conditioned())
+      std::cout << "Charge " << system.charge() << ", spin multiplicity " << system.spin_multiplicity() << "\n";
+    else if (system.charge() != 0 || system.spin_multiplicity() != 1)
+      std::cerr << "Warning: the model is not conditioned on charge / spin; ignoring them\n";
     std::cout << "Input: " << xyz_path << " (" << system.num_atoms()
               << " atoms)\n";
     std::cout << "Model cutoff: " << model->cutoff() << " A\n";
@@ -125,6 +141,8 @@ int main(int argc, char *argv[]) {
       popts.compute_forces = compute_forces;
       popts.compute_stress = compute_stress;
       popts.fd_stress = true;
+      popts.charge = system.charge();
+      popts.spin_multiplicity = system.spin_multiplicity();
 
       const Cell *cell_ptr = system.cell();
       float lattice_buf[9];

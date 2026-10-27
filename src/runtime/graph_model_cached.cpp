@@ -274,6 +274,10 @@ void GraphModel::build_cached_graph(int n, int M, bool exact_mask, bool backward
   g->padding_mask = input(GGML_TYPE_F32, {M, n}, "padding_mask");
   g->reverse = input(GGML_TYPE_I32, {int64_t(n) * M}, "reverse_neighbor_index");
   g->cutoff_values = input(GGML_TYPE_F32, {M, n}, "cutoff_values");
+  if (conditioning_.enabled) {
+    g->charge_index = input(GGML_TYPE_I32, {n}, "charge_index");
+    g->spin_index = input(GGML_TYPE_I32, {n}, "spin_index");
+  }
   if (backward) {
     ggml_set_param(g->edge_vectors);
     if (adaptive) ggml_set_param(g->cutoff_values);
@@ -497,13 +501,25 @@ bool GraphModel::fit_cached_graph(int n, int max_kept) {
   return true;
 }
 
+void GraphModel::upload_conditioning(CachedGraph &g, int charge, int spin_multiplicity) const {
+  if (!g.charge_index) return;
+  const auto [ci, si] = conditioning_.rows(charge, spin_multiplicity);
+  if (g.cond_set && g.cond_charge == charge && g.cond_spin == spin_multiplicity) return;
+  std::vector<int32_t> c(g.n_atoms, ci), s(g.n_atoms, si);
+  ggml_backend_tensor_set(g.charge_index, c.data(), 0, ggml_nbytes(g.charge_index));
+  ggml_backend_tensor_set(g.spin_index, s.data(), 0, ggml_nbytes(g.spin_index));
+  g.cond_set = true, g.cond_charge = charge, g.cond_spin = spin_multiplicity;
+}
+
 bool GraphModel::use_ragged() {
   if (ragged_state_ >= 0) return ragged_state_ == 1;
   ragged_state_ = 0;
   const char *e = std::getenv("MLIPCPP_RAGGED");
   if (!e || !*e || *e == '0') return false;
   std::string why;
-  if (cutoff_function_ != "bump" || nc_forces_ || long_range_ || !forces_mode_) {
+  if (conditioning_.enabled) {
+    why = "does not implement charge / spin conditioning";
+  } else if (cutoff_function_ != "bump" || nc_forces_ || long_range_ || !forces_mode_) {
     why = "needs a forces-mode model with the bump cutoff, no direct forces and no long range";
   } else {
     ragged_weights_.clear();
@@ -734,6 +750,7 @@ ModelResult GraphModel::predict_cached(const AtomicSystem &system, bool compute_
   if (!ragged) ggml_backend_tensor_set(g.padding_mask, pm.data(), 0, ggml_nbytes(g.padding_mask));
   ggml_backend_tensor_set(g.reverse, rev.data(), 0, ggml_nbytes(g.reverse));
   ggml_backend_tensor_set(g.cutoff_values, cv.data(), 0, ggml_nbytes(g.cutoff_values));
+  upload_conditioning(g, system.charge(), system.spin_multiplicity());
   if (ragged) {
     std::vector<int32_t> off(first.begin(), first.end());
     ggml_backend_tensor_set(g.offsets, off.data(), 0, ggml_nbytes(g.offsets));
@@ -918,6 +935,7 @@ ModelResult GraphModel::predict_cached_device(const AtomicSystem &system, bool c
   const bool no_edges = max_kept == 0, forces_requested = compute_forces;
   if (no_edges) compute_forces = false;
   CachedGraph &g = *cached_;
+  upload_conditioning(g, system.charge(), system.spin_multiplicity());
   if (backend_provider_->compute(compute_forces ? g.graph : g.forward) != GGML_STATUS_SUCCESS)
     throw std::runtime_error("Graph computation failed");
   profile.mark("compute");
@@ -1096,6 +1114,7 @@ GraphModel::DeviceTotals GraphModel::predict_device_step(const DeviceStep &in) {
     }
 
     CachedGraph &g = *cached_;
+    upload_conditioning(g, in.charge, in.spin_multiplicity); // synchronous, only when they change
     if (g.direct < 0) { // every node on the compute backend: no scheduler, no host round trip
       g.direct = 1;
       for (int i = 0; i < ggml_graph_n_nodes(g.graph) && g.direct; i++) {

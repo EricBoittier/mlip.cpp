@@ -1,4 +1,5 @@
 #include "train/dataset.h"
+#include "core/conditioning.h"
 
 #include "core/adaptive_cutoff.h"
 
@@ -94,6 +95,18 @@ MemmapSplit::MemmapSplit(const std::string &dir) : dir_(dir) {
   if (x_.size() != 3 * N || a_.size() != N || c_.size() != 9 * ns ||
       energy_.size() != ns || force_.size() != 3 * N)
     throw std::runtime_error(dir + ": array sizes do not match ns.npy / na.npy");
+  // charge / spin conditioning (metatrain extra_data): float32 [ns, 1], optional
+  auto optional = [&](const char *name, std::vector<int32_t> &out) {
+    const std::string path = dir + "/" + name + ".bin";
+    if (!std::filesystem::exists(path)) return;
+    Mapped<float> m(path);
+    if (m.size() != ns) throw std::runtime_error(path + ": " + std::to_string(m.size()) + " values for " +
+                                                 std::to_string(ns) + " structures");
+    out.resize(ns);
+    for (size_t s = 0; s < ns; s++) out[s] = integer_value(m[s], name);
+  };
+  optional("charge", charge_);
+  optional("spin_multiplicity", spin_);
 }
 
 AtomicSystem MemmapSplit::system(int64_t s) const {
@@ -101,8 +114,11 @@ AtomicSystem MemmapSplit::system(int64_t s) const {
   bool pbc[3];
   for (int k = 0; k < 3; k++)
     pbc[k] = c[3 * k] != 0.0f || c[3 * k + 1] != 0.0f || c[3 * k + 2] != 0.0f;
-  if (!pbc[0] && !pbc[1] && !pbc[2])
-    return AtomicSystem(n_atoms(s), positions(s), numbers(s));
+  if (!pbc[0] && !pbc[1] && !pbc[2]) {
+    AtomicSystem out(n_atoms(s), positions(s), numbers(s));
+    out.set_charge(charge(s)), out.set_spin_multiplicity(spin_multiplicity(s));
+    return out;
+  }
 
   float lattice[3][3];
   std::memcpy(lattice, c, sizeof lattice);
@@ -127,7 +143,9 @@ AtomicSystem MemmapSplit::system(int64_t s) const {
     for (int d = 0; d < 3; d++) lattice[k][d] = 1000.0f * w[d] / norm;
   }
   Cell cell_obj(lattice, pbc[0], pbc[1], pbc[2]);
-  return AtomicSystem(n_atoms(s), positions(s), numbers(s), &cell_obj);
+  AtomicSystem out(n_atoms(s), positions(s), numbers(s), &cell_obj);
+  out.set_charge(charge(s)), out.set_spin_multiplicity(spin_multiplicity(s));
+  return out;
 }
 
 namespace {

@@ -181,6 +181,9 @@ def _unwrap_to_pet(model):
     if getattr(model, 'long_range', False):
         unwrapped.long_range = True
         unwrapped.long_range_featurizer = model.long_range_featurizer
+    # the outermost wrapper, for the metatrain state-dict names of the parameters
+    # (a list, so that it is not registered as a submodule)
+    unwrapped.__dict__['_outer_model'] = [model]
     return unwrapped
 
 
@@ -377,6 +380,15 @@ class PETFullModel(torch.nn.Module):
         self.featurizer_type = getattr(pet_model, 'featurizer_type', 'residual')
         self.num_readout_layers = getattr(pet_model, 'num_readout_layers', len(pet_model.gnn_layers))
 
+        # charge / spin conditioning (metatrain SystemConditioningEmbedding): two
+        # extra graph inputs, per atom, the table rows of the structure's charge and
+        # spin multiplicity (charge + max_charge, 2S+1 - 1), filled by the C++ side
+        self.system_conditioning = getattr(pet_model, 'system_conditioning', None)
+        self.conditioning = self.system_conditioning is not None
+        if self.conditioning:
+            self.max_charge = int(self.system_conditioning.max_charge)
+            self.max_spin_multiplicity = int(self.system_conditioning.max_spin_multiplicity)
+
         # Node embeddings
         self.node_embedders = pet_model.node_embedders
 
@@ -467,7 +479,19 @@ class PETFullModel(torch.nn.Module):
 
         When forces=False: args = (edge_distances, padding_mask, reverse_neighbor_index, cutoff_factors)
         When forces=True:  args = (padding_mask, reverse_neighbor_index, cutoff_values)
+        then the coulomb matrix (PET-LR), then charge_index, spin_index [n_atoms]
+        (conditioned models).
         """
+        cond = None
+        if self.conditioning:
+            # per-atom conditioning features: the per-system embedding of
+            # metatrain, row by row (the gather by system index is the C++ side's)
+            charge_index, spin_index = args[-2], args[-1]
+            args = args[:-2]
+            sc = self.system_conditioning
+            cond = sc.project(torch.cat([sc.charge_embedding(charge_index),
+                                         sc.spin_multiplicity_embedding(spin_index)], dim=-1))
+
         if self.forces:
             padding_mask = args[0]
             reverse_neighbor_index = args[1]
@@ -496,18 +520,18 @@ class PETFullModel(torch.nn.Module):
             return self._forward_feedforward(
                 species, neighbor_species, edge_vectors, edge_distances,
                 padding_mask, reverse_neighbor_index, cutoff_factors,
-                input_messages, n_atoms, max_neighbors, coulomb
+                input_messages, n_atoms, max_neighbors, coulomb, cond
             )
         else:
             return self._forward_residual(
                 species, neighbor_species, edge_vectors, edge_distances,
                 padding_mask, reverse_neighbor_index, cutoff_factors,
-                input_messages, n_atoms, max_neighbors, coulomb
+                input_messages, n_atoms, max_neighbors, coulomb, cond
             )
 
     def _forward_residual(self, species, neighbor_species, edge_vectors, edge_distances,
                           padding_mask, reverse_neighbor_index, cutoff_factors,
-                          input_messages, n_atoms, max_neighbors, coulomb=None):
+                          input_messages, n_atoms, max_neighbors, coulomb=None, cond=None):
         """Residual featurization: per-layer energy accumulation (pet-mad-s style)."""
         # Initialize atomic energies accumulator
         atomic_energies = species.new_zeros(n_atoms, dtype=torch.float32)
@@ -541,6 +565,8 @@ class PETFullModel(torch.nn.Module):
                 torch.zeros_like(output_edge),
                 output_edge,
             )
+            if cond is not None:  # metatrain: after the GNN layer, before the readout
+                output_node = output_node + cond
 
             nodes.append(output_node)
             edges.append(output_edge)
@@ -575,7 +601,7 @@ class PETFullModel(torch.nn.Module):
 
     def _forward_feedforward(self, species, neighbor_species, edge_vectors, edge_distances,
                              padding_mask, reverse_neighbor_index, cutoff_factors,
-                             input_messages, n_atoms, max_neighbors, coulomb=None):
+                             input_messages, n_atoms, max_neighbors, coulomb=None, cond=None):
         """Feedforward featurization: combination_mlps between layers, final-only energy (pet-omad-s style)."""
         # Single node embedder used for all layers
         input_node_embeddings = self.node_embedders[0](species)
@@ -609,6 +635,8 @@ class PETFullModel(torch.nn.Module):
                 output_edge,
             )
 
+            if cond is not None:  # metatrain: after the GNN layer, before the next one
+                output_node = output_node + cond
             # Update node embeddings for next layer
             input_node_embeddings = output_node
 

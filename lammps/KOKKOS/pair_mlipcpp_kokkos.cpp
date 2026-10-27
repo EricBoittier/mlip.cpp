@@ -138,6 +138,8 @@ template <class DeviceType> void PairMLIPCPPKokkos<DeviceType>::compute(int efla
   s.rebuild_neighbors = neighbor->ago == 0;
   s.skin = neighbor->skin;
   s.compute_virial = vflag_global != 0;
+  s.charge = charge;
+  s.spin_multiplicity = spin_multiplicity;
 
   mlipcpp_device_result_t r;
   if (mlipcpp_compute_device(model, &s, &r) != MLIPCPP_OK)

@@ -65,5 +65,13 @@ void write_xyz(std::ostream &stream, const AtomicSystem &system,
  */
 bool parse_exyz_lattice(const std::string &comment_line, double cell[3][3]);
 
+/// key=value (or key="value") of an extended-XYZ comment line as a number;
+/// false if the key is absent
+bool parse_exyz_number(const std::string &comment_line, const std::string &key, double &value);
+
+/// charge= and spin_multiplicity= (or spin=, OMol's key) of an extended-XYZ
+/// comment line into the system (they must be integers; absent: unchanged)
+void read_exyz_conditioning(const std::string &comment_line, AtomicSystem &system);
+
 } // namespace io
 } // namespace mlipcpp

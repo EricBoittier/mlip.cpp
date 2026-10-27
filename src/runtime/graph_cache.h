@@ -54,6 +54,11 @@ struct CachedGraph {
 
   ggml_tensor *species = nullptr, *neighbor_species = nullptr, *edge_vectors = nullptr,
               *padding_mask = nullptr, *reverse = nullptr, *cutoff_values = nullptr;
+  // charge / spin conditioning: I32 [n] table rows (nullptr: an unconditioned model),
+  // and the (charge, spin multiplicity) last uploaded to them
+  ggml_tensor *charge_index = nullptr, *spin_index = nullptr;
+  int cond_charge = 0, cond_spin = 0;
+  bool cond_set = false;
   ggml_tensor *energy = nullptr, *nc = nullptr;            // [1, n], [3, n] (unscaled)
   ggml_tensor *loss = nullptr;                             // what the backward pass differentiates
   ggml_tensor *grad_ev = nullptr, *grad_cv = nullptr;      // dE / d edge_vectors, cutoff_values

@@ -49,6 +49,11 @@ public:
   const float *cell(int64_t s) const { return c_.data() + 9 * s; }
   float energy(int64_t s) const { return energy_[s]; }
   const float *forces(int64_t s) const { return force_.data() + 3 * na_[s]; }
+  /// total charge and spin multiplicity (charge.bin / spin_multiplicity.bin,
+  /// float32 [ns, 1], metatrain's extra_data; absent: 0 and 1)
+  int charge(int64_t s) const { return charge_.empty() ? 0 : charge_[s]; }
+  int spin_multiplicity(int64_t s) const { return spin_.empty() ? 1 : spin_[s]; }
+  bool has_conditioning_data() const { return !charge_.empty() || !spin_.empty(); }
 
   /// System s as an AtomicSystem. Zero cell rows become non-periodic vacuum
   /// vectors so the cell stays invertible for the neighbour-list grid.
@@ -62,6 +67,7 @@ private:
   std::vector<int64_t> na_;
   Mapped<float> x_, c_, energy_, force_;
   Mapped<int32_t> a_;
+  std::vector<int32_t> charge_, spin_;
 };
 
 /// Neighbour lists of every structure in a split, built once and cached on

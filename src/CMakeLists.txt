@@ -254,6 +254,8 @@ if(MLIPCPP_BUILD_TRAINING AND UNIX AND NOT EMSCRIPTEN)
 
     add_executable(mlipcpp-predict bin/mlipcpp_predict.cpp)
     target_link_libraries(mlipcpp-predict PRIVATE mlipcpp_train)
+    add_executable(mlipcpp-eval bin/mlipcpp_eval.cpp)
+    target_link_libraries(mlipcpp-eval PRIVATE mlipcpp_train)
 
     add_executable(mlipcpp-jvp-check bin/mlipcpp_jvp_check.cpp)
     target_link_libraries(mlipcpp-jvp-check PRIVATE mlipcpp_train)

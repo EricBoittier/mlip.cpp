@@ -34,6 +34,7 @@
 #include "force.h"
 #include "memory.h"
 #include "update.h"
+#include "utils.h"
 
 #include <cmath>
 #include <cstring>
@@ -120,6 +121,8 @@ void PairMLIPCPP::compute(int eflag, int vflag)
   mlipcpp_predict_options_default(&opts);
   opts.compute_forces = true;
   opts.compute_stress = periodic && vflag_global;
+  opts.charge = charge;
+  opts.spin_multiplicity = spin_multiplicity;
   mlipcpp_result_t res = nullptr;
   if (mlipcpp_predict_ptr_with_options(model, n, pos.data(), z.data(), periodic ? cell : nullptr,
                                        periodic ? pbc : nullptr, &opts, &res) != MLIPCPP_OK)
@@ -173,11 +176,15 @@ void PairMLIPCPP::settings(int narg, char **arg)
 {
   if (narg < 1 || narg % 2 == 0)
     error->all(FLERR, "Illegal pair_style mlipcpp command: pair_style mlipcpp MODEL.gguf "
-                      "[backend auto|cpu|cuda|hip|metal|vulkan|sycl]");
+                      "[backend auto|cpu|cuda|hip|metal|vulkan|sycl] [charge Q] [spin 2S+1]");
   mlipcpp_model_options_t opts;
   mlipcpp_model_options_default(&opts);
   for (int k = 1; k < narg; k += 2) {
     const std::string key = arg[k], val = arg[k + 1];
+    // total charge and spin multiplicity of the whole box, for models with charge /
+    // spin conditioning (an error with other models, out of the model's range too)
+    if (key == "charge") { charge = utils::inumeric(FLERR, val, false, lmp); continue; }
+    if (key == "spin") { spin_multiplicity = utils::inumeric(FLERR, val, false, lmp); continue; }
     if (key != "backend") error->all(FLERR, "Illegal pair_style mlipcpp keyword: {}", key);
     if (val == "auto") opts.backend = MLIPCPP_BACKEND_AUTO;
     else if (val == "cpu") opts.backend = MLIPCPP_BACKEND_CPU;
@@ -197,6 +204,15 @@ void PairMLIPCPP::settings(int narg, char **arg)
   if (mlipcpp_model_get_cutoff(model, &rc) != MLIPCPP_OK)
     error->all(FLERR, "Pair style mlipcpp: {}", last_error());
   cutoff = rc;
+  bool conditioned = false;
+  int32_t max_q = 0, max_s = 0;
+  if (mlipcpp_model_get_conditioning(model, &conditioned, &max_q, &max_s) != MLIPCPP_OK)
+    error->all(FLERR, "Pair style mlipcpp: {}", last_error());
+  if (!conditioned && (charge != 0 || spin_multiplicity != 1))
+    error->all(FLERR, "Pair style mlipcpp: charge / spin given, but {} is not conditioned on them", arg[0]);
+  if (conditioned && (charge < -max_q || charge > max_q || spin_multiplicity < 1 || spin_multiplicity > max_s))
+    error->all(FLERR, "Pair style mlipcpp: charge {} / spin {} outside the model's [-{}, {}] / [1, {}]", charge,
+               spin_multiplicity, max_q, max_q, max_s);
   if (comm->me == 0)
     utils::logmesg(lmp, "pair_style mlipcpp: {} on {}, cutoff {:.4g} A, mlip.cpp {}\n", arg[0],
                    mlipcpp_get_backend_name(), cutoff, mlipcpp_version());

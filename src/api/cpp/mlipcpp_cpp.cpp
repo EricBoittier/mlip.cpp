@@ -267,7 +267,10 @@ struct Predictor::Impl {
     return stress;
   }
 
-  Result predict_impl(const AtomicSystem &system, const PredictOptions &options) {
+  Result predict_impl(const AtomicSystem &system_in, const PredictOptions &options) {
+    AtomicSystem system = system_in;
+    system.set_charge(options.charge);
+    system.set_spin_multiplicity(options.spin_multiplicity);
     // Use predict_batch for NC forces support
     auto *pet_model = dynamic_cast<pet::PETModel *>(model.get());
     if (pet_model) {
@@ -342,6 +345,9 @@ const std::vector<int32_t> &Predictor::atomic_types() const {
 }
 
 bool Predictor::has_nc_forces() const { return impl_->nc_forces; }
+bool Predictor::conditioned() const { return impl_->model->conditioned(); }
+int Predictor::max_charge() const { return impl_->model->max_charge(); }
+int Predictor::max_spin_multiplicity() const { return impl_->model->max_spin_multiplicity(); }
 
 Result Predictor::predict(std::span<const float> positions,
                           std::span<const int32_t> atomic_numbers,

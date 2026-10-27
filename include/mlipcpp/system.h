@@ -49,11 +49,21 @@ public:
   std::vector<int32_t> &atomic_numbers_mut() { return atomic_numbers_; }
   void set_cell(const Cell &cell) { cell_ = cell; }
 
+  /// Total charge (e) and spin multiplicity 2S+1 of the system, for models with
+  /// charge / spin conditioning (metatrain `system_conditioning`; extxyz
+  /// info["charge"], info["spin_multiplicity"] or info["spin"]). Ignored by
+  /// other models. Defaults: neutral singlet, as metatrain.
+  int charge() const { return charge_; }
+  int spin_multiplicity() const { return spin_multiplicity_; }
+  void set_charge(int charge) { charge_ = charge; }
+  void set_spin_multiplicity(int spin_multiplicity) { spin_multiplicity_ = spin_multiplicity; }
+
 private:
   int n_atoms_ = 0;
   std::vector<float> positions_; // [n_atoms * 3], flattened (x,y,z) per atom
   std::vector<int32_t> atomic_numbers_;
   std::optional<Cell> cell_;
+  int charge_ = 0, spin_multiplicity_ = 1;
 };
 
 } // namespace mlipcpp

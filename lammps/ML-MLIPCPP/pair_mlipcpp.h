@@ -44,6 +44,7 @@ class PairMLIPCPP : public Pair {
   std::vector<int> type_z;          // atomic number of each LAMMPS type
   std::vector<float> pos, frc;      // what crosses the C API, per step
   std::vector<int32_t> z;
+  int charge = 0, spin_multiplicity = 1; // pair_style keywords charge / spin (conditioned models)
 
   void allocate();
 };

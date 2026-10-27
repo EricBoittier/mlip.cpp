@@ -352,6 +352,27 @@ void mlipcpp_model_free(mlipcpp_model_t model) {
   }
 }
 
+mlipcpp_error_t mlipcpp_model_get_conditioning(mlipcpp_model_t model, bool *conditioned,
+                                               int32_t *max_charge, int32_t *max_spin_multiplicity) {
+  if (!model) {
+    set_error("Invalid model handle");
+    return MLIPCPP_ERROR_INVALID_HANDLE;
+  }
+  if (!conditioned) {
+    set_error("NULL conditioned pointer");
+    return MLIPCPP_ERROR_NULL_POINTER;
+  }
+  if (!model->weights_loaded) {
+    set_error("Model weights not loaded");
+    return MLIPCPP_ERROR_MODEL_NOT_LOADED;
+  }
+  *conditioned = model->model->conditioned();
+  if (max_charge) *max_charge = model->model->max_charge();
+  if (max_spin_multiplicity) *max_spin_multiplicity = model->model->max_spin_multiplicity();
+  clear_error();
+  return MLIPCPP_OK;
+}
+
 mlipcpp_error_t mlipcpp_model_get_cutoff(mlipcpp_model_t model, float *cutoff) {
   if (!model) {
     set_error("Invalid model handle");
@@ -390,6 +411,8 @@ mlipcpp_predict_options_default(mlipcpp_predict_options_t *options) {
   options->compute_forces = true;
   options->compute_stress = false;
   options->use_nc_forces = false;
+  options->charge = 0;
+  options->spin_multiplicity = 1;
 
   clear_error();
   return MLIPCPP_OK;
@@ -564,6 +587,8 @@ mlipcpp_error_t mlipcpp_predict_with_options(mlipcpp_model_t model,
     // Create AtomicSystem using the constructor
     mlipcpp::AtomicSystem cpp_system(system->n_atoms, system->positions,
                                      system->atomic_numbers, cell_ptr);
+    cpp_system.set_charge(options->charge);
+    cpp_system.set_spin_multiplicity(options->spin_multiplicity);
 
     // Run prediction using predict_batch for NC forces support
     auto *pet_model = dynamic_cast<mlipcpp::pet::PETModel *>(model->model.get());
@@ -796,6 +821,7 @@ mlipcpp_error_t mlipcpp_device_system_default(mlipcpp_device_system_t *system) {
   system->position_strides[0] = system->force_strides[0] = 3;
   system->position_strides[1] = system->force_strides[1] = 1;
   system->skin = -1.0;
+  system->spin_multiplicity = 1;
   clear_error();
   return MLIPCPP_OK;
 }
@@ -853,6 +879,8 @@ mlipcpp_error_t mlipcpp_compute_device(mlipcpp_model_t model, const mlipcpp_devi
     step.rebuild = system->rebuild_neighbors;
     step.skin = system->skin;
     step.virial = system->compute_virial;
+    step.charge = system->charge;
+    step.spin_multiplicity = system->spin_multiplicity;
     const auto totals = graph->predict_device_step(step);
     result->energy = totals.energy;
     for (int k = 0; k < 6; k++) result->virial[k] = totals.virial[k];
