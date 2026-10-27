@@ -53,6 +53,35 @@ mlipcpp-train --data DATA --init init.gguf -o model.gguf \
   end as `model.gguf`. The final evaluation is on `test/`.
 - `--epochs 0` only evaluates `--init` on val and test.
 
+## Long runs
+
+```bash
+mlipcpp-train --data DATA --init init.gguf -o model.gguf --conservative --nc-force-weight 0 \
+    --batch-size 32 --lr 1e-4 --schedule linear --decay-after 10 --min-lr 1e-6 --grad-clip 1e30 \
+    --epochs 4000 --save-every 100 --state-every 10 --max-hours 23.3 --log log.jsonl
+# next job, after "paused at epoch k":
+mlipcpp-train ... --init model.gguf --resume model.gguf.state
+```
+
+- `--schedule linear`: the lr is constant for `--decay-after` epochs, then
+  linear to `--min-lr` at the last step (LOREM's schedule). The default is
+  metatrain's warmup and cosine.
+- `model.gguf.best.gguf` is the epoch with the highest R²(E) + R²(F) on `val/`
+  (R² = 1 − SSE/SST, energies per atom after the composition, force
+  components pooled).
+- `--log FILE` appends one JSON line per epoch: val E/F MAE (conservative
+  mode), RMSE and R² in %, train loss and RMSE, lr, times. Line 0 is the
+  initial model.
+- `--save-every N` writes `model.gguf.epoch%05d.gguf` (numbered by epochs
+  done) every N epochs instead of a file after every epoch.
+- `--state-every N` writes `model.gguf` and `model.gguf.state` (the Adam
+  moments, step, epoch, best score) every N epochs. With `--max-hours H` the
+  run stops after the epoch in which H hours passed and writes both. A resumed
+  run continues with the same shuffles and rotations (they are seeded per
+  epoch and step). The Muon split over devices has no state support.
+- `scripts/train/xyz_to_memmap.py` writes an extended-XYZ file as a split;
+  `scripts/train/pet_long*.sbatch` are the bio_dimers runs on lyra.
+
 ## Recommended settings
 
 ### Optimizer

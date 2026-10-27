@@ -67,6 +67,14 @@ double lr_factor(int64_t step, int64_t total, int64_t warmup) {
   return 0.5 * (1.0 + std::cos(std::numbers::pi * progress));
 }
 
+/// LOREM's schedule: 1 for the first `constant` steps, then linear to
+/// `min_factor` at the end.
+double lr_factor_linear(int64_t step, int64_t total, int64_t constant, double min_factor) {
+  if (step < constant) return 1.0;
+  const double progress = double(step - constant) / double(std::max<int64_t>(1, total - constant));
+  return 1.0 + (min_factor - 1.0) * std::min(1.0, progress);
+}
+
 
 void write_gguf(const std::string &src, const std::string &dst, Worker &w,
                 const std::vector<float> &flat, const TargetScaling &sc) {
@@ -108,6 +116,40 @@ void write_gguf(const std::string &src, const std::string &dst, Worker &w,
   std::filesystem::rename(tmp, dst);
 }
 
+/// <output>.state of a chain of jobs: epochs done, the global step, the best
+/// validation score and the optimizer state (Optimizer::get_state).
+struct TrainState {
+  int64_t epoch = 0, step = 0;
+  double best = -1e300;
+  std::vector<uint8_t> optimizer;
+};
+constexpr char state_magic[8] = {'M', 'L', 'P', 'S', 'T', 'A', 'T', '1'};
+
+void write_state(const std::string &path, const TrainState &s) {
+  const std::string tmp = path + ".tmp";
+  std::unique_ptr<std::FILE, int (*)(std::FILE *)> f(std::fopen(tmp.c_str(), "wb"), std::fclose);
+  const uint64_t n = s.optimizer.size();
+  bool ok = f && std::fwrite(state_magic, 1, 8, f.get()) == 8 && std::fwrite(&s.epoch, 8, 1, f.get()) == 1 &&
+            std::fwrite(&s.step, 8, 1, f.get()) == 1 && std::fwrite(&s.best, 8, 1, f.get()) == 1 &&
+            std::fwrite(&n, 8, 1, f.get()) == 1 && std::fwrite(s.optimizer.data(), 1, n, f.get()) == n;
+  ok = f && std::fclose(f.release()) == 0 && ok;
+  if (!ok) throw std::runtime_error("cannot write " + path);
+  std::filesystem::rename(tmp, path);
+}
+
+TrainState read_state(const std::string &path) {
+  std::unique_ptr<std::FILE, int (*)(std::FILE *)> f(std::fopen(path.c_str(), "rb"), std::fclose);
+  char magic[8];
+  TrainState s;
+  uint64_t n = 0;
+  if (!f || std::fread(magic, 1, 8, f.get()) != 8 || std::memcmp(magic, state_magic, 8) != 0 ||
+      std::fread(&s.epoch, 8, 1, f.get()) != 1 || std::fread(&s.step, 8, 1, f.get()) != 1 ||
+      std::fread(&s.best, 8, 1, f.get()) != 1 || std::fread(&n, 8, 1, f.get()) != 1)
+    throw std::runtime_error("cannot read the trainer state " + path);
+  s.optimizer.resize(n);
+  if (std::fread(s.optimizer.data(), 1, n, f.get()) != n) throw std::runtime_error(path + ": truncated");
+  return s;
+}
 
 /// Online least squares for CostModel: decayed normal equations over the
 /// measured micro-batch times, non-negative coefficients (features with a
@@ -246,6 +288,8 @@ StepStats &StepStats::operator+=(const StepStats &o) {
   loss += o.loss, loss_energy += o.loss_energy, loss_force += o.loss_force;
   loss_nc += o.loss_nc, se_force_nc += o.se_force_nc;
   se_energy_per_atom += o.se_energy_per_atom, se_force += o.se_force;
+  ae_energy_per_atom += o.ae_energy_per_atom, ae_force += o.ae_force;
+  sum_e += o.sum_e, sum2_e += o.sum2_e, sum_f += o.sum_f, sum2_f += o.sum2_f;
   n_systems += o.n_systems, n_force_components += o.n_force_components;
   return *this;
 }
@@ -361,6 +405,22 @@ void fill_constants(const std::vector<std::pair<ggml_tensor *, float>> &cs) {
     if (!t->buffer) continue;
     staging.assign(ggml_nelements(t), v);
     ggml_backend_tensor_set(t, staging.data(), 0, ggml_nbytes(t));
+  }
+}
+
+/// The targets' sums for R^2: physical energies per atom after the
+/// composition (eV/atom) and force components (eV/A) of the real structures.
+void add_target_sums(const Batch &b, double energy_scale, StepStats &st) {
+  for (int k = 0; k < b.n_real_systems; k++) {
+    const double y = double(b.energy_target[k]) * energy_scale;
+    st.sum_e += y, st.sum2_e += y * y;
+  }
+  for (int a = 0; a < b.n_atoms; a++) {
+    if (b.force_mask[a] == 0.0f) continue;
+    for (int c = 0; c < 3; c++) {
+      const double y = double(b.force_target[3 * a + c]) * b.force_scale[a];
+      st.sum_f += y, st.sum2_f += y * y;
+    }
   }
 }
 
@@ -720,6 +780,7 @@ StepStats Worker::run(const Batch &b, double energy_scale, bool backward) {
   st.se_force = stats[3];
   st.n_systems = b.n_real_systems;
   for (float w : b.force_mask) st.n_force_components += 3 * static_cast<int64_t>(w);
+  add_target_sums(b, energy_scale, st);
   if (system_errors) {
     std::vector<float> ps(2 * static_cast<size_t>(S));
     ggml_backend_tensor_get(g->per_system, ps.data(), 0, ps.size() * sizeof(float));
@@ -798,7 +859,9 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
     d_e[k] -= b.energy_target[k];
     st.loss_energy += w.energy * e_norm * d_e[k] * d_e[k];
     st.se_energy_per_atom += d_e[k] * d_e[k] * energy_scale * energy_scale;
+    if (k < b.n_real_systems) st.ae_energy_per_atom += std::abs(d_e[k]) * energy_scale;
   }
+  add_target_sums(b, energy_scale, st);
   std::vector<float> per_atom(n, 0.0f);
   for (int a = 0, sys = 0, left = S ? b.n_per_system[0] : 0; a < n; a++) {
     if (b.force_mask[a] == 0.0f) continue;
@@ -813,6 +876,7 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
       st.loss_nc += w.nc_force * f_norm * rnc * rnc;
       st.se_force_nc += std::pow(rnc * b.force_scale[a], 2);
       e2 += std::pow(r * energy_scale, 2);
+      st.ae_force += std::abs(r) * energy_scale;
       u[3 * a + c] = 2 * w.force * f_norm * r;
     }
     st.se_force += e2;
@@ -1525,6 +1589,44 @@ void Optimizer::stage(size_t w) {
   staged_[w] = 1;
 }
 
+std::vector<uint8_t> Optimizer::get_state() const {
+  // the step count, then every tensor of the state buffer (moments, momenta;
+  // the staging and constants come along, they are overwritten anyway)
+  if (!replicas_.empty()) {
+    std::vector<uint8_t> s = replicas_[0]->get_state(); // the replicas step identically
+    std::memcpy(s.data() + sizeof(int64_t), &t_, sizeof t_);
+    return s;
+  }
+  if (!shards_.empty()) throw std::runtime_error("optimizer state: not with the Muon split over devices");
+  std::vector<uint8_t> s(2 * sizeof(int64_t));
+  std::memcpy(s.data(), &t_, sizeof t_);
+  for (ggml_tensor *t = ggml_get_first_tensor(ctx_); t; t = ggml_get_next_tensor(ctx_, t)) {
+    const size_t at = s.size();
+    s.resize(at + ggml_nbytes(t));
+    ggml_backend_tensor_get(t, s.data() + at, 0, ggml_nbytes(t));
+  }
+  return s;
+}
+
+void Optimizer::set_state(const std::vector<uint8_t> &s) {
+  if (s.size() < 2 * sizeof(int64_t)) throw std::runtime_error("optimizer state: truncated");
+  if (!replicas_.empty()) {
+    for (auto &r : replicas_) r->set_state(s);
+    std::memcpy(&t_, s.data() + sizeof(int64_t), sizeof t_);
+    return;
+  }
+  if (!shards_.empty()) throw std::runtime_error("optimizer state: not with the Muon split over devices");
+  size_t at = 2 * sizeof(int64_t);
+  for (ggml_tensor *t = ggml_get_first_tensor(ctx_); t; t = ggml_get_next_tensor(ctx_, t)) at += ggml_nbytes(t);
+  if (at != s.size()) throw std::runtime_error("optimizer state: size mismatch (another model or optimizer?)");
+  std::memcpy(&t_, s.data(), sizeof t_);
+  at = 2 * sizeof(int64_t);
+  for (ggml_tensor *t = ggml_get_first_tensor(ctx_); t; t = ggml_get_next_tensor(ctx_, t)) {
+    ggml_backend_tensor_set(t, s.data() + at, 0, ggml_nbytes(t));
+    at += ggml_nbytes(t);
+  }
+}
+
 void train(const TrainOptions &o) {
   auto t_setup = clock_type::now();
   MemmapSplit train_split(o.data_dir + "/train"), val_split(o.data_dir + "/val"),
@@ -1610,6 +1712,12 @@ void train(const TrainOptions &o) {
   const int64_t steps_per_epoch = static_cast<int64_t>(ids_train.size()) / (int64_t(B) * W); // drop_last
   const int64_t total_steps = o.epochs * steps_per_epoch;
   const int64_t warmup = static_cast<int64_t>(o.warmup_fraction * total_steps);
+  if (o.schedule != "cosine" && o.schedule != "linear") throw std::runtime_error("--schedule must be cosine or linear");
+  const bool linear = o.schedule == "linear";
+  auto lr_at = [&](int64_t step) {
+    return o.lr * (linear ? lr_factor_linear(step, total_steps, int64_t(o.decay_after) * steps_per_epoch, o.min_lr / o.lr)
+                          : lr_factor(step, total_steps, warmup));
+  };
 
   // identical parameters on every worker, then the device-side optimizer
   std::vector<float> params = w0.get_params();
@@ -1628,8 +1736,16 @@ void train(const TrainOptions &o) {
                                             "graph cache {} shapes/device",
                                             o.tile_nb_ratio, o.tile_atom_ratio, B, o.graph_cache)
                               : std::string("dynamic shapes"));
-  fmt::print("setup: {:.1f} s; {} steps/epoch of {} x {} structures, warmup {} steps\n",
-             seconds_since(t_setup), steps_per_epoch, W, B, warmup);
+  fmt::print("setup: {:.1f} s; {} steps/epoch of {} x {} structures, {}\n", seconds_since(t_setup), steps_per_epoch, W, B,
+             linear ? fmt::format("lr {:g} for {} epochs, then linear to {:g}", o.lr, o.decay_after, o.min_lr)
+                    : fmt::format("warmup {} steps, then cosine", warmup));
+  TrainState state;
+  if (!o.resume.empty()) {
+    state = read_state(o.resume);
+    optimizer.set_state(state.optimizer);
+    fmt::print("resumed from {}: {} epochs done, step {}, best R2(E) + R2(F) {:.6g}%\n", o.resume, state.epoch,
+               state.step, state.best);
+  }
   if (!optimizer.muon_split.empty()) fmt::print("muon split: {}\n", optimizer.muon_split);
 
   // per-structure records of the workers (--dump-errors / --log-errors)
@@ -1667,6 +1783,34 @@ void train(const TrainOptions &o) {
   auto rmse = [](const StepStats &s) {
     return std::pair{1e3 * std::sqrt(s.se_energy_per_atom / s.n_systems),
                      1e3 * std::sqrt(s.se_force / s.n_force_components)};
+  };
+  // MAE (conservative mode) and R^2 in % (energies per atom after the composition, force components pooled)
+  auto mae = [](const StepStats &s) {
+    return std::pair{1e3 * s.ae_energy_per_atom / s.n_systems, 1e3 * s.ae_force / s.n_force_components};
+  };
+  auto r2 = [](const StepStats &s) {
+    auto one = [](double sse, double sum, double sum2, int64_t n) { return 100 * (1 - sse / (sum2 - sum * sum / n)); };
+    return std::pair{one(s.se_energy_per_atom, s.sum_e, s.sum2_e, s.n_systems),
+                     one(s.se_force, s.sum_f, s.sum2_f, s.n_force_components)};
+  };
+  std::unique_ptr<std::FILE, int (*)(std::FILE *)> jsonl(nullptr, std::fclose);
+  if (!o.log_jsonl.empty() && !eval_only) {
+    jsonl.reset(std::fopen(o.log_jsonl.c_str(), "a"));
+    if (!jsonl) throw std::runtime_error("cannot open " + o.log_jsonl);
+  }
+  // one line of val metrics (and the `extra` fields) per epoch
+  auto log_line = [&](int64_t epoch, const StepStats &val, const std::string &extra) {
+    if (!jsonl) return;
+    auto [ve, vf] = rmse(val);
+    auto [ae, af] = mae(val);
+    auto [re, rf] = r2(val);
+    auto num = [](double x) { return std::isfinite(x) ? fmt::format("{}", x) : std::string("null"); };
+    fmt::print(jsonl.get(),
+               "{{\"epoch\":{}{},\"val_e_mae_mev_atom\":{},\"val_f_mae_mev_a\":{},\"val_e_rmse_mev_atom\":{},"
+               "\"val_f_rmse_mev_a\":{},\"val_r2_e\":{},\"val_r2_f\":{}}}\n",
+               epoch, extra, o.conservative ? num(ae) : "null", o.conservative ? num(af) : "null", num(ve), num(vf),
+               num(re), num(rf));
+    std::fflush(jsonl.get());
   };
   // conservative mode: the direct head's force RMSE too
   auto nc_rmse = [&](const StepStats &s) {
@@ -1730,8 +1874,10 @@ void train(const TrainOptions &o) {
                o.log_errors_epochs);
   }
 
-  int64_t global_step = 0;
-  for (int epoch = 0; epoch < o.epochs && global_step != o.max_steps; epoch++) {
+  int64_t global_step = state.step;
+  if (jsonl && o.resume.empty()) log_line(0, evaluate(val_split, nl_val, ids_val), ""); // the initial model
+  const auto t_run = clock_type::now();
+  for (int epoch = static_cast<int>(state.epoch); epoch < o.epochs && global_step != o.max_steps; epoch++) {
     const bool logging = log_file && epoch < o.log_errors_epochs;
     collect_errors(logging);
     std::vector<int64_t> perm = ids_train;
@@ -1784,7 +1930,7 @@ void train(const TrainOptions &o) {
 
       // DDP: average, clip to the global norm, Adam -- all on device 0
       t = clock_type::now();
-      const double lr = o.lr * lr_factor(global_step, total_steps, warmup);
+      const double lr = lr_at(global_step);
       const double norm = optimizer.step(lr);
       if (!std::isfinite(norm)) throw std::runtime_error(fmt::format("non-finite gradient at step {}", global_step));
       t_sync += seconds_since(t);
@@ -1828,15 +1974,39 @@ void train(const TrainOptions &o) {
 
     auto t = clock_type::now();
     const StepStats val = evaluate(val_split, nl_val, ids_val);
+    const double t_val = seconds_since(t);
     auto [ve, vf] = rmse(val);
+    auto [re, rf] = r2(val);
     fmt::print("epoch {} done: train {:.1f} s ({:.1f} struct/s, mean loss {:.4g}), RMSE E {:.2f} meV/atom, "
-               "F {:.2f} meV/A{} | val ({:.1f} s) RMSE E {:.2f} meV/atom, F {:.2f} meV/A{}\n",
+               "F {:.2f} meV/A{} | val ({:.1f} s) RMSE E {:.2f} meV/atom, F {:.2f} meV/A{}, R2 E {:.4f}% F {:.4f}%\n",
                epoch, t_train, ep.n_systems / t_train, ep.loss / done, tre, trf, nc_rmse(ep),
-               seconds_since(t), ve, vf, nc_rmse(val));
+               t_val, ve, vf, nc_rmse(val), re, rf);
     std::fflush(stdout);
     params = w0.get_params(); // the master copy lives on device 0
-    write_gguf(o.init_gguf, fmt::format("{}.epoch{}", o.output, epoch), w0, params, scaling);
+    const int64_t done_epochs = epoch + 1;
+    // LOREM's checkpoint selection: the highest R^2(E) + R^2(F) on val/
+    const bool best = re + rf > state.best;
+    if (best) state.best = re + rf, write_gguf(o.init_gguf, o.output + ".best.gguf", w0, params, scaling);
+    log_line(done_epochs, val,
+             fmt::format(",\"step\":{},\"lr\":{},\"train_loss\":{},\"train_e_rmse_mev_atom\":{},\"train_f_rmse_mev_a\":{},"
+                         "\"wall_s\":{},\"val_s\":{},\"best\":{}",
+                         global_step, lr_at(global_step), ep.loss / done, tre, trf, t_train, t_val, best));
+    if (o.save_every <= 0)
+      write_gguf(o.init_gguf, fmt::format("{}.epoch{}", o.output, epoch), w0, params, scaling);
+    else if (done_epochs % o.save_every == 0)
+      write_gguf(o.init_gguf, fmt::format("{}.epoch{:05d}.gguf", o.output, done_epochs), w0, params, scaling);
+    const bool pause = o.max_hours > 0 && done_epochs < o.epochs && seconds_since(t_run) / 3600 > o.max_hours;
+    if ((o.state_every > 0 && done_epochs % o.state_every == 0) || pause) {
+      write_gguf(o.init_gguf, o.output, w0, params, scaling);
+      state.epoch = done_epochs, state.step = global_step, state.optimizer = optimizer.get_state();
+      write_state(o.output + ".state", state);
+    }
     std::fflush(stdout);
+    if (pause) {
+      fmt::print("paused at epoch {} ({:.2f} h): wrote {} and {}.state\n", done_epochs, seconds_since(t_run) / 3600,
+                 o.output, o.output);
+      return;
+    }
   }
 
   log_file.reset();
