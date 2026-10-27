@@ -1211,6 +1211,7 @@ ModelResult GraphModel::predict_single(
   }
 
   interp_.init_constants();
+  if (plato) plato->upload(system.positions()); // again: the inputs made while building
   profile.mark("build_allocate");
 
   P3MResult mesh_result;

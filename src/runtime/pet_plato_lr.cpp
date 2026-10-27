@@ -90,6 +90,8 @@ void PetPlatoLR::create(ggml_context *ctx, const PetPlatoLRSpec &spec, const std
   spec_ = spec, st_ = structures, n_ = n_atoms;
   all_.clear(), groups_.clear();
   frac_ = pair_r_ = charges_ = key_log_keep_ = nullptr;
+  lazy_i32_.clear(), lazy_f32_.clear();
+  swap_halves_ = rope_sign_ = slot_mask_ = nullptr;
   strain = nullptr, pair_i_ = pair_j_ = nullptr, atom_inv_cell_t_ = nullptr, open_mask_ = nullptr;
   n_pairs_ = 0, any_open_ = false;
   const int G = static_cast<int>(st_.size());
@@ -322,6 +324,8 @@ void PetPlatoLR::upload(const float *pos) const {
   if (pair_i_) set(pair_i_, h_pi_.data()), set(pair_j_, h_pj_.data());
   if (open_mask_) set(open_mask_, h_omask_.data());
   if (atom_inv_cell_t_) set(atom_inv_cell_t_, h_aict_.data());
+  for (const auto &[t, v] : lazy_i32_) set(t, v.data());
+  for (const auto &[t, v] : lazy_f32_) set(t, v.data());
   for (const Group &q : groups_) {
     std::vector<float> z(ggml_nelements(q.strain), 0.0f);
     set(q.strain, z.data());
@@ -381,6 +385,60 @@ ggml_tensor *PetPlatoLR::rope_attn(ggml_context *ctx, const GIRNode &node, const
     return ggml_view_4d(ctx, x, C2, L, H, N, x->nb[1], x->nb[2], x->nb[3], s * C2 * ggml_element_size(x));
   };
   static const bool loop = std::getenv("MLIPCPP_PLATO_FRAME_LOOP") != nullptr;
+  static const bool no_qkv = std::getenv("MLIPCPP_PLATO_ROPE_CONCAT") != nullptr;
+  // the projection x [D, 3, L, N] the q, k, v views come from (the model's input_linear)
+  ggml_tensor *x3 = nullptr;
+  if (!loop && !no_qkv) {
+    auto base = [&](ggml_tensor *t) -> ggml_tensor * {
+      for (int depth = 0; t && depth < 8; depth++) {
+        ggml_tensor *b = t->view_src ? t->view_src : t;
+        if (ggml_nelements(b) == 3 * D * L * N && ggml_is_contiguous(b) && b->type == GGML_TYPE_F32 &&
+            (b->ne[0] == D || b->ne[0] == 3 * D))
+          return b;
+        t = t->src[0];
+      }
+      return nullptr;
+    };
+    ggml_tensor *bq = base(in[0]), *bk = base(in[1]), *bv = base(in[2]);
+    if (bq && bq == bk && bq == bv) x3 = bq;
+  }
+  if (x3) {
+    // every frame at once, without concatenations: the q, k, v slots of x rotated together
+    // (the v slot by angle 0) on the frames' copies of the sequences, one fused attention
+    //   y = x cos(a) + swap(x) (sign sin(a)), swap: the two halves of each head exchanged
+    const int64_t NF = N * F, S = L * N;
+    ggml_tensor *om2 = ggml_concat(ctx, omega, omega, 1);                                       // [3, Ch]
+    ggml_tensor *Rw = mm_f32(ctx, ggml_reshape_2d(ctx, cont(ctx, frames), 3, 3 * F), om2);     // [3F, Ch]
+    Rw = ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, Rw, 3, F, Ch), 0, 2, 1, 3)), 3, Ch * F);
+    ggml_tensor *ang = mm_f32(ctx, Rw, pos);                                                   // [Ch F, L N]
+    ang = ggml_reshape_4d(ctx, ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, ang, Ch, F, S), 0, 2, 1, 3)), Ch, 1, 1, S * F);
+    if (!rope_sign_) { // -1 on the first half of a head, +1 on the second; slots q, k rotated, v not
+      std::vector<float> sg(Ch), m = {1.0f, 1.0f, 0.0f};
+      for (int64_t c2 = 0; c2 < Ch; c2++) sg[c2] = c2 < C2 ? -1.0f : 1.0f;
+      rope_sign_ = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, Ch);
+      slot_mask_ = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, 1, 3, 1);
+      for (ggml_tensor *t : {rope_sign_, slot_mask_}) ggml_set_input(t), all_.push_back(t);
+      lazy_f32_.emplace_back(rope_sign_, sg), lazy_f32_.emplace_back(slot_mask_, m);
+    }
+    ggml_tensor *shape3 = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, Ch, 1, 3, S * F);
+    ggml_tensor *cc = ggml_add(ctx, ggml_mul(ctx, ggml_repeat(ctx, ggml_scale_bias(ctx, ggml_cos(ctx, ang), 1.0f, -1.0f), shape3), slot_mask_),
+                               ggml_fill(ctx, ggml_dup_tensor(ctx, shape3), 1.0f));            // cos (q, k), 1 (v)
+    ggml_tensor *ss = ggml_mul(ctx, ggml_repeat(ctx, ggml_mul(ctx, ggml_sin(ctx, ang), ggml_reshape_4d(ctx, rope_sign_, Ch, 1, 1, 1)), shape3),
+                               slot_mask_);                                                    // sign sin (q, k), 0 (v)
+    ggml_tensor *xF = ggml_repeat(ctx, ggml_reshape_4d(ctx, x3, Ch, H, 3, S), ggml_new_tensor_4d(ctx, GGML_TYPE_F32, Ch, H, 3, S * F));
+    const int64_t rows = 2 * H * 3 * S * F;
+    ggml_tensor *xs = ggml_reshape_4d(ctx, ggml_get_rows(ctx, ggml_reshape_2d(ctx, xF, C2, rows), swap_index(ctx, rows)), Ch, H, 3, S * F);
+    ggml_tensor *xt = ggml_reshape_4d(ctx, ggml_add(ctx, ggml_mul(ctx, xF, cc), ggml_mul(ctx, xs, ss)), D, 3, L, NF);
+    ggml_tensor *bF = ggml_repeat(ctx, bias, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, L, L, 1, NF));
+    ggml_tensor *r = ggml_pet_attn(ctx, xt, bF, static_cast<int>(H), scale); // [D + H, L, NF]
+    ggml_tensor *o = nullptr;
+    for (int f = 0; f < F; f++) {
+      ggml_tensor *of = ggml_view_3d(ctx, r, D, L, N, r->nb[1], r->nb[2], f * N * r->nb[2]);
+      o = o ? ggml_add(ctx, o, of) : ggml_cont(ctx, of);
+    }
+    if (F > 1) o = ggml_scale(ctx, o, 1.0f / F);
+    return ggml_permute(ctx, ggml_reshape_4d(ctx, o, Ch, H, L, N), 0, 2, 1, 3); // [Ch, L, H, N]
+  }
   if (!loop) {
     // every frame at once: the frames as an outer block of the sequence axis, N F sequences in
     // one fused attention (fewer, larger kernels than one attention per frame)
@@ -462,6 +520,19 @@ ggml_tensor *PetPlatoLR::edge_sum(ggml_context *ctx, const std::vector<ggml_tens
   }
   if (F > 1) acc = ggml_scale(ctx, acc, 1.0f / F);
   return ggml_reshape_3d(ctx, acc, d, M, n);
+}
+
+ggml_tensor *PetPlatoLR::swap_index(ggml_context *ctx, int64_t rows) {
+  for (const auto &[t, v] : lazy_i32_)
+    if (ggml_nelements(t) == rows && t->name[0] == 's') return t;
+  ggml_tensor *t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, rows);
+  ggml_set_name(t, "swap_halves");
+  ggml_set_input(t);
+  all_.push_back(t);
+  std::vector<int32_t> v(rows);
+  for (int64_t r = 0; r < rows; r++) v[r] = static_cast<int32_t>(r ^ 1);
+  lazy_i32_.emplace_back(t, std::move(v));
+  return t;
 }
 
 ggml_tensor *PetPlatoLR::pearson(ggml_context *ctx, ggml_tensor *a, ggml_tensor *b) const {

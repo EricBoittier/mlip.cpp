@@ -124,6 +124,11 @@ private:
   std::vector<float> h_onehot_, h_invc_, h_qpa_, h_aict_, h_omask_;
   ggml_tensor *frac_ = nullptr, *pair_r_ = nullptr; // built once per graph
   ggml_tensor *charges_ = nullptr, *padding_mask_ = nullptr, *key_log_keep_ = nullptr;
+  // inputs made while building (shape-dependent constants): tensor and its values
+  std::vector<std::pair<ggml_tensor *, std::vector<int32_t>>> lazy_i32_;
+  std::vector<std::pair<ggml_tensor *, std::vector<float>>> lazy_f32_;
+  ggml_tensor *swap_halves_ = nullptr, *rope_sign_ = nullptr, *slot_mask_ = nullptr;
+  ggml_tensor *swap_index(ggml_context *ctx, int64_t rows);
 
   ggml_tensor *frac(ggml_context *ctx);
   ggml_tensor *pair_r(ggml_context *ctx); // [1, P] distances of the pairs

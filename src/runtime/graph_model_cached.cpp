@@ -287,7 +287,6 @@ void GraphModel::build_cached_graph(int n, int M, bool exact_mask, bool backward
     g->plato = std::make_unique<PetPlatoLR>();
     g->plato->create(ctx, plato_lr_, plato_st_, n, backward && plato_lr_.long_range());
     g->plato->set_padding_mask(g->padding_mask);
-    for (ggml_tensor *t : g->plato->tensors()) inputs.push_back(t);
     interp_.custom_op = [p = g->plato.get()](ggml_context *c, const GIRNode &node, const std::vector<ggml_tensor *> &in) {
       return p->build(c, node, in);
     };
@@ -310,6 +309,8 @@ void GraphModel::build_cached_graph(int n, int M, bool exact_mask, bool backward
   interp_.set_input_gradients(false);
   interp_.set_fuse_glu(false);
   if (!out) throw std::runtime_error("GraphModel: cannot build the model graph");
+  if (g->plato) // (after the build: it makes some inputs of its own)
+    for (ggml_tensor *t : g->plato->tensors()) inputs.push_back(t);
   // [1, n] contiguous outputs (a view of `out` would not keep the allocator
   // from reusing its memory in the backward pass)
   g->energy = nc_forces_ ? ggml_cont(ctx, ggml_view_2d(ctx, out, 1, n, out->nb[1], 0)) : ggml_cont(ctx, out);
