@@ -329,6 +329,35 @@ __global__ void radii_kernel(int n, int K, const int32_t *count, const double *c
   if (lane == 0) r[i] = a.r, root[i] = a.root, dn[i] = a.dn_root, clamped[i] = a.clamped;
 }
 
+// grid_solve's reductions across a warp (lane 0's totals everywhere, so all
+// lanes agree bit for bit), and the warp's shared scratch synchronised
+struct WarpGrid {
+  __device__ void max(double &a) const {
+    for (int o = 16; o > 0; o >>= 1) a = fmax(a, __shfl_xor_sync(0xffffffffu, a, o));
+    a = __shfl_sync(0xffffffffu, a, 0);
+  }
+  __device__ void sum(double &a, double &b) const {
+    for (int o = 16; o > 0; o >>= 1)
+      a += __shfl_xor_sync(0xffffffffu, a, o), b += __shfl_xor_sync(0xffffffffu, b, o);
+    a = __shfl_sync(0xffffffffu, a, 0), b = __shfl_sync(0xffffffffu, b, 0);
+  }
+  __device__ void sync() const { __syncwarp(); }
+};
+
+// the "grid" radii: a warp per atom, the lanes over its probes, then its
+// candidates (d r_i / d d into jac); buf: 3 P doubles per atom
+__global__ void grid_radii_kernel(int n, int K, const int32_t *count, const double *cd, double cutoff,
+                                  double n_target, double width, int P, double *buf, double *r, double *jac) {
+  const int i = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x % 32;
+  if (i >= n) return; // whole warps
+  const double *d = cd + int64_t(i) * K;
+  double *J = jac + int64_t(i) * K;
+  const double a = adaptive::grid_solve(
+      count[i], [&](int k) { return d[k] < cutoff ? d[k] : 1e30; }, cutoff, n_target, width,
+      buf + int64_t(i) * 3 * P, [&](int k, double v) { J[k] = v; }, lane, 32, WarpGrid{});
+  if (lane == 0) r[i] = a;
+}
+
 // atom i's kept edges, in candidate order, into slots [0, nkept); the rest padded
 __global__ void pack_kernel(int n, int K, int M, const int32_t *cand_j, const int32_t *count,
                             const int32_t *cand_rev, const double *cv, const double *cd,
@@ -493,16 +522,19 @@ __global__ void edge_force_kernel(int n, int M, const int32_t *nkept, const int3
 }
 
 // chain term of the adaptive cutoff on each candidate edge k -> l:
-// dE/dv += dE/dr_k * (dr_k/dd) * v / d
+// dE/dv += dE/dr_k * (dr_k/dd) * v / d (dr_k/dd: jac with the grid, else the solver's)
 __global__ void chain_kernel(int n, int K, const int32_t *count, const double *cv, const double *cd,
                              double cutoff, double width, const double *r, const double *root,
-                             const double *dn, const int8_t *clamped, const double *dEdr, double *chain) {
+                             const double *dn, const int8_t *clamped, const double *jac, const double *dEdr,
+                             double *chain) {
   const int e = blockIdx.x * blockDim.x + threadIdx.x;
   const int i = e / K, k = e % K;
   if (i >= n || k >= count[i]) return;
   const double d = cd[e];
   double coef = 0;
-  if (d < cutoff) {
+  if (jac) {
+    if (d < cutoff) coef = dEdr[i] * jac[e] / d;
+  } else if (d < cutoff) {
     adaptive::Radius a;
     a.r = r[i], a.root = root[i], a.dn_root = dn[i], a.clamped = clamped[i];
     coef = dEdr[i] * adaptive::ddist(d, a, width) / d;
@@ -601,7 +633,18 @@ struct CellList {
   int n_cap = 0, cell_cap = 0;
 };
 
+struct GridScratch {
+  double *buf = nullptr, *jac = nullptr; // [n, 3 P], [n K]
+  size_t buf_cap = 0, jac_cap = 0;
+};
+
 void free_cells(State &s) {
+  if (s.grid) {
+    if (s.grid->buf) cudaFree(s.grid->buf);
+    if (s.grid->jac) cudaFree(s.grid->jac);
+    delete s.grid;
+    s.grid = nullptr;
+  }
   if (!s.cells) return;
   for (void *p : {(void *)s.cells->cell_of, (void *)s.cells->atoms, (void *)s.cells->count, (void *)s.cells->start,
                   (void *)s.cells->bbox})
@@ -746,12 +789,38 @@ void build_list(State &s, const Cutoff &cut) {
   LAUNCH(reverse_kernel, s.n * s.K, s.n, s.K, s.cand_j, s.cand_s, s.count, s.cand_rev);
 }
 
+namespace {
+// the per-atom adaptive radii (and, for the grid, d r / d d per candidate)
+void radii(State &s, const Cutoff &c) {
+  if (!(c.grid && c.n_target > 0)) {
+    LAUNCH(radii_kernel, 32 * s.n, s.n, s.K, s.count, s.cand_d, c.cutoff, c.n_target, c.width, s.r, s.root,
+           s.dn_root, s.clamped);
+    return;
+  }
+  const int P = adaptive::grid_probes(c.cutoff, c.width);
+  if (!s.grid) s.grid = new GridScratch();
+  GridScratch &g = *s.grid;
+  const size_t nb = size_t(s.n) * 3 * std::max(P, 1), nj = size_t(s.n) * s.K;
+  if (nb > g.buf_cap) {
+    if (g.buf) cudaFree(g.buf);
+    check(cudaMalloc(&g.buf, nb * sizeof(double)), "grid malloc");
+    g.buf_cap = nb;
+  }
+  if (nj > g.jac_cap) {
+    if (g.jac) cudaFree(g.jac);
+    check(cudaMalloc(&g.jac, nj * sizeof(double)), "grid malloc");
+    g.jac_cap = nj;
+  }
+  LAUNCH(grid_radii_kernel, 32 * s.n, s.n, s.K, s.count, s.cand_d, c.cutoff, c.n_target, c.width, P, g.buf, s.r,
+         g.jac);
+}
+} // namespace
+
 void prepare_inputs(State &s, const Cutoff &c, const Graph &g) {
   const Cell cell = make_cell(s);
   const int E = s.n * s.K;
   LAUNCH(edge_kernel, E, s.n, s.K, s.x, cell, s.cand_j, s.cand_s, s.count, s.cand_v, s.cand_d);
-  LAUNCH(radii_kernel, 32 * s.n, s.n, s.K, s.count, s.cand_d, c.cutoff, c.n_target, c.width, s.r, s.root,
-         s.dn_root, s.clamped);
+  radii(s, c);
   check(cudaMemsetAsync(s.scalars + 1, 0, sizeof(int32_t), stream_of(s)), "memset");
   LAUNCH(pack_kernel, s.n, s.n, s.K, s.M, s.cand_j, s.count, s.cand_rev, s.cand_v, s.cand_d, s.r,
          c.cutoff, c.n_target > 0, std::getenv("MLIPCPP_MD_REVERSE_SLOTS") != nullptr, s.species, s.cand_slot, s.nkept, s.scalars + 1, g.neighbor_species,
@@ -764,8 +833,7 @@ void count_kept(State &s, const Cutoff &c) {
   const Cell cell = make_cell(s);
   const int E = s.n * s.K;
   LAUNCH(edge_kernel, E, s.n, s.K, s.x, cell, s.cand_j, s.cand_s, s.count, s.cand_v, s.cand_d);
-  LAUNCH(radii_kernel, 32 * s.n, s.n, s.K, s.count, s.cand_d, c.cutoff, c.n_target, c.width, s.r, s.root,
-         s.dn_root, s.clamped);
+  radii(s, c);
   check(cudaMemsetAsync(s.scalars + 1, 0, sizeof(int32_t), stream_of(s)), "memset");
   LAUNCH(count_kept_kernel, 32 * s.n, s.n, s.K, s.cand_j, s.count, s.cand_rev, s.cand_d, s.r, c.cutoff, c.n_target > 0,
          s.nkept, s.scalars + 1);
@@ -827,7 +895,7 @@ void conservative_forces(State &s, const Cutoff &c, const Graph &g, double energ
          energy_scale, s.f_cons, s.dEdr, skip);
   if (!adaptive) return;
   LAUNCH(chain_kernel, s.n * s.K, s.n, s.K, s.count, s.cand_v, s.cand_d, c.cutoff, c.width, s.r, s.root,
-         s.dn_root, s.clamped, s.dEdr, s.chain);
+         s.dn_root, s.clamped, c.grid && s.grid ? s.grid->jac : nullptr, s.dEdr, s.chain);
   LAUNCH(chain_gather_kernel, 32 * s.n, s.n, s.K, s.count, s.cand_rev, s.chain, energy_scale, s.f_cons);
 }
 

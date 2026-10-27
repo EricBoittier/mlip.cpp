@@ -358,7 +358,7 @@ public:
 /// Neighbour-list cache file of `split` under `cache_dir` ("" if no dir).
 std::string cache_path(const std::string &cache_dir, const MemmapSplit &split, float cutoff,
                        const AdaptiveCutoff &adaptive = {});
-/// The model's adaptive-cutoff settings (training implements the "solver" method only).
+/// The model's adaptive-cutoff settings ("solver" or "grid").
 AdaptiveCutoff adaptive_cutoff(const runtime::GraphModel &model);
 
 void train(const TrainOptions &opts);

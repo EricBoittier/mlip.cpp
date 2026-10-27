@@ -78,13 +78,14 @@ private:
 /// centre; `slot` is the rank of an edge among its centre's edges and
 /// `reverse` the local index of the edge j->i with the opposite shift
 /// (or -1).
-/// PET's adaptive cutoff (metatrain `num_neighbors_adaptive`, "solver"
-/// method): per-atom radii r_i that make the smoothed neighbour count
+/// PET's adaptive cutoff (metatrain `num_neighbors_adaptive`, "solver" or
+/// "grid" method): per-atom radii r_i that make the smoothed neighbour count
 /// `n_target`, pair cutoffs (r_i + r_j) / 2, edges beyond them dropped.
 /// Positions are fixed in training, so this is part of the cached lists.
 struct AdaptiveCutoff {
   double n_target = 0; // 0: the fixed cutoff
   double width = 1.0;  // cutoff_width_adaptive
+  bool grid = false;   // the "grid" method (else "solver")
   bool enabled() const { return n_target > 0; }
 };
 

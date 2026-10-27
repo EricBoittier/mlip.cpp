@@ -761,7 +761,7 @@ ModelResult GraphModel::predict_single(
         nlist.centers, nlist.distances,
         num_neighbors_adaptive_, n_atoms, cutoff_, adapt_cache,
         /*min_cutoff=*/0.5f,
-        /*effective_width=*/cutoff_width_);
+        /*effective_width=*/cutoff_width_adaptive_);
     atomic_cutoffs = adapt_cache.atomic_cutoffs;
 
     // Compact nlist in place: keep edge e iff distances[e] <= pair_cutoff

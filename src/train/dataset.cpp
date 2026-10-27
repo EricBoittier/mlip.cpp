@@ -152,6 +152,7 @@ namespace {
 
 constexpr uint64_t CACHE_MAGIC = 0x314c4e5050494c4dULL;          // "MLIPPNL1"
 constexpr uint64_t CACHE_MAGIC_ADAPTIVE = 0x324c4e5050494c4dULL; // "MLIPPNL2": + n_target, width, pair_cutoff
+constexpr uint64_t CACHE_MAGIC_GRID = 0x334c4e5050494c4dULL;     // "MLIPPNL3": as MLIPPNL2, the "grid" method
 
 struct LocalEdges {
   std::vector<int32_t> center, neighbor, slot, reverse;
@@ -160,15 +161,15 @@ struct LocalEdges {
   int32_t max_neighbors = 0;
 };
 
-// metatrain's "solver" adaptive cutoff (core/adaptive_cutoff.h), in double.
-// Edges sorted by centre: atom i's are [start[i], start[i+1]).
+// metatrain's adaptive cutoff ("solver" or "grid", core/adaptive_cutoff.h), in
+// double. Edges sorted by centre: atom i's are [start[i], start[i+1]).
 std::vector<double> adaptive_radii(const std::vector<int32_t> &start, const std::vector<double> &dist,
                                    double cutoff, const AdaptiveCutoff &a) {
   const int n = static_cast<int>(start.size()) - 1;
   std::vector<double> radii(n);
   for (int i = 0; i < n; i++)
-    radii[i] = adaptive::solve(start[i + 1] - start[i], [&](int k) { return dist[start[i] + k]; },
-                               cutoff, a.n_target, a.width).r;
+    radii[i] = adaptive::radius(a.grid, start[i + 1] - start[i], [&](int k) { return dist[start[i] + k]; },
+                                cutoff, a.n_target, a.width);
   return radii;
 }
 
@@ -269,11 +270,12 @@ TaperEdges taper_one(const MemmapSplit &split, int64_t s, double cutoff, const A
   }
   for (int i = 0; i < n; i++) start[i + 1] += start[i];
   TaperEdges t;
+  std::vector<double> jac(E);
   for (int i = 0; i < n; i++) {
-    const adaptive::Radius r = adaptive::solve(start[i + 1] - start[i], [&](int k) { return dist[start[i] + k]; },
-                                               cutoff, a.n_target, a.width);
+    adaptive::radius(a.grid, start[i + 1] - start[i], [&](int k) { return dist[start[i] + k]; }, cutoff,
+                     a.n_target, a.width, jac.data() + start[i]);
     for (int k = start[i]; k < start[i + 1]; k++) {
-      const double J = adaptive::ddist(dist[k], r, a.width);
+      const double J = jac[k];
       if (J == 0.0) continue;
       t.center.push_back(i);
       t.neighbor.push_back(nl.neighbors[order[k]]);
@@ -302,7 +304,8 @@ NeighborCache NeighborCache::load_or_build(const MemmapSplit &split, float cutof
   NeighborCache nc;
   nc.cutoff = cutoff;
   nc.adaptive = adaptive;
-  const uint64_t magic_expected = adaptive.enabled() ? CACHE_MAGIC_ADAPTIVE : CACHE_MAGIC;
+  const uint64_t magic_expected =
+      adaptive.enabled() ? (adaptive.grid ? CACHE_MAGIC_GRID : CACHE_MAGIC_ADAPTIVE) : CACHE_MAGIC;
 
   if (!cache_path.empty() && std::filesystem::exists(cache_path)) {
     std::ifstream f(cache_path, std::ios::binary);
@@ -315,7 +318,7 @@ NeighborCache NeighborCache::load_or_build(const MemmapSplit &split, float cutof
     f.read(reinterpret_cast<char *>(&c_cut), 4);
     f.read(reinterpret_cast<char *>(&c_edges), 8);
     double c_adaptive[2] = {0, 0};
-    if (magic == CACHE_MAGIC_ADAPTIVE) f.read(reinterpret_cast<char *>(c_adaptive), sizeof c_adaptive);
+    if (magic == CACHE_MAGIC_ADAPTIVE || magic == CACHE_MAGIC_GRID) f.read(reinterpret_cast<char *>(c_adaptive), sizeof c_adaptive);
     if (f && magic == magic_expected && c_ns == ns && c_atoms == n_atoms_total && c_cut == cutoff &&
         (!adaptive.enabled() || (c_adaptive[0] == adaptive.n_target && c_adaptive[1] == adaptive.width))) {
       read_vec(f, nc.edge_offset, ns + 1);

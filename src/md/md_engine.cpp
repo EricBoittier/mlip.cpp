@@ -77,13 +77,14 @@ Engine::Engine(const std::string &gguf, int device, double skin) {
   model_.set_device(device);
   model_.load_from_gguf(gguf);
   if (!model_.forces_mode()) throw std::runtime_error(gguf + ": MD needs a forces-mode export");
-  if (model_.num_neighbors_adaptive() > 0 && model_.adaptive_cutoff_method() != "solver")
-    throw std::runtime_error(gguf + ": MD implements the \"solver\" adaptive cutoff only, the model uses \"" +
-                             model_.adaptive_cutoff_method() + "\"");
+  if (model_.num_neighbors_adaptive() > 0 && model_.adaptive_cutoff_method() != "solver" &&
+      model_.adaptive_cutoff_method() != "grid")
+    throw std::runtime_error(gguf + ": unknown adaptive cutoff method \"" + model_.adaptive_cutoff_method() + "\"");
   cut_.cutoff = model_.cutoff();
   cut_.skin = skin;
   cut_.n_target = model_.num_neighbors_adaptive();
   cut_.width = model_.cutoff_width_adaptive();
+  cut_.grid = model_.adaptive_cutoff_method() == "grid";
   energy_scale_ = model_.energy_scale();
   galloc_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model_.backend()));
   dalloc(st_.scalars, 3);
