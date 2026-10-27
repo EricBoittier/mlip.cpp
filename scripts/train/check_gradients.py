@@ -173,14 +173,20 @@ def main():
         e_pa = torch.stack([chunk.sum() / len(chunk) for chunk in torch.split(e_atom, counts)])
         if os.environ.get("CHECK_GRADIENTS_DEBUG"):
             print("e_pa", e_pa.tolist(), "n", counts)
-        loss_e = ((e_pa - torch.tensor(e_target, dtype=dtype)) ** 2).mean()
-        loss_f = ((f_atom - torch.tensor(np.concatenate(f_target), dtype=dtype)) ** 2).mean() if nc_head \
+        lt = meta.get("loss_type")
+        def crit(a, b, delta):  # mse, or torch's Huber (metatrain's "huber")
+            if lt:
+                return torch.nn.functional.huber_loss(a, b, delta=delta)
+            return ((a - b) ** 2).mean()
+        de_, df_ = (lt["delta_e"], lt["delta_f"]) if lt else (0, 0)
+        loss_e = crit(e_pa, torch.tensor(e_target, dtype=dtype), de_)
+        loss_f = crit(f_atom, torch.tensor(np.concatenate(f_target), dtype=dtype), df_) if nc_head \
             else torch.zeros((), dtype=dtype)
         if cons:
             # -dE/dx of the scaled energy against F / s_E, kept differentiable
             grads = torch.autograd.grad(e_atom.sum(), [s.positions for s in systems], create_graph=True)
             f_cons = -torch.cat(grads)
-            loss_fc = ((f_cons - torch.tensor(np.concatenate(f_phys) / s_e, dtype=dtype)) ** 2).mean()
+            loss_fc = crit(f_cons, torch.tensor(np.concatenate(f_phys) / s_e, dtype=dtype), df_)
             loss_e, loss_nc = cons["energy_weight"] * loss_e, cons["nc_force_weight"] * loss_f
             loss_f = cons["force_weight"] * loss_fc
             loss = loss_e + loss_f + loss_nc

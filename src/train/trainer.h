@@ -5,6 +5,8 @@
 
 #include <ggml-alloc.h>
 
+#include <algorithm>
+#include <cmath>
 #include <functional>
 #include <map>
 #include <memory>
@@ -64,6 +66,9 @@ struct TrainOptions {
   // them, the direct head keeps a term of its own; loss weights of the
   // energy, the conservative and the direct forces
   bool conservative = false;
+  // loss: "mse" or "huber" (deltas: energy per atom over the energy scale, forces over their scale)
+  std::string loss = "mse";
+  double huber_delta_e = 0.01, huber_delta_f = 0.02;
   // auxiliary loss on the LES latent charges (Plato-PET-LR): weight * mean_s max(0, r_min - r_s), r_s the
   // Pearson correlation of the first latent charge channel with the DFT partial charges
   // <split>/<target>_charge.bin (float32 per atom; target mulliken | lowdin | nbo); structures without
@@ -187,6 +192,21 @@ public:
   /// auxiliary loss on the LES latent charges (Plato-PET-LR): weight * mean over the structures with
   /// partial charges of max(0, r_min - r_s), r_s the Pearson correlation of the first latent charge
   /// channel with the DFT partial charges (Batch::ref_charge); weight 0: off
+  /// loss of each component: "mse" (squared error) or "huber" (torch.nn.HuberLoss: 0.5 d^2 for
+  /// |d| < delta, delta (|d| - delta / 2) beyond; metatrain's "huber"), deltas in the loss's units
+  /// (energy per atom over the energy scale; forces over their scale)
+  struct Loss {
+    bool huber = false;
+    double delta_e = 0.01, delta_f = 0.02;
+    double value(double d, double delta) const {
+      if (!huber) return d * d;
+      const double a = std::abs(d);
+      return a < delta ? 0.5 * d * d : delta * (a - 0.5 * delta);
+    }
+    double slope(double d, double delta) const { // d value / d d
+      return huber ? std::max(-delta, std::min(delta, d)) : 2 * d;
+    }
+  } loss;
   struct ChargeCorr {
     double weight = 0.0, r_min = 1.0;
   } charge_corr;

@@ -34,6 +34,8 @@ int main(int argc, char **argv) {
   Worker::Conservative cons;
   Worker::ChargeCorr qcorr;
   std::string qtarget = "mulliken";
+  bool huber = false;
+  double de = 0.01, df = 0.02;
   double tile_ratio = 1.25, tol = 1e-3;
   for (int i = 1; i + 1 < argc; i += 2) {
     const std::string a = argv[i], v = argv[i + 1];
@@ -56,6 +58,9 @@ int main(int argc, char **argv) {
     else if (a == "--charge-corr-weight") qcorr.weight = std::stod(v);
     else if (a == "--charge-corr-min") qcorr.r_min = std::stod(v);
     else if (a == "--charge-corr-target") qtarget = v;
+    else if (a == "--loss") huber = v == "huber";
+    else if (a == "--huber-delta-e") de = std::stod(v);
+    else if (a == "--huber-delta-f") df = std::stod(v);
   }
   // the node-by-node profile computes one-node graph views; ggml's CUDA graph
   // cache (keyed by the first node's address) could replay a stale capture
@@ -69,6 +74,7 @@ int main(int argc, char **argv) {
   Worker worker(init, gpus > 0 ? 0 : -1);
   worker.conservative = cons;
   worker.charge_corr = qcorr;
+  worker.loss.huber = huber, worker.loss.delta_e = de, worker.loss.delta_f = df;
   if (qcorr.weight > 0 && !split.load_partial_charges(qtarget))
     throw std::runtime_error(data + "/train/" + qtarget + "_charge.bin: not found");
   const TargetScaling sc = TargetScaling::fit(split);
@@ -441,6 +447,7 @@ int main(int argc, char **argv) {
     meta["conservative"] = {{"energy_weight", cons.energy}, {"force_weight", cons.force},
                             {"nc_force_weight", cons.nc_force}, {"loss_nc", st.loss_nc}};
   meta["energy_scale"] = sc.energy_scale;
+  if (huber) meta["loss_type"] = {{"type", "huber"}, {"delta_e", de}, {"delta_f", df}};
   if (qcorr.weight > 0)
     meta["charge_corr"] = {{"weight", qcorr.weight}, {"r_min", qcorr.r_min}, {"target", qtarget},
                            {"loss", st.loss_charge}, {"mean_r", st.sum_charge_r / std::max<int64_t>(1, st.n_charge_r)},

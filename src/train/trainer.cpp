@@ -650,8 +650,16 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
     // metatrain's average_by_num_atoms: per-structure Σ_i e_i / N
     ggml_tensor *d_energy = ggml_sub(ctx, ggml_mul_mat(ctx, atom_weight, energy), energy_target);
     ggml_tensor *d_force = ggml_mul(ctx, ggml_sub(ctx, force, force_target), force_mask);
-    ggml_tensor *loss_e = ggml_mul(ctx, ggml_sum(ctx, ggml_sqr(ctx, d_energy)), e_norm);
-    ggml_tensor *loss_f = ggml_mul(ctx, ggml_sum(ctx, ggml_sqr(ctx, d_force)), f_norm);
+    // squared error, or Huber 0.5 c^2 + delta (|d| - |c|), c = clamp(d, -delta, delta)
+    auto component = [&](ggml_tensor *d, double delta) {
+      if (!loss.huber) return ggml_sum(ctx, ggml_sqr(ctx, d));
+      const float dl = static_cast<float>(delta);
+      ggml_tensor *c = ggml_clamp(ctx, d, -dl, dl);
+      return ggml_sum(ctx, ggml_add(ctx, ggml_scale(ctx, ggml_sqr(ctx, c), 0.5f),
+                                    ggml_scale(ctx, ggml_sub(ctx, ggml_abs(ctx, d), ggml_abs(ctx, c)), dl)));
+    };
+    ggml_tensor *loss_e = ggml_mul(ctx, component(d_energy, loss.delta_e), e_norm);
+    ggml_tensor *loss_f = ggml_mul(ctx, component(d_force, loss.delta_f), f_norm);
     ggml_tensor *loss = ggml_add(ctx, loss_e, loss_f);
     if (ggml_tensor *lq = charge_corr_graph(*g, ctx, S, true)) loss = ggml_add(ctx, loss, lq);
     if (mode == MIXED) {
@@ -988,7 +996,7 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
   for (int k = 0; k < S; k++) {
     for (int a = 0; a < n; a++) d_e[k] += double(b.atom_weight[static_cast<size_t>(k) * n + a]) * out[ow * a];
     d_e[k] -= b.energy_target[k];
-    st.loss_energy += w.energy * e_norm * d_e[k] * d_e[k];
+    st.loss_energy += w.energy * e_norm * loss.value(d_e[k], loss.delta_e);
     st.se_energy_per_atom += d_e[k] * d_e[k] * energy_scale * energy_scale;
     if (k < b.n_real_systems) st.ae_energy_per_atom += std::abs(d_e[k]) * energy_scale;
   }
@@ -1003,12 +1011,12 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
     for (int c = 0; c < 3; c++) {
       const double target = double(b.force_target[3 * a + c]) * b.force_scale[a];
       const double r = F[3 * a + c] - target / energy_scale, rnc = nc ? out[4 * a + 1 + c] - b.force_target[3 * a + c] : 0.0;
-      st.loss_force += w.force * f_norm * r * r;
-      st.loss_nc += w.nc_force * f_norm * rnc * rnc;
+      st.loss_force += w.force * f_norm * loss.value(r, loss.delta_f);
+      st.loss_nc += w.nc_force * f_norm * loss.value(rnc, loss.delta_f);
       st.se_force_nc += std::pow(rnc * b.force_scale[a], 2);
       e2 += std::pow(r * energy_scale, 2);
       st.ae_force += std::abs(r) * energy_scale;
-      u[3 * a + c] = 2 * w.force * f_norm * r;
+      u[3 * a + c] = w.force * f_norm * loss.slope(r, loss.delta_f);
     }
     st.se_force += e2;
     per_atom[a] = static_cast<float>(e2);
@@ -1883,6 +1891,10 @@ void train(const TrainOptions &o) {
         o.tile_nb_ratio > 1 ? static_cast<size_t>(o.graph_cache) : 0));
   for (auto &w : workers) w->conservative = {o.conservative, o.energy_weight, o.force_weight, o.nc_force_weight};
   for (auto &w : workers) w->charge_corr = {o.charge_corr_weight, o.charge_corr_min};
+  if (o.loss != "mse" && o.loss != "huber") throw std::runtime_error("--loss mse|huber, not " + o.loss);
+  for (auto &w : workers) w->loss.huber = o.loss == "huber", w->loss.delta_e = o.huber_delta_e, w->loss.delta_f = o.huber_delta_f;
+  if (o.loss == "huber")
+    fmt::print("loss: Huber, delta {} (energy per atom / energy scale), {} (forces / their scale)\n", o.huber_delta_e, o.huber_delta_f);
   if (o.charge_corr_weight > 0) {
     if (o.charge_corr_target != "mulliken" && o.charge_corr_target != "lowdin" && o.charge_corr_target != "nbo")
       throw std::runtime_error("--charge-corr-target mulliken|lowdin|nbo, not " + o.charge_corr_target);

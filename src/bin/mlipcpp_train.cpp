@@ -29,6 +29,9 @@ int main(int argc, char **argv) {
                "          [--allreduce {}] [--save-every N] [--log JSONL] [--state-every N] [--max-hours H] [--resume STATE]\n"
                "          [--lr-schedule FILE.json] [--dump-lr-schedule N [--dump-steps-per-epoch S]]\n"
                "          [--charge-corr-weight W] [--charge-corr-target mulliken|lowdin|nbo] [--charge-corr-min R]\n"
+               "          [--loss mse|huber] [--huber-delta-e D] [--huber-delta-f D]\n"
+               "--loss huber: torch.nn.HuberLoss per component (metatrain's huber; 0.5 d^2 below delta, then linear), deltas in\n"
+               "the loss's units: energy per atom over the energy scale (default 0.01), forces over their scale (0.02);\n"
                "--charge-corr-weight W (Plato-PET-LR with LES; default 0: off): an auxiliary loss on the latent charges,\n"
                "W x mean over structures of max(0, R - r), r the per-structure Pearson correlation of the first latent\n"
                "charge channel with the DFT partial charges <split>/<target>_charge.bin (float32 per atom; --charge-corr-target,\n"
@@ -106,6 +109,9 @@ int main(int argc, char **argv) {
     else if (a == "--nc-force-weight") o.nc_force_weight = std::stod(val());
     else if (a == "--model-baselines") o.model_baselines = true;
     else if (a == "--charge-corr-weight") o.charge_corr_weight = std::stod(val());
+    else if (a == "--loss") o.loss = val();
+    else if (a == "--huber-delta-e") o.huber_delta_e = std::stod(val());
+    else if (a == "--huber-delta-f") o.huber_delta_f = std::stod(val());
     else if (a == "--charge-corr-target") o.charge_corr_target = val();
     else if (a == "--charge-corr-min") o.charge_corr_min = std::stod(val());
     else if (a == "--allreduce") o.allreduce = std::stoi(val()) != 0;
