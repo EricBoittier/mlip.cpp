@@ -271,7 +271,9 @@ int attn_test(int gpus) {
   if (gpus > 0) prefs.push_back(BackendPreference::Auto);
   for (auto pref : prefs) {
     auto bp = BackendProvider::create(pref);
-    for (auto [H, d, L, N] : {std::array<int, 4>{4, 16, 13, 5}, {2, 8, 40, 3}, {16, 16, 34, 7}}) {
+    // (d 32, L 29: PET-OMol-S; L 64: the CUDA kernel's opt-in shared memory; L 150: its per-row fallback)
+    for (auto [H, d, L, N] : {std::array<int, 4>{4, 16, 13, 5}, {2, 8, 40, 3}, {16, 16, 34, 7}, {8, 32, 29, 6},
+                              {8, 32, 64, 3}, {2, 32, 150, 2}}) {
       std::vector<float> in[4], R;
       inputs(H, d, L, N, in, R);
       const AttnProbe u = attn_probe(bp->primary(), false, H, d, L, N, in, R, 0),
@@ -285,13 +287,14 @@ int attn_test(int gpus) {
                  bp->name(), H, d, L, N, e[0], e[1], e[2], e[3], e[4], good ? "ok" : "WRONG");
     }
     if (pref != BackendPreference::CPU) { // training-sized: the big model, adaptive cutoff
-      const int H = 16, d = 16, L = 34, N = 4096;
-      std::vector<float> in[4], R;
-      inputs(H, d, L, N, in, R);
-      for (bool fused : {false, true}) {
-        const AttnProbe p = attn_probe(bp->primary(), fused, H, d, L, N, in, R, 5);
-        fmt::print("{:<6} H {} d {} L {} N {}: {} tangent + backward {:.2f} ms, compute buffer {:.0f} MiB\n", bp->name(),
-                   H, d, L, N, fused ? "fused  " : "unfused", p.ms, p.buffer / 1048576.0);
+      for (auto [H, d, L, N] : {std::array<int, 4>{16, 16, 34, 4096}, {8, 32, 29, 2624}}) { // + PET-OMol-LR's frames
+        std::vector<float> in[4], R;
+        inputs(H, d, L, N, in, R);
+        for (bool fused : {false, true}) {
+          const AttnProbe p = attn_probe(bp->primary(), fused, H, d, L, N, in, R, 5);
+          fmt::print("{:<6} H {} d {} L {} N {}: {} tangent + backward {:.2f} ms, compute buffer {:.0f} MiB\n", bp->name(),
+                     H, d, L, N, fused ? "fused  " : "unfused", p.ms, p.buffer / 1048576.0);
+        }
       }
     }
   }

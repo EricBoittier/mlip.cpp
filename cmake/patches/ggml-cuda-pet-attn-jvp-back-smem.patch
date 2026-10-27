@@ -1,0 +1,135 @@
+--- a/src/ggml-cuda/pet-attn.cu
++++ b/src/ggml-cuda/pet-attn.cu
+@@ -1472,6 +1472,113 @@
+     dst[((n*2 + 1)*L + i)*L + j] = sdb;
+ }
+ 
++// GGML_OP_PET_ATTN_JVP_BACK with one block per (sequence, head): the sequence's q, k, v,
++// dq, dk, dv, G and g in shared memory, and the L x L matrices P, dS (then W = P (dS - c)),
++// G.v (then Gam) and G.dv (then Sig) computed once; pet_attn_jvp_bwd_rows / _keys recompute
++// every score from global memory four to five times and keep up to 8 d floats per thread in
++// registers (spilled for d = 32). The sums run in the same order as theirs.
++template <int d>
++__global__ void pet_attn_jvp_bwd_smem(const float * __restrict__ qkv, const float * __restrict__ bias,
++                                      const float * __restrict__ grad, const float * __restrict__ dqkv,
++                                      const float * __restrict__ dbias, float * __restrict__ dst,
++                                      const int H, const int L, const float scale) {
++    extern __shared__ float sm[];
++    constexpr int dp = d + 1; // padded rows: the cell loops read X[j][c] across j
++    const int64_t n = blockIdx.x / H;
++    const int h = blockIdx.x % H;
++    const int D = H*d;
++    float * X  = sm;              // [7][L][dp]: q k v dq dk dv G
++    float * Pm = X + 7*L*dp;      // [L][L] S, then P
++    float * Wm = Pm + L*L;        // dS, then W
++    float * Am = Wm + L*L;        // G.v, then Gam
++    float * Bm = Am + L*L;        // G.dv, then Sig
++    float * sg = Bm + L*L;        // [L] g
++    float * st = sg + L;          // [5][L] mx inv c D E
++    const float * x  = qkv + n*L*3*D;
++    const float * dx = dqkv ? dqkv + n*L*3*D : nullptr;
++    for (int idx = threadIdx.x; idx < L*d; idx += blockDim.x) {
++        const int j = idx / d, c = idx - j*d;
++#pragma unroll
++        for (int s = 0; s < 3; s++) {
++            X[(s*L + j)*dp + c]     = x[((int64_t) j*3 + s)*D + h*d + c];
++            X[((s + 3)*L + j)*dp + c] = dx ? dx[((int64_t) j*3 + s)*D + h*d + c] : 0.0f;
++        }
++        X[(6*L + j)*dp + c] = grad[(n*L + j)*(D + H) + h*d + c];
++    }
++    for (int j = threadIdx.x; j < L; j += blockDim.x) sg[j] = grad[(n*L + j)*(D + H) + D + h];
++    __syncthreads();
++    const float * q = X, * k = X + L*dp, * v = X + 2*L*dp, * dq = X + 3*L*dp, * dk = X + 4*L*dp, * dv = X + 5*L*dp,
++                * G = X + 6*L*dp;
++    for (int cell = threadIdx.x; cell < L*L; cell += blockDim.x) {
++        const int i = cell / L, j = cell - i*L;
++        const float * qi = q + i*dp, * kj = k + j*dp, * dqi = dq + i*dp, * dkj = dk + j*dp, * Gi = G + i*dp,
++                    * vj = v + j*dp, * dvj = dv + j*dp;
++        float qk = 0.0f, a = 0.0f, b2 = 0.0f, t1 = 0.0f, t2 = 0.0f;
++#pragma unroll
++        for (int c = 0; c < d; c++) qk += qi[c]*kj[c], t1 += dqi[c]*kj[c], t2 += qi[c]*dkj[c], a += Gi[c]*vj[c], b2 += Gi[c]*dvj[c];
++        const int64_t bi = (n*L + i)*L + j;
++        Pm[cell] = scale*qk + bias[bi];
++        float ds = dbias ? dbias[bi] : 0.0f;
++        if (dx) ds += scale*(t1 + t2);
++        Wm[cell] = ds, Am[cell] = a, Bm[cell] = dx ? b2 : 0.0f;
++    }
++    __syncthreads();
++    for (int i = threadIdx.x; i < L; i += blockDim.x) {
++        const float * S = Pm + i*L, * dS = Wm + i*L, * A = Am + i*L, * B = Bm + i*L;
++        float mx = -INFINITY;
++        for (int j = 0; j < L; j++) mx = fmaxf(mx, S[j]);
++        float sum = 0.0f, c = 0.0f, Dv = 0.0f;
++        for (int j = 0; j < L; j++) {
++            const float e = expf(S[j] - mx);
++            sum += e, c += e*dS[j], Dv += e*A[j];
++        }
++        const float inv = 1.0f/sum;
++        c *= inv, Dv *= inv;
++        const float g = sg[i];
++        float E = 0.0f;
++        for (int j = 0; j < L; j++) {
++            const float P = expf(S[j] - mx)*inv;
++            E += P*(dS[j]*(A[j] - Dv + g) - c*A[j] + B[j]);
++        }
++        st[i] = mx, st[L + i] = inv, st[2*L + i] = c, st[3*L + i] = Dv, st[4*L + i] = E;
++    }
++    __syncthreads();
++    for (int cell = threadIdx.x; cell < L*L; cell += blockDim.x) {
++        const int i = cell / L;
++        const float mx = st[i], inv = st[L + i], c = st[2*L + i], Dv = st[3*L + i], E = st[4*L + i], g = sg[i];
++        const float P = expf(Pm[cell] - mx)*inv, dS = Wm[cell], A = Am[cell], B = Bm[cell];
++        const float a = A - Dv + g;
++        Pm[cell] = P;
++        Am[cell] = P*a;                         // Gam
++        Bm[cell] = P*(dS*a - c*A + B - E);      // Sig
++        Wm[cell] = P*(dS - c);                  // W
++    }
++    __syncthreads();
++    for (int idx = threadIdx.x; idx < L*d; idx += blockDim.x) {
++        const int r = idx / d, c = idx - r*d;
++        float gq = 0.0f, gdq = 0.0f, gk = 0.0f, gdk = 0.0f, gv = 0.0f, gdv = 0.0f;
++        for (int j = 0; j < L; j++) {
++            const float sig = Bm[r*L + j], gam = Am[r*L + j], kc = k[j*dp + c];
++            gq  += scale*(sig*kc + gam*dk[j*dp + c]);
++            gdq += scale*gam*kc;
++        }
++        for (int i = 0; i < L; i++) {
++            const float sig = Bm[i*L + r], gam = Am[i*L + r], qc = q[i*dp + c], Gc = G[i*dp + c];
++            gk  += scale*(sig*qc + gam*dq[i*dp + c]);
++            gdk += scale*gam*qc;
++            gv  += Wm[i*L + r]*Gc;
++            gdv += Pm[i*L + r]*Gc;
++        }
++        float * out = dst + ((n*L + r)*6)*D + h*d + c;
++        out[0] = gq, out[D] = gk, out[2*D] = gv, out[3*D] = gdq, out[4*D] = gdk, out[5*D] = gdv;
++    }
++}
++
++template <int d>
++static size_t pet_attn_jvp_smem_bytes(int L) {
++    return sizeof(float)*((size_t) 7*L*(d + 1) + (size_t) 4*L*L + 6*(size_t) L);
++}
++
+ template <int d>
+ void pet_attn_jvp_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * qkv = dst->src[0];
+@@ -1488,6 +1595,18 @@
+     if (dst->op == GGML_OP_PET_ATTN_JVP) {
+         pet_attn_jvp_fwd<d><<<blocks, threads, 0, stream>>>(ptr(0), ptr(1), ptr(2), ptr(3), (float *) dst->data, H, L, N, scale);
+     } else {
++        // GGML_PET_JVP_ROWS=1: the per-row kernels for every L
++        static const bool rows_only = getenv("GGML_PET_JVP_ROWS") != nullptr;
++        const size_t smem = pet_attn_jvp_smem_bytes<d>(L);
++        if (dst->op == GGML_OP_PET_ATTN_JVP_BACK && !rows_only && smem <= 160*1024 && N*H < INT_MAX) {
++            if (smem > 48*1024) { // (per device: set on every such launch)
++                CUDA_CHECK(cudaFuncSetAttribute(pet_attn_jvp_bwd_smem<d>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
++            }
++            pet_attn_jvp_bwd_smem<d><<<(unsigned) (N*H), 128, smem, stream>>>(ptr(0), ptr(1), ptr(2), ptr(3), ptr(4),
++                                                                              (float *) dst->data, H, L, scale);
++            CUDA_CHECK(cudaGetLastError());
++            return;
++        }
+         ggml_cuda_pool_alloc<pet_jvp_stats> stats(ctx.pool(), rows);
+         if (dst->op == GGML_OP_PET_ATTN_JVP_BACK) {
+             pet_attn_jvp_bwd_rows<d><<<blocks, threads, 0, stream>>>(ptr(0), ptr(1), ptr(2), ptr(3), ptr(4), stats.get(),

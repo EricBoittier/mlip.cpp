@@ -300,6 +300,10 @@ else()
         # CUDA GET_ROWS of narrow F32/F16 rows (2 ne00 <= 256): several rows per block instead of a
         # 256-thread block per row with ne00 threads active (Plato-PET-LR's [16, ...] RoPE gathers)
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-get-rows-narrow.patch"
+        # CUDA PET_ATTN_JVP_BACK (conservative training's weight gradient through the attention
+        # tangent) with one block per (sequence, head) and its L x L matrices in shared memory
+        # (L <= 76 at d = 32); GGML_PET_JVP_ROWS=1: the per-row kernels
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-pet-attn-jvp-back-smem.patch"
     )
     # the source cache is keyed by the ggml tag and the patches' contents:
     # CPM's default key hashes the arguments, i.e. the patch paths, so every
