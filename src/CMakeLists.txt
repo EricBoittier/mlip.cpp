@@ -208,6 +208,7 @@ if(MLIPCPP_BUILD_TRAINING AND UNIX AND NOT EMSCRIPTEN)
         train/dataset.cpp
         train/batch.cpp
         train/trainer.cpp
+        train/lr_schedule.cpp
     )
     target_include_directories(mlipcpp_train PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${ggml_SOURCE_DIR}/include
                                PRIVATE ${ggml_SOURCE_DIR}/src) # ggml-impl.h: ggml_graph_view

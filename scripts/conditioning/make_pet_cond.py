@@ -24,13 +24,13 @@ from metatrain.utils.data.target_info import get_energy_target_info, get_generic
 
 
 def build(featurizer="feedforward", max_charge=3, max_spin=4, seed=0, gate_scale=0.5,
-          types=(1, 6, 7, 8), nc_forces=True, cutoff=4.5, adaptive=None):
+          types=(1, 6, 7, 8), nc_forces=True, cutoff=4.5, adaptive=None, conditioning=True):
     torch.manual_seed(seed)
     hypers = get_default_hypers("pet")["model"]
     hypers.update(dict(
         cutoff=cutoff, d_pet=32, d_node=48, d_head=32, d_feedforward=64, num_heads=4,
         num_attention_layers=2, num_gnn_layers=2, featurizer_type=featurizer,
-        system_conditioning=True, max_charge=max_charge, max_spin_multiplicity=max_spin,
+        system_conditioning=conditioning, max_charge=max_charge, max_spin_multiplicity=max_spin,
         num_neighbors_adaptive=adaptive,
     ))
     targets = {"energy": get_energy_target_info("energy", {"unit": "eV"}, add_position_gradients=True)}
@@ -41,6 +41,9 @@ def build(featurizer="feedforward", max_charge=3, max_spin=4, seed=0, gate_scale
     info = DatasetInfo(length_unit="angstrom", atomic_types=list(types), targets=targets)
     model = PET(hypers, info)
     sc = model.system_conditioning
+    if not conditioning:
+        model.eval()
+        return model, hypers
     assert sc is not None and sc is model.backend.system_conditioning
     # the gate is zero-initialised (a no-op); randomise it, and spread the tables, so
     # charge and spin move the energy by a visible amount
@@ -64,9 +67,11 @@ def main():
     ap.add_argument("--gate-scale", type=float, default=0.5)
     ap.add_argument("--no-nc-forces", action="store_true")
     ap.add_argument("--adaptive", type=int, default=None, help="num_neighbors_adaptive")
+    ap.add_argument("--no-conditioning", action="store_true", help="the same PET without conditioning")
     args = ap.parse_args()
     model, hypers = build(args.featurizer, args.max_charge, args.max_spin, args.seed, args.gate_scale,
-                          nc_forces=not args.no_nc_forces, adaptive=args.adaptive)
+                          nc_forces=not args.no_nc_forces, adaptive=args.adaptive,
+                          conditioning=not args.no_conditioning)
     out = Path(args.output)
     torch.save({"model": model, "hypers": hypers}, out)
     torch.save(model.get_checkpoint(), out.with_suffix(".ckpt"))

@@ -1,4 +1,5 @@
 #include "train/trainer.h"
+#include "train/lr_schedule.h"
 
 #include "runtime/graph_jvp.h"
 
@@ -1637,6 +1638,101 @@ void Optimizer::set_state(const std::vector<uint8_t> &s) {
   }
 }
 
+namespace {
+/// --lr-schedule: the groups' optimizer (GroupOptimizer) on device 0, the workers' gradients
+/// averaged there first (peer copies), the weights copied back to the other workers after
+struct GroupScheduled {
+  std::vector<Worker *> workers;
+  std::unique_ptr<GroupOptimizer> opt;
+  ggml_context *vctx = nullptr, *sctx = nullptr, *gctx = nullptr;
+  ggml_backend_buffer_t sbuf = nullptr;
+  std::vector<ggml_tensor *> staging;
+  ggml_cgraph *reduce = nullptr;
+  ggml_gallocr_t galloc = nullptr;
+  bool unmapped = false; // a GGUF without train.state_dict_names: GGUF names matched
+
+  GroupScheduled(std::vector<std::unique_ptr<Worker>> &ws, LrSchedule sched, double clip, double mu, double scale,
+                 int ns_steps) {
+    for (auto &w : ws) workers.push_back(w.get());
+    Worker &w0 = *workers[0];
+    const auto &names = w0.model().state_dict_names();
+    unmapped = names.empty();
+    vctx = ggml_init({ggml_tensor_overhead() * (w0.params().size() + 4), nullptr, true});
+    std::vector<GroupOptimizer::Param> ps;
+    for (size_t k = 0; k < w0.params().size(); k++) {
+      ggml_tensor *p = w0.params()[k];
+      ggml_tensor *g = ggml_view_4d(vctx, w0.grad_flat(), p->ne[0], p->ne[1], p->ne[2], p->ne[3], p->nb[1], p->nb[2],
+                                    p->nb[3], w0.grad_offset(k) * sizeof(float));
+      if (ggml_backend_view_init(g) != GGML_STATUS_SUCCESS) throw std::runtime_error("cannot view the gradients");
+      const std::string gguf = ggml_get_name(p);
+      auto it = names.find(gguf);
+      ps.push_back({p, g, it == names.end() ? gguf : it->second, is_muon_param(p)});
+    }
+    opt = std::make_unique<GroupOptimizer>(
+        w0.model().backend(), std::move(ps), std::move(sched), clip, mu, scale,
+        [ns_steps](ggml_context *ctx, ggml_tensor *g) { return orthogonalize(ctx, g, ns_steps); });
+    if (workers.size() > 1) { // mean of the workers' gradients into worker 0's accumulator
+      sctx = ggml_init({ggml_tensor_overhead() * workers.size(), nullptr, true});
+      for (size_t w = 1; w < workers.size(); w++) staging.push_back(ggml_dup_tensor(sctx, w0.grad_flat()));
+      sbuf = ggml_backend_alloc_ctx_tensors(sctx, w0.model().backend());
+      const size_t nn = 4 * workers.size() + 16;
+      gctx = ggml_init({ggml_tensor_overhead() * nn + ggml_graph_overhead_custom(nn, false), nullptr, true});
+      ggml_tensor *s = w0.grad_flat();
+      for (ggml_tensor *t : staging) s = ggml_add(gctx, s, t);
+      reduce = ggml_new_graph_custom(gctx, nn, false);
+      ggml_build_forward_expand(reduce, ggml_cpy(gctx, ggml_scale(gctx, s, 1.0f / float(workers.size())), w0.grad_flat()));
+      galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(w0.model().backend()));
+      if (!ggml_gallocr_alloc_graph(galloc, reduce)) throw std::runtime_error("cannot allocate the gradient mean");
+    }
+  }
+  ~GroupScheduled() {
+    opt.reset();
+    if (galloc) ggml_gallocr_free(galloc);
+    if (gctx) ggml_free(gctx);
+    if (sbuf) ggml_backend_buffer_free(sbuf);
+    if (sctx) ggml_free(sctx);
+    if (vctx) ggml_free(vctx);
+  }
+  double step(int64_t n, int64_t S, int64_t T) {
+    Worker &w0 = *workers[0];
+    if (reduce) {
+      for (size_t w = 1; w < workers.size(); w++) ggml_backend_tensor_copy(workers[w]->grad_flat(), staging[w - 1]);
+      if (ggml_backend_graph_compute(w0.model().backend(), reduce) != GGML_STATUS_SUCCESS)
+        throw std::runtime_error("gradient mean failed");
+    }
+    const double norm = opt->step(n, S, T);
+    for (size_t w = 1; w < workers.size(); w++)
+      for (size_t k = 0; k < w0.params().size(); k++) ggml_backend_tensor_copy(w0.params()[k], workers[w]->params()[k]);
+    for (Worker *w : workers) w->zero_grads();
+    return norm;
+  }
+  std::string summary(int64_t S, int64_t T) const {
+    const LrSchedule &s = opt->schedule();
+    const auto sizes = opt->group_sizes();
+    std::vector<int> tensors(s.groups.size(), 0);
+    for (int g : opt->group_of_param()) tensors[g]++;
+    std::string out = fmt::format("base {:g}, min {:g}, {} after {} epochs, warmup {} epochs, {} steps/epoch, {} steps{}",
+                                  s.base, s.min, s.shape, s.decay_after_epochs, s.warmup_epochs, S, T,
+                                  unmapped ? " (GGUF without train.state_dict_names: GGUF names matched)" : "");
+    for (size_t g = 0; g < s.groups.size(); g++) {
+      const LrGroup &x = s.groups[g];
+      out += fmt::format("\n  group {}: {} tensors, {} values; lr x{:g}, frozen {} epochs, warmup {} epochs, "
+                         "weight decay {:g}, {}",
+                         x.name, tensors[g], sizes[g], x.lr_mult, x.freeze_epochs, x.warmup_epochs, x.weight_decay,
+                         x.muon ? "Muon (matrices) + AdamW" : "AdamW");
+    }
+    return out;
+  }
+  std::string lr_json(int64_t n, int64_t S, int64_t T) const {
+    const LrSchedule &s = opt->schedule();
+    std::string out = "{";
+    for (size_t g = 0; g < s.groups.size(); g++)
+      out += fmt::format("{}\"{}\":{}", g ? "," : "", s.groups[g].name, s.group_lr(int(g), n, S, T).first);
+    return out + "}";
+  }
+};
+} // namespace
+
 void train(const TrainOptions &o) {
   auto t_setup = clock_type::now();
   MemmapSplit train_split(o.data_dir + "/train"), val_split(o.data_dir + "/val"),
@@ -1746,16 +1842,46 @@ void train(const TrainOptions &o) {
                           : lr_factor(step, total_steps, warmup));
   };
 
+  // --lr-schedule: per-group learning rates, the groups' optimizers (GroupScheduled)
+  std::unique_ptr<GroupScheduled> grouped;
+  if (!o.lr_schedule.empty()) {
+    LrSchedule sched = LrSchedule::load(o.lr_schedule);
+    if (o.dump_lr_schedule > 0) {
+      fmt::print("{}\n", sched.table_json(o.dump_lr_schedule, steps_per_epoch, total_steps));
+      return;
+    }
+    grouped = std::make_unique<GroupScheduled>(workers, std::move(sched), o.grad_clip, o.muon_momentum,
+                                               o.muon_lr_scale, o.muon_ns_steps);
+  } else if (o.dump_lr_schedule > 0) {
+    throw std::runtime_error("--dump-lr-schedule needs --lr-schedule");
+  }
+
   // identical parameters on every worker, then the device-side optimizer
   std::vector<float> params = w0.get_params();
   for (size_t w = 1; w < workers.size(); w++) workers[w]->set_params(params);
   if (o.optimizer != "adam" && o.optimizer != "muon")
     throw std::runtime_error("--optimizer must be adam or muon");
-  Optimizer optimizer(workers, o.grad_clip, o.optimizer == "muon", o.muon_momentum,
-                      o.muon_lr_scale, o.muon_ns_steps, o.allreduce);
+  // without --lr-schedule: exactly the optimizer as before
+  std::unique_ptr<Optimizer> optimizer_owner =
+      grouped ? nullptr
+              : std::make_unique<Optimizer>(workers, o.grad_clip, o.optimizer == "muon", o.muon_momentum,
+                                            o.muon_lr_scale, o.muon_ns_steps, o.allreduce);
+  struct OptimizerFacade { // the calls the loop makes, to either optimizer
+    Optimizer *plain;
+    GroupScheduled *grouped;
+    std::string allreduce_info, muon_split;
+    size_t n_muon_tensors = 0;
+    void stage(size_t w) {
+      if (plain) plain->stage(w);
+    }
+    std::vector<uint8_t> get_state() const { return plain ? plain->get_state() : grouped->opt->get_state(); }
+    void set_state(const std::vector<uint8_t> &s) { plain ? plain->set_state(s) : grouped->opt->set_state(s); }
+  } optimizer{optimizer_owner.get(), grouped.get(), optimizer_owner ? optimizer_owner->allreduce_info : "",
+              optimizer_owner ? optimizer_owner->muon_split : "", optimizer_owner ? optimizer_owner->n_muon_tensors : 0};
   if (!optimizer.allreduce_info.empty()) fmt::print("sync: {}\n", optimizer.allreduce_info);
-  fmt::print("optimizer: {}{}; {}\n", o.optimizer,
-             o.optimizer == "muon" ? fmt::format(" ({} tensors, momentum {}, lr scale {}, {} NS steps)",
+  if (grouped) fmt::print("lr schedule {}: {}\n", o.lr_schedule, grouped->summary(steps_per_epoch, total_steps));
+  fmt::print("optimizer: {}{}; {}\n", grouped ? std::string("per group (--lr-schedule)") : o.optimizer,
+             !grouped && o.optimizer == "muon" ? fmt::format(" ({} tensors, momentum {}, lr scale {}, {} NS steps)",
                                                  optimizer.n_muon_tensors, o.muon_momentum,
                                                  o.muon_lr_scale, o.muon_ns_steps)
                                    : "",
@@ -1957,8 +2083,10 @@ void train(const TrainOptions &o) {
 
       // DDP: average, clip to the global norm, Adam -- all on device 0
       t = clock_type::now();
-      const double lr = lr_at(global_step);
-      const double norm = optimizer.step(lr);
+      const double lr = grouped ? grouped->opt->schedule().base_lr(global_step, steps_per_epoch, total_steps)
+                                : lr_at(global_step);
+      const double norm = grouped ? grouped->step(global_step, steps_per_epoch, total_steps)
+                                  : optimizer.plain->step(lr);
       if (!std::isfinite(norm)) throw std::runtime_error(fmt::format("non-finite gradient at step {}", global_step));
       t_sync += seconds_since(t);
       if (step_pack) {
@@ -2004,6 +2132,8 @@ void train(const TrainOptions &o) {
     const double t_val = seconds_since(t);
     auto [ve, vf] = rmse(val);
     auto [re, rf] = r2(val);
+    if (grouped) // the groups' learning rates of the epoch's last step
+      fmt::print("epoch {} lr: {}\n", epoch, grouped->opt->describe(std::max<int64_t>(0, global_step - 1), steps_per_epoch, total_steps));
     fmt::print("epoch {} done: train {:.1f} s ({:.1f} struct/s, mean loss {:.4g}), RMSE E {:.2f} meV/atom, "
                "F {:.2f} meV/A{} | val ({:.1f} s) RMSE E {:.2f} meV/atom, F {:.2f} meV/A{}, R2 E {:.4f}% F {:.4f}%\n",
                epoch, t_train, ep.n_systems / t_train, ep.loss / done, tre, trf, nc_rmse(ep),
@@ -2017,7 +2147,11 @@ void train(const TrainOptions &o) {
     log_line(done_epochs, val,
              fmt::format(",\"step\":{},\"lr\":{},\"train_loss\":{},\"train_e_rmse_mev_atom\":{},\"train_f_rmse_mev_a\":{},"
                          "\"wall_s\":{},\"val_s\":{},\"best\":{}",
-                         global_step, lr_at(global_step), ep.loss / done, tre, trf, t_train, t_val, best));
+                         global_step, grouped ? grouped->opt->schedule().base_lr(global_step, steps_per_epoch, total_steps)
+                                              : lr_at(global_step),
+                         ep.loss / done, tre, trf, t_train, t_val, best) +
+                 (grouped ? ",\"lr_groups\":" + grouped->lr_json(std::max<int64_t>(0, global_step - 1), steps_per_epoch, total_steps)
+                          : std::string()));
     if (o.save_every <= 0)
       write_gguf(o.init_gguf, fmt::format("{}.epoch{}", o.output, epoch), w0, params, scaling);
     else if (done_epochs % o.save_every == 0)

@@ -16,6 +16,9 @@
 //   hidden weight matrices, each FrameLinear basis kernel a matrix of its own; Adam for the rest (default: Adam).
 //   --max-len N drops the structures with more than N - 1 neighbours of an atom (training and validation):
 //   the ragged attention keeps a sequence in shared memory (the limit depends on head width, frames, GPU).
+//   --lr-schedule FILE.json: per-group learning rates (src/train/lr_schedule.h; replaces --lr, --warmup, --schedule,
+//   --decay-after, --min-lr and --optimizer; groups matched on the state-dict names); --dump-lr-schedule N prints the
+//   groups' lr of the first N steps as JSON and stops (with --dump-steps-per-epoch S: without data or model).
 //   mlipcpp-train-plato --init model.gguf --train data.bin --gradcheck H [--batch-size 8] [weights]: the loss
 //       along the trainer's gradient direction, (L(p + h g/|g|) - L(p - h g/|g|)) / 2h against |g|
 //   mlipcpp-train-plato --init model.gguf --train data.bin --check REF   (REF.json / REF.f64 of
@@ -39,6 +42,7 @@
 // Schedules: metatrain's (warmup + cosine) or LOREM's (constant for --decay-after
 // epochs, then linear to --min-lr). Data: scripts/plato/plato_dataset.py.
 #include "core/conditioning.h"
+#include "train/lr_schedule.h"
 #include "models/plato/plato.h"
 
 #include <ggml-alloc.h>
@@ -500,6 +504,8 @@ struct Worker {
   ggml_tensor *muon_lr = nullptr;
   std::vector<float> muon_rms;
   int64_t n_muon_values = 0;
+  // --lr-schedule: the groups' optimizer (replaces step(); its own clipping, moments and step counts)
+  std::unique_ptr<mlipcpp::train::GroupOptimizer> grouped;
   std::list<std::pair<std::tuple<int, int64_t, int, int, int64_t, int, int, int>, std::unique_ptr<BatchGraph>>> cache;
   size_t cache_limit = 12;
   double fd_eps = 5e-3, energy_weight = 1, force_weight = 1, charge_weight = 0, stress_weight = 0;
@@ -989,14 +995,17 @@ struct State {
   std::string rng;
   double best = 1e300;
   std::vector<float> m, v;
+  std::vector<uint8_t> grouped; // --lr-schedule: GroupOptimizer::get_state()
 };
 void save_state(const std::string &path, const State &s) {
   std::ofstream f(path + ".tmp", std::ios::binary);
-  const nlohmann::json h = {{"step", s.step}, {"epoch", s.epoch}, {"rng", s.rng}, {"best", s.best}, {"n", s.m.size()}};
+  const nlohmann::json h = {{"step", s.step}, {"epoch", s.epoch}, {"rng", s.rng}, {"best", s.best}, {"n", s.m.size()},
+                            {"grouped", s.grouped.size()}};
   const std::string hs = h.dump();
   const uint64_t hl = hs.size();
   f.write(reinterpret_cast<const char *>(&hl), 8), f.write(hs.data(), hl);
   f.write(reinterpret_cast<const char *>(s.m.data()), 4 * s.m.size()), f.write(reinterpret_cast<const char *>(s.v.data()), 4 * s.v.size());
+  f.write(reinterpret_cast<const char *>(s.grouped.data()), s.grouped.size());
   f.close();
   std::filesystem::rename(path + ".tmp", path);
 }
@@ -1013,6 +1022,8 @@ State load_state(const std::string &path) {
   const size_t n = h["n"];
   s.m.resize(n), s.v.resize(n);
   f.read(reinterpret_cast<char *>(s.m.data()), 4 * n), f.read(reinterpret_cast<char *>(s.v.data()), 4 * n);
+  s.grouped.resize(h.value("grouped", size_t(0)));
+  f.read(reinterpret_cast<char *>(s.grouped.data()), s.grouped.size());
   return s;
 }
 
@@ -1073,6 +1084,15 @@ struct Prefetcher {
 
 int main(int argc, char **argv) {
   try {
+    const std::string lr_schedule = arg(argc, argv, "--lr-schedule", "");
+    const int64_t dump_lr = std::stoll(arg(argc, argv, "--dump-lr-schedule", "0"));
+    if (dump_lr > 0 && lr_schedule.empty()) throw std::runtime_error("--dump-lr-schedule needs --lr-schedule");
+    // the table without data or model (golden test): --dump-steps-per-epoch S [--epochs E]
+    if (const int64_t S = std::stoll(arg(argc, argv, "--dump-steps-per-epoch", "0")); dump_lr > 0 && S > 0) {
+      const auto s = mlipcpp::train::LrSchedule::load(lr_schedule);
+      std::printf("%s\n", s.table_json(dump_lr, S, S * std::stoll(arg(argc, argv, "--epochs", "3"))).c_str());
+      return 0;
+    }
     const std::string init = arg(argc, argv, "--init", ""), train_path = arg(argc, argv, "--train", "");
     if (init.empty() || train_path.empty()) {
       std::fprintf(stderr, "usage: mlipcpp-train-plato --init M.gguf --train T.bin [--val V.bin -o OUT.gguf | --check REF]\n");
@@ -1297,6 +1317,36 @@ int main(int argc, char **argv) {
     const auto train_groups = groups(train);
     const int64_t spe = int64_t(ranges(train_groups).size()), total = int64_t(epochs) * spe;
     std::printf("%zu mesh-size groups, %lld micro-batch steps per epoch\n", train_groups.size(), (long long)spe);
+    if (!lr_schedule.empty()) { // per-group learning rates: one GroupOptimizer per replica (after the all-reduce)
+      const auto sched = mlipcpp::train::LrSchedule::load(lr_schedule);
+      if (dump_lr > 0) {
+        std::printf("%s\n", sched.table_json(dump_lr, spe, total).c_str());
+        return 0;
+      }
+      const double gclip = std::stod(arg(argc, argv, "--grad-clip", "1.0"));
+      for (auto &w : workers) {
+        std::vector<mlipcpp::train::GroupOptimizer::Param> ps;
+        for (size_t k = 0; k < w->params.size(); k++)
+          ps.push_back({w->params[k], w->acc[k], w->names[k], is_muon_param(w->params[k], w->names[k])});
+        const int ns = w->muon_ns_steps;
+        w->grouped = std::make_unique<mlipcpp::train::GroupOptimizer>(
+            w->model->backend()->primary(), std::move(ps), sched, gclip, w->muon_momentum, w->muon_lr_scale,
+            [ns](ggml_context *ctx, ggml_tensor *g) { return orthogonalize(ctx, g, ns); });
+      }
+      std::printf("lr schedule %s: base %g, min %g, %s after %g epochs, warmup %g epochs, %lld steps\n", lr_schedule.c_str(),
+                  sched.base, sched.min, sched.shape.c_str(), sched.decay_after_epochs, sched.warmup_epochs, (long long)total);
+      const auto sizes = w0.grouped->group_sizes();
+      std::vector<int> nt(sched.groups.size(), 0);
+      for (int g : w0.grouped->group_of_param()) nt[g]++;
+      for (size_t g = 0; g < sched.groups.size(); g++) {
+        const auto &x = sched.groups[g];
+        std::printf("  group %s: %d tensors, %zu values; lr x%g, frozen %g epochs, warmup %g epochs, weight decay %g, %s\n",
+                    x.name.c_str(), nt[g], sizes[g], x.lr_mult, x.freeze_epochs, x.warmup_epochs, x.weight_decay,
+                    x.muon ? "Muon (matrices) + AdamW" : "AdamW");
+      }
+    } else if (dump_lr > 0) {
+      throw std::runtime_error("--dump-lr-schedule needs --lr-schedule");
+    }
     auto lr_at = [&](int64_t step) {
       if (schedule == "linear") { // LOREM: constant for decay_after epochs, then linear to min_lr at the end
         const int64_t s0 = int64_t(decay_after) * spe;
@@ -1317,6 +1367,8 @@ int main(int argc, char **argv) {
       st = load_state(resume);
       std::istringstream(st.rng) >> rng;
       for (auto &w : workers) w->set_moments(st.m, false), w->set_moments(st.v, true);
+      if (w0.grouped)
+        for (auto &w : workers) w->grouped->set_state(st.grouped);
       std::printf("resumed at epoch %d, step %lld\n", st.epoch, (long long)st.step);
     }
 #ifdef MLIPCPP_NCCL
@@ -1437,12 +1489,16 @@ int main(int argc, char **argv) {
 #endif
         st.step++;
         std::vector<std::future<double>> sf;
-        for (auto &w : workers) sf.push_back(std::async(std::launch::async, [&, wp = w.get()] { return wp->step(lr_at(st.step - 1), st.step, clip); }));
+        for (auto &w : workers)
+          sf.push_back(std::async(std::launch::async, [&, wp = w.get()] {
+            return wp->grouped ? wp->grouped->step(st.step - 1, spe, total) : wp->step(lr_at(st.step - 1), st.step, clip);
+          }));
         for (auto &f : sf) gn = f.get();
         nb++;
         if (st.step % 100 == 0) {
           std::printf("  step %lld loss %.6g (E %.4g F %.4g) |g| %.3g lr %.3g\n", (long long)st.step,
-                      lt / nb, le / nb, lf / nb, gn, lr_at(st.step));
+                      lt / nb, le / nb, lf / nb, gn,
+                      w0.grouped ? w0.grouped->schedule().base_lr(st.step - 1, spe, total) : lr_at(st.step));
           std::fflush(stdout);
         }
         if (max_steps > 0 && st.step >= max_steps) break;
@@ -1457,13 +1513,15 @@ int main(int argc, char **argv) {
       const double val_s = std::chrono::duration<double>(clk::now() - tv).count();
       std::printf("epoch %d: train loss %.6g (E %.4g F %.4g), %.1f s (host wait %.1f, build %.1f, inputs %.1f, compute %.1f s; %lld graphs built), lr %.3g",
                   ep, lt / nb, le / nb, lf / nb, wall, wait_ms / 1e3, w0.t_build / 1e3,
-                  w0.t_host / 1e3, w0.t_compute / 1e3, (long long)w0.builds, lr_at(st.step));
+                  w0.t_host / 1e3, w0.t_compute / 1e3, (long long)w0.builds,
+                  w0.grouped ? w0.grouped->schedule().base_lr(std::max<int64_t>(0, st.step - 1), spe, total) : lr_at(st.step));
       if (do_val)
         std::printf(", val E MAE %.4f meV/atom, F MAE %.4f meV/A, loss %.6g, R2 E %.4f%% F %.4f%% (%.1f s)", 1e3 * m[0], 1e3 * m[1],
                     m[2], m[3], m[4], val_s);
       if (do_val && m[7] > 0) std::printf(", molecule charge MAE %.4f e, formal sign %.1f%%", m[5], m[6]);
       if (do_val && m[10] > 0) std::printf(", stress MAE %.4f GPa, R2 %.3f%%", 160.21766 * m[8], m[9]);
       std::printf("\n");
+      if (w0.grouped) std::printf("epoch %d lr: %s\n", ep, w0.grouped->describe(std::max<int64_t>(0, st.step - 1), spe, total).c_str());
       std::fflush(stdout);
       nlohmann::json line = {{"epoch", ep}, {"step", st.step}, {"train_loss", lt / nb},
                              {"train_loss_e", le / nb}, {"train_loss_f", lf / nb}, {"train_loss_q", lq / nb}, {"train_loss_s", ls / nb}, {"wall_s", wall}, {"lr", lr_at(st.step)}};
@@ -1473,6 +1531,13 @@ int main(int argc, char **argv) {
                                {"val_r2_e", m[3]}, {"val_r2_f", m[4]}, {"best", best}});
       if (do_val && m[7] > 0) line.update({{"val_q_mae_e", m[5]}, {"val_q_sign_pct", m[6]}});
       if (do_val && m[10] > 0) line.update({{"val_s_mae_gpa", 160.21766 * m[8]}, {"val_r2_s", m[9]}});
+      if (w0.grouped) {
+        nlohmann::json lg;
+        const auto &sc = w0.grouped->schedule();
+        for (size_t g = 0; g < sc.groups.size(); g++) lg[sc.groups[g].name] = sc.group_lr(int(g), std::max<int64_t>(0, st.step - 1), spe, total).first;
+        line["lr_groups"] = lg;
+        line["lr"] = sc.base_lr(std::max<int64_t>(0, st.step - 1), spe, total);
+      }
       log_line(line);
       const bool last = ep == epochs || epochs_this_run >= max_epochs_run || (max_steps > 0 && st.step >= max_steps) ||
                         std::chrono::duration<double>(clk::now() - run_start).count() / 3600.0 > max_hours;
@@ -1497,6 +1562,7 @@ int main(int argc, char **argv) {
         std::ostringstream rs;
         rs << rng;
         st.rng = rs.str(), st.m = w0.get_moments(false), st.v = w0.get_moments(true);
+        if (w0.grouped) st.grouped = w0.grouped->get_state();
         save_state(state_path, st);
       }
       if (last) {

@@ -3,6 +3,7 @@
 // src/train/trainer.h.
 #include "train/crash.h"
 #include "train/trainer.h"
+#include "train/lr_schedule.h"
 
 #include <fmt/core.h>
 
@@ -26,6 +27,11 @@ int main(int argc, char **argv) {
                "          [--dump-errors PREFIX] [--log-errors FILE] [--log-errors-epochs {}] [--exclude DIR]\n"
                "          [--conservative] [--energy-weight {}] [--force-weight {}] [--nc-force-weight {}] [--model-baselines]\n"
                "          [--allreduce {}] [--save-every N] [--log JSONL] [--state-every N] [--max-hours H] [--resume STATE]\n"
+               "          [--lr-schedule FILE.json] [--dump-lr-schedule N [--dump-steps-per-epoch S]]\n"
+               "--lr-schedule: per-group learning rates (src/train/lr_schedule.h), replaces --lr, --warmup-fraction,\n"
+               "--schedule, --decay-after, --min-lr and --optimizer; groups matched on metatrain state-dict names;\n"
+               "--dump-lr-schedule N prints the groups' lr of the first N steps as JSON and stops (with\n"
+               "--dump-steps-per-epoch S: without data, S steps per epoch, --epochs epochs);\n"
                "--dump-errors writes PREFIX.{{val,test}}.bin, --log-errors the training structures' errors\n"
                "before each update (24-byte records, see SystemError); --exclude DIR drops the split\n"
                "indices in DIR/{{train,val,test}}.npy;\n"
@@ -49,6 +55,7 @@ int main(int argc, char **argv) {
                o.log_errors_epochs, o.energy_weight, o.force_weight, o.nc_force_weight, int(o.allreduce));
     std::exit(2);
   };
+  int64_t dump_spe = 0;
   for (int i = 1; i < argc; i++) {
     const std::string a = argv[i];
     auto val = [&]() -> std::string { return i + 1 < argc ? argv[++i] : (usage(), ""); };
@@ -97,7 +104,18 @@ int main(int argc, char **argv) {
     else if (a == "--state-every") o.state_every = std::stoi(val());
     else if (a == "--max-hours") o.max_hours = std::stod(val());
     else if (a == "--resume") o.resume = val();
+    else if (a == "--lr-schedule") o.lr_schedule = val();
+    else if (a == "--dump-lr-schedule") o.dump_lr_schedule = std::stoll(val());
+    else if (a == "--dump-steps-per-epoch") dump_spe = std::stoll(val());
     else usage();
+  }
+  // --lr-schedule F --dump-lr-schedule N --dump-steps-per-epoch S [--epochs E]: the table
+  // without data or model (the golden test); with data, the run's own steps per epoch
+  if (o.dump_lr_schedule > 0 && dump_spe > 0) {
+    if (o.lr_schedule.empty()) usage();
+    const auto s = mlipcpp::train::LrSchedule::load(o.lr_schedule);
+    fmt::print("{}\n", s.table_json(o.dump_lr_schedule, dump_spe, dump_spe * o.epochs));
+    return 0;
   }
   if (o.data_dir.empty() || o.init_gguf.empty() || o.output.empty()) usage();
   try {

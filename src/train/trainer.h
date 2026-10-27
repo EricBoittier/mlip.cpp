@@ -81,6 +81,12 @@ struct TrainOptions {
   int state_every = 0;
   double max_hours = 0;
   std::string resume;
+  // per-group learning rates (train/lr_schedule.h): a JSON spec that replaces --lr,
+  // --warmup-fraction, --schedule, --decay-after and --min-lr; groups matched on the metatrain
+  // state-dict names (GGUF train.state_dict_names); dump_lr_schedule > 0: print the per-group
+  // table of that many steps (JSON) and stop
+  std::string lr_schedule;
+  int64_t dump_lr_schedule = 0;
   // several GPUs: average the gradients with one NCCL all-reduce and step a
   // replica of the optimizer on every device (no gradient staging on device
   // 0, no weight broadcast); default with a build that has NCCL

@@ -214,3 +214,17 @@ if(MLIPCPP_BUILD_TRAINING)
     target_link_libraries(test_conservative PRIVATE mlipcpp_train Catch2::Catch2WithMain)
     catch_discover_tests(test_conservative)
 endif()
+
+# Charge / spin conditioning inputs (no model file needed)
+add_executable(test_conditioning test_conditioning.cpp)
+target_link_libraries(test_conditioning PRIVATE mlipcpp Catch2::Catch2WithMain fmt::fmt)
+target_include_directories(test_conditioning PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/)
+catch_discover_tests(test_conditioning)
+
+# Per-group learning-rate schedules against metatrain's golden tables
+if(TARGET mlipcpp_train)
+    add_executable(test_lr_schedule test_lr_schedule.cpp)
+    target_link_libraries(test_lr_schedule PRIVATE mlipcpp_train Catch2::Catch2WithMain fmt::fmt)
+    target_compile_definitions(test_lr_schedule PRIVATE MLIPCPP_TEST_RESOURCES="${CMAKE_CURRENT_SOURCE_DIR}/resources")
+    catch_discover_tests(test_lr_schedule)
+endif()
