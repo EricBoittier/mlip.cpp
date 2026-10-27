@@ -4,7 +4,10 @@
  * as JSON: for parity checks against metatrain / metatomic
  * (scripts/conditioning/parity_*.py).
  *
- *   mlipcpp-eval MODEL.gguf IN.xyz OUT.json [--backend cpu|cuda|...] [--charge Q] [--spin S]
+ *   mlipcpp-eval MODEL.gguf IN.xyz OUT.json [--backend cpu|cuda|...] [--charge Q] [--spin S] [--repeat N]
+ *
+ * --repeat N: each frame is evaluated N + 1 times (the first a warm-up) and its
+ * median wall time per evaluation is written as "seconds".
  *
  * Charge and spin multiplicity per frame come from the frame's charge= and
  * spin_multiplicity= (or spin=) keys, else 0 and 1; --charge / --spin
@@ -18,6 +21,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <chrono>
 #include <fstream>
 #include <iostream>
 #include <optional>
@@ -48,12 +53,14 @@ int main(int argc, char *argv[]) {
     return 1;
   }
   std::optional<int> charge, spin;
+  int repeat = 0;
   std::string backend = "cpu";
   for (int i = 4; i + 1 < argc; i++) {
     const std::string a = argv[i];
     if (a == "--backend") backend = argv[++i];
     else if (a == "--charge") charge = std::stoi(argv[++i]);
     else if (a == "--spin") spin = std::stoi(argv[++i]);
+    else if (a == "--repeat") repeat = std::stoi(argv[++i]);
     else {
       std::cerr << "unknown option " << a << "\n";
       return 1;
@@ -102,6 +109,17 @@ int main(int argc, char *argv[]) {
         }
         Result r = model.predict(sys.num_atoms(), sys.positions(), sys.atomic_numbers(),
                                  sys.cell() ? cell : nullptr, sys.cell() ? pbc : nullptr, po);
+        if (repeat > 0) {
+          std::vector<double> t;
+          for (int k = 0; k < repeat; k++) {
+            const auto t0 = std::chrono::steady_clock::now();
+            model.predict(sys.num_atoms(), sys.positions(), sys.atomic_numbers(), sys.cell() ? cell : nullptr,
+                          sys.cell() ? pbc : nullptr, po);
+            t.push_back(std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+          }
+          std::sort(t.begin(), t.end());
+          f["seconds"] = t[t.size() / 2];
+        }
         f["energy"] = r.energy;
         f["forces"] = r.forces;
         if (r.has_stress()) f["stress"] = r.stress;
