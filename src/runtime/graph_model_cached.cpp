@@ -287,6 +287,7 @@ void GraphModel::build_cached_graph(int n, int M, bool exact_mask, bool backward
     g->plato = std::make_unique<PetPlatoLR>();
     g->plato->create(ctx, plato_lr_, plato_st_, n, backward && plato_lr_.long_range());
     g->plato->set_padding_mask(g->padding_mask);
+    g->plato->set_fused_frames(true);
     interp_.custom_op = [p = g->plato.get()](ggml_context *c, const GIRNode &node, const std::vector<ggml_tensor *> &in) {
       return p->build(c, node, in);
     };

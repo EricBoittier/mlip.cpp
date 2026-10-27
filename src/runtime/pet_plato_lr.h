@@ -79,6 +79,9 @@ public:
   /// the graph's padding mask [max_neighbors, n] (1 = padded): the frame RoPE attention masks the
   /// padded keys exactly (-inf), as metatrain's FrameRoPEAttention (feat/pet-plato-lr 9362e3df)
   void set_padding_mask(ggml_tensor *pm) { padding_mask_ = pm; }
+  /// the frame attention as one ggml_plato_attn on the ragged token order (inference graphs: the
+  /// op has a backward pass but no forward-mode rule); MLIPCPP_PLATO_ATTN=0 keeps ggml_pet_attn
+  void set_fused_frames(bool on) { fused_frames_ = on; }
 
   ggml_tensor *positions = nullptr; // F32 [3, n]
   ggml_tensor *strain = nullptr;    // F32 [3, 3, G_p] of the first periodic group (one structure: its strain), or nullptr
@@ -129,6 +132,8 @@ private:
   std::vector<std::pair<ggml_tensor *, std::vector<float>>> lazy_f32_;
   ggml_tensor *swap_halves_ = nullptr, *rope_sign_ = nullptr, *slot_mask_ = nullptr;
   ggml_tensor *swap_index(ggml_context *ctx, int64_t rows);
+  bool fused_frames_ = false;
+  ggml_tensor *lazy_index(ggml_context *ctx, const char *name, std::vector<int32_t> values);
 
   ggml_tensor *frac(ggml_context *ctx);
   ggml_tensor *pair_r(ggml_context *ctx); // [1, P] distances of the pairs

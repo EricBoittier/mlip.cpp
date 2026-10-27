@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <map>
+#include <string>
 #include <stdexcept>
 
 namespace mlipcpp::runtime {
@@ -402,6 +403,32 @@ ggml_tensor *PetPlatoLR::rope_attn(ggml_context *ctx, const GIRNode &node, const
     ggml_tensor *bq = base(in[0]), *bk = base(in[1]), *bv = base(in[2]);
     if (bq && bq == bk && bq == bv) x3 = bq;
   }
+  static const bool plato_attn_off = [] { const char *e = std::getenv("MLIPCPP_PLATO_ATTN"); return e && *e == '0'; }();
+  if (x3 && fused_frames_ && !plato_attn_off && F <= 12 && (Ch == 8 || Ch == 16 || Ch == 32) && L > 1) {
+    // ggml_plato_attn on the ragged token order: the N centres, then each atom's M = L - 1 slots
+    // (padded slots included, their keys at -inf); the frames inside the op
+    const int64_t M = L - 1, T = N * L;
+    std::vector<int32_t> perm(T), inv(T), off(N + 1);
+    for (int64_t n = 0; n < N; n++) {
+      perm[n] = static_cast<int32_t>(n * L), off[n] = static_cast<int32_t>(n * M);
+      for (int64_t s = 1; s < L; s++) perm[N + n * M + s - 1] = static_cast<int32_t>(n * L + s);
+    }
+    off[N] = static_cast<int32_t>(N * M);
+    for (int64_t t = 0; t < T; t++) inv[perm[t]] = static_cast<int32_t>(t);
+    ggml_tensor *ip = lazy_index(ctx, "ragged_perm", perm), *ii = lazy_index(ctx, "ragged_inv", inv);
+    ggml_tensor *io = lazy_index(ctx, "ragged_off", off);
+    ggml_tensor *X = ggml_get_rows(ctx, ggml_reshape_2d(ctx, cont(ctx, x3), 3 * D, T), ip);          // [3D, T]
+    ggml_tensor *Rw = mm_f32(ctx, ggml_reshape_2d(ctx, cont(ctx, frames), 3, 3 * F), omega);       // [3F, C2]
+    Rw = ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, Rw, 3, F, C2), 0, 2, 1, 3)), 3, C2 * F);
+    ggml_tensor *ang = ggml_get_rows(ctx, mm_f32(ctx, Rw, pos), ip);                              // [C2 F, T]: f C2 + j
+    // the keys' bias (the same for every query): slots 1..M of each atom
+    ggml_tensor *kb = ggml_view_2d(ctx, bias, M, N, bias->nb[3], ggml_element_size(bias));
+    ggml_tensor *b1 = ggml_reshape_1d(ctx, ggml_cont(ctx, kb), M * N);
+    std::vector<float> w(F, 1.0f / F);
+    ggml_tensor *o = ggml_plato_attn(ctx, X, ang, b1, io, static_cast<int>(H), static_cast<int>(L), scale, F, w.data()); // [D, T]
+    o = ggml_get_rows(ctx, o, ii);                                                                 // [D, L N]
+    return ggml_permute(ctx, ggml_reshape_4d(ctx, o, Ch, H, L, N), 0, 2, 1, 3); // [Ch, L, H, N]
+  }
   if (x3) {
     // every frame at once, without concatenations: the q, k, v slots of x rotated together
     // (the v slot by angle 0) on the frames' copies of the sequences, one fused attention
@@ -521,6 +548,17 @@ ggml_tensor *PetPlatoLR::edge_sum(ggml_context *ctx, const std::vector<ggml_tens
   }
   if (F > 1) acc = ggml_scale(ctx, acc, 1.0f / F);
   return ggml_reshape_3d(ctx, acc, d, M, n);
+}
+
+ggml_tensor *PetPlatoLR::lazy_index(ggml_context *ctx, const char *name, std::vector<int32_t> values) {
+  for (const auto &[t, v] : lazy_i32_)
+    if (std::string(t->name) == name && v == values) return t;
+  ggml_tensor *t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, static_cast<int64_t>(values.size()));
+  ggml_set_name(t, name);
+  ggml_set_input(t);
+  all_.push_back(t);
+  lazy_i32_.emplace_back(t, std::move(values));
+  return t;
 }
 
 ggml_tensor *PetPlatoLR::swap_index(ggml_context *ctx, int64_t rows) {
