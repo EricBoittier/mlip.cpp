@@ -530,8 +530,9 @@ __global__ void bwd_bias_rows(const T *__restrict__ qkv, const T *__restrict__ b
                               const T scale) {
   extern __shared__ __align__(16) unsigned char smraw[];
   T *sm = reinterpret_cast<T *>(smraw);
-  const int D = H * d, i = blockIdx.x;
-  const int64_t n = blockIdx.y;
+  // grid (N, L): sequences on x (up to 2^31 - 1), rows on y
+  const int D = H * d, i = blockIdx.y;
+  const int64_t n = blockIdx.x;
   T *q = sm, *dO = sm + D, *lse = sm + 2 * D, *Di = lse + H;
   const T *x = qkv + n * L * 3 * D;
   const int64_t row = n * L + i;
@@ -1083,10 +1084,10 @@ void backward(const T *qkv, const T *bias, const T *o, const T *lse, const T *go
         else launch(bwd_bias_seq<D_, 16>);
       } else {
         const size_t smem = (2 * (size_t)H * D_ + 2 * H) * sizeof(T);
-        if (smem > MAX_SMEM || N > 65535)
-          throw std::runtime_error("mlipcpp pet_attn: bias gradient shape not supported (N > 65535 or H*d too large)");
+        if (smem > MAX_SMEM || L > 65535)
+          throw std::runtime_error("mlipcpp pet_attn: bias gradient shape not supported (L > 65535 or H*d too large)");
         const int threads = std::min(128, (L + 31) / 32 * 32);
-        bwd_bias_rows<D_, T><<<dim3((unsigned)L, (unsigned)N), threads, smem, stream>>>(
+        bwd_bias_rows<D_, T><<<dim3((unsigned)N, (unsigned)L), threads, smem, stream>>>(
             qkv, bias, o, lse, go, glse, dbias, H, L, (T)scale);
       }
       PA_CHECK(cudaGetLastError());
