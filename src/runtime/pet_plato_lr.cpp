@@ -404,7 +404,9 @@ ggml_tensor *PetPlatoLR::rope_attn(ggml_context *ctx, const GIRNode &node, const
     if (bq && bq == bk && bq == bv) x3 = bq;
   }
   static const bool plato_attn_off = [] { const char *e = std::getenv("MLIPCPP_PLATO_ATTN"); return e && *e == '0'; }();
-  if (x3 && fused_frames_ && !plato_attn_off && F <= 12 && (Ch == 8 || Ch == 16 || Ch == 32) && L > 1) {
+  // (one CUDA block per atom: below ~100 atoms the ggml_pet_attn path is faster on a GH200)
+  static const int64_t plato_attn_min = [] { const char *e = std::getenv("MLIPCPP_PLATO_ATTN_MIN"); return e && *e ? std::atoll(e) : 96LL; }();
+  if (x3 && fused_frames_ && !plato_attn_off && N >= plato_attn_min && F <= 12 && (Ch == 8 || Ch == 16 || Ch == 32) && L > 1) {
     // ggml_plato_attn on the ragged token order: the N centres, then each atom's M = L - 1 slots
     // (padded slots included, their keys at -inf); the frames inside the op
     const int64_t M = L - 1, T = N * L;
