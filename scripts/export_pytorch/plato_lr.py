@@ -17,6 +17,8 @@ mesh LayerNorm and its down / up projections) stays ordinary traced PyTorch:
   kernel sum) on the latent channels ``v`` of :class:`PETMeshCoupling`.
 - ``plato_les(q, charge_unit, ...)``: the per-atom LES energies of the latent charges
   (neutralised per structure, or shifted to the structure's total charge).
+- ``plato_split(q, charge_unit, radius, ...)``: the ungated per-atom E_split of the same
+  shifted charges (``les_split``; gate ``plato_split_gate``, radius ``plato_split_radius``).
 
 The positions, cell and total charge are not graph inputs: the C++ side supplies them to
 the native builders (the energy depends on them through those ops only), and the
@@ -148,6 +150,29 @@ def _(q, edge_distances, cutoff_factors, charge_unit, sigma, total_charge_constr
     return q.new_empty(q.shape[0])
 
 
+@torch.library.custom_op("mlipcpp::plato_split", mutates_args=())
+def plato_split(q: torch.Tensor, charge_unit: torch.Tensor, radius: torch.Tensor, delta: float,
+                radius_max: float, total_charge_constraint: int) -> torch.Tensor:
+    """The ungated per-atom E_split (n,) of the shifted latent charges (metatrain's
+    plato_lr.split_energy): sum_c q_ic (sum_j w(r_ij) q_jc - Q_c f), f = 1 open, V_w / V
+    periodic."""
+    from metatrain.pet.modules.plato_lr import split_energy
+    if "positions" not in CONTEXT:
+        return q.new_zeros(q.shape[0])
+    shift = q.mean(0)
+    if total_charge_constraint:
+        shift = shift - float(CONTEXT.get("charge", 0.0)) / charge_unit.to(q.dtype) / q.shape[0]
+    periodic = bool(CONTEXT.get("periodic", False))
+    cell = CONTEXT["cell"].to(q.dtype) if periodic else q.new_zeros(3, 3)
+    return split_energy(q - shift, CONTEXT["positions"].to(q.dtype), cell, periodic, radius.to(q.dtype),
+                        delta, radius_max)
+
+
+@plato_split.register_fake
+def _(q, charge_unit, radius, delta, radius_max, total_charge_constraint):
+    return q.new_empty(q.shape[0])
+
+
 # ---------------------------------------------------------------- module patches
 
 
@@ -218,6 +243,9 @@ def plato_lr_hypers(pet_model) -> Optional[dict]:
         total_charge_constraint=bool(les.total_charge_constraint) if les is not None else False,
         les_tail_sigma=float(getattr(les, "tail_sigma", 0.0)) if les is not None else 0.0,
         les_tail_subtract_cutoff=bool(getattr(les, "tail_subtract_cutoff", False)) if les is not None else False,
+        les_split=bool(getattr(les, "split", False)) if les is not None else False,
+        les_split_delta=float(getattr(les, "split_delta", 1.0)) if les is not None else 1.0,
+        les_split_radius_max=float(getattr(les, "split_radius_max", 10.0)) if les is not None else 10.0,
     )
 
 
@@ -276,6 +304,9 @@ class PlatoLRParts(torch.nn.Module):
             self.les_charge_head = les.charge_head
             self.les_gate = les.les_gate
             self.register_buffer("les_charge_unit", les.charge_unit.clone())
+            if getattr(les, "split", False):  # GGUF plato_split_gate, plato_split_radius
+                self.split_gate = les.split_gate
+                self.split_radius = les.split_radius
 
     def mesh_update(self, x: torch.Tensor) -> torch.Tensor:
         h = self.h
@@ -303,7 +334,12 @@ class PlatoLRParts(torch.nn.Module):
         if h.get("les_tail_subtract_cutoff", False):  # the part inside the neighbour list (padded slots: f_c = 0)
             e = e - torch.ops.mlipcpp.les_cutoff_sub(q, edge_distances, cutoff_factors, self.les_charge_unit,
                                                      sigma, int(h["total_charge_constraint"]))
-        return self.les_gate * e
+        e = self.les_gate * e
+        if h.get("les_split", False):
+            e = e + self.split_gate * torch.ops.mlipcpp.plato_split(
+                q, self.les_charge_unit, self.split_radius, float(h["les_split_delta"]),
+                float(h["les_split_radius_max"]), int(h["total_charge_constraint"]))
+        return e
 
     def sync_back(self) -> None:
         """Write the folded mesh projections back into the FrameLinears (GGUF ->
@@ -352,3 +388,7 @@ def gguf_metadata(writer, h: dict) -> None:
         if h.get("les_tail_sigma", 0.0) > 0:  # absent: today's LES
             writer.add_float32("pet.plato_lr.les_tail_sigma", float(h["les_tail_sigma"]))
             writer.add_int32("pet.plato_lr.les_tail_subtract_cutoff", int(h["les_tail_subtract_cutoff"]))
+        if h.get("les_split", False):  # absent: no E_split
+            writer.add_int32("pet.plato_lr.les_split", 1)
+            writer.add_float32("pet.plato_lr.les_split_delta", float(h["les_split_delta"]))
+            writer.add_float32("pet.plato_lr.les_split_radius_max", float(h["les_split_radius_max"]))

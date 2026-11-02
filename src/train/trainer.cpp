@@ -535,7 +535,8 @@ void Worker::plato_create(StepGraph &g, ggml_context *ctx, int n, bool grad) {
     st.push_back(s);
   }
   g.plato = std::make_unique<runtime::PetPlatoLR>();
-  g.plato->create(ctx, model_.plato_lr(), st, n, grad);
+  const bool pos = plato_batch_ && plato_batch_->n_atoms == n && plato_batch_->positions.size() == 3 * size_t(n);
+  g.plato->create(ctx, model_.plato_lr(), st, n, grad, pos ? plato_batch_->positions.data() : nullptr);
 }
 
 std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode mode, bool cached) {

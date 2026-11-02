@@ -285,7 +285,7 @@ void GraphModel::build_cached_graph(int n, int M, bool exact_mask, bool backward
   }
   if (plato_lr_.enabled) {
     g->plato = std::make_unique<PetPlatoLR>();
-    g->plato->create(ctx, plato_lr_, plato_st_, n, backward && plato_lr_.long_range());
+    g->plato->create(ctx, plato_lr_, plato_st_, n, backward && plato_lr_.long_range(), plato_pos_);
     g->plato->set_padding_mask(g->padding_mask);
     g->plato->set_fused_frames(true);
     interp_.custom_op = [p = g->plato.get()](ggml_context *c, const GIRNode &node, const std::vector<ggml_tensor *> &in) {
@@ -518,7 +518,7 @@ bool GraphModel::fit_cached_graph(int n, int max_kept) {
   const int pad = pad_env >= 0 ? pad_env : (backend_provider_->is_gpu() ? 4 : 0);
   const int need = std::max(max_kept, 1);
   if (cached_ && cached_->n_atoms == n && cached_->exact_mask == exact && cached_->backward == backward &&
-      need <= cached_->M && cached_->M <= need + 2 * pad && (!cached_->plato || cached_->plato->refresh(plato_st_)))
+      need <= cached_->M && cached_->M <= need + 2 * pad && (!cached_->plato || cached_->plato->refresh(plato_st_, plato_pos_)))
     return false;
   build_cached_graph(n, need + pad, exact, backward);
   return true;
@@ -718,6 +718,7 @@ ModelResult GraphModel::predict_cached(const AtomicSystem &system, bool compute_
     }
     st.charge = system.charge();
     plato_st_ = {st};
+    plato_pos_ = system.positions();
   }
 #ifdef MLIPCPP_HAVE_CUDA_INPUTS
   static const bool host_inputs = std::getenv("MLIPCPP_HOST_INPUTS") != nullptr;

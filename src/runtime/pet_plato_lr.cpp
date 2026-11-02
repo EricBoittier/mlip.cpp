@@ -80,6 +80,11 @@ PetPlatoLRSpec PetPlatoLRSpec::from_gguf(const GGUFLoader &L) {
   s.total_charge_constraint = L.get_int32("pet.plato_lr.total_charge_constraint", 0) != 0;
   s.les_tail_sigma = L.get_float32("pet.plato_lr.les_tail_sigma", 0.0f);
   s.les_tail_subtract_cutoff = L.get_int32("pet.plato_lr.les_tail_subtract_cutoff", 0) != 0;
+  s.les_split = L.get_int32("pet.plato_lr.les_split", 0) != 0;
+  s.split_delta = L.get_float32("pet.plato_lr.les_split_delta", 1.0f);
+  s.split_radius_max = L.get_float32("pet.plato_lr.les_split_radius_max", 10.0f);
+  if (s.les_split && !(s.les && s.split_delta > 0 && s.split_radius_max > s.split_delta))
+    throw std::runtime_error("Plato-PET-LR: les_split needs les and 0 < les_split_delta < les_split_radius_max");
   s.les_method = L.get_string("pet.plato_lr.les_method", "auto");
   s.les_pme_atoms = L.get_int32("pet.plato_lr.les_pme_atoms", 128);
   if (const char *e = std::getenv("MLIPCPP_PLATO_LES_METHOD"); e && *e) s.les_method = e;
@@ -89,9 +94,10 @@ PetPlatoLRSpec PetPlatoLRSpec::from_gguf(const GGUFLoader &L) {
 }
 
 void PetPlatoLR::create(ggml_context *ctx, const PetPlatoLRSpec &spec, const std::vector<PetPlatoLRStructure> &structures,
-                        int n_atoms, bool grad) {
+                        int n_atoms, bool grad, const float *pos0) {
   spec_ = spec, st_ = structures, n_ = n_atoms;
-  all_.clear(), groups_.clear();
+  all_.clear(), groups_.clear(), split_img_.clear();
+  split_mask_ = nullptr;
   frac_ = pair_r_ = charges_ = key_log_keep_ = nbr_ = nullptr;
   lazy_i32_.clear(), lazy_f32_.clear();
   swap_halves_ = rope_sign_ = slot_mask_ = nullptr;
@@ -140,6 +146,12 @@ void PetPlatoLR::create(ggml_context *ctx, const PetPlatoLRSpec &spec, const std
       pair_j_ = input(GGML_TYPE_I32, n_pairs_, 1, 1, "plato_lr.pair_j");
     }
     open_mask_ = ggml_reshape_2d(ctx, input(GGML_TYPE_F32, 1, n_, 1, "plato_lr.open_mask"), 1, n_);
+  }
+  if (spec_.les_split) { // the atoms of some structure (not the trainer's padding atoms)
+    h_smask_.assign(n_, 0.0f);
+    for (const auto &s : st_)
+      for (int i = s.a0; i < s.a1; i++) h_smask_[i] = 1.0f;
+    split_mask_ = ggml_reshape_2d(ctx, input(GGML_TYPE_F32, 1, n_, 1, "plato_lr.split_mask"), 1, n_);
   }
   bool any_periodic = false;
   for (const auto &s : st_) any_periodic |= s.periodic;
@@ -279,10 +291,63 @@ void PetPlatoLR::create(ggml_context *ctx, const PetPlatoLRSpec &spec, const std
       q.les_k = input(GGML_TYPE_F32, 3, q.nk, Gq, "plato_lr.les_k");
     }
   }
+  if (spec_.les_split) // the periodic image pairs, a capacity with room for the positions to move
+    for (const Group &q : groups_) {
+      SplitImages im;
+      const int64_t c = pos0 ? split_images(q, pos0, nullptr) : 0;
+      im.cap = c + c / 4 + 16;
+      im.ti = input(GGML_TYPE_I32, im.cap, 1, 1, "plato_lr.split_i");
+      im.tj = input(GGML_TYPE_I32, im.cap, 1, 1, "plato_lr.split_j");
+      im.tb = input(GGML_TYPE_I32, im.cap, 1, 1, "plato_lr.split_b");
+      im.tt = ggml_reshape_2d(ctx, input(GGML_TYPE_F32, 3, im.cap, 1, "plato_lr.split_t"), 3, im.cap);
+      split_img_.push_back(std::move(im));
+    }
   strain = groups_[0].strain;
 }
 
-bool PetPlatoLR::refresh(const std::vector<PetPlatoLRStructure> &structures) {
+// the image pairs (i <= j; i == j: half the nonzero shifts) of group g's structures closer
+// than split_radius_max at `pos`, appended to out (if given); the count
+int64_t PetPlatoLR::split_images(const Group &g, const float *pos, SplitImages *out) const {
+  const double rmax = spec_.split_radius_max, r2max = rmax * rmax;
+  int64_t count = 0;
+  for (int b = 0; b < g.size(); b++) {
+    const auto &s = st_[g.structs[b]];
+    const auto &A = s.cell;
+    double I[3][3], det;
+    inverse3(A, I, det);
+    int M[3];
+    for (int a = 0; a < 3; a++) { // the perpendicular width V / |A_b x A_c|
+      const double *u = A[(a + 1) % 3], *v = A[(a + 2) % 3];
+      const double cx = u[1] * v[2] - u[2] * v[1], cy = u[2] * v[0] - u[0] * v[2], cz = u[0] * v[1] - u[1] * v[0];
+      M[a] = static_cast<int>(std::floor(rmax * std::sqrt(cx * cx + cy * cy + cz * cz) / std::abs(det) + 0.5));
+    }
+    for (int i = s.a0; i < s.a1; i++)
+      for (int j = i; j < s.a1; j++) {
+        double dx[3], n0[3];
+        for (int c = 0; c < 3; c++) dx[c] = double(pos[3 * j + c]) - double(pos[3 * i + c]);
+        for (int k = 0; k < 3; k++) n0[k] = -std::round(dx[0] * I[0][k] + dx[1] * I[1][k] + dx[2] * I[2][k]);
+        for (int m0 = -M[0]; m0 <= M[0]; m0++)
+          for (int m1 = -M[1]; m1 <= M[1]; m1++)
+            for (int m2 = -M[2]; m2 <= M[2]; m2++) {
+              const double n[3] = {n0[0] + m0, n0[1] + m1, n0[2] + m2};
+              if (i == j && !(n[0] > 0 || (n[0] == 0 && (n[1] > 0 || (n[1] == 0 && n[2] > 0))))) continue;
+              double t[3], d2 = 0;
+              for (int c = 0; c < 3; c++) {
+                t[c] = n[0] * A[0][c] + n[1] * A[1][c] + n[2] * A[2][c];
+                d2 += (dx[c] + t[c]) * (dx[c] + t[c]);
+              }
+              if (!(d2 < r2max)) continue;
+              count++;
+              if (!out) continue;
+              out->pi.push_back(i), out->pj.push_back(j), out->b.push_back(b);
+              for (int c = 0; c < 3; c++) out->t.push_back(static_cast<float>(t[c]));
+            }
+      }
+  }
+  return count;
+}
+
+bool PetPlatoLR::refresh(const std::vector<PetPlatoLRStructure> &structures, const float *pos) {
   PetPlatoLR t;
   ggml_context *c = ggml_init({ggml_tensor_overhead() * 512, nullptr, true});
   try {
@@ -292,7 +357,10 @@ bool PetPlatoLR::refresh(const std::vector<PetPlatoLRStructure> &structures) {
     throw;
   }
   ggml_free(c);
-  bool same = t.n_pairs_ == n_pairs_ && t.any_open_ == any_open_ && t.groups_.size() == groups_.size() &&
+  bool same = t.split_img_.size() == split_img_.size();
+  for (size_t k = 0; same && k < split_img_.size(); k++)
+    same = pos && t.split_images(t.groups_[k], pos, nullptr) <= split_img_[k].cap;
+  same = same && t.n_pairs_ == n_pairs_ && t.any_open_ == any_open_ && t.groups_.size() == groups_.size() &&
               t.st_.size() == st_.size() && t.h_pi_ == h_pi_ && t.h_sidx_ == h_sidx_;
   for (size_t k = 0; same && k < groups_.size(); k++) {
     const Group &a = groups_[k], &b = t.groups_[k];
@@ -335,6 +403,19 @@ void PetPlatoLR::upload(const float *pos) const {
     set(nbr_, h_nbr_.data());
   }
   for (const auto &[t, v] : lazy_f32_) set(t, v.data());
+  if (split_mask_) set(split_mask_, h_smask_.data());
+  for (size_t k = 0; k < split_img_.size(); k++) {
+    const SplitImages &im = split_img_[k];
+    im.pi.clear(), im.pj.clear(), im.b.clear(), im.t.clear();
+    const int64_t c = split_images(groups_[k], pos, const_cast<SplitImages *>(&im));
+    if (c > im.cap)
+      throw std::runtime_error("Plato-PET-LR: " + std::to_string(c) + " E_split images, the graph has room for " +
+                               std::to_string(im.cap) + " (refresh / rebuild it)");
+    const int pad = st_[groups_[k].structs[0]].a0; // padding: a pair far beyond any radius (w = 0)
+    im.pi.resize(im.cap, pad), im.pj.resize(im.cap, pad), im.b.resize(im.cap, 0);
+    for (int64_t e = c; e < im.cap; e++) im.t.insert(im.t.end(), {1.0e4f, 0.0f, 0.0f});
+    set(im.ti, im.pi.data()), set(im.tj, im.pj.data()), set(im.tb, im.b.data()), set(im.tt, im.t.data());
+  }
   for (const Group &q : groups_) {
     std::vector<float> z(ggml_nelements(q.strain), 0.0f);
     set(q.strain, z.data());
@@ -352,6 +433,7 @@ ggml_tensor *PetPlatoLR::build(ggml_context *ctx, const GIRNode &node, const std
   if (node.op == "MLIPCPP_PLATO_MESH") return mesh_op(ctx, node, in);
   if (node.op == "MLIPCPP_PLATO_LES") return les_op(ctx, node, in);
   if (node.op == "MLIPCPP_LES_CUTOFF_SUB") return les_sub(ctx, node, in);
+  if (node.op == "MLIPCPP_PLATO_SPLIT") return split_op(ctx, node, in);
   throw std::runtime_error("Plato-PET-LR: unknown graph op " + node.op);
 }
 
@@ -694,6 +776,60 @@ ggml_tensor *PetPlatoLR::les_sub(ggml_context *ctx, const GIRNode &node, const s
   ggml_tensor *t = ggml_reshape_3d(ctx, ggml_mul(ctx, ggml_get_rows(ctx, q, nbr_), w), Q, M, n);                            // [Q, M, n]
   ggml_tensor *s = ggml_reshape_2d(ctx, ggml_sum_rows(ctx, ggml_cont(ctx, ggml_permute(ctx, t, 1, 0, 2, 3))), Q, n);         // [Q, n]
   return ggml_reshape_1d(ctx, ggml_scale(ctx, ggml_sum_rows(ctx, ggml_mul(ctx, q, s)), static_cast<float>(0.5 * KE)), n);
+}
+
+// E_split per atom: q [Q, n], charge_unit [1], radius [1] -> [n] (ungated),
+//   sum_c q_ic (Qt_ic - Q_c f_i), Qt_i = q_i + sum_{pairs, images} w(r) q_j, f = 1 (open) or V_w / V
+ggml_tensor *PetPlatoLR::split_op(ggml_context *ctx, const GIRNode &node, const std::vector<ggml_tensor *> &in) {
+  if (in.size() != 3) throw std::runtime_error("PLATO_SPLIT: 3 inputs");
+  if (!split_mask_) throw std::runtime_error("PLATO_SPLIT in a GGUF without pet.plato_lr.les_split");
+  const float delta = static_cast<float>(param_num(node, "delta", spec_.split_delta));
+  const float rmax = static_cast<float>(param_num(node, "radius_max", spec_.split_radius_max));
+  if (std::abs(rmax - spec_.split_radius_max) > 1e-6f) throw std::runtime_error("PLATO_SPLIT: radius_max != the GGUF key");
+  const bool tcc = param_num(node, "total_charge_constraint", spec_.total_charge_constraint) != 0;
+  ggml_tensor *q = les_shift(ctx, cont(ctx, in[0]), in[1], tcc); // [Q, n]
+  const int64_t n = q->ne[1];
+  ggml_tensor *R = ggml_clamp(ctx, ggml_reshape_2d(ctx, cont(ctx, in[2]), 1, 1), delta, rmax); // [1, 1]
+  auto sw = [&](ggml_tensor *r) { // [1, P]: 1 - x^3 (10 - 15 x + 6 x^2), x = clamp((r - R + delta) / delta, 0, 1)
+    ggml_tensor *x = ggml_clamp(ctx, ggml_scale_bias(ctx, ggml_sub(ctx, r, ggml_repeat(ctx, R, r)), 1.0f / delta, 1.0f), 0.0f, 1.0f);
+    ggml_tensor *x2 = ggml_sqr(ctx, x);
+    ggml_tensor *p = ggml_add(ctx, ggml_scale(ctx, x2, 6.0f), ggml_scale_bias(ctx, x, -15.0f, 10.0f));
+    return ggml_scale_bias(ctx, ggml_mul(ctx, ggml_mul(ctx, x2, x), p), -1.0f, 1.0f);
+  };
+  ggml_tensor *qt = q;
+  auto pairs = [&](ggml_tensor *pi, ggml_tensor *pj, ggml_tensor *w) { // Qt += w q_j at i and w q_i at j
+    qt = ggml_add(ctx, qt, ggml_add(ctx, ggml_get_rows_back(ctx, ggml_mul(ctx, ggml_get_rows(ctx, q, pj), w), pi, q),
+                                    ggml_get_rows_back(ctx, ggml_mul(ctx, ggml_get_rows(ctx, q, pi), w), pj, q)));
+  };
+  if (n_pairs_ > 0) pairs(pair_i_, pair_j_, sw(pair_r(ctx)));
+  ggml_tensor *f = open_mask_; // [1, n]
+  if (!groups_.empty()) {
+    const double m0 = 0.5, m1 = 1.0 / 7.0, m2 = 5.0 / 84.0, d = delta, pi4 = 4.0 * M_PI; // the switch's moments
+    ggml_tensor *a = ggml_scale_bias(ctx, R, 1.0f, -delta), *a2 = ggml_sqr(ctx, a);
+    ggml_tensor *vw = ggml_add(ctx, ggml_add(ctx, ggml_scale(ctx, ggml_mul(ctx, a2, a), static_cast<float>(pi4 / 3)),
+                                             ggml_scale(ctx, a2, static_cast<float>(pi4 * d * m0))),
+                               ggml_scale_bias(ctx, a, static_cast<float>(2 * pi4 * d * d * m1), static_cast<float>(pi4 * d * d * d * m2))); // [1, 1]
+    for (size_t k = 0; k < groups_.size(); k++) {
+      const Group &g = groups_[k];
+      const SplitImages &im = split_img_[k];
+      const int64_t P = im.cap;
+      ggml_tensor *dx = ggml_add(ctx, ggml_sub(ctx, ggml_get_rows(ctx, positions, im.tj), ggml_get_rows(ctx, positions, im.ti)), im.tt); // [3, P]
+      // under the strain eps (row-major, as the LES k vectors k - eps k): d + eps^T d
+      ggml_tensor *S = ggml_get_rows(ctx, ggml_reshape_2d(ctx, g.strain, 9, g.size()), im.tb); // [9, P]
+      ggml_tensor *St = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, S, 3, 3, P), 1, 0, 2, 3));
+      dx = ggml_add(ctx, dx, ggml_reshape_2d(ctx, mm_f32(ctx, St, ggml_reshape_3d(ctx, dx, 3, 1, P)), 3, P));
+      pairs(im.ti, im.tj, sw(ggml_sqrt(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, dx)))));
+      // the background: V_w / V of the group's structures on their atoms
+      ggml_tensor *fv = ggml_reshape_2d(ctx, ggml_mul(ctx, inv_volume(ctx, g), vw), 1, g.size());
+      ggml_tensor *fg = ggml_mul(ctx, ggml_reshape_2d(ctx, ggml_get_rows(ctx, fv, g.bidx), 1, n), g.mask);
+      f = f ? ggml_add(ctx, f, fg) : fg;
+    }
+  }
+  // Q_c of each atom's structure
+  ggml_tensor *qsum = ggml_cont(ctx, ggml_transpose(ctx, mm_f32(ctx, onehot_, ggml_cont(ctx, ggml_transpose(ctx, q))))); // [Q, G]
+  ggml_tensor *Qa = ggml_mul(ctx, ggml_get_rows(ctx, qsum, struct_index_), f);                                        // [Q, n]
+  ggml_tensor *e = ggml_mul(ctx, ggml_sum_rows(ctx, ggml_mul(ctx, q, ggml_sub(ctx, qt, Qa))), split_mask_);         // [1, n]
+  return ggml_reshape_1d(ctx, e, n);
 }
 
 ggml_tensor *PetPlatoLR::les_op(ggml_context *ctx, const GIRNode &node, const std::vector<ggml_tensor *> &in) {

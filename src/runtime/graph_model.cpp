@@ -931,7 +931,7 @@ ModelResult GraphModel::predict_single(
     }
     st.charge = system.charge();
     plato = std::make_unique<PetPlatoLR>();
-    plato->create(input_ctx, plato_lr_, {st}, n_atoms, compute_forces && plato_lr_.long_range());
+    plato->create(input_ctx, plato_lr_, {st}, n_atoms, compute_forces && plato_lr_.long_range(), system.positions());
   }
 
   // Allocate input buffer

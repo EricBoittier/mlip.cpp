@@ -14,6 +14,11 @@
 //       (periodic: Ewald k-sum or smooth PME, the structure's energy spread evenly over
 //       its atoms; open: the erf pair sum per atom), neutralised per structure or shifted
 //       to the structure's total charge
+//   MLIPCPP_PLATO_SPLIT(q, charge_unit, radius)  the ungated per-atom E_split of the same
+//       shifted charges, sum_c q_ic (sum_j w(r_ij) q_jc - Q_c f), w the C2 switch from 1 at
+//       R - delta to 0 at R = clamp(radius, delta, radius_max); open: every pair of the
+//       structure, f = 1; periodic: every image within radius_max (a host list rebuilt
+//       from the positions at each upload, padded to a capacity), f = V_w / V
 //
 // The long-range ops depend on the absolute positions (input `positions`, [3, n]) and,
 // for periodic structures, a strain tensor (input `strain`, [3, 3, G], zeros): their
@@ -45,6 +50,9 @@ struct PetPlatoLRSpec {
   float les_tail_sigma = 0.0f;
   bool les_tail_subtract_cutoff = false;
   float les_energy_sigma() const { return les_tail_sigma > 0 ? les_tail_sigma : les_sigma; }
+  // E_split (MLIPCPP_PLATO_SPLIT): GGUF pet.plato_lr.les_split / les_split_delta / les_split_radius_max
+  bool les_split = false;
+  float split_delta = 1.0f, split_radius_max = 10.0f;
   // periodic LES: "ewald" | "pme" | "auto" (PME from les_pme_atoms atoms per structure);
   // GGUF "pet.plato_lr.les_method", MLIPCPP_PLATO_LES_METHOD overrides
   std::string les_method = "auto";
@@ -69,13 +77,16 @@ class PetPlatoLR {
 public:
   /// `grad`: positions and strain become ggml params (forces, virial). mesh_fixed: a
   /// fixed periodic mesh (0: max(8, ceil(|a| / spacing)) per axis, all structures equal).
+  /// `positions` [n][3]: sizes the periodic E_split image list (absent: an empty one, grown
+  /// by refresh)
   void create(ggml_context *ctx, const PetPlatoLRSpec &spec, const std::vector<PetPlatoLRStructure> &structures,
-              int n_atoms, bool grad);
+              int n_atoms, bool grad, const float *positions = nullptr);
   /// writes the host data into the created tensors; positions [n][3]
   void upload(const float *positions) const;
   /// new structures (cells, charges) for the same graph: false if they need other shapes
-  /// (another mesh, k set, pair count, structure layout), then nothing is changed
-  bool refresh(const std::vector<PetPlatoLRStructure> &structures);
+  /// (another mesh, k set, pair count, structure layout, more E_split images than the
+  /// capacity at `positions`), then nothing is changed
+  bool refresh(const std::vector<PetPlatoLRStructure> &structures, const float *positions = nullptr);
   /// every input tensor created (cached graphs place them in their input buffer)
   const std::vector<ggml_tensor *> &tensors() const { return all_; }
   /// the MLIPCPP_* op of `node`
@@ -153,6 +164,20 @@ private:
   ggml_tensor *les_shift(ggml_context *ctx, ggml_tensor *q, ggml_tensor *charge_unit, bool tcc);
   std::vector<int32_t> h_nbr_;
   ggml_tensor *nbr_ = nullptr;
+  // E_split: open pairs (i < j of each open structure) and, per periodic group, the image
+  // pairs (i, j, shift t, structure in the group) within split_radius_max, padded to a capacity
+  struct SplitImages {
+    int64_t cap = 0;
+    mutable std::vector<int32_t> pi, pj, b;
+    mutable std::vector<float> t; // [3][cap]
+    ggml_tensor *ti = nullptr, *tj = nullptr, *tb = nullptr, *tt = nullptr;
+  };
+  std::vector<int32_t> h_spi_, h_spj_;
+  ggml_tensor *split_pi_ = nullptr, *split_pj_ = nullptr, *split_mask_ = nullptr;
+  std::vector<float> h_smask_;
+  std::vector<SplitImages> split_img_; // one per group
+  int64_t split_images(const Group &g, const float *pos, SplitImages *out) const; // the count
+  ggml_tensor *split_op(ggml_context *ctx, const GIRNode &node, const std::vector<ggml_tensor *> &in);
   ggml_tensor *inv_volume(ggml_context *ctx, const Group &g); // (1 - tr eps) / V, [1, G_g]
 };
 
