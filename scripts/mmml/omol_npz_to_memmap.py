@@ -1,87 +1,212 @@
 #!/usr/bin/env python3
-"""OMol25 npz shards (omol_universal/scripts/omol_to_npz.py layout) -> mlipcpp-train data.
+"""OMol25 npz shards (omol_universal/scripts/omol_to_npz.py layout) -> mlipcpp-train splits.
 
-Writes DIR/{train,val,test} as metatrain MemmapDataset splits (the layout of
-scripts/train/xyz_to_memmap.py) with charge.bin and spin_multiplicity.bin, so a
-SpookyPhysNet GGUF trains with mlipcpp-train on the same structures, energies
-(E, the referenced energy the mmml trainer fits) and forces as the JAX trainer.
+The same structures, energies and forces as the mmml (JAX) SpookyPhysNet trainer
+(scripts/train_so3lr_spooky_extxyz.py --cache-path, caches built by
+omol_universal/scripts/npz_to_spooky_cache.py):
 
-    python scripts/mmml/omol_npz_to_memmap.py OMOL/npz/train_4M/shard_f000*.npz -o omol_pilot \
-        --n-train 20000 --n-val 1000 --n-test 1000 [--max-atoms 120] [--max-z 87]
+- selection: --n-structures N --seed S picks exactly the rows npz_to_spooky_cache.py
+  --n-structures N --seed S picks (np.random.default_rng(S).choice over the sorted
+  shards), in the same order;
+- energy: the shards' E (E_DFT - sum E_iso, eV) minus the linear reference
+  sum_Z n_Z b_Z + b_Q Q stored in a cache's metadata.json (--linear-ref-from), the
+  target the JAX model is trained on; forces unchanged (eV/A);
+- split: --valid-fraction f --split-seed s reproduces the JAX trainer's
+  split_indices(n, f, s) on the selection -> train/ and val/; without it every
+  selected structure goes to --split-name.
 
-Also writes DIR/structures.npz (the selected R, Z, N, Q, S, E, F) for the JAX benchmark.
+Each split is a metatrain MemmapDataset directory as mlipcpp-train reads it
+(src/train/dataset.cpp: x.bin a.bin c.bin energy.bin non_conservative_force.bin
+float32/int32, ns.npy, na.npy; charge.bin and spin_multiplicity.bin float32 [ns, 1],
+the SpookyPhysNet conditioning inputs), plus source.npz (shard index, row in the
+shard, row in the selection, the shard's LMDB key "dataNNNN.aselmdb:id") so every
+structure traces back to the npz shards and the raw LMDB records, and meta.json.
+
+--aux DIR (multitask): per-shard aux npz files written by omol_aux_from_lmdb.py
+(same file names as the shards, rows aligned with them) add, per split,
+{lowdin,mulliken,nbo}_charge.bin (float32 per atom), {lowdin,mulliken,nbo}_spin.bin
+(float32 per atom, 0 where absent), <scheme>_spin_mask.bin and nbo_charge_mask.bin
+(float32 per structure: 1 when the record has that field, finite), homo_energy.bin,
+homo_lumo_gap.bin (eV), s_squared.bin (float32 per structure).
+
+Data files are opened read-only with allow_pickle=False.
+
+    python -I scripts/mmml/omol_npz_to_memmap.py --shards OMOL/npz/train_4M -o DATA/pilot200k \\
+        --n-structures 200000 --seed 0 --valid-fraction 0.02 --split-seed 0 \\
+        --linear-ref-from OMOL/caches/omol_train4M_pilot200k/metadata.json
 """
 
+from __future__ import annotations
+
 import argparse
+import glob
+import json
+import os
 from pathlib import Path
 
 import numpy as np
 
+AUX_ATOM = ("lowdin_charge", "mulliken_charge", "nbo_charge", "lowdin_spin", "mulliken_spin", "nbo_spin")
+AUX_SYS = ("homo_energy", "homo_lumo_gap", "s_squared", "lowdin_spin_mask", "mulliken_spin_mask", "nbo_spin_mask",
+           "nbo_charge_mask")
 
-def write_split(out: Path, mols):
-    out.mkdir(parents=True, exist_ok=True)
-    if (out / "ns.npy").exists():
-        raise SystemExit(f"{out} already holds a split")
-    with open(out / "x.bin", "wb") as fx, open(out / "a.bin", "wb") as fa, open(out / "c.bin", "wb") as fc, \
-            open(out / "energy.bin", "wb") as fe, open(out / "non_conservative_force.bin", "wb") as ff, \
-            open(out / "energy_forces.bin", "wb") as fg:
-        for m in mols:
-            m["R"].astype(np.float32).tofile(fx)
-            m["Z"].astype(np.int32).tofile(fa)
-            np.zeros((3, 3), np.float32).tofile(fc)
-            np.float32(m["E"]).tofile(fe)
-            m["F"].astype(np.float32).tofile(ff)
-            m["F"].astype(np.float32).tofile(fg)
-    np.array([m["Q"] for m in mols], np.float32).reshape(-1, 1).tofile(out / "charge.bin")
-    np.array([m["S"] for m in mols], np.float32).reshape(-1, 1).tofile(out / "spin_multiplicity.bin")
-    np.save(out / "ns.npy", np.int64(len(mols)))
-    np.save(out / "na.npy", np.cumsum([0] + [len(m["Z"]) for m in mols]).astype(np.int64))
+
+def shard_files(paths):
+    files = []
+    for s in paths:
+        files += sorted(glob.glob(os.path.join(s, "*.npz"))) if os.path.isdir(s) else [s]
+    return files
+
+
+def split_indices(n_items: int, valid_fraction: float, seed: int):
+    """scripts/train_so3lr_spooky_extxyz.py split_indices"""
+    rng = np.random.default_rng(seed)
+    order = rng.permutation(n_items).astype(np.int64)
+    n_valid = max(1, int(round(n_items * valid_fraction))) if valid_fraction > 0 else 0
+    return order[n_valid:], order[:n_valid]
+
+
+class SplitWriter:
+    def __init__(self, out: Path, aux: bool):
+        out.mkdir(parents=True, exist_ok=True)
+        if (out / "ns.npy").exists():
+            raise SystemExit(f"{out} already holds a split")
+        self.out = out
+        names = ["x", "a", "c", "energy", "non_conservative_force", "charge", "spin_multiplicity"]
+        if aux:
+            names += list(AUX_ATOM) + list(AUX_SYS)
+        self.f = {k: open(out / f"{k}.bin", "wb") for k in names}
+        self.n_atoms = [np.zeros(1, np.int64)]
+        self.src = {"shard": [], "row": [], "sel": [], "key": []}
+        self.Q, self.S, self.E = [], [], []
+
+    def add(self, R, Z, F, N, E, Q, S, shard, rows, sel, keys, aux=None):
+        """R, Z, F: atoms of the structures (concatenated); per structure: N, E, Q, S, ..."""
+        R.astype(np.float32).tofile(self.f["x"])
+        Z.astype(np.int32).tofile(self.f["a"])
+        np.zeros((len(N), 3, 3), np.float32).tofile(self.f["c"])
+        E.astype(np.float32).tofile(self.f["energy"])
+        F.astype(np.float32).tofile(self.f["non_conservative_force"])
+        Q.astype(np.float32).reshape(-1, 1).tofile(self.f["charge"])
+        S.astype(np.float32).reshape(-1, 1).tofile(self.f["spin_multiplicity"])
+        if aux is not None:
+            for k in AUX_ATOM + AUX_SYS:
+                aux[k].astype(np.float32).tofile(self.f[k])
+        self.n_atoms.append(N.astype(np.int64))
+        self.src["shard"].append(np.full(len(N), shard, np.int32))
+        self.src["row"].append(rows.astype(np.int64))
+        self.src["sel"].append(sel.astype(np.int64))
+        self.src["key"].append(keys)
+        self.Q.append(Q), self.S.append(S), self.E.append(E)
+
+    def close(self, files, meta):
+        for f in self.f.values():
+            f.close()
+        na = np.cumsum(np.concatenate(self.n_atoms)).astype(np.int64)
+        ns = len(na) - 1
+        np.save(self.out / "ns.npy", np.int64(ns))
+        np.save(self.out / "na.npy", na)
+        src = {k: np.concatenate(v) for k, v in self.src.items()}
+        np.savez(self.out / "source.npz", shard_files=np.asarray(files), **src)
+        Q, S, E = (np.concatenate(v) for v in (self.Q, self.S, self.E))
+        N = np.diff(na)
+        info = dict(meta, n_structures=int(ns), n_atoms=int(na[-1]), mean_atoms=float(N.mean()) if ns else 0.0,
+                    max_atoms=int(N.max()) if ns else 0, charge_range=[int(Q.min()), int(Q.max())] if ns else None,
+                    multiplicity_range=[int(S.min()), int(S.max())] if ns else None,
+                    energy_mean_eV=float(E.mean()) if ns else None, energy_std_eV=float(E.std()) if ns else None)
+        with open(self.out / "meta.json", "w") as fh:
+            json.dump(info, fh, indent=1)
+        print(f"{self.out}: {ns} structures, {int(na[-1])} atoms, Q {info['charge_range']}, "
+              f"S {info['multiplicity_range']}, E std {info['energy_std_eV']:.3f} eV", flush=True)
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("shards", nargs="+")
-    ap.add_argument("-o", "--out", required=True)
-    ap.add_argument("--n-train", type=int, default=20000)
-    ap.add_argument("--n-val", type=int, default=1000)
-    ap.add_argument("--n-test", type=int, default=1000)
-    ap.add_argument("--max-atoms", type=int, default=120)
-    ap.add_argument("--max-z", type=int, default=87)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--shards", nargs="+", required=True, help="shard dirs or npz files")
+    ap.add_argument("-o", "--out", required=True, help="directory to hold the split(s)")
+    ap.add_argument("--n-structures", type=int, default=None, help="random subset (npz_to_spooky_cache.py's)")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--valid-fraction", type=float, default=0.0, help="the JAX trainer's --valid-fraction")
+    ap.add_argument("--split-seed", type=int, default=0, help="the JAX trainer's --seed")
+    ap.add_argument("--split-name", default="train", help="split name without --valid-fraction")
+    ap.add_argument("--linear-ref-from", default=None, help="metadata.json holding linear_ref (applied, not fitted)")
+    ap.add_argument("--max-structures", type=int, default=None, help="first N of the selection only (tests)")
+    ap.add_argument("--aux", default=None, help="dir of per-shard aux npz (omol_aux_from_lmdb.py), multitask")
     a = ap.parse_args()
-    need = a.n_train + a.n_val + a.n_test
-    mols = []
-    for path in a.shards:
-        z = np.load(path, allow_pickle=True)
-        d = {k: z[k] for k in ("R", "Z", "F", "E", "Q", "S", "N", "mol_offsets")}  # NpzFile reloads per access
-        off, N = d["mol_offsets"], d["N"][:, 0]
-        for i in range(len(N)):
-            if N[i] > a.max_atoms:
-                continue
-            Z = d["Z"][off[i]:off[i + 1]]
-            if Z.max() > a.max_z:
-                continue
-            mols.append(dict(R=d["R"][off[i]:off[i + 1]], Z=Z, F=d["F"][off[i]:off[i + 1]], E=float(d["E"][i, 0]),
-                             Q=int(round(d["Q"][i, 0])), S=int(round(d["S"][i, 0]))))
-        if len(mols) >= 2 * need:
-            break
+
+    files = shard_files(a.shards)
+    sizes = []
+    for f in files:
+        with np.load(f, allow_pickle=False) as d:
+            sizes.append(int(d["N"].shape[0]))
+    n_all = int(sum(sizes))
     rng = np.random.default_rng(a.seed)
-    idx = rng.permutation(len(mols))[:need]
-    if len(idx) < need:
-        raise SystemExit(f"only {len(idx)} structures available, {need} requested")
-    sel = [mols[i] for i in idx]
+    if a.n_structures is not None and a.n_structures < n_all:
+        pick = np.sort(rng.choice(n_all, size=a.n_structures, replace=False))
+    else:
+        pick = np.arange(n_all)
+    if a.max_structures is not None:
+        pick = pick[:a.max_structures]
+    n_sel = len(pick)
+    starts = np.concatenate([[0], np.cumsum(sizes)])
+    # which split each selected structure (position in the selection) goes to
+    split_of = np.zeros(n_sel, np.int8)
+    names = [a.split_name]
+    if a.valid_fraction > 0:
+        _, valid = split_indices(n_sel, a.valid_fraction, a.split_seed)
+        split_of[valid] = 1
+        names = ["train", "val"]
+    linref, tab = None, None
+    if a.linear_ref_from:
+        with open(a.linear_ref_from) as fh:
+            linref = json.load(fh)["linear_ref"]
+        tab = np.zeros(119)
+        tab[np.asarray(linref["Z"])] = linref["b_eV"]
     out = Path(a.out)
-    write_split(out / "train", sel[:a.n_train])
-    write_split(out / "val", sel[a.n_train:a.n_train + a.n_val])
-    write_split(out / "test", sel[a.n_train + a.n_val:])
-    tr = sel[:a.n_train]
-    np.savez(out / "structures.npz", N=np.array([len(m["Z"]) for m in tr]), R=np.concatenate([m["R"] for m in tr]),
-             Z=np.concatenate([m["Z"] for m in tr]), F=np.concatenate([m["F"] for m in tr]),
-             E=np.array([m["E"] for m in tr]), Q=np.array([m["Q"] for m in tr]), S=np.array([m["S"] for m in tr]))
-    n_at = np.array([len(m["Z"]) for m in tr])
-    print(f"{out}: train {a.n_train} (mean {n_at.mean():.1f} atoms, max {n_at.max()}), val {a.n_val}, test {a.n_test}; "
-          f"Q in [{min(m['Q'] for m in sel)}, {max(m['Q'] for m in sel)}], S in [{min(m['S'] for m in sel)}, "
-          f"{max(m['S'] for m in sel)}]")
+    writers = [SplitWriter(out / n, a.aux is not None) for n in names]
+
+    pos = 0  # position in the selection
+    for fi, f in enumerate(files):
+        sel = pick[(pick >= starts[fi]) & (pick < starts[fi + 1])] - starts[fi]
+        if sel.size == 0:
+            continue
+        with np.load(f, allow_pickle=False) as z:
+            d = {k: z[k] for k in ("R", "Z", "F", "E", "N", "Q", "S", "mol_offsets", "keys")}
+        aux = None
+        if a.aux:
+            with np.load(os.path.join(a.aux, os.path.basename(f)), allow_pickle=False) as z:
+                aux = {k: z[k] for k in z.files}
+            if not np.array_equal(aux["keys"], d["keys"]):
+                raise SystemExit(f"{f}: aux keys do not match the shard")
+        off = d["mol_offsets"]
+        E = d["E"].reshape(-1)[sel].astype(np.float64)
+        Q = d["Q"].reshape(-1)[sel]
+        S = d["S"].reshape(-1)[sel]
+        N = d["N"].reshape(-1)[sel]
+        if tab is not None:
+            shift = np.array([tab[d["Z"][off[i]:off[i + 1]]].sum() for i in sel]) + linref["b_Q_eV_per_e"] * Q
+            E = E - shift
+        sel_pos = np.arange(pos, pos + sel.size)
+        pos += sel.size
+        for w_idx, w in enumerate(writers):
+            m = split_of[sel_pos] == w_idx
+            if not m.any():
+                continue
+            rows = sel[m]
+            atoms = np.concatenate([np.arange(off[i], off[i + 1]) for i in rows])
+            ax = None
+            if aux is not None:
+                ax = {k: aux[k][atoms] for k in AUX_ATOM}
+                ax.update({k: aux[k][rows] for k in AUX_SYS})
+            w.add(d["R"][atoms], d["Z"][atoms], d["F"][atoms], N[m], E[m], Q[m], S[m], fi, rows, sel_pos[m],
+                  d["keys"][rows], ax)
+        print(f"  {os.path.basename(f)}: {sel.size} structures", flush=True)
+    meta = dict(source=a.shards, n_structures_arg=a.n_structures, seed=a.seed, valid_fraction=a.valid_fraction,
+                split_seed=a.split_seed, linear_ref_from=a.linear_ref_from, linear_ref=linref,
+                energy="E_DFT - sum E_iso(Z) - (sum_Z n_Z b_Z + b_Q Q) [eV] (float32)", forces="eV/A",
+                aux=a.aux)
+    for w in writers:
+        w.close(files, meta)
 
 
 if __name__ == "__main__":

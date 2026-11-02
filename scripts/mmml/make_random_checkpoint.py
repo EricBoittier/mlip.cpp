@@ -40,6 +40,9 @@ def main():
                          "num_basis O(1) terms per message, which makes untrained features (and float32 "
                          "round-off) grow by orders of magnitude over the iterations")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--pristine", action="store_true",
+                    help="flax's initialisation as is (no perturbation, --filter-scale 1): the parameters "
+                         "train_so3lr_spooky_extxyz.py starts from with --seed, for training")
     ap.add_argument("-o", "--output", required=True)
     a = ap.parse_args()
     config = dict(
@@ -72,9 +75,10 @@ def main():
         if not np.any(x):
             return a.noise * eps
         return x * (1 + 0.1 * eps)
-    leaves = [perturb(x, k) for x, k in zip(leaves, keys)]
+    if not a.pristine:
+        leaves = [perturb(x, k) for x, k in zip(leaves, keys)]
     params = jax.tree_util.tree_unflatten(tree, leaves)
-    for name, sub in params["params"].items():
+    for name, sub in params["params"].items() if not a.pristine else ():
         if name.startswith("MessagePass_"):
             for deg in sub["filter"]:
                 sub["filter"][deg]["kernel"] = sub["filter"][deg]["kernel"] * a.filter_scale
