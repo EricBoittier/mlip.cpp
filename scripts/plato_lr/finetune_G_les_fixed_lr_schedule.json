@@ -14,7 +14,7 @@
   {
    "name": "les_gate",
    "match": [
-    "plato_les_gate"
+    "*plato_les_gate"
    ],
    "lr_mult": 0.0
   },
