@@ -219,7 +219,11 @@ def run(checkpoints: dict, spooky_random: bool = True, x64: bool = True):
             ck = Path(td) / "spooky_random.json"
             subprocess.run([sys.executable, str(ROOT / "scripts/mmml/make_random_checkpoint.py"), "-o", str(ck)],
                            check=True, capture_output=True)
-            checkpoints = dict(checkpoints, spooky_random=ck)
+            # feature_rmsnorm (mmml SpookyPhysNet option, per-atom RMS-normalised refinement output)
+            ck_rms = Path(td) / "spooky_random_rms.json"
+            subprocess.run([sys.executable, str(ROOT / "scripts/mmml/make_random_checkpoint.py"), "--feature-rmsnorm",
+                            "-o", str(ck_rms)], check=True, capture_output=True)
+            checkpoints = dict(checkpoints, spooky_random=ck, spooky_random_rms=ck_rms)
         for name, ck in checkpoints.items():
             if name.startswith("spooky"):
                 structs = omol_structures(20) + wmo_structures(n_dimers=4, n_clusters=0)

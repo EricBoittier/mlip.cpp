@@ -51,6 +51,8 @@ def main():
     ap.add_argument("--gap-offset", type=float, default=0.0, help="eV; the training set's mean HOMO-LUMO gap")
     ap.add_argument("--offsets-from", default=None, help="mlipcpp-train split dir: --homo-offset / --gap-offset = the "
                     "means of its labelled homo_energy.bin / homo_lumo_gap.bin (homo_mask.bin, gap_mask.bin)")
+    ap.add_argument("--feature-rmsnorm", action="store_true",
+                    help="SpookyPhysNet feature_rmsnorm (RMS-normalised features after each refinement stage)")
     ap.add_argument("-o", "--output", required=True)
     a = ap.parse_args()
     config = dict(
@@ -62,6 +64,8 @@ def main():
     )
     if a.model_type == "spooky":
         config["model_type"] = "spooky"
+        if a.feature_rmsnorm:
+            config["feature_rmsnorm"] = True
     if a.offsets_from:
         from pathlib import Path
         sp = Path(a.offsets_from)

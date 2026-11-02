@@ -204,6 +204,15 @@ ggml_tensor *build_physnet(ggml_context *ctx, const PhysNetHypers &h, const Phys
     }
     b.dense(t * (h.n_res + 1) + h.n_res, ys, yv);
     b.silu(ys, yv);
+    if (h.feature_rmsnorm) { // y / sqrt(mean over every (degree, feature) component of y^2 + 1e-6), per atom
+      const int64_t count = F * (yv ? 4 : 1);
+      ggml_tensor *ss = ggml_sum_rows(c, ggml_sqr(c, ys)); // [1, n]
+      if (yv) ss = ggml_add(c, ss, ggml_sum_rows(c, ggml_reshape_2d(c, ggml_sqr(c, yv), 3 * F, n)));
+      ggml_tensor *rms = ggml_sqrt(c, ggml_scale_bias(c, ss, 1.0f / float(count), 1e-6f));
+      ggml_tensor *inv = ggml_div(c, constant(c, {1, n}, 1.0f), rms); // [1, n]
+      ys = ggml_mul(c, ys, inv);
+      if (yv) yv = ggml_mul(c, yv, ggml_reshape_3d(c, inv, 1, 1, n));
+    }
     s = ys, v = yv;
   }
 

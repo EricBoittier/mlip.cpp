@@ -20,6 +20,7 @@
 //     01->1, 10->1 (MessagePass/tensor kernel), the last iteration to degree 0,
 //     then n_res residual blocks x += Dense(x + silu(x)), y = silu(Dense(y_last))
 //     with the e3x gated silu (sigmoid of the scalar channel times every degree)
+//     (feature_rmsnorm: then y /= sqrt(mean of y^2 over all components + 1e-6) per atom)
 //   E_i = (x_i W_e) w + energy_bias[Z_i] + ZBL_i
 #include <functional>
 #include <map>
@@ -44,6 +45,9 @@ struct PhysNetHypers {
   float zbl_cutoff = 0.6f;
   float zbl_cuton = 0.1f;
   bool energy_bias = false;
+  // mmml SpookyPhysNet feature_rmsnorm: after each refinement stage's final silu,
+  // y <- y / sqrt(mean_{degree, feature}(y^2) + 1e-6), one scalar per atom (no parameters)
+  bool feature_rmsnorm = false;
   // multitask heads (mmml SpookyPhysNet multitask_*, proposals/SPOOKY_MULTITASK.md) on the
   // final scalar features x_i, the energy head's input:
   //   charges q_i = q~_i + (Q - sum_s q~) / N_s, q~_i = x_i w_q + b_q[Z_i]  (mt.charge.w, mt.charge.zbias)

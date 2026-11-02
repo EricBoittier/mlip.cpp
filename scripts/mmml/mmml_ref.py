@@ -185,6 +185,8 @@ def spooky_check_supported(config: dict, model_type: str) -> list[str]:
         bad.append("trainable_zbl=True")
     if model_type == "spooky" and (config.get("interaction_trust_map", False)):
         bad.append("interaction_trust_map=True")
+    if model_type != "spooky" and config.get("feature_rmsnorm", False):
+        bad.append("feature_rmsnorm=True on PhysNet (a SpookyPhysNet option)")
     return bad
 
 
@@ -207,6 +209,7 @@ def hypers(config: dict, model_type: str) -> dict:
         zbl_cutoff=float(config.get("zbl_cutoff", 0.6)),
         zbl_cuton=float(config["zbl_cuton"]) if config.get("zbl_cuton", 0.1) is not None else 0.0,
         use_energy_bias=bool(config.get("use_energy_bias", False)),
+        feature_rmsnorm=bool(config.get("feature_rmsnorm", False)),
     )
 
 
@@ -287,6 +290,10 @@ def numpy_energy(config: dict, params: dict, model_type: str, Z, R, Q=0.0, S=1.0
         y_s, y_v = dense(f"Dense_{dense_index(h, t, h['n_res'])}", y_s, y_v)
         g = sig(y_s)
         s, vec = y_s * g, (None if y_v is None else y_v * g[:, None, :])
+        if h["feature_rmsnorm"]:  # one RMS per atom over every (degree, feature) component
+            ms = (s * s).sum(1) + (0 if vec is None else (vec * vec).sum((1, 2)))
+            inv = 1 / np.sqrt(ms / (s.shape[1] * (1 if vec is None else 4)) + 1e-6)
+            s, vec = s * inv[:, None], (None if vec is None else vec * inv[:, None, None])
     nd = h["num_iterations"] * (h["n_res"] + 1)
     e = (s @ p[f"Dense_{nd}"]["0+"]["kernel"]) @ p[f"Dense_{nd + 1}"]["kernel"]
     e = e[:, 0]

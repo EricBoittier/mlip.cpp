@@ -2269,6 +2269,7 @@ ggml_tensor *GraphInterpreter::build_physnet(ggml_context *ctx, const GIRNode &n
   h.zbl_cutoff = static_cast<float>(get_param<double>(node, "zbl_cutoff", 0.6));
   h.zbl_cuton = static_cast<float>(get_param<double>(node, "zbl_cuton", 0.1));
   h.energy_bias = get_param<bool>(node, "use_energy_bias", false);
+  h.feature_rmsnorm = get_param<bool>(node, "feature_rmsnorm", false);
   // multitask heads (mmml model fields of the same names)
   h.head_charges = get_param<bool>(node, "multitask_charges", false);
   h.head_spins = get_param<bool>(node, "multitask_spins", false);

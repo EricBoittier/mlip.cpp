@@ -270,6 +270,8 @@ def to_gguf(src: str, out: str, model_type: str | None = None, max_charge: int =
                                       "cutoff", "max_atomic_number", "zbl", "zbl_cutoff", "zbl_cuton")}
     node_params["n_res"] = h["n_res"]
     node_params["use_energy_bias"] = h["use_energy_bias"]
+    if h["feature_rmsnorm"]:  # absent = false: GGUFs of models without it are unchanged
+        node_params["feature_rmsnorm"] = True
     for k in ("multitask_charges", "multitask_spins", "multitask_orbitals"):
         if config.get(k):
             node_params[k] = True
@@ -337,6 +339,10 @@ def to_json(src: str, out: str, allow_baselines: bool = False) -> dict:
         raise SystemExit(f"{src}: not a PhysNet GGUF (no physnet.config)")
     config = json.loads(kv["physnet.config"])
     model_type = kv.get("physnet.model_type", "physnet")
+    # the node params are what the graph runs: they win over physnet.config
+    node = json.loads(kv["graph.json"])["nodes"][0]["params"] if "graph.json" in kv else {}
+    if node.get("feature_rmsnorm", False) or config.get("feature_rmsnorm", False):
+        config["feature_rmsnorm"] = bool(node.get("feature_rmsnorm", False))
     params = tensors_to_params(config, model_type, t)
     # baselines refitted by mlipcpp-train (without --model-baselines): fold into mmml's
     # parameters where they map exactly (composition -> energy_bias), else refuse

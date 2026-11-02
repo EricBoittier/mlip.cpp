@@ -293,3 +293,10 @@ Multitask heads (node params `multitask_charges / _spins / _orbitals`, mmml's pr
 `<scheme>_charge.bin`, `<scheme>_spin.bin`, `homo_energy.bin`, `homo_lumo_gap.bin` + masks from
 `omol_npz_to_memmap.py --aux`). Predictions: `Result.charges`, `.spins`, `.homo`, `.gap`
 (single-structure predict). sbatch files: `scripts/mmml/sbatch/`.
+
+Feature normalisation (node param `feature_rmsnorm`, mmml SpookyPhysNet `feature_rmsnorm=True`,
+mmml 1b5f7f615): each refinement stage's output is divided by its per-atom RMS over every
+(degree, feature) component, `y / sqrt(mean(y^2) + 1e-6)`; no parameters. Without it the residual
+stack grows the OMol25 features ~800x and forces do not train. Off by default (GGUFs without the
+param are unchanged); `convert_mmml.py` carries it both ways. Init:
+`make_random_checkpoint.py --pristine --feature-rmsnorm`; sbatch: `RMSNORM=1`.
