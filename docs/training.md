@@ -268,3 +268,28 @@ These are for A/B tests and diagnostics. The defaults are the tested paths.
 | `MLIPCPP_JVP_UNFUSED_ATTN=1` | unfused attention tangent (checks) |
 | `MLIPCPP_NO_FUSED_ATTN=1` | unfused attention (checks) |
 | `MLIPCPP_PAD_FLOOR=x` | padded-key attention floor (diagnostic) |
+
+## PhysNet / SpookyPhysNet on OMol25 (mmml conventions)
+
+A PhysNet GGUF (`scripts/convert_mmml.py to-gguf`, or `scripts/mmml/make_random_checkpoint.py
+--pristine` for flax's initialisation) trains with `--conservative --nc-force-weight 0
+--model-baselines`. The loss, batches and schedule of mmml's `train_so3lr_spooky_extxyz.py`:
+
+| mmml | mlipcpp-train |
+|---|---|
+| total-energy MSE (`energy_weight` 1), `forces_weight` 52.91 | `--energy-per-structure --energy-weight 1 --force-weight 52.91` (without the flag: per-atom energies, mmml `--energy-loss-per-atom`) |
+| pad buckets of 8 atoms, `max_pairs // pad^2` per device, cap 256 | `--batch-pairs 210000 --bucket-width 8 --batch-cap 256` |
+| `warmup_cosine`, 2000 warmup steps, end 0.02 | `--warmup-steps 2000 --cosine-end-fraction 0.02` |
+| AdamW (wd 0), clip 10, no rotations | `--optimizer adam --grad-clip 10 --no-rotations` |
+
+Data: `scripts/mmml/omol_npz_to_memmap.py` (the npz shards, the cache's selection, split and
+linear reference) or `scripts/mmml/orbax_cache_to_memmap.py` (the Orbax caches). Gradients:
+`mlipcpp-train-check ... --model-baselines 1 --energy-per-structure 1` +
+`scripts/mmml/check_train_grads_jax.py` (vs JAX autograd). Back to mmml: `convert_mmml.py to-json`.
+
+Multitask heads (node params `multitask_charges / _spins / _orbitals`, mmml's proposal
+`omol_universal/proposals/SPOOKY_MULTITASK.md`): `--charge-weight 50 --spin-weight 20
+--homo-weight 1 --gap-weight 1` (masked MSE over the labelled atoms / structures; labels
+`<scheme>_charge.bin`, `<scheme>_spin.bin`, `homo_energy.bin`, `homo_lumo_gap.bin` + masks from
+`omol_npz_to_memmap.py --aux`). Predictions: `Result.charges`, `.spins`, `.homo`, `.gap`
+(single-structure predict). sbatch files: `scripts/mmml/sbatch/`.
