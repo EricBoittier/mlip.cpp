@@ -126,12 +126,15 @@ public:
       return nullptr;
     if (auto it = tangents.find(x); it != tangents.end())
       return it->second;
+    // integer tensors (indices) carry no tangent
+    if (x->type == GGML_TYPE_I32 || x->type == GGML_TYPE_I64) return tangents[x] = nullptr;
     auto *a = x->src[0], *b = x->src[1];
-    auto *u = (*this)(a), *v = (*this)(b);
+    // ggml_cast is a CPY whose destination operand (src[1]) is the node itself
+    auto *u = (*this)(a), *v = b == x ? nullptr : (*this)(b);
     ggml_tensor *t = nullptr;
     bool extra = false; // a tangent on src[2..]: only rules that read them may proceed
     for (int i = 2; i < GGML_MAX_SRC; i++)
-      extra = (*this)(x->src[i]) || extra;
+      extra = (x->src[i] != x && (*this)(x->src[i])) || extra;
     if (!u && !v && !extra)
       return tangents[x] = nullptr;
     if (extra)
