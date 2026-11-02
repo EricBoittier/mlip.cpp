@@ -23,13 +23,13 @@ pair() { for s in val_sel qcell_curves; do
     $PY -I $QS/compare_paired.py $R/$2/$s.per.npz $R/$1/$s.per.npz $R/$1-minus-$2.$s.json --label "$1-$2 $s" > /dev/null
 done; }
 pair E-s13 Ectl-s13
-for X in E-s7 G1 G2 G3 G4; do pair $X Ectl-s7; done
-for X in E-s7 E-s13 Ectl-s7 Ectl-s13 G1 G2 G3 G4; do pair $X Z; done
-for X in E-init E-s7 C; do
+for X in E-s7 G1 G2 G3 G4 Gs1 Gs2 Gs3 Gs4; do pair $X Ectl-s7; done
+for X in E-s7 E-s13 Ectl-s7 Ectl-s13 G1 G2 G3 G4 Gs1 Gs2 Gs3 Gs4; do pair $X Z; done
+for X in E-init E-init-sub E-s7 C; do
   [ -f $R/les-$X-g0/val_sel.per.npz ] && [ -f $R/les-$X-g1/val_sel.per.npz ] && \
     $PY -I $S/les_decomp.py $R/les-$X-g0/val_sel.per.npz $R/les-$X-g1/val_sel.per.npz $R/les-$X.decomp.json --label $X
 done
 /users/boittier/venvs/mptrj-py/bin/python -I $S/collect_curves.py -o $D/curves_G.json \
   A=$D/abc/A B=$D/abc/B C=$D/abc/C D1=$D/abc/D1 D2=$D/abc/D2 D3=$D/abc/D3 D4=$D/abc/D4 \
   E-s7=$D/E/E-s7 E-s13=$D/E/E-s13 Ectl-s7=$D/E/Ectl-s7 Ectl-s13=$D/E/Ectl-s13 \
-  G1=$D/G/G1 G2=$D/G/G2 G3=$D/G/G3 G4=$D/G/G4
+  G1=$D/G/G1 G2=$D/G/G2 G3=$D/G/G3 G4=$D/G/G4 Gs1=$D/Gsub/Gs1 Gs2=$D/Gsub/Gs2 Gs3=$D/Gsub/Gs3 Gs4=$D/Gsub/Gs4
