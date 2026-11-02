@@ -21,6 +21,7 @@ BUILD=$M/build-sm80-90
 PY=/scicore/home/meuwly/boitti0000/mmml_new/.venv/bin/python   # orbax, jax (cpu use here), flax
 BRANCH=${BRANCH:-feat/physnet-spooky}
 mkdir -p "$M/logs" "$M/data" "$M/init"
+[ -f /etc/profile.d/soft_stacks.sh ] && source /etc/profile.d/soft_stacks.sh   # Lmod is not initialised in non-login batch shells
 module purge
 module load GCCcore/14.3.0 CMake/3.31.8-GCCcore-14.3.0 CUDA/12.9.1 NCCL/2.27.7-GCCcore-14.3.0-CUDA-12.9.1
 echo "host=$(hostname) job=${SLURM_JOB_ID:-}"

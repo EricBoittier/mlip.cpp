@@ -38,6 +38,7 @@ NAME=${NAME:-$(basename "$DATA")_$([ "$MT" = 1 ] && echo mt || echo ef)_${ELOSS}
 RUN=${RUN:-$M/runs/$NAME}
 HOURS=${HOURS:-23.0}
 PY=/scicore/home/meuwly/boitti0000/mmml_new/.venv/bin/python
+[ -f /etc/profile.d/soft_stacks.sh ] && source /etc/profile.d/soft_stacks.sh   # Lmod is not initialised in non-login batch shells
 module purge
 module load GCCcore/14.3.0 CUDA/12.9.1 NCCL/2.27.7-GCCcore-14.3.0-CUDA-12.9.1
 export GGML_CUDA_NO_TF32=1
