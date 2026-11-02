@@ -36,6 +36,11 @@ int main(int argc, char **argv) {
                "--batch-pairs P (steps of one atom-count bucket each, min(cap, P / pad^2) structures per GPU,\n"
                "pad = atom count rounded up to --bucket-width), --warmup-steps / --cosine-end-fraction\n"
                "(optax warmup_cosine_decay_schedule), --no-rotations (no O(3) augmentation);\n"
+               "multitask PhysNet heads (GGUF node param heads): [--charge-weight W] [--spin-weight W] [--homo-weight W]\n"
+               "[--gap-weight W] [--charge-scheme lowdin|mulliken|nbo] [--spin-scheme lowdin|mulliken|nbo]: squared\n"
+               "errors of the per-atom charges (sum = Q), spin populations (sum = 2S+1 - 1), HOMO and HOMO-LUMO gap (eV,\n"
+               "structure means of atomic contributions), each the mean over the step's atoms / structures that have\n"
+               "the target (<split>/<scheme>_charge.bin, <scheme>_spin.bin, homo_energy.bin, homo_lumo_gap.bin + masks);\n"
                "--loss huber: torch.nn.HuberLoss per component (metatrain's huber; 0.5 d^2 below delta, then linear), deltas in\n"
                "the loss's units: energy per atom over the energy scale (default 0.01), forces over their scale (0.02);\n"
                "--charge-corr-weight W (Plato-PET-LR with LES; default 0: off): an auxiliary loss on the latent charges,\n"
@@ -91,6 +96,12 @@ int main(int argc, char **argv) {
     else if (a == "--bucket-width") o.bucket_width = std::stoi(val());
     else if (a == "--batch-cap") o.batch_cap = std::stoi(val());
     else if (a == "--no-rotations") o.rotate = false;
+    else if (a == "--charge-weight") o.aux_weight[0] = std::stod(val());
+    else if (a == "--spin-weight") o.aux_weight[1] = std::stod(val());
+    else if (a == "--homo-weight") o.aux_weight[2] = std::stod(val());
+    else if (a == "--gap-weight") o.aux_weight[3] = std::stod(val());
+    else if (a == "--charge-scheme") o.aux_charge_scheme = val();
+    else if (a == "--spin-scheme") o.aux_spin_scheme = val();
     else if (a == "--schedule") o.schedule = val();
     else if (a == "--decay-after") o.decay_after = std::stoi(val());
     else if (a == "--min-lr") o.min_lr = std::stod(val());

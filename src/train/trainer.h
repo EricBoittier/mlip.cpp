@@ -79,6 +79,13 @@ struct TrainOptions {
   double charge_corr_weight = 0.0, charge_corr_min = 1.0;
   std::string charge_corr_target = "mulliken";
   double energy_weight = 1.0, force_weight = 1.0, nc_force_weight = 1.0;
+  // multitask PhysNet heads (GGUF node param "heads"): loss weights of the per-atom charges
+  // (sum q = Q), spin populations (sum s = 2S+1 - 1), HOMO energy and HOMO-LUMO gap (molecular
+  // means of atomic contributions); squared errors, means over the step's atoms / structures
+  // that have the target (<split>/<scheme>_charge.bin, <scheme>_spin.bin + masks,
+  // homo_energy.bin, homo_lumo_gap.bin); weight 0 or no head: off
+  double aux_weight[4] = {0, 0, 0, 0}; // charges, spins, homo, gap
+  std::string aux_charge_scheme = "lowdin", aux_spin_scheme = "lowdin";
   // fine-tuning: keep the composition and scales stored in --init instead of
   // fitting them on the training set
   bool model_baselines = false;
@@ -138,6 +145,11 @@ struct StepStats {
   double loss = 0, loss_energy = 0, loss_force = 0;
   double loss_nc = 0, se_force_nc = 0; // conservative mode: the direct head's term and (eV/Å)^2
   double loss_charge = 0, sum_charge_r = 0; // charge correlation: loss term, sum of r over the structures taking part
+  // multitask heads (charges, spins, homo, gap): loss terms, sums of |error| and of error^2, counts
+  // (atoms / structures with the target); constraint residuals max_s |sum_s q - Q|, |sum_s s - M|
+  double loss_aux[4] = {0, 0, 0, 0}, ae_aux[4] = {0, 0, 0, 0}, se_aux[4] = {0, 0, 0, 0};
+  int64_t n_aux[4] = {0, 0, 0, 0};
+  double max_constraint[2] = {0, 0};
   int64_t n_charge_r = 0, n_charge_skipped = 0;
   double se_energy_per_atom = 0; // Σ_s (ΔE_s / N_s)^2, eV^2
   double se_force = 0;           // Σ_i,k ΔF_ik^2, (eV/Å)^2 (conservative mode: of -dE/dx)
@@ -222,6 +234,9 @@ public:
   struct ChargeCorr {
     double weight = 0.0, r_min = 1.0;
   } charge_corr;
+  /// multitask heads: loss weights (charges, spins, homo, gap); the model's heads that have one
+  double aux_weight[4] = {0, 0, 0, 0};
+  bool aux_on(int k) const;
 
   /// Profiling: compute node by node (synchronised) and accumulate, per op
   /// ("fwd:OP" / "bwd:OP"; conservative mode "F.fwd:OP" / "F.bwd:OP" for the
@@ -263,6 +278,8 @@ private:
     ggml_context *ctx = nullptr;
     ggml_cgraph *gf = nullptr;
     std::vector<ggml_tensor *> inputs; // in upload order (see upload_inputs)
+    bool loss_inputs = false;          // inputs holds the loss's inputs (not FORCES)
+    ggml_tensor *aux[4] = {nullptr, nullptr, nullptr, nullptr}; // heads' per-atom outputs [n]
     // (loss, loss_e, loss_f, physical force squared error): one download
     ggml_tensor *stats = nullptr, *loss_grad = nullptr;
     ggml_tensor *per_system = nullptr; // [S, 2]: d_energy (scaled, per atom), mean |dF|^2 per atom (physical)
@@ -323,6 +340,8 @@ private:
   size_t ctx_bytes_[4] = {0, 0, 0, 0};  // graph context size per Mode; measured on the first build
   std::vector<uint8_t> staging_;   // host side of the input blob
   std::vector<int32_t> cond_rows_[2]; // charge / spin table rows of the batch's atoms (conditioned models)
+  std::vector<float> aux_w_[4], aux_mean_; // upload staging: mask x norm x weight, 1/N_s [S, n]
+  void aux_stats(StepGraph &g, const Batch &b, StepStats &st);
   // Plato-PET-LR: the batch the next graph is built for (structures, cells, charges),
   // the MIXED graph's position tangent and tangent scale
   const Batch *plato_batch_ = nullptr;

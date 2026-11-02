@@ -43,6 +43,12 @@ def main():
     ap.add_argument("--pristine", action="store_true",
                     help="flax's initialisation as is (no perturbation, --filter-scale 1): the parameters "
                          "train_so3lr_spooky_extxyz.py starts from with --seed, for training")
+    ap.add_argument("--multitask", default="", help="comma list of charges,spins,orbitals: mmml multitask heads "
+                    "(proposals/SPOOKY_MULTITASK.md); initialised by mmml if it has them, else here with the same "
+                    "scheme (kernels N(0, 0.01^2) / lecun normal, biases and the orbital output 0)")
+    ap.add_argument("--orbital-hidden", type=int, default=None, help="H of the orbital MLP (default: features)")
+    ap.add_argument("--homo-offset", type=float, default=0.0, help="eV; the training set's mean HOMO energy")
+    ap.add_argument("--gap-offset", type=float, default=0.0, help="eV; the training set's mean HOMO-LUMO gap")
     ap.add_argument("-o", "--output", required=True)
     a = ap.parse_args()
     config = dict(
@@ -54,6 +60,14 @@ def main():
     )
     if a.model_type == "spooky":
         config["model_type"] = "spooky"
+    mt = {x for x in a.multitask.split(",") if x}
+    if mt - {"charges", "spins", "orbitals"}:
+        raise SystemExit(f"--multitask: unknown heads {mt - {'charges', 'spins', 'orbitals'}}")
+    for h in mt:
+        config[f"multitask_{h}"] = True
+    if "orbitals" in mt:
+        config.update(multitask_orbital_hidden=a.orbital_hidden or a.features, multitask_homo_offset=a.homo_offset,
+                      multitask_gap_offset=a.gap_offset)
     model = build_model(config, a.model_type, natoms=8)
     Z = jnp.array([8, 1, 1, 6, 1, 1, 1, 7], jnp.int32)
     R = jax.random.normal(jax.random.PRNGKey(1), (8, 3)) * 1.5
@@ -82,6 +96,17 @@ def main():
         if name.startswith("MessagePass_"):
             for deg in sub["filter"]:
                 sub["filter"][deg]["kernel"] = sub["filter"][deg]["kernel"] * a.filter_scale
+    # heads mmml does not know (the multitask patch not applied): the same initialisation here
+    rng = np.random.default_rng(a.seed + 11)
+    P, F, Zn = params["params"], a.features, a.max_atomic_number + 1
+    for key, name in (("charge", "charges"), ("spin", "spins")):
+        if name in mt and f"mt_{key}_dense" not in P:
+            P[f"mt_{key}_dense"] = {"kernel": rng.normal(0.0, 0.01, (F, 1))}
+            P[f"mt_{key}_zbias"] = np.zeros(Zn)
+    if "orbitals" in mt and "mt_orb_hidden" not in P:
+        H = config["multitask_orbital_hidden"]
+        P["mt_orb_hidden"] = {"kernel": rng.normal(0.0, 1.0 / np.sqrt(F), (F, H)), "bias": np.zeros(H)}
+        P["mt_orb_out"] = {"kernel": np.zeros((H, 2)), "bias": np.zeros(2)}
     tolist = lambda x: {k: tolist(v) for k, v in x.items()} if isinstance(x, dict) else np.asarray(x).tolist()
     with open(a.output, "w") as f:
         json.dump({"params": tolist(params["params"]), "config": config}, f)

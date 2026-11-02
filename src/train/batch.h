@@ -79,7 +79,17 @@ struct Batch {
   // Loss normalisation: 1/S and 1/(3N) of the *whole* step batch, so that
   // micro-batch losses (and gradients) sum to the full-batch ones.
   float energy_norm = 0.0f, force_norm = 0.0f;
+  // multitask heads (k = 0 charges, 1 spins per atom; 2 HOMO, 3 gap per structure): the atom's
+  // structure (padding atoms: their own index), targets, 1 where the structure has the target,
+  // and the loss normalisation 1 / (the step's atoms / structures with the target)
+  std::vector<int32_t> system_index;                    // [n_atoms]
+  std::vector<float> aux_target[4], aux_mask[4];        // [n_atoms] (k < 2) or [n_systems]
+  float aux_norm[4] = {0, 0, 0, 0};
+  bool has_aux = false;
 };
+
+/// 1 / (atoms, atoms, structures, structures of `ids` with each multitask target), 0 if none
+std::array<float, 4> aux_norms(const MemmapSplit &split, const std::vector<int64_t> &ids, float scale = 1.0f);
 
 /// Fixed-shape tiles: every micro-batch is padded up to a point of a
 /// geometric grid (atoms x neighbours, systems fixed), so a training run only

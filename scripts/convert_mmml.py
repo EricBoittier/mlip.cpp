@@ -192,8 +192,19 @@ def params_to_tensors(config: dict, params: dict, model_type: str, max_charge: i
     z = np.arange(Zmax + 1, dtype=np.float64)
     t["zbl.z"] = z.astype(np.float32).reshape(-1, 1)
     t["zbl.za"] = (z ** 0.23).astype(np.float32).reshape(-1, 1)
+    # multitask heads (mmml multitask_*; proposals/SPOOKY_MULTITASK.md): numpy (out, in) as energy.w
+    for key, name in (("charge", "multitask_charges"), ("spin", "multitask_spins")):
+        if config.get(name):
+            t[f"mt.{key}.w"] = _f32(p[f"mt_{key}_dense"]["kernel"]).reshape(F, 1).T  # (F, 1) -> (1, F)
+            t[f"mt.{key}.zbias"] = _f32(p[f"mt_{key}_zbias"]).reshape(-1, 1)
+    if config.get("multitask_orbitals"):
+        t["mt.orb.hidden.w"] = _f32(p["mt_orb_hidden"]["kernel"]).T  # (F, H) -> (H, F)
+        t["mt.orb.hidden.b"] = _f32(p["mt_orb_hidden"]["bias"]).reshape(-1)
+        t["mt.orb.out.w"] = _f32(p["mt_orb_out"]["kernel"]).T  # (H, 2) -> (2, H)
+        t["mt.orb.out.b"] = _f32(p["mt_orb_out"]["bias"]).reshape(2)
     # sanity: every params leaf used
-    used = {"Embed_0", "energy_bias", "charge_feature_projection", "spin_feature_projection"}
+    used = {"Embed_0", "energy_bias", "charge_feature_projection", "spin_feature_projection",
+            "mt_charge_dense", "mt_charge_zbias", "mt_spin_dense", "mt_spin_zbias", "mt_orb_hidden", "mt_orb_out"}
     used |= {f"MessagePass_{i}" for i in range(T)} | {f"Dense_{i}" for i in range(nd + 2)}
     extra = sorted(set(p) - used)
     if extra:
@@ -236,10 +247,19 @@ def tensors_to_params(config: dict, model_type: str, t: dict) -> dict:
     p[f"Dense_{nd + 1}"] = {"kernel": f64(t["energy.scale"]).reshape(1, 1)}
     if "energy_bias" in t:
         p["energy_bias"] = f64(t["energy_bias"]).reshape(-1)
+    for key in ("charge", "spin"):
+        if f"mt.{key}.w" in t:
+            p[f"mt_{key}_dense"] = {"kernel": f64(t[f"mt.{key}.w"]).reshape(1, F).T}
+            p[f"mt_{key}_zbias"] = f64(t[f"mt.{key}.zbias"]).reshape(-1)
+    if "mt.orb.out.w" in t:
+        p["mt_orb_hidden"] = {"kernel": f64(t["mt.orb.hidden.w"]).reshape(-1, F).T,
+                              "bias": f64(t["mt.orb.hidden.b"]).reshape(-1)}
+        p["mt_orb_out"] = {"kernel": f64(t["mt.orb.out.w"]).reshape(2, -1).T, "bias": f64(t["mt.orb.out.b"]).reshape(2)}
     return p
 
 
-def to_gguf(src: str, out: str, model_type: str | None = None, max_charge: int = 10, max_spin: int = 10) -> dict:
+def to_gguf(src: str, out: str, model_type: str | None = None, max_charge: int = 10, max_spin: int = 10,
+            frozen: tuple[str, ...] = ()) -> dict:
     config, params, model_type = load_checkpoint(src, model_type)
     bad = spooky_check_supported(config, model_type)
     if bad:
@@ -250,6 +270,12 @@ def to_gguf(src: str, out: str, model_type: str | None = None, max_charge: int =
                                       "cutoff", "max_atomic_number", "zbl", "zbl_cutoff", "zbl_cuton")}
     node_params["n_res"] = h["n_res"]
     node_params["use_energy_bias"] = h["use_energy_bias"]
+    for k in ("multitask_charges", "multitask_spins", "multitask_orbitals"):
+        if config.get(k):
+            node_params[k] = True
+    if config.get("multitask_orbitals"):
+        node_params["multitask_homo_offset"] = float(config.get("multitask_homo_offset", 0.0))
+        node_params["multitask_gap_offset"] = float(config.get("multitask_gap_offset", 0.0))
     inputs = ["input:species", "input:neighbor_species", "input:edge_vectors", "input:padding_mask",
               "input:reverse_neighbor_index"]
     gin = [
@@ -292,7 +318,8 @@ def to_gguf(src: str, out: str, model_type: str | None = None, max_charge: int =
         "pet.composition_keys": list(range(1, Zmax + 1)),
         "pet.composition_values": [0.0] * Zmax,
         "graph.json": json.dumps(graph),
-        "train.param_names": json.dumps([k for k in tensors if k not in BUFFERS]),
+        # trainable tensors (mlipcpp-train updates these; --frozen: kept fixed, e.g. energy_bias)
+        "train.param_names": json.dumps([k for k in tensors if k not in BUFFERS and k not in frozen]),
         "graph.weight_shapes": json.dumps({k: list(v.shape) for k, v in tensors.items()}),
     }
     if model_type == "spooky":
@@ -351,13 +378,15 @@ def main(argv=None):
     a.add_argument("--model-type", choices=["physnet", "spooky"], default=None)
     a.add_argument("--max-charge", type=int, default=10, help="Spooky: charge table range [-q, q]")
     a.add_argument("--max-spin-multiplicity", type=int, default=10, help="Spooky: 2S+1 table range [1, s]")
+    a.add_argument("--frozen", default="", help="comma-separated GGUF tensors mlipcpp-train keeps fixed (e.g. energy_bias)")
     b = sub.add_parser("to-json", help="GGUF -> mmml portable JSON")
     b.add_argument("gguf")
     b.add_argument("-o", "--output", required=True)
     b.add_argument("--allow-baselines", action="store_true")
     args = ap.parse_args(argv)
     if args.cmd == "to-gguf":
-        info = to_gguf(args.checkpoint, args.output, args.model_type, args.max_charge, args.max_spin_multiplicity)
+        info = to_gguf(args.checkpoint, args.output, args.model_type, args.max_charge, args.max_spin_multiplicity,
+                       tuple(x for x in args.frozen.split(",") if x))
     else:
         info = to_json(args.gguf, args.output, args.allow_baselines)
     print(json.dumps(info))

@@ -44,6 +44,21 @@ struct PhysNetHypers {
   float zbl_cutoff = 0.6f;
   float zbl_cuton = 0.1f;
   bool energy_bias = false;
+  // multitask heads (mmml SpookyPhysNet multitask_*, proposals/SPOOKY_MULTITASK.md) on the
+  // final scalar features x_i, the energy head's input:
+  //   charges q_i = q~_i + (Q - sum_s q~) / N_s, q~_i = x_i w_q + b_q[Z_i]  (mt.charge.w, mt.charge.zbias)
+  //   spins   s_i = s~_i + (M - sum_s s~) / N_s, M = multiplicity - 1      (mt.spin.w, mt.spin.zbias)
+  //   orbitals: h_i = silu(W_h x_i + c_h), (homo_i, gap_i) = W_o h_i + c_o + offsets
+  //            (mt.orb.hidden.w/b, mt.orb.out.w/b); the molecular values are the structure means
+  // sums and means over the atom's structure (system_index); Q, M: the Spooky conditioning values
+  bool head_charges = false, head_spins = false, head_orbitals = false;
+  float homo_offset = 0.0f, gap_offset = 0.0f;
+  bool any_head() const { return head_charges || head_spins || head_orbitals; }
+};
+
+/// per-atom outputs of the heads ([n] each, nullptr when absent)
+struct PhysNetHeads {
+  ggml_tensor *charges = nullptr, *spins = nullptr, *homo = nullptr, *gap = nullptr;
 };
 
 struct PhysNetInputs {
@@ -54,14 +69,16 @@ struct PhysNetInputs {
   ggml_tensor *reverse_index = nullptr;    // I32 [m n]  flat slot of the edge j -> i
   ggml_tensor *charge_index = nullptr;     // I32 [n]  (Spooky)
   ggml_tensor *spin_index = nullptr;       // I32 [n]  (Spooky)
+  // I32 [n]: the atom's structure in [0, n) (heads: per-structure sums); nullptr = one structure
+  ggml_tensor *system_index = nullptr;
 };
 
 using WeightFn = std::function<ggml_tensor *(const std::string &)>;
 /// a tensor of the given ggml shape filled with `value` (an input set after allocation)
 using ConstantFn = std::function<ggml_tensor *(ggml_context *, std::vector<int64_t>, float)>;
 
-/// per-atom energies [n]
+/// per-atom energies [n]; the heads' per-atom outputs in *heads (if given)
 ggml_tensor *build_physnet(ggml_context *ctx, const PhysNetHypers &h, const PhysNetInputs &in,
-                           const WeightFn &weight, const ConstantFn &constant);
+                           const WeightFn &weight, const ConstantFn &constant, PhysNetHeads *heads = nullptr);
 
 } // namespace mlipcpp::physnet

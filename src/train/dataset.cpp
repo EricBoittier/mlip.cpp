@@ -118,6 +118,38 @@ bool MemmapSplit::load_partial_charges(const std::string &target) {
   return true;
 }
 
+std::array<bool, 4> MemmapSplit::load_aux(const std::string &charge_scheme, const std::string &spin_scheme) {
+  const std::string file[4] = {charge_scheme + "_charge", spin_scheme + "_spin", "homo_energy", "homo_lumo_gap"};
+  const std::string mask[4] = {charge_scheme + "_charge_mask", spin_scheme + "_spin_mask", "homo_mask", "gap_mask"};
+  std::array<bool, 4> found{};
+  for (int k = 0; k < 4; k++) {
+    const std::string path = dir_ + "/" + file[k] + ".bin";
+    if (!std::filesystem::exists(path)) continue;
+    aux_[k] = Mapped<float>(path);
+    const size_t want = k < 2 ? static_cast<size_t>(na_.back()) : static_cast<size_t>(n_systems_);
+    if (aux_[k].size() != want)
+      throw std::runtime_error(path + ": " + std::to_string(aux_[k].size()) + " values, expected " + std::to_string(want));
+    aux_ok_[k].assign(n_systems_, 1);
+    const std::string mpath = dir_ + "/" + mask[k] + ".bin";
+    if (std::filesystem::exists(mpath)) {
+      Mapped<float> mk(mpath);
+      if (mk.size() != static_cast<size_t>(n_systems_)) throw std::runtime_error(mpath + ": one value per structure expected");
+      for (int64_t s = 0; s < n_systems_; s++) aux_ok_[k][s] = mk[s] > 0.5f;
+    }
+    for (int64_t s = 0; s < n_systems_; s++) {
+      if (!aux_ok_[k][s]) continue;
+      if (k < 2) {
+        for (int64_t a = na_[s]; a < na_[s + 1]; a++)
+          if (!std::isfinite(aux_[k][a])) { aux_ok_[k][s] = 0; break; }
+      } else if (!std::isfinite(aux_[k][s])) {
+        aux_ok_[k][s] = 0;
+      }
+    }
+    found[k] = true;
+  }
+  return found;
+}
+
 bool MemmapSplit::partial_charges_ok(int64_t s) const {
   if (!pq_.size() || n_atoms(s) < 3) return false;
   const float *p = partial_charges(s);

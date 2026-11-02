@@ -79,6 +79,13 @@ public:
 
   // Output tensor of every built node, by GIR node id (valid until next build)
   const std::map<int, ggml_tensor *> &node_outputs() const { return node_outputs_; }
+  /// extra per-atom outputs of the last build (PhysNet heads: "charges", "spins", "homo",
+  /// "gap"), nullptr when the model has none
+  ggml_tensor *aux_output(const std::string &name) const {
+    auto it = aux_outputs_.find(name);
+    return it == aux_outputs_.end() ? nullptr : it->second;
+  }
+  const std::map<std::string, ggml_tensor *> &aux_outputs() const { return aux_outputs_; }
 
   // Debug mode: set output directory for dumping intermediate tensors
   void set_debug_output_dir(const std::string &dir);
@@ -132,6 +139,7 @@ private:
   std::map<std::string, ggml_tensor *> weights_;
   std::map<std::string, ggml_tensor *> inputs_;
   std::map<int, ggml_tensor *> node_outputs_; // node_id -> tensor
+  std::map<std::string, ggml_tensor *> aux_outputs_;
 
   // Output tensor
   ggml_tensor *output_ = nullptr;

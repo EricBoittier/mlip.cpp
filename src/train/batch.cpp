@@ -167,6 +167,12 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
   b.cells.assign(b.n_real_systems, {});
   b.periodic.assign(b.n_real_systems, 0);
   b.system_charge.assign(b.n_real_systems, 0);
+  b.system_index.resize(n);
+  for (int a = 0; a < n; a++) b.system_index[a] = a; // padding atoms: a structure of their own
+  b.has_aux = split.has_aux(0) || split.has_aux(1) || split.has_aux(2) || split.has_aux(3);
+  if (b.has_aux)
+    for (int k = 0; k < 4; k++)
+      b.aux_target[k].assign(k < 2 ? n : b.n_systems, 0.0f), b.aux_mask[k].assign(k < 2 ? n : b.n_systems, 0.0f);
   // padding atoms: no neighbours, so every slot is padded and points to itself
   for (int a = n_real; a < n; a++)
     for (int j = 0; j < m; j++) b.reverse_neighbor_index[a * m + j] = a * m + j;
@@ -214,6 +220,16 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
           std::copy(split.partial_charges(s), split.partial_charges(s) + ns, b.ref_charge.begin() + offset);
       }
     }
+    for (int i = 0; i < ns; i++) b.system_index[offset + i] = k;
+    if (b.has_aux) {
+      for (int t = 0; t < 2; t++)
+        if (split.aux_ok(t, s)) {
+          const float *v = split.aux_atoms(t, s);
+          for (int i = 0; i < ns; i++) b.aux_target[t][offset + i] = v[i], b.aux_mask[t][offset + i] = 1.0f;
+        }
+      for (int t = 2; t < 4; t++)
+        if (split.aux_ok(t, s)) b.aux_target[t][k] = split.aux_value(t, s), b.aux_mask[t][k] = 1.0f;
+    }
     b.energy_target[k] = static_cast<float>(
         (split.energy(s) - scaling.comp(Z, ns)) / (scaling.energy_scale * (scaling.per_structure ? 1 : ns)));
     b.n_per_system[k] = ns;
@@ -246,6 +262,16 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
   return b;
 }
 
+std::array<float, 4> aux_norms(const MemmapSplit &split, const std::vector<int64_t> &ids, float scale) {
+  std::array<double, 4> count{};
+  for (int64_t s : ids)
+    for (int k = 0; k < 4; k++)
+      if (split.aux_ok(k, s)) count[k] += k < 2 ? split.n_atoms(s) : 1;
+  std::array<float, 4> out{};
+  for (int k = 0; k < 4; k++) out[k] = count[k] > 0 ? static_cast<float>(scale / count[k]) : 0.0f;
+  return out;
+}
+
 std::vector<Batch> make_microbatches(const MemmapSplit &split, const NeighborCache &nl,
                                      const std::vector<int64_t> &ids,
                                      const std::vector<std::array<float, 9>> &rotations,
@@ -262,6 +288,7 @@ std::vector<Batch> make_microbatches(const MemmapSplit &split, const NeighborCac
   });
   int64_t n_total = 0;
   for (int64_t s : ids) n_total += split.n_atoms(s);
+  const std::array<float, 4> an = aux_norms(split, ids);
 
   std::vector<Batch> out;
   std::vector<int64_t> g_ids;
@@ -281,6 +308,7 @@ std::vector<Batch> make_microbatches(const MemmapSplit &split, const NeighborCac
                              pad_nb, tiling.enabled() ? tiling.systems : 0));
     out.back().energy_norm = 1.0f / ids.size();
     out.back().force_norm = 1.0f / (3.0f * n_total);
+    std::copy_n(an.begin(), 4, out.back().aux_norm);
     out.back().charge_norm = charge_norm;
     g_ids.clear(), g_rot.clear(), g_atoms = 0;
   };
@@ -382,6 +410,7 @@ std::vector<std::vector<Batch>> make_step_batches(const MemmapSplit &split, cons
     }
   }
 
+  const std::array<float, 4> an = aux_norms(split, ids, static_cast<float>(W));
   std::vector<std::future<Batch>> built;
   for (const auto &grp : groups)
     built.push_back(std::async(std::launch::async, [&, i = grp.first, j = grp.second] {
@@ -400,6 +429,7 @@ std::vector<std::vector<Batch>> make_step_batches(const MemmapSplit &split, cons
       b.energy_norm = static_cast<float>(W) / K;
       b.force_norm = static_cast<float>(W) / (3.0f * atoms[K]);
       b.charge_norm = charge_norm;
+      std::copy_n(an.begin(), 4, b.aux_norm);
       return b;
     }));
   std::vector<std::vector<Batch>> out(W);

@@ -78,7 +78,7 @@ struct Builder {
 } // namespace
 
 ggml_tensor *build_physnet(ggml_context *ctx, const PhysNetHypers &h, const PhysNetInputs &in,
-                           const WeightFn &weight, const ConstantFn &constant) {
+                           const WeightFn &weight, const ConstantFn &constant, PhysNetHeads *heads) {
   if (h.max_degree < 0 || h.max_degree > 1) throw std::runtime_error("PhysNet: max_degree must be 0 or 1");
   if (h.n_res < 1) throw std::runtime_error("PhysNet: n_res must be >= 1");
   Builder b{ctx, h, weight, constant};
@@ -129,10 +129,12 @@ ggml_tensor *build_physnet(ggml_context *ctx, const PhysNetHypers &h, const Phys
   // --- embedding (+ charge / spin conditioning) ---
   ggml_tensor *s = ggml_get_rows(c, b.w("embed"), in.species); // [F, n]
   ggml_tensor *v = nullptr;                                      // [F, 3, n]
+  ggml_tensor *q_atom = nullptr, *mult_atom = nullptr;           // [1, n]: Q and 2S+1 of the atom's structure
   if (h.spooky) {
     if (!in.charge_index || !in.spin_index) throw std::runtime_error("SpookyPhysNet: no charge / spin inputs");
     ggml_tensor *q = ggml_get_rows(c, b.w("cond.charge_values"), in.charge_index); // [1, n]
     ggml_tensor *sp = ggml_get_rows(c, b.w("cond.spin_values"), in.spin_index);
+    q_atom = q, mult_atom = sp;
     ggml_tensor *cq = ggml_add(c, ggml_mul_mat(c, b.w("cond.charge.w"), q), b.w("cond.charge.b"));
     ggml_tensor *cs = ggml_add(c, ggml_mul_mat(c, b.w("cond.spin.w"), sp), b.w("cond.spin.b"));
     s = ggml_add(c, s, ggml_add(c, cq, cs));
@@ -203,6 +205,37 @@ ggml_tensor *build_physnet(ggml_context *ctx, const PhysNetHypers &h, const Phys
     b.dense(t * (h.n_res + 1) + h.n_res, ys, yv);
     b.silu(ys, yv);
     s = ys, v = yv;
+  }
+
+  // --- multitask heads (per atom) ---
+  if (heads && h.any_head()) {
+    auto head = [&](const char *name) { // x w + b[Z]: [1, n]
+      const std::string p = std::string("mt.") + name + ".";
+      return ggml_add(c, ggml_mul_mat(c, b.w(p + "w"), s), ggml_get_rows(c, b.w(p + "zbias"), in.species));
+    };
+    // per-structure sums gathered back to the atoms: [1, n]
+    auto structure_sum = [&](ggml_tensor *x) {
+      if (!in.system_index) return ggml_repeat(c, ggml_sum(c, x), x);
+      ggml_tensor *sums = ggml_get_rows_back(c, x, in.system_index, ggml_new_tensor_2d(c, GGML_TYPE_F32, 1, n));
+      return ggml_reshape_2d(c, ggml_get_rows(c, sums, in.system_index), 1, n);
+    };
+    ggml_tensor *count = (h.head_charges || h.head_spins) ? structure_sum(constant(c, {1, n}, 1.0f)) : nullptr;
+    // x + (target - sum_s x) / N_s
+    auto constrain = [&](ggml_tensor *x, ggml_tensor *target) {
+      ggml_tensor *d = ggml_neg(c, structure_sum(x));
+      if (target) d = ggml_add(c, d, target);
+      return ggml_reshape_1d(c, ggml_add(c, x, ggml_div(c, d, count)), n);
+    };
+    if (h.head_charges) heads->charges = constrain(head("charge"), q_atom);
+    if (h.head_spins) heads->spins = constrain(head("spin"), mult_atom ? ggml_scale_bias(c, mult_atom, 1.0f, -1.0f) : nullptr);
+    if (h.head_orbitals) {
+      ggml_tensor *hid = ggml_silu(c, ggml_add(c, ggml_mul_mat(c, b.w("mt.orb.hidden.w"), s), b.w("mt.orb.hidden.b")));
+      ggml_tensor *o = ggml_add(c, ggml_mul_mat(c, b.w("mt.orb.out.w"), hid), b.w("mt.orb.out.b")); // [2, n]
+      heads->homo = ggml_scale_bias(c, ggml_cont(c, ggml_view_1d(c, ggml_cont(c, ggml_transpose(c, o)), n, 0)), 1.0f,
+                                    h.homo_offset);
+      heads->gap = ggml_scale_bias(c, ggml_cont(c, ggml_view_1d(c, ggml_cont(c, ggml_transpose(c, o)), n,
+                                                              n * sizeof(float))), 1.0f, h.gap_offset);
+    }
   }
 
   // --- atomic energies ---

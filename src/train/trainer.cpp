@@ -295,6 +295,9 @@ StepStats &StepStats::operator+=(const StepStats &o) {
   ae_energy_per_atom += o.ae_energy_per_atom, ae_force += o.ae_force;
   sum_e += o.sum_e, sum2_e += o.sum2_e, sum_f += o.sum_f, sum2_f += o.sum2_f;
   n_systems += o.n_systems, n_force_components += o.n_force_components;
+  for (int k = 0; k < 4; k++)
+    loss_aux[k] += o.loss_aux[k], ae_aux[k] += o.ae_aux[k], se_aux[k] += o.se_aux[k], n_aux[k] += o.n_aux[k];
+  for (int k = 0; k < 2; k++) max_constraint[k] = std::max(max_constraint[k], o.max_constraint[k]);
   return *this;
 }
 
@@ -481,6 +484,66 @@ Worker::GraphCost Worker::graph_cost(int n, int m, int S, bool backward) {
   return c;
 }
 
+namespace {
+const char *const kAuxName[4] = {"charges", "spins", "homo", "gap"};
+// the model's PHYSNET node has multitask heads (node param "heads")
+bool physnet_heads(const runtime::GraphInterpreter &interp) {
+  for (const auto &node : interp.graph().nodes) {
+    if (node.op != "PHYSNET") continue;
+    for (const char *k : {"multitask_charges", "multitask_spins", "multitask_orbitals"}) {
+      auto it = node.params.find(k);
+      if (it != node.params.end() && std::holds_alternative<bool>(it->second) && std::get<bool>(it->second)) return true;
+    }
+  }
+  return false;
+}
+} // namespace
+
+bool Worker::aux_on(int k) const { return aux_weight[k] > 0; }
+
+/// the heads' predictions vs the batch's targets (host): loss terms, |error|, constraints
+void Worker::aux_stats(StepGraph &g, const Batch &b, StepStats &st) {
+  if (!b.has_aux) return;
+  const int n = b.n_atoms, S = b.n_systems;
+  std::vector<float> p(n);
+  for (int k = 0; k < 4; k++) {
+    if (!g.aux[k]) continue;
+    ggml_backend_tensor_get(g.aux[k], p.data(), 0, n * sizeof(float));
+    if (k < 2) { // per atom; constraint residual per structure
+      std::vector<double> sum(S, 0.0);
+      for (int a = 0; a < n; a++) {
+        const int s = b.system_index[a];
+        if (s < b.n_real_systems) sum[s] += p[a];
+        if (b.aux_mask[k][a] == 0.0f) continue;
+        const double d = p[a] - b.aux_target[k][a];
+        st.ae_aux[k] += std::abs(d), st.se_aux[k] += d * d, st.n_aux[k]++;
+        st.loss_aux[k] += aux_weight[k] * b.aux_norm[k] * d * d;
+      }
+      for (int s = 0; s < b.n_real_systems; s++) {
+        const double want = k == 0 ? b.system_charge[s] : 0.0;
+        double target = want;
+        if (k == 1) { // M = multiplicity - 1 of the structure: from any of its atoms
+          for (int a = 0; a < n; a++)
+            if (b.system_index[a] == s) { target = b.atom_spin[a] - 1; break; }
+        }
+        st.max_constraint[k] = std::max(st.max_constraint[k], std::abs(sum[s] - target));
+      }
+    } else { // molecular mean of the atomic contributions
+      std::vector<double> mean(S, 0.0);
+      for (int a = 0; a < n; a++) {
+        const int s = b.system_index[a];
+        if (s < b.n_real_systems) mean[s] += double(p[a]) / b.n_per_system[s];
+      }
+      for (int s = 0; s < b.n_real_systems; s++) {
+        if (b.aux_mask[k][s] == 0.0f) continue;
+        const double d = mean[s] - b.aux_target[k][s];
+        st.ae_aux[k] += std::abs(d), st.se_aux[k] += d * d, st.n_aux[k]++;
+        st.loss_aux[k] += aux_weight[k] * b.aux_norm[k] * d * d;
+      }
+    }
+  }
+}
+
 ggml_tensor *Worker::charge_corr_graph(StepGraph &g, ggml_context *ctx, int S, bool loss) {
   (void)S;
   if (!(charge_corr.weight > 0)) return nullptr;
@@ -580,6 +643,17 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
     interp.set_input("charge_index", in(GGML_TYPE_I32, {n}, "charge_index"));
     interp.set_input("spin_index", in(GGML_TYPE_I32, {n}, "spin_index"));
   }
+  const bool heads = physnet_heads(interp);
+  if (heads) interp.set_input("system_index", in(GGML_TYPE_I32, {n}, "system_index"));
+  // the heads' outputs of this build (metrics; their loss terms in the loss graphs)
+  auto take_aux = [&] {
+    for (int k = 0; k < 4; k++) {
+      g->aux[k] = interp.aux_output(kAuxName[k]);
+      if (aux_on(k) && !g->aux[k])
+        throw std::runtime_error(std::string("aux loss on ") + kAuxName[k] + ": the model has no such head");
+      if (g->aux[k]) ggml_set_output(g->aux[k]);
+    }
+  };
   if (model_.plato_lr().enabled) {
     plato_create(*g, ctx, n, mode == FORCES || shared);
     g->plato->set_padding_mask(padding_mask);
@@ -596,6 +670,7 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
     ggml_set_param(edges), ggml_set_param(cv);
     for (ggml_tensor *p : params_) p->flags &= ~GGML_TENSOR_FLAG_PARAM;
     g->out = interp.build(ctx);
+    take_aux();
     ggml_set_output(g->out); // (an energy-only export's [n]: the source of the view below, kept too)
     if (ggml_n_dims(g->out) == 1) g->out = ggml_reshape_2d(ctx, g->out, 1, n), ggml_set_output(g->out);
     charge_corr_graph(*g, ctx, S, false); // r for the metrics (the loss term is in MIXED)
@@ -604,6 +679,8 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
     ggml_build_forward_expand(g->gf, g->out);
     ggml_build_forward_expand(g->gf, E);
     if (g->charge_r) ggml_build_forward_expand(g->gf, g->charge_r);
+    for (ggml_tensor *t : g->aux)
+      if (t) ggml_build_forward_expand(g->gf, t);
     g->n_forward = ggml_graph_n_nodes(g->gf);
     ggml_set_loss(E);
     ggml_build_backward_expand(ctx, g->gf, nullptr);
@@ -628,6 +705,17 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
     // per-step loss normalisation (1/S, 1/3N of the whole step): inputs, so a
     // cached graph serves every step
     ggml_tensor *norms = in(GGML_TYPE_F32, {2}, "loss_norms");
+    g->loss_inputs = true;
+    // multitask: targets and per-atom / per-structure weights (mask x norm x loss weight),
+    // the structure means of the atomic HOMO / gap contributions as an [n, S] matrix
+    ggml_tensor *aux_t[4] = {}, *aux_w[4] = {}, *aux_mean = nullptr;
+    for (int k = 0; k < 4; k++) {
+      if (!aux_on(k)) continue;
+      if (!heads) throw std::runtime_error(std::string("aux loss on ") + kAuxName[k] + ": the model has no heads");
+      aux_t[k] = in(GGML_TYPE_F32, {k < 2 ? n : S, 1}, "aux_target");
+      aux_w[k] = in(GGML_TYPE_F32, {k < 2 ? n : S, 1}, "aux_weight");
+    }
+    if (aux_on(2) || aux_on(3)) aux_mean = in(GGML_TYPE_F32, {n, S}, "aux_mean");
     ggml_tensor *e_norm = ggml_view_1d(ctx, norms, 1, 0);
     ggml_tensor *f_norm = ggml_view_1d(ctx, norms, 1, sizeof(float));
 
@@ -663,6 +751,14 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
     ggml_tensor *loss_f = ggml_mul(ctx, component(d_force, loss.delta_f), f_norm);
     ggml_tensor *loss = ggml_add(ctx, loss_e, loss_f);
     if (ggml_tensor *lq = charge_corr_graph(*g, ctx, S, true)) loss = ggml_add(ctx, loss, lq);
+    take_aux();
+    for (int k = 0; k < 4; k++) {
+      if (!aux_t[k]) continue;
+      ggml_tensor *p = ggml_reshape_2d(ctx, g->aux[k], n, 1);
+      if (k >= 2) p = ggml_mul_mat(ctx, aux_mean, p); // [S, 1]
+      ggml_tensor *d = ggml_sub(ctx, p, aux_t[k]);
+      loss = ggml_add(ctx, loss, ggml_sum(ctx, ggml_mul(ctx, ggml_sqr(ctx, d), aux_w[k])));
+    }
     if (mode == MIXED) {
       // - <dE/dx, u> along the scaled residual u: its weight gradient is the
       // conservative force loss's (u held fixed)
@@ -689,6 +785,8 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
       g->gforces = ggml_new_graph_custom(ctx, graph_size, true);
       ggml_build_forward_expand(g->gforces, out);
       ggml_build_forward_expand(g->gforces, E);
+      for (ggml_tensor *t : g->aux) // the heads' outputs from stage 1 (metrics before stage 2)
+        if (t) ggml_build_forward_expand(g->gforces, t);
       if (g->charge_r) ggml_build_forward_expand(g->gforces, g->charge_r);
       g->n_forces_forward = ggml_graph_n_nodes(g->gforces);
       ggml_set_loss(E);
@@ -828,9 +926,30 @@ void Worker::upload_inputs(StepGraph &g, const Batch &b, const std::vector<float
       std::tie(cond_rows_[0][a], cond_rows_[1][a]) = cond.rows(b.atom_charge[a], b.atom_spin[a]);
     src.insert(src.end(), {span(cond_rows_[0]), span(cond_rows_[1])});
   }
-  if (g.inputs.size() > src.size())
+  if (physnet_heads(model_.interpreter())) src.push_back(span(b.system_index));
+  if (g.loss_inputs) {
     src.insert(src.end(), {span(b.atom_weight), span(b.energy_target), span(b.force_target),
                            span(b.force_mask), span(b.force_scale), {norms, sizeof norms}});
+    const int n = b.n_atoms, S = b.n_systems;
+    for (int k = 0; k < 4; k++) {
+      if (!aux_on(k)) continue;
+      const size_t len = k < 2 ? n : S;
+      aux_w_[k].assign(len, 0.0f);
+      if (b.has_aux)
+        for (size_t i = 0; i < len; i++) aux_w_[k][i] = b.aux_mask[k][i] * b.aux_norm[k] * float(aux_weight[k]);
+      if (b.has_aux) src.push_back(span(b.aux_target[k]));
+      else src.push_back(span(aux_w_[k])); // no targets in this split: zeros (the weights are 0 too)
+      src.push_back(span(aux_w_[k]));
+    }
+    if (aux_on(2) || aux_on(3)) {
+      aux_mean_.assign(static_cast<size_t>(n) * S, 0.0f); // [S][n]: ggml ne (n, S)
+      for (int a = 0; a < n; a++) {
+        const int s = b.system_index[a];
+        if (s < b.n_real_systems) aux_mean_[static_cast<size_t>(s) * n + a] = 1.0f / b.n_per_system[s];
+      }
+      src.push_back(span(aux_mean_));
+    }
+  }
   if (dv) src.insert(src.end(), {span(*dv), span(*dc)});
   if (src.size() != g.inputs.size()) throw std::logic_error("upload_inputs: input count");
   if (g.qref) {
@@ -970,6 +1089,7 @@ StepStats Worker::run(const Batch &b, double energy_scale, bool backward) {
   st.se_force = stats[3];
   st.n_systems = b.n_real_systems;
   charge_corr_stats(*g, b, st);
+  aux_stats(*g, b, st);
   for (float w : b.force_mask) st.n_force_components += 3 * static_cast<int64_t>(w);
   add_target_sums(b, energy_scale, st);
   if (system_errors) {
@@ -1024,6 +1144,7 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
   }
   StepStats st;
   charge_corr_stats(gf, b, st);
+  aux_stats(gf, b, st);
   if (gf.grad_x) { // Plato-PET-LR: the explicit position dependence (mesh, LES)
     gx.resize(3 * static_cast<size_t>(n));
     ggml_backend_tensor_get(gf.grad_x, gx.data(), 0, gx.size() * sizeof(float));
@@ -1093,7 +1214,8 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
     per_atom[a] = static_cast<float>(e2);
     fse[sys] += e2;
   }
-  st.loss = st.loss_energy + st.loss_force + st.loss_nc + st.loss_charge;
+  st.loss = st.loss_energy + st.loss_force + st.loss_nc + st.loss_charge + st.loss_aux[0] + st.loss_aux[1] +
+            st.loss_aux[2] + st.loss_aux[3];
   if (system_errors) {
     for (int k = 0; k < b.n_real_systems; k++)
       system_errors->push_back({b.ids[k], -1, b.n_per_system[k],
@@ -1997,6 +2119,26 @@ void train(const TrainOptions &o) {
     fmt::print("charge correlation: weight {} x mean over structures of max(0, {} - r), r = Pearson(first latent "
                "charge channel, {} charges)\n", o.charge_corr_weight, o.charge_corr_min, o.charge_corr_target);
   }
+  const bool any_aux = o.aux_weight[0] > 0 || o.aux_weight[1] > 0 || o.aux_weight[2] > 0 || o.aux_weight[3] > 0;
+  for (auto &w : workers) std::copy_n(o.aux_weight, 4, w->aux_weight);
+  if (any_aux) {
+    if (!o.conservative) throw std::runtime_error("multitask heads train with --conservative");
+    for (MemmapSplit *sp : {&train_split, &val_split, &test_split}) {
+      const auto got = sp->load_aux(o.aux_charge_scheme, o.aux_spin_scheme);
+      std::string msg;
+      const char *names[4] = {"charges", "spins", "homo", "gap"};
+      for (int k = 0; k < 4; k++) {
+        int64_t ok = 0;
+        for (int64_t s = 0; s < sp->size(); s++) ok += sp->aux_ok(k, s);
+        msg += fmt::format(" {} {}", names[k], got[k] ? fmt::format("{}/{}", ok, sp->size()) : std::string("absent"));
+        if (o.aux_weight[k] > 0 && !got[k] && sp == &train_split)
+          throw std::runtime_error(sp->dir() + ": no target file for the " + names[k] + " head");
+      }
+      fmt::print("multitask targets ({}):{}\n", sp->dir(), msg);
+    }
+    fmt::print("multitask loss weights: charges {} ({}), spins {} ({}), homo {}, gap {}\n", o.aux_weight[0],
+               o.aux_charge_scheme, o.aux_weight[1], o.aux_spin_scheme, o.aux_weight[2], o.aux_weight[3]);
+  }
   if (o.conservative)
     fmt::print("conservative forces -dE/dx: loss weights energy {}, forces {}, direct forces {}\n", o.energy_weight,
                o.force_weight, o.nc_force_weight);
@@ -2253,6 +2395,27 @@ void train(const TrainOptions &o) {
                num(re), num(rf));
     std::fflush(jsonl.get());
   };
+  // multitask heads: MAE (e, e, eV, eV) and the constraint residuals
+  auto aux_text = [&](const StepStats &st) {
+    if (!any_aux) return std::string();
+    std::string t = " | heads MAE:";
+    const char *names[4] = {"q", "s", "homo", "gap"};
+    for (int k = 0; k < 4; k++)
+      if (st.n_aux[k]) t += fmt::format(" {} {:.4g}", names[k], st.ae_aux[k] / st.n_aux[k]);
+    return t + fmt::format(" (max |sum q - Q| {:.1e}, |sum s - M| {:.1e})", st.max_constraint[0], st.max_constraint[1]);
+  };
+  auto aux_json = [&](const StepStats &st, const char *prefix) {
+    if (!any_aux) return std::string();
+    std::string t;
+    const char *names[4] = {"charges", "spins", "homo", "gap"};
+    for (int k = 0; k < 4; k++)
+      if (st.n_aux[k])
+        t += fmt::format(",\"{}_{}_mae\":{},\"{}_{}_rmse\":{},\"{}_{}_loss\":{}", prefix, names[k],
+                         st.ae_aux[k] / st.n_aux[k], prefix, names[k], std::sqrt(st.se_aux[k] / st.n_aux[k]),
+                         prefix, names[k], st.loss_aux[k]);
+    return t + fmt::format(",\"{}_max_charge_constraint\":{},\"{}_max_spin_constraint\":{}", prefix,
+                           st.max_constraint[0], prefix, st.max_constraint[1]);
+  };
   // conservative mode: the direct head's force RMSE too
   auto nc_rmse = [&](const StepStats &s) {
     return o.conservative ? fmt::format(", F_nc {:.2f} meV/A", 1e3 * std::sqrt(s.se_force_nc / s.n_force_components))
@@ -2416,6 +2579,10 @@ void train(const TrainOptions &o) {
           fmt::print("  packing cost model: {:.2f} ms + {:.3g} n(m+1)^2 + {:.3g} n(m+1)\n",
                      plan_cost.c[0], plan_cost.c[1], plan_cost.c[2]);
         }
+        if (any_aux)
+          fmt::print("  heads loss: q {:.4g}, s {:.4g}, homo {:.4g}, gap {:.4g}{}\n", step_total.loss_aux[0] / W,
+                     step_total.loss_aux[1] / W, step_total.loss_aux[2] / W, step_total.loss_aux[3] / W,
+                     aux_text(step_total));
         std::fflush(stdout);
       }
     }
@@ -2440,6 +2607,7 @@ void train(const TrainOptions &o) {
       fmt::print("epoch {} charge correlation ({}): mean r train {:.4f} ({} structures, {} skipped), val {:.4f} ({} structures)\n",
                  epoch, o.charge_corr_target, ep.sum_charge_r / std::max<int64_t>(1, ep.n_charge_r), ep.n_charge_r,
                  ep.n_charge_skipped, val.sum_charge_r / std::max<int64_t>(1, val.n_charge_r), val.n_charge_r);
+    if (any_aux) fmt::print("epoch {} heads: train{} | val{}\n", epoch, aux_text(ep), aux_text(val));
     std::fflush(stdout);
     params = w0.get_params(); // the master copy lives on device 0
     const int64_t done_epochs = epoch + 1;
@@ -2452,6 +2620,8 @@ void train(const TrainOptions &o) {
                          global_step, grouped ? grouped->opt->schedule().base_lr(global_step, steps_per_epoch, total_steps)
                                               : lr_at(global_step),
                          ep.loss / done, tre, trf, t_train, t_val, best) +
+                 fmt::format(",\"train_struct_per_s\":{}", ep.n_systems / t_train) + aux_json(ep, "train") +
+                 aux_json(val, "val") +
                  (grouped ? ",\"lr_groups\":" + grouped->lr_json(std::max<int64_t>(0, global_step - 1), steps_per_epoch, total_steps)
                           : std::string()));
     if (o.save_every <= 0)

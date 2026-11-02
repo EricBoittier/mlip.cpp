@@ -282,6 +282,7 @@ ggml_tensor *GraphInterpreter::build(ggml_context *ctx) {
 
   output_ = nullptr;
   node_outputs_.clear();
+  aux_outputs_.clear();
   pending_constants_.clear();
   zeros_.clear();
 
@@ -2268,6 +2269,12 @@ ggml_tensor *GraphInterpreter::build_physnet(ggml_context *ctx, const GIRNode &n
   h.zbl_cutoff = static_cast<float>(get_param<double>(node, "zbl_cutoff", 0.6));
   h.zbl_cuton = static_cast<float>(get_param<double>(node, "zbl_cuton", 0.1));
   h.energy_bias = get_param<bool>(node, "use_energy_bias", false);
+  // multitask heads (mmml model fields of the same names)
+  h.head_charges = get_param<bool>(node, "multitask_charges", false);
+  h.head_spins = get_param<bool>(node, "multitask_spins", false);
+  h.head_orbitals = get_param<bool>(node, "multitask_orbitals", false);
+  h.homo_offset = static_cast<float>(get_param<double>(node, "multitask_homo_offset", 0.0));
+  h.gap_offset = static_cast<float>(get_param<double>(node, "multitask_gap_offset", 0.0));
   auto input = [&](const char *name, bool required) -> ggml_tensor * {
     auto it = inputs_.find(name);
     if (it == inputs_.end()) {
@@ -2284,6 +2291,7 @@ ggml_tensor *GraphInterpreter::build_physnet(ggml_context *ctx, const GIRNode &n
   in.reverse_index = input("reverse_neighbor_index", true);
   in.charge_index = input("charge_index", h.spooky);
   in.spin_index = input("spin_index", h.spooky);
+  in.system_index = input("system_index", false);
   auto weight = [&](const std::string &name) -> ggml_tensor * {
     auto it = weights_.find(name);
     return it == weights_.end() ? nullptr : it->second;
@@ -2294,7 +2302,13 @@ ggml_tensor *GraphInterpreter::build_physnet(ggml_context *ctx, const GIRNode &n
     pending_constants_.push_back({t, value});
     return t;
   };
-  return physnet::build_physnet(ctx, h, in, weight, constant);
+  physnet::PhysNetHeads heads;
+  ggml_tensor *e = physnet::build_physnet(ctx, h, in, weight, constant, &heads);
+  aux_outputs_.clear();
+  for (auto [name, t] : {std::pair{"charges", heads.charges}, std::pair{"spins", heads.spins},
+                         std::pair{"homo", heads.homo}, std::pair{"gap", heads.gap}})
+    if (t) aux_outputs_[name] = t;
+  return e;
 }
 
 } // namespace mlipcpp::runtime

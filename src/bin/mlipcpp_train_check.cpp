@@ -35,6 +35,8 @@ int main(int argc, char **argv) {
   Worker::ChargeCorr qcorr;
   std::string qtarget = "mulliken";
   bool huber = false, model_baselines = false, per_structure = false;
+  double aux_w[4] = {0, 0, 0, 0};
+  std::string q_scheme = "lowdin", s_scheme = "lowdin";
   double de = 0.01, df = 0.02;
   double tile_ratio = 1.25, tol = 1e-3;
   for (int i = 1; i + 1 < argc; i += 2) {
@@ -60,6 +62,12 @@ int main(int argc, char **argv) {
     else if (a == "--charge-corr-target") qtarget = v;
     else if (a == "--loss") huber = v == "huber";
     else if (a == "--model-baselines") model_baselines = v == "1"; // --init's composition and scales
+    else if (a == "--charge-weight") aux_w[0] = std::stod(v); // multitask heads (mlipcpp-train's flags)
+    else if (a == "--spin-weight") aux_w[1] = std::stod(v);
+    else if (a == "--homo-weight") aux_w[2] = std::stod(v);
+    else if (a == "--gap-weight") aux_w[3] = std::stod(v);
+    else if (a == "--charge-scheme") q_scheme = v;
+    else if (a == "--spin-scheme") s_scheme = v;
     else if (a == "--energy-per-structure") per_structure = v == "1"; // mmml's total-energy loss
     else if (a == "--huber-delta-e") de = std::stod(v);
     else if (a == "--huber-delta-f") df = std::stod(v);
@@ -76,6 +84,8 @@ int main(int argc, char **argv) {
   Worker worker(init, gpus > 0 ? 0 : -1);
   worker.conservative = cons;
   worker.charge_corr = qcorr;
+  std::copy_n(aux_w, 4, worker.aux_weight);
+  if (aux_w[0] > 0 || aux_w[1] > 0 || aux_w[2] > 0 || aux_w[3] > 0) split.load_aux(q_scheme, s_scheme);
   worker.loss.huber = huber, worker.loss.delta_e = de, worker.loss.delta_f = df;
   if (qcorr.weight > 0 && !split.load_partial_charges(qtarget))
     throw std::runtime_error(data + "/train/" + qtarget + "_charge.bin: not found");
@@ -95,6 +105,7 @@ int main(int argc, char **argv) {
   std::vector<int64_t> ids(n);
   std::iota(ids.begin(), ids.end(), first);
   Batch b = make_batch(split, nl, ids, {}, worker.model().species_to_index(), sc, worker.model().cutoff());
+  { const auto an = aux_norms(split, ids); std::copy_n(an.begin(), 4, b.aux_norm); } // (as make_microbatches)
 
   // gradient of every IR node output, for scripts/train/compare_node_grads.py
   // grad points into the compute context, which run() frees: copy ne and data in after_compute
@@ -456,6 +467,11 @@ int main(int argc, char **argv) {
   nlohmann::json meta;
   meta["ids"] = ids;
   meta["loss"] = st.loss, meta["loss_energy"] = st.loss_energy, meta["loss_force"] = st.loss_force;
+  meta["aux"] = {{"weights", std::vector<double>(aux_w, aux_w + 4)}, {"schemes", {q_scheme, s_scheme}},
+                 {"loss", std::vector<double>(st.loss_aux, st.loss_aux + 4)},
+                 {"mae", {st.n_aux[0] ? st.ae_aux[0] / st.n_aux[0] : 0.0, st.n_aux[1] ? st.ae_aux[1] / st.n_aux[1] : 0.0,
+                          st.n_aux[2] ? st.ae_aux[2] / st.n_aux[2] : 0.0, st.n_aux[3] ? st.ae_aux[3] / st.n_aux[3] : 0.0}},
+                 {"max_constraint", {st.max_constraint[0], st.max_constraint[1]}}};
   if (cons.on)
     meta["conservative"] = {{"energy_weight", cons.energy}, {"force_weight", cons.force},
                             {"nc_force_weight", cons.nc_force}, {"loss_nc", st.loss_nc}};

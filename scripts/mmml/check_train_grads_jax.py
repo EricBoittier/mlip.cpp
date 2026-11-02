@@ -12,6 +12,11 @@ The JAX loss is the one of scripts/train_so3lr_spooky_extxyz.py: w_E mean_s (E_s
 forces -dE/dx, all pairs within each molecule, float64. The JAX gradient tree is mapped
 onto the GGUF tensors with convert_mmml.params_to_tensors (a linear relayout). Prints the
 relative difference per tensor and in total; exit 1 above --tol.
+
+Multitask heads (weights in check.json "aux", from mlipcpp-train-check --charge-weight ...): the JAX
+model must have them (mmml with proposals/spooky_multitask.diff); the terms are masked means of
+squared errors as in mlipcpp-train (charges / spins over labelled atoms, HOMO / gap over labelled
+structures), the labels read from the split (<scheme>_charge.bin, ..., masks).
 """
 
 import argparse
@@ -77,18 +82,51 @@ def main():
     args = (jnp.asarray(Z), jnp.asarray(R), jnp.asarray(seg), jnp.asarray(dst), jnp.asarray(src),
             jnp.asarray(Q, jnp.float64), jnp.asarray(S, jnp.float64))
 
+    aux = meta.get("aux", {"weights": [0, 0, 0, 0]})
+    aw = aux["weights"]
+    mt_on = any(w > 0 for w in aw)
+    if mt_on:
+        qs, ss = aux["schemes"]
+        cat = lambda name: np.concatenate([np.fromfile(sp / f"{name}.bin", np.float32)[na[i]:na[i + 1]] for i in ids])
+        per = lambda name: np.fromfile(sp / f"{name}.bin", np.float32)[ids]
+        lab = [jnp.asarray(cat(f"{qs}_charge"), jnp.float64), jnp.asarray(cat(f"{ss}_spin"), jnp.float64),
+               jnp.asarray(per("homo_energy"), jnp.float64), jnp.asarray(per("homo_lumo_gap"), jnp.float64)]
+        nat = np.array([len(m["Z"]) for m in mols])
+        msk = [np.repeat(per(f"{qs}_charge_mask"), nat), np.repeat(per(f"{ss}_spin_mask"), nat),
+               per("homo_mask"), per("gap_mask")]
+        msk = [jnp.asarray(m, jnp.float64) for m in msk]
+        model = ref.model
+        Zj, Rj, segj, dstj, srcj, Qj, Sj = args
+
+        def heads(params):
+            out = model.apply(params, Zj, Qj, Sj, Rj, dstj, srcj, batch_segments=segj, batch_size=len(mols),
+                              batch_mask=jnp.ones(len(dst), jnp.float64), atom_mask=jnp.ones(len(Z), jnp.float64),
+                              compute_forces=False)
+            return [out["mt_charges"].reshape(-1), out["mt_spins"].reshape(-1), out["mt_homo"].reshape(-1),
+                    out["mt_gap"].reshape(-1)]
+
     def loss(params):
         E, F = f(params, *args)
         dE = (E - Eref) / (N if a.per_atom else 1.0)
         le = w_e * jnp.mean(dE ** 2)
         lf = w_f * jnp.mean((F.reshape(-1, 3) - Fref) ** 2)
-        return le + lf, (le, lf)
+        lt = le + lf
+        la = []
+        if mt_on:
+            for k, p in enumerate(heads(params)):
+                if aw[k] > 0:
+                    la.append(aw[k] * jnp.sum(msk[k] * (p - lab[k]) ** 2) / jnp.maximum(jnp.sum(msk[k]), 1.0))
+                    lt = lt + la[-1]
+        return lt, (le, lf, la)
 
-    (L, (le, lf)), g = jax.value_and_grad(loss, has_aux=True)(ref.params)
+    (L, (le, lf, la)), g = jax.value_and_grad(loss, has_aux=True)(ref.params)
     g = jax.tree_util.tree_map(lambda x: np.asarray(x, np.float64), g)["params"]
     tg = cm.params_to_tensors(ref.config, g, ref.model_type, max_q, 10)
     print(f"loss: mlipcpp {meta['loss']:.8g} (E {meta['loss_energy']:.6g}, F {meta['loss_force']:.6g}) | "
           f"JAX float64 {float(L):.8g} (E {float(le):.6g}, F {float(lf):.6g})")
+    if mt_on:
+        print(f"heads loss: mlipcpp {[round(x, 8) for x in aux['loss']]} | JAX {[round(float(x), 8) for x in la]}; "
+              f"mlipcpp max |sum q - Q|, |sum s - M|: {aux['max_constraint']}")
     num = den = 0.0
     worst = (0.0, "")
     for p in meta["params"]:

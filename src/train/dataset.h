@@ -63,6 +63,18 @@ public:
   /// (NBO has NaN for failed analyses) and not all equal
   bool partial_charges_ok(int64_t s) const;
 
+  /// multitask targets (PhysNet heads), k = 0 charges, 1 spins (per atom: <scheme>_charge.bin,
+  /// <scheme>_spin.bin), 2 HOMO energy, 3 HOMO-LUMO gap (per structure: homo_energy.bin,
+  /// homo_lumo_gap.bin; eV); each with an optional per-structure mask (<scheme>_charge_mask.bin,
+  /// <scheme>_spin_mask.bin, homo_mask.bin, gap_mask.bin; 1 = has the target), else every
+  /// structure whose values are finite. Returns which of the four files exist.
+  std::array<bool, 4> load_aux(const std::string &charge_scheme, const std::string &spin_scheme);
+  bool has_aux(int k) const { return aux_[k].size() > 0; }
+  /// per atom (k = 0, 1): structure s's values; per structure (k = 2, 3): its value
+  const float *aux_atoms(int k, int64_t s) const { return aux_[k].data() + na_[s]; }
+  float aux_value(int k, int64_t s) const { return aux_[k][s]; }
+  bool aux_ok(int k, int64_t s) const { return has_aux(k) && aux_ok_[k][s]; }
+
   /// System s as an AtomicSystem. Zero cell rows become non-periodic vacuum
   /// vectors so the cell stays invertible for the neighbour-list grid.
   AtomicSystem system(int64_t s) const;
@@ -77,6 +89,8 @@ private:
   Mapped<int32_t> a_;
   std::vector<int32_t> charge_, spin_;
   Mapped<float> pq_;
+  Mapped<float> aux_[4];
+  std::vector<uint8_t> aux_ok_[4];
 };
 
 /// Neighbour lists of every structure in a split, built once and cached on

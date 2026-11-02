@@ -22,12 +22,12 @@ the SpookyPhysNet conditioning inputs), plus source.npz (shard index, row in the
 shard, row in the selection, the shard's LMDB key "dataNNNN.aselmdb:id") so every
 structure traces back to the npz shards and the raw LMDB records, and meta.json.
 
---aux DIR (multitask): per-shard aux npz files written by omol_aux_from_lmdb.py
-(same file names as the shards, rows aligned with them) add, per split,
-{lowdin,mulliken,nbo}_charge.bin (float32 per atom), {lowdin,mulliken,nbo}_spin.bin
-(float32 per atom, 0 where absent), <scheme>_spin_mask.bin and nbo_charge_mask.bin
-(float32 per structure: 1 when the record has that field, finite), homo_energy.bin,
-homo_lumo_gap.bin (eV), s_squared.bin (float32 per structure).
+--aux DIR (multitask): the label shards of npz_aux/<split>/ (same file names as the shards,
+rows and atoms aligned with them, checked by key) add, per split, for scheme in lowdin,
+mulliken, nbo: <scheme>_charge.bin, <scheme>_spin.bin (float32 per atom, 0 where absent),
+<scheme>_charge_mask.bin, <scheme>_spin_mask.bin (float32 per structure, 1 = labelled:
+has_q_<scheme>, has_s_<scheme>); homo_energy.bin, homo_lumo_gap.bin (eV), homo_mask.bin,
+gap_mask.bin, s_squared.bin (float32 per structure); source.npz also gets unique_id.
 
 Data files are opened read-only with allow_pickle=False.
 
@@ -46,9 +46,30 @@ from pathlib import Path
 
 import numpy as np
 
-AUX_ATOM = ("lowdin_charge", "mulliken_charge", "nbo_charge", "lowdin_spin", "mulliken_spin", "nbo_spin")
-AUX_SYS = ("homo_energy", "homo_lumo_gap", "s_squared", "lowdin_spin_mask", "mulliken_spin_mask", "nbo_spin_mask",
-           "nbo_charge_mask")
+SCHEMES = ("lowdin", "mulliken", "nbo")
+AUX_ATOM = tuple(f"{sc}_{t}" for sc in SCHEMES for t in ("charge", "spin"))
+AUX_SYS = tuple(f"{sc}_{t}_mask" for sc in SCHEMES for t in ("charge", "spin")) + (
+    "homo_energy", "homo_lumo_gap", "homo_mask", "gap_mask", "s_squared")
+
+
+def aux_arrays(z):
+    """npz_aux shard (omol aux label extraction) -> the split files' arrays (atoms, structures)"""
+    out = {}
+    for sc in SCHEMES:
+        for t, key in (("charge", "q"), ("spin", "s")):
+            v = np.asarray(z[f"{key}_{sc}"], np.float64)
+            has = np.asarray(z[f"has_{key}_{sc}"], bool).reshape(-1)
+            atom_has = np.repeat(has, np.diff(z["mol_offsets"]))
+            out[f"{sc}_{t}"] = np.where(atom_has & np.isfinite(v), v, 0.0)
+            out[f"{sc}_{t}_mask"] = has.astype(np.float64)
+    for name, key in (("homo_energy", "homo"), ("homo_lumo_gap", "gap")):
+        v = np.asarray(z[key], np.float64).reshape(-1)
+        out[name] = np.where(np.isfinite(v), v, 0.0)
+        out[name.split("_")[0] + "_mask" if name == "homo_energy" else "gap_mask"] = np.isfinite(v).astype(np.float64)
+    out["s_squared"] = np.nan_to_num(np.asarray(z["s2"], np.float64).reshape(-1))
+    out["keys"] = z["keys"]
+    out["unique_id"] = z["unique_id"]
+    return out
 
 
 def shard_files(paths):
@@ -78,6 +99,8 @@ class SplitWriter:
         self.f = {k: open(out / f"{k}.bin", "wb") for k in names}
         self.n_atoms = [np.zeros(1, np.int64)]
         self.src = {"shard": [], "row": [], "sel": [], "key": []}
+        if aux:
+            self.src["unique_id"] = []
         self.Q, self.S, self.E = [], [], []
 
     def add(self, R, Z, F, N, E, Q, S, shard, rows, sel, keys, aux=None):
@@ -92,6 +115,7 @@ class SplitWriter:
         if aux is not None:
             for k in AUX_ATOM + AUX_SYS:
                 aux[k].astype(np.float32).tofile(self.f[k])
+            self.src["unique_id"].append(aux["unique_id"])
         self.n_atoms.append(N.astype(np.int64))
         self.src["shard"].append(np.full(len(N), shard, np.int32))
         self.src["row"].append(rows.astype(np.int64))
@@ -175,7 +199,7 @@ def main():
         aux = None
         if a.aux:
             with np.load(os.path.join(a.aux, os.path.basename(f)), allow_pickle=False) as z:
-                aux = {k: z[k] for k in z.files}
+                aux = aux_arrays(z)
             if not np.array_equal(aux["keys"], d["keys"]):
                 raise SystemExit(f"{f}: aux keys do not match the shard")
         off = d["mol_offsets"]
@@ -198,6 +222,7 @@ def main():
             if aux is not None:
                 ax = {k: aux[k][atoms] for k in AUX_ATOM}
                 ax.update({k: aux[k][rows] for k in AUX_SYS})
+                ax["unique_id"] = aux["unique_id"][rows]
             w.add(d["R"][atoms], d["Z"][atoms], d["F"][atoms], N[m], E[m], Q[m], S[m], fi, rows, sel_pos[m],
                   d["keys"][rows], ax)
         print(f"  {os.path.basename(f)}: {sel.size} structures", flush=True)
