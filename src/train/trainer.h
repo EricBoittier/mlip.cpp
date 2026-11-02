@@ -28,6 +28,8 @@ struct TrainOptions {
   int n_gpus = 1;      // 0 = CPU
   double lr = 1e-4;
   double warmup_fraction = 0.01;
+  int64_t warmup_steps = -1;          // >= 0: replaces warmup_fraction (optax warmup_cosine_decay_schedule)
+  double cosine_end_fraction = 0.0;   // cosine: decay to lr * this (optax end_value / peak_value)
   // "cosine" (metatrain: warmup_fraction, then cosine to 0) or "linear"
   // (LOREM: constant for decay_after epochs, then linear to min_lr at the end)
   std::string schedule = "cosine";
@@ -80,6 +82,15 @@ struct TrainOptions {
   // fine-tuning: keep the composition and scales stored in --init instead of
   // fitting them on the training set
   bool model_baselines = false;
+  // mmml's loss (scripts/train_so3lr_spooky_extxyz.py): the energy term on the total
+  // energy of each structure, not the energy per atom (metatrain's average_by_num_atoms)
+  bool energy_per_structure = false;
+  // mmml's batches: structures grouped by atom count padded to bucket_width, each step
+  // one bucket's structures, min(batch_cap, batch_pairs / pad^2) per GPU (0: --batch-size)
+  int64_t batch_pairs = 0;
+  int bucket_width = 8, batch_cap = 256;
+  // random O(3) rotations of every training structure (metatrain); off: mmml
+  bool rotate = true;
   // checkpoints: save_every > 0 writes <output>.epoch%05d.gguf every that many
   // epochs (numbered by epochs done) instead of <output>.epoch<k> after every
   // epoch; <output>.best.gguf is the epoch with the highest R^2(E) + R^2(F) on

@@ -126,6 +126,7 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
                  const TargetScaling &scaling, float cutoff, int pad_atoms,
                  int pad_neighbors, int pad_systems) {
   Batch b;
+  b.per_structure = scaling.per_structure;
   b.n_real_systems = static_cast<int>(ids.size());
   b.ids.assign(ids.begin(), ids.end());
   int n_real = 0;
@@ -187,7 +188,7 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
       b.species[a] = index_of(Z[i]);
       b.atom_charge[a] = split.charge(s);
       b.atom_spin[a] = split.spin_multiplicity(s);
-      b.atom_weight[static_cast<size_t>(k) * n + a] = 1.0f / ns;
+      b.atom_weight[static_cast<size_t>(k) * n + a] = scaling.per_structure ? 1.0f : 1.0f / ns;
       const double fs = scaling.fscale(Z[i]);
       b.force_scale[a] = static_cast<float>(fs);
       b.force_mask[a] = 1.0f;
@@ -214,7 +215,7 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
       }
     }
     b.energy_target[k] = static_cast<float>(
-        (split.energy(s) - scaling.comp(Z, ns)) / (scaling.energy_scale * ns));
+        (split.energy(s) - scaling.comp(Z, ns)) / (scaling.energy_scale * (scaling.per_structure ? 1 : ns)));
     b.n_per_system[k] = ns;
 
     const int64_t e0 = nl.edge_offset[s], e1 = nl.edge_offset[s + 1];

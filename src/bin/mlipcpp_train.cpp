@@ -30,6 +30,12 @@ int main(int argc, char **argv) {
                "          [--lr-schedule FILE.json] [--dump-lr-schedule N [--dump-steps-per-epoch S]]\n"
                "          [--charge-corr-weight W] [--charge-corr-target mulliken|lowdin|nbo] [--charge-corr-min R]\n"
                "          [--loss mse|huber] [--huber-delta-e D] [--huber-delta-f D]\n"
+               "          [--warmup-steps N] [--cosine-end-fraction F] [--energy-per-structure] [--no-rotations]\n"
+               "          [--batch-pairs P [--bucket-width 8] [--batch-cap 256]]\n"
+               "mmml (JAX) conventions: --energy-per-structure (energy loss on total energies, not per atom),\n"
+               "--batch-pairs P (steps of one atom-count bucket each, min(cap, P / pad^2) structures per GPU,\n"
+               "pad = atom count rounded up to --bucket-width), --warmup-steps / --cosine-end-fraction\n"
+               "(optax warmup_cosine_decay_schedule), --no-rotations (no O(3) augmentation);\n"
                "--loss huber: torch.nn.HuberLoss per component (metatrain's huber; 0.5 d^2 below delta, then linear), deltas in\n"
                "the loss's units: energy per atom over the energy scale (default 0.01), forces over their scale (0.02);\n"
                "--charge-corr-weight W (Plato-PET-LR with LES; default 0: off): an auxiliary loss on the latent charges,\n"
@@ -78,6 +84,13 @@ int main(int argc, char **argv) {
     else if (a == "--gpus") o.n_gpus = std::stoi(val());
     else if (a == "--lr") o.lr = std::stod(val());
     else if (a == "--warmup-fraction") o.warmup_fraction = std::stod(val());
+    else if (a == "--warmup-steps") o.warmup_steps = std::stoll(val());
+    else if (a == "--cosine-end-fraction") o.cosine_end_fraction = std::stod(val());
+    else if (a == "--energy-per-structure") o.energy_per_structure = true;
+    else if (a == "--batch-pairs") o.batch_pairs = std::stoll(val());
+    else if (a == "--bucket-width") o.bucket_width = std::stoi(val());
+    else if (a == "--batch-cap") o.batch_cap = std::stoi(val());
+    else if (a == "--no-rotations") o.rotate = false;
     else if (a == "--schedule") o.schedule = val();
     else if (a == "--decay-after") o.decay_after = std::stoi(val());
     else if (a == "--min-lr") o.min_lr = std::stod(val());

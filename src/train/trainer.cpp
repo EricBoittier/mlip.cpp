@@ -62,10 +62,10 @@ ggml_tensor *input(ggml_context *ctx, ggml_type type, std::initializer_list<int6
 
 /// metatrain's schedule: linear warmup from 0, then cosine to 0; step k
 /// (0-based) runs at lr * factor(k).
-double lr_factor(int64_t step, int64_t total, int64_t warmup) {
+double lr_factor(int64_t step, int64_t total, int64_t warmup, double end = 0.0) {
   if (step < warmup) return double(step) / double(std::max<int64_t>(1, warmup));
-  const double progress = double(step - warmup) / double(std::max<int64_t>(1, total - warmup));
-  return 0.5 * (1.0 + std::cos(std::numbers::pi * progress));
+  const double progress = std::min(1.0, double(step - warmup) / double(std::max<int64_t>(1, total - warmup)));
+  return end + (1.0 - end) * 0.5 * (1.0 + std::cos(std::numbers::pi * progress));
 }
 
 /// LOREM's schedule: 1 for the first `constant` steps, then linear to
@@ -417,7 +417,7 @@ void fill_constants(const std::vector<std::pair<ggml_tensor *, float>> &cs) {
 /// composition (eV/atom) and force components (eV/A) of the real structures.
 void add_target_sums(const Batch &b, double energy_scale, StepStats &st) {
   for (int k = 0; k < b.n_real_systems; k++) {
-    const double y = double(b.energy_target[k]) * energy_scale;
+    const double y = double(b.energy_target[k]) * energy_scale / (b.per_structure ? b.n_per_system[k] : 1);
     st.sum_e += y, st.sum2_e += y * y;
   }
   for (int a = 0; a < b.n_atoms; a++) {
@@ -948,6 +948,7 @@ StepStats Worker::run(const Batch &b, double energy_scale, bool backward) {
   plato_batch_ = &b;
   if (conservative.on) return run_conservative(b, energy_scale, backward);
   if (!model_.nc_forces()) throw std::runtime_error("an energy-only model trains with conservative forces only");
+  if (b.per_structure) throw std::runtime_error("--energy-per-structure needs --conservative");
   const int n = b.n_atoms, m = b.max_neighbors, S = b.n_systems;
   std::unique_ptr<StepGraph> once;
   StepGraph *g = &graph(n, m, S, backward ? BACKWARD : FORWARD, once);
@@ -1065,8 +1066,10 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
     for (int a = 0; a < n; a++) d_e[k] += double(b.atom_weight[static_cast<size_t>(k) * n + a]) * out[ow * a];
     d_e[k] -= b.energy_target[k];
     st.loss_energy += w.energy * e_norm * loss.value(d_e[k], loss.delta_e);
-    st.se_energy_per_atom += d_e[k] * d_e[k] * energy_scale * energy_scale;
-    if (k < b.n_real_systems) st.ae_energy_per_atom += std::abs(d_e[k]) * energy_scale;
+    // metrics per atom (per_structure: d_e is the structure's energy error)
+    const double de_atom = b.per_structure && k < b.n_real_systems ? d_e[k] / b.n_per_system[k] : d_e[k];
+    st.se_energy_per_atom += de_atom * de_atom * energy_scale * energy_scale;
+    if (k < b.n_real_systems) st.ae_energy_per_atom += std::abs(de_atom) * energy_scale;
   }
   add_target_sums(b, energy_scale, st);
   std::vector<float> per_atom(n, 0.0f);
@@ -1093,7 +1096,8 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
   st.loss = st.loss_energy + st.loss_force + st.loss_nc + st.loss_charge;
   if (system_errors) {
     for (int k = 0; k < b.n_real_systems; k++)
-      system_errors->push_back({b.ids[k], -1, b.n_per_system[k], static_cast<float>(d_e[k] * energy_scale),
+      system_errors->push_back({b.ids[k], -1, b.n_per_system[k],
+                                static_cast<float>(d_e[k] * energy_scale / (b.per_structure ? b.n_per_system[k] : 1)),
                                 static_cast<float>(fse[k])});
     if (atom_errors) { // real atoms come first, structure by structure
       const int n_real = std::accumulate(b.n_per_system.begin(), b.n_per_system.begin() + b.n_real_systems, 0);
@@ -2031,6 +2035,7 @@ void train(const TrainOptions &o) {
   } else {
     scaling = TargetScaling::fit(train_split);
   }
+  scaling.per_structure = o.energy_per_structure;
   fmt::print("targets ({}): composition for {} species, energy scale {:.6g} eV/atom ({:.1f} s)\n",
              eval_only || o.model_baselines ? "from the model" : "fitted", scaling.composition.size(),
              scaling.energy_scale, seconds_since(t0));
@@ -2077,14 +2082,48 @@ void train(const TrainOptions &o) {
 
   const int W = static_cast<int>(workers.size()), B = o.batch_size;
   const Tiling tiling{o.tile_nb_ratio, o.tile_atom_ratio, B};
-  const int64_t steps_per_epoch = static_cast<int64_t>(ids_train.size()) / (int64_t(B) * W); // drop_last
+  // an epoch's steps: structures perm[bounds[k], bounds[k+1]) of the shuffled training
+  // set. Fixed batches (W x B, drop_last), or mmml's pad buckets (--batch-pairs):
+  // structures grouped by atom count rounded up to --bucket-width, every bucket
+  // shuffled and cut into steps of W x min(cap, pairs / pad^2) (drop_last), the
+  // steps in random order (the same count every epoch)
+  const bool bucketed = o.batch_pairs > 0;
+  if (bucketed && o.pack != "step") throw std::runtime_error("--batch-pairs needs --pack step");
+  auto epoch_plan = [&](int epoch) {
+    std::pair<std::vector<int64_t>, std::vector<int64_t>> plan; // (perm, bounds)
+    auto &[perm, bounds] = plan;
+    std::mt19937_64 rng(o.seed + epoch);
+    if (!bucketed) {
+      perm = ids_train;
+      std::shuffle(perm.begin(), perm.end(), rng);
+      const int64_t n_steps = static_cast<int64_t>(ids_train.size()) / (int64_t(B) * W);
+      for (int64_t k = 0; k <= n_steps; k++) bounds.push_back(k * B * W);
+      return plan;
+    }
+    std::map<int64_t, std::vector<int64_t>> by_pad;
+    for (int64_t s : ids_train) {
+      const int64_t na = train_split.n_atoms(s);
+      by_pad[(na + o.bucket_width - 1) / o.bucket_width * o.bucket_width].push_back(s);
+    }
+    std::vector<std::vector<int64_t>> steps;
+    for (auto &[pad, v] : by_pad) {
+      std::shuffle(v.begin(), v.end(), rng);
+      const int64_t b = W * std::clamp<int64_t>(o.batch_pairs / (pad * pad), 1, o.batch_cap);
+      for (size_t k = 0; k + b <= v.size(); k += b) steps.emplace_back(v.begin() + k, v.begin() + k + b);
+    }
+    std::shuffle(steps.begin(), steps.end(), rng);
+    bounds.push_back(0);
+    for (auto &st : steps) perm.insert(perm.end(), st.begin(), st.end()), bounds.push_back(perm.size());
+    return plan;
+  };
+  const int64_t steps_per_epoch = eval_only ? 0 : static_cast<int64_t>(epoch_plan(0).second.size()) - 1;
   const int64_t total_steps = o.epochs * steps_per_epoch;
-  const int64_t warmup = static_cast<int64_t>(o.warmup_fraction * total_steps);
+  const int64_t warmup = o.warmup_steps >= 0 ? o.warmup_steps : static_cast<int64_t>(o.warmup_fraction * total_steps);
   if (o.schedule != "cosine" && o.schedule != "linear") throw std::runtime_error("--schedule must be cosine or linear");
   const bool linear = o.schedule == "linear";
   auto lr_at = [&](int64_t step) {
     return o.lr * (linear ? lr_factor_linear(step, total_steps, int64_t(o.decay_after) * steps_per_epoch, o.min_lr / o.lr)
-                          : lr_factor(step, total_steps, warmup));
+                          : lr_factor(step, total_steps, warmup, o.cosine_end_fraction));
   };
 
   // --lr-schedule: per-group learning rates, the groups' optimizers (GroupScheduled)
@@ -2136,7 +2175,11 @@ void train(const TrainOptions &o) {
                               : std::string("dynamic shapes"));
   fmt::print("setup: {:.1f} s; {} steps/epoch of {} x {} structures, {}\n", seconds_since(t_setup), steps_per_epoch, W, B,
              linear ? fmt::format("lr {:g} for {} epochs, then linear to {:g}", o.lr, o.decay_after, o.min_lr)
-                    : fmt::format("warmup {} steps, then cosine", warmup));
+                    : fmt::format("warmup {} steps, then cosine to {:g} x lr; {}", warmup, o.cosine_end_fraction,
+                                  bucketed ? fmt::format("pad buckets of {} atoms, {} pairs per GPU (cap {}), {} "
+                                                         "structures per epoch", o.bucket_width, o.batch_pairs,
+                                                         o.batch_cap, epoch_plan(0).first.size())
+                                           : std::string("fixed batches")));
   TrainState state;
   if (!o.resume.empty()) {
     state = read_state(o.resume);
@@ -2231,13 +2274,18 @@ void train(const TrainOptions &o) {
   // batches of a step: structures perm[step*W*B, +W*B); worker w's rotation
   // stream covers its B of them (the same augmentation in both pack modes).
   // "worker": worker w gets its B structures; "step": all packed together
-  auto make_step = [&](const std::vector<int64_t> &perm, int64_t step, uint64_t rng_seed) {
+  auto make_step = [&](const std::vector<int64_t> &perm, const std::vector<int64_t> &bounds, int64_t step,
+                       uint64_t rng_seed) {
     if (step_pack) {
-      std::vector<int64_t> ids(perm.begin() + step * W * B, perm.begin() + (step + 1) * W * B);
-      std::vector<std::array<float, 9>> rot(ids.size());
-      for (int w = 0; w < W; w++) {
-        std::mt19937_64 rng(rng_seed * 0x9E3779B97F4A7C15ULL + w);
-        for (int k = 0; k < B; k++) rot[w * B + k] = random_o3(rng);
+      std::vector<int64_t> ids(perm.begin() + bounds[step], perm.begin() + bounds[step + 1]);
+      std::vector<std::array<float, 9>> rot;
+      if (o.rotate) {
+        rot.resize(ids.size());
+        const int Bs = static_cast<int>(ids.size()) / W;
+        for (int w = 0; w < W; w++) {
+          std::mt19937_64 rng(rng_seed * 0x9E3779B97F4A7C15ULL + w);
+          for (int k = 0; k < Bs; k++) rot[w * Bs + k] = random_o3(rng);
+        }
       }
       CostModel cost;
       {
@@ -2252,7 +2300,7 @@ void train(const TrainOptions &o) {
       fs.push_back(std::async(std::launch::async, [&, w] {
         std::mt19937_64 rng(rng_seed * 0x9E3779B97F4A7C15ULL + w);
         std::vector<int64_t> ids(perm.begin() + (step * W + w) * B, perm.begin() + (step * W + w + 1) * B);
-        std::vector<std::array<float, 9>> rot(B);
+        std::vector<std::array<float, 9>> rot(o.rotate ? B : 0);
         for (auto &r : rot) r = random_o3(rng);
         return make_microbatches(train_split, nl_train, ids, rot, species, scaling, cutoff,
                                  o.mb_budget, o.mb_growth, tiling);
@@ -2278,8 +2326,8 @@ void train(const TrainOptions &o) {
   for (int epoch = static_cast<int>(state.epoch); epoch < o.epochs && global_step != o.max_steps; epoch++) {
     const bool logging = log_file && epoch < o.log_errors_epochs;
     collect_errors(logging);
-    std::vector<int64_t> perm = ids_train;
-    std::shuffle(perm.begin(), perm.end(), std::mt19937_64(o.seed + epoch));
+    const auto [perm, bounds] = epoch_plan(epoch);
+    const int64_t step0 = global_step;
 
     auto t_epoch = clock_type::now();
     StepStats ep;
@@ -2290,7 +2338,7 @@ void train(const TrainOptions &o) {
     int64_t queued = 0;
     auto refill = [&] {
       while (queued < steps_per_epoch && static_cast<int>(ahead.size()) < std::max(1, o.prefetch)) {
-        ahead.push_back(std::async(std::launch::async, make_step, std::cref(perm), queued,
+        ahead.push_back(std::async(std::launch::async, make_step, std::cref(perm), std::cref(bounds), queued,
                                    o.seed + epoch * 1000003ULL + queued));
         queued++;
       }
@@ -2358,7 +2406,7 @@ void train(const TrainOptions &o) {
                                           step_total.sum_charge_r / std::max<int64_t>(1, step_total.n_charge_r),
                                           step_total.n_charge_skipped)
                             : std::string()),
-                   lr, norm, (step + 1) * W * B / el, 1e3 * t_wait / (step + 1),
+                   lr, norm, bounds[step + 1] / el, 1e3 * t_wait / (step + 1),
                    1e3 * t_gpu / (step + 1), 1e3 * t_build / (step + 1),
                    1e3 * t_compute / (step + 1), 1e3 * t_sync / (step + 1),
                    double(n_micro) / ((step + 1) * W), w0.cache_size(), w0.compute_buffer_bytes() / 1e9,
@@ -2374,7 +2422,7 @@ void train(const TrainOptions &o) {
     collect_errors(false);
     if (logging) std::fflush(log_file.get());
     const double t_train = seconds_since(t_epoch);
-    const int64_t done = std::max<int64_t>(1, ep.n_systems / B);
+    const int64_t done = std::max<int64_t>(1, global_step - step0);
     auto [tre, trf] = rmse(ep);
 
     auto t = clock_type::now();

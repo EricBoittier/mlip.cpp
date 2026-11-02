@@ -15,6 +15,9 @@ namespace mlipcpp::train {
 struct TargetScaling {
   std::map<int, double> composition; // Z -> eV, least-squares fit
   double energy_scale = 1.0;         // RMS of (E - comp) / N
+  // energy targets and atom weights per structure (E - comp) / s_E, weight 1
+  // (mmml's loss), not per atom (E - comp) / (s_E N), weight 1/N (metatrain)
+  bool per_structure = false;
   std::map<int, double> force_scale; // Z -> RMS of force components
 
   double comp(const int32_t *Z, int n) const;
@@ -50,7 +53,8 @@ struct Batch {
   std::vector<float> taper_vector, taper_jacobian; // [E_t, 3], [E_t]
 
   std::vector<float> atom_weight;   // [n_systems, n_atoms]: 1/N_s if atom in s
-  std::vector<float> energy_target; // [n_systems]: (E - comp) / (s_E N_s)
+  std::vector<float> energy_target; // [n_systems]: (E - comp) / (s_E N_s), or / s_E (per_structure)
+  bool per_structure = false;       // TargetScaling::per_structure
   std::vector<float> force_target;  // [n_atoms, 3]: R F / s_Z
   std::vector<float> force_scale;   // [n_atoms]: s_Z, for physical metrics (0: padding)
   std::vector<float> force_mask;    // [n_atoms]: 1 real atom, 0 padding atom
