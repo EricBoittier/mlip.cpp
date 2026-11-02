@@ -35,6 +35,7 @@ set(MLIPCPP_RUNTIME_SOURCES
     runtime/graph_interpreter.cpp
     runtime/graph_model.cpp
     runtime/graph_model_cached.cpp
+    runtime/graph_model_batch.cpp
     runtime/pet_ragged.cpp
     runtime/plato_graph.cpp
     runtime/pet_plato_lr.cpp

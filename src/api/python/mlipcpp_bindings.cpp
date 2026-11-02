@@ -73,7 +73,10 @@ NB_MODULE(_mlipcpp, m) {
       .def_rw("use_nc_forces", &mlipcpp::PredictOptions::use_nc_forces,
               "Use non-conservative forces from forward pass heads (faster, not energy-conserving)")
       .def_rw("fd_stress", &mlipcpp::PredictOptions::fd_stress,
-              "Use finite-difference Voigt-strain stress (12 forward passes, slow but exact)");
+              "Use finite-difference Voigt-strain stress (12 forward passes, slow but exact)")
+      .def_rw("charge", &mlipcpp::PredictOptions::charge, "Total charge (conditioned models)")
+      .def_rw("spin_multiplicity", &mlipcpp::PredictOptions::spin_multiplicity,
+              "2S+1 (conditioned models)");
 
   // Result struct
   nb::class_<mlipcpp::Result>(m, "Result", "Prediction results")
@@ -120,7 +123,8 @@ NB_MODULE(_mlipcpp, m) {
                  atomic_numbers,
              std::optional<nb::ndarray<const float, nb::shape<3, 3>, nb::c_contig>> cell,
              std::optional<std::array<bool, 3>> pbc,
-             bool compute_forces, bool compute_stress, bool fd_stress) {
+             bool compute_forces, bool compute_stress, bool fd_stress, int charge,
+             int spin_multiplicity) {
             size_t n_atoms = positions.shape(0);
             if (atomic_numbers.shape(0) != n_atoms) {
               throw std::runtime_error(
@@ -143,6 +147,8 @@ NB_MODULE(_mlipcpp, m) {
             options.compute_forces = compute_forces || compute_stress;
             options.compute_stress = compute_stress;
             options.fd_stress = fd_stress;
+            options.charge = charge;
+            options.spin_multiplicity = spin_multiplicity;
 
             return self.predict(static_cast<int32_t>(n_atoms), positions.data(),
                                 atomic_numbers.data(), cell_ptr, pbc_ptr,
@@ -150,7 +156,8 @@ NB_MODULE(_mlipcpp, m) {
           },
           "positions"_a, "atomic_numbers"_a, "cell"_a = nb::none(),
           "pbc"_a = nb::none(), "compute_forces"_a = true,
-          "compute_stress"_a = false, "fd_stress"_a = false,
+          "compute_stress"_a = false, "fd_stress"_a = false, "charge"_a = 0,
+          "spin_multiplicity"_a = 1,
           R"doc(
 Predict energy and forces for an atomic system.
 
@@ -172,11 +179,68 @@ fd_stress : bool
     If True, evaluate stress via 4th-order central difference on energy
     under symmetric Voigt strain (12 forward passes, slow but exact w.r.t.
     the model's own energy). Default uses the autograd-based virial.
+charge : int
+    Total charge (e), for charge / spin conditioned models (default 0)
+spin_multiplicity : int
+    2S+1, for charge / spin conditioned models (default 1)
 
 Returns
 -------
 Result
     Object containing energy, forces, and stress
+)doc")
+      .def_prop_ro("conditioned", &mlipcpp::Predictor::conditioned,
+                   "Whether the model reads the total charge and spin multiplicity")
+      .def_prop_ro("max_charge", &mlipcpp::Predictor::max_charge)
+      .def_prop_ro("max_spin_multiplicity", &mlipcpp::Predictor::max_spin_multiplicity)
+      .def(
+          "predict_batch",
+          [](mlipcpp::Predictor &self,
+             nb::ndarray<const float, nb::shape<-1, 3>, nb::c_contig> positions,
+             nb::ndarray<const int32_t, nb::shape<-1>, nb::c_contig> atomic_numbers,
+             nb::ndarray<const int32_t, nb::shape<-1>, nb::c_contig> n_atoms,
+             std::optional<nb::ndarray<const int32_t, nb::shape<-1>, nb::c_contig>> charges,
+             std::optional<nb::ndarray<const int32_t, nb::shape<-1>, nb::c_contig>> spin_multiplicities,
+             bool compute_forces) {
+            const size_t S = n_atoms.shape(0);
+            size_t total = 0;
+            for (size_t k = 0; k < S; k++) total += static_cast<size_t>(n_atoms.data()[k]);
+            if (total != positions.shape(0) || total != atomic_numbers.shape(0))
+              throw std::runtime_error("predict_batch: sum(n_atoms) must equal the number of positions");
+            if ((charges && charges->shape(0) != S) || (spin_multiplicities && spin_multiplicities->shape(0) != S))
+              throw std::runtime_error("predict_batch: charges / spin_multiplicities need one value per system");
+            auto *E = new double[S];
+            float *F = compute_forces ? new float[3 * total] : nullptr;
+            {
+              nb::gil_scoped_release release;
+              self.predict_batch(static_cast<int32_t>(S), n_atoms.data(), positions.data(), atomic_numbers.data(),
+                                 charges ? charges->data() : nullptr,
+                                 spin_multiplicities ? spin_multiplicities->data() : nullptr, E, F);
+            }
+            nb::capsule ce(E, [](void *p) noexcept { delete[] static_cast<double *>(p); });
+            auto energies = nb::ndarray<nb::numpy, double>(E, {S}, ce);
+            if (!F) return nb::make_tuple(energies, nb::none());
+            nb::capsule cf(F, [](void *p) noexcept { delete[] static_cast<float *>(p); });
+            return nb::make_tuple(energies, nb::ndarray<nb::numpy, float>(F, {total, 3}, cf));
+          },
+          "positions"_a, "atomic_numbers"_a, "n_atoms"_a, "charges"_a = nb::none(),
+          "spin_multiplicities"_a = nb::none(), "compute_forces"_a = true,
+          R"doc(
+Predict many non-periodic structures in one call.
+
+Parameters
+----------
+positions : ndarray[float32, (sum n_atoms, 3)]
+    Concatenated positions (A)
+atomic_numbers : ndarray[int32, (sum n_atoms,)]
+n_atoms : ndarray[int32, (n_systems,)]
+charges, spin_multiplicities : ndarray[int32, (n_systems,)], optional
+    Total charge and 2S+1 per structure (conditioned models; default 0 and 1)
+compute_forces : bool
+
+Returns
+-------
+(energies [n_systems] float64 eV, forces [sum n_atoms, 3] float32 eV/A or None)
 )doc")
       .def(
           "predict_with_options",

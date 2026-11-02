@@ -50,6 +50,11 @@ public:
   // Model interface
   ModelResult predict(const AtomicSystem &system) override;
   ModelResult predict(const AtomicSystem &system, bool compute_forces) override;
+  /// Many non-periodic structures in one graph computation (block-diagonal
+  /// neighbour lists, each structure's charge / spin): energies and forces per
+  /// structure. Periodic structures and PET variants without the cached path
+  /// (long range, adaptive cutoff, Plato-PET-LR, direct forces) go one at a time.
+  std::vector<ModelResult> predict_batch(const std::vector<AtomicSystem> &systems, bool compute_forces);
   std::string model_type() const override { return "graph"; }
   float cutoff() const override { return cutoff_; }
   bool conditioned() const override { return conditioning_.enabled; }

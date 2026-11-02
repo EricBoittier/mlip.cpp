@@ -357,6 +357,40 @@ const std::vector<int32_t> &Predictor::atomic_types() const {
 
 bool Predictor::has_nc_forces() const { return impl_->nc_forces; }
 bool Predictor::conditioned() const { return impl_->model->conditioned(); }
+void Predictor::predict_batch(int32_t n_systems, const int32_t *n_atoms, const float *positions,
+                              const int32_t *atomic_numbers, const int32_t *charges,
+                              const int32_t *spin_multiplicities, double *energies, float *forces) {
+  if (n_systems < 0 || (n_systems > 0 && (!n_atoms || !positions || !atomic_numbers || !energies)))
+    throw std::invalid_argument("predict_batch: null input");
+  std::vector<AtomicSystem> systems;
+  systems.reserve(n_systems);
+  size_t a0 = 0;
+  for (int32_t k = 0; k < n_systems; k++) {
+    if (n_atoms[k] < 0) throw std::invalid_argument("predict_batch: negative atom count");
+    AtomicSystem sys(n_atoms[k], positions + 3 * a0, atomic_numbers + a0);
+    sys.set_charge(charges ? charges[k] : 0);
+    sys.set_spin_multiplicity(spin_multiplicities ? spin_multiplicities[k] : 1);
+    systems.push_back(std::move(sys));
+    a0 += n_atoms[k];
+  }
+  const bool want_forces = forces != nullptr;
+  std::vector<ModelResult> res;
+  if (auto *graph = dynamic_cast<runtime::GraphModel *>(impl_->model.get())) {
+    res = graph->predict_batch(systems, want_forces);
+  } else {
+    for (const auto &sys : systems) res.push_back(impl_->model->predict(sys, want_forces));
+  }
+  a0 = 0;
+  for (int32_t k = 0; k < n_systems; k++) {
+    energies[k] = res[k].energy;
+    if (want_forces) {
+      if (res[k].forces.size() != 3 * size_t(n_atoms[k])) throw std::runtime_error("predict_batch: no forces");
+      std::copy(res[k].forces.begin(), res[k].forces.end(), forces + 3 * a0);
+    }
+    a0 += n_atoms[k];
+  }
+}
+
 int Predictor::max_charge() const { return impl_->model->max_charge(); }
 int Predictor::max_spin_multiplicity() const { return impl_->model->max_spin_multiplicity(); }
 

@@ -254,6 +254,23 @@ public:
                  const bool *pbc, const PredictOptions &options);
 
   /**
+   * @brief Many non-periodic structures in one call (one graph computation for
+   * graph models such as PhysNet / SpookyPhysNet; others: one at a time)
+   *
+   * @param n_systems number of structures
+   * @param n_atoms [n_systems] atoms per structure
+   * @param positions [sum n_atoms * 3] concatenated positions (A)
+   * @param atomic_numbers [sum n_atoms]
+   * @param charges [n_systems] total charges (nullptr: 0); conditioned models only
+   * @param spin_multiplicities [n_systems] 2S+1 (nullptr: 1); conditioned models only
+   * @param energies output [n_systems] (eV)
+   * @param forces output [sum n_atoms * 3] (eV/A), or nullptr for energies only
+   */
+  void predict_batch(int32_t n_systems, const int32_t *n_atoms, const float *positions,
+                     const int32_t *atomic_numbers, const int32_t *charges,
+                     const int32_t *spin_multiplicities, double *energies, float *forces);
+
+  /**
    * @brief Predict energy and capture every intermediate tensor.
    *
    * Runs the energy graph and collects each node's output (plus inputs and
