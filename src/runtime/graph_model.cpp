@@ -1133,6 +1133,13 @@ ModelResult GraphModel::predict_single(
   interp_.coulomb_application = {};
   interp_.custom_op = {};
   interp_.set_input_gradients(false);
+  // PhysNet multitask heads (one structure: the per-structure sums run over all atoms)
+  ggml_tensor *heads[4] = {nullptr, nullptr, nullptr, nullptr};
+  {
+    const char *names[4] = {"charges", "spins", "homo", "gap"};
+    for (int k = 0; k < 4; k++)
+      if (ggml_tensor *t = interp_.aux_output(names[k])) ggml_set_output(heads[k] = ggml_cont(compute_ctx, t));
+  }
   if (p3m_ && !lr_charges)
     throw std::runtime_error("Missing PET-LR charge application");
   if (!output) {
@@ -1169,6 +1176,8 @@ ModelResult GraphModel::predict_single(
     cgraph = ggml_new_graph_custom(compute_ctx, 32768, true);
     ggml_build_forward_expand(cgraph, output);
     if (nc_output) ggml_build_forward_expand(cgraph, nc_output);
+    for (ggml_tensor *t : heads)
+      if (t) ggml_build_forward_expand(cgraph, t);
     ggml_build_forward_expand(cgraph, total_energy);
     ggml_build_backward_expand(compute_ctx, cgraph, nullptr);
 
@@ -1197,6 +1206,8 @@ ModelResult GraphModel::predict_single(
     cgraph = ggml_new_graph(compute_ctx);
     ggml_build_forward_expand(cgraph, output);
     if (nc_output) ggml_build_forward_expand(cgraph, nc_output);
+    for (ggml_tensor *t : heads)
+      if (t) ggml_build_forward_expand(cgraph, t);
   }
 
   ggml_cgraph *charge_graph = nullptr;
@@ -1284,6 +1295,7 @@ ModelResult GraphModel::predict_single(
   ModelResult result;
 
   if (latent_q) read_latent_charges(latent_q, result);
+  read_heads(heads, n_atoms, result);
 
   // Get atomic energies
   std::vector<float> atomic_energies(n_atoms);

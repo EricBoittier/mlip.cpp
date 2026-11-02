@@ -99,6 +99,22 @@ NB_MODULE(_mlipcpp, m) {
             return nb::ndarray<nb::numpy, const float>(r.stress.data(), {6});
           },
           "Stress tensor [6] in Voigt notation (eV/Angstrom^3)")
+      .def_prop_ro(
+          "charges",
+          [](const mlipcpp::Result &r) {
+            if (r.atomic_charges.empty()) return nb::ndarray<nb::numpy, const float>();
+            return nb::ndarray<nb::numpy, const float>(r.atomic_charges.data(), {r.atomic_charges.size()});
+          },
+          "PhysNet multitask: atomic charges [n_atoms] (e, sum = total charge); empty without the head")
+      .def_prop_ro(
+          "spins",
+          [](const mlipcpp::Result &r) {
+            if (r.atomic_spins.empty()) return nb::ndarray<nb::numpy, const float>();
+            return nb::ndarray<nb::numpy, const float>(r.atomic_spins.data(), {r.atomic_spins.size()});
+          },
+          "PhysNet multitask: atomic spin populations [n_atoms] (sum = multiplicity - 1); empty without the head")
+      .def_ro("homo", &mlipcpp::Result::homo, "PhysNet multitask: HOMO energy (eV), NaN without the head")
+      .def_ro("gap", &mlipcpp::Result::gap, "PhysNet multitask: HOMO-LUMO gap (eV), NaN without the head")
       .def("has_forces", &mlipcpp::Result::has_forces)
       .def("has_stress", &mlipcpp::Result::has_stress);
 

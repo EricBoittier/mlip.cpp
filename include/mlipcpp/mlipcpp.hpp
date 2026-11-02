@@ -10,6 +10,7 @@
 
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -50,6 +51,10 @@ struct Result {
   std::vector<float> stress; ///< [6] Voigt notation (xx, yy, zz, yz, xz, xy)
   /// Plato-PET-LR models with LES: latent charges per atom (e, first channel); empty otherwise
   std::vector<float> latent_charges;
+  /// PhysNet multitask heads (single-structure predict): charges (e, sum = Q), spin populations
+  /// (sum = 2S+1 - 1), HOMO energy and HOMO-LUMO gap (eV); empty / NaN without the head
+  std::vector<float> atomic_charges, atomic_spins;
+  float homo = std::numeric_limits<float>::quiet_NaN(), gap = std::numeric_limits<float>::quiet_NaN();
 
   bool has_forces() const { return !forces.empty(); }
   bool has_stress() const { return !stress.empty(); }

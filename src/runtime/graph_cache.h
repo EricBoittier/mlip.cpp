@@ -42,6 +42,7 @@ struct GraphProfile {
 /// goes through GraphModel's ggml_gallocr.
 struct CachedGraph {
   int n_atoms = 0, M = 0;
+  ggml_tensor *heads[4] = {nullptr, nullptr, nullptr, nullptr}; // PhysNet charges, spins, homo, gap [n]
   bool exact_mask = false, backward = false;
   // packed edges (pet_ragged.h): rows [offsets[i], offsets[i + 1]) of atom i,
   // then padding rows up to e_cap; sequences of at most max_len tokens

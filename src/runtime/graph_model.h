@@ -196,6 +196,8 @@ private:
   PetPlatoLRSpec plato_lr_;
   std::vector<PetPlatoLRStructure> plato_st_; // the cached path's structure (set before fit_cached_graph)
   float plato_charge_unit_ = 0.0f;             // plato_les_charge_unit (read on first use)
+  /// PhysNet multitask heads' outputs (one structure of n atoms) into result
+  static void read_heads(ggml_tensor *const heads[4], int n, ModelResult &result);
   void read_latent_charges(ggml_tensor *q, ModelResult &result);
   bool long_range_ = false;
   bool p3m_ = false;

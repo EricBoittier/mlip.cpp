@@ -185,6 +185,9 @@ struct Predictor::Impl {
       result.stress = std::move(internal_result.stress);
     }
     result.latent_charges = std::move(internal_result.latent_charges);
+    result.atomic_charges = std::move(internal_result.atomic_charges);
+    result.atomic_spins = std::move(internal_result.atomic_spins);
+    result.homo = internal_result.homo, result.gap = internal_result.gap;
     return result;
   }
 

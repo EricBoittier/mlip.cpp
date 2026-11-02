@@ -45,6 +45,9 @@
 #include <vector>
 
 namespace mlipcpp::runtime {
+namespace {
+const char *const kHeadNames[4] = {"charges", "spins", "homo", "gap"};
+}
 
 namespace {
 
@@ -319,14 +322,21 @@ void GraphModel::build_cached_graph(int n, int M, bool exact_mask, bool backward
   g->nc = nc_forces_ ? ggml_cont(ctx, ggml_view_2d(ctx, out, 3, n, out->nb[1], sizeof(float))) : nullptr;
   ggml_set_output(g->energy);
   if (g->nc) ggml_set_output(g->nc);
+  // PhysNet multitask heads (one structure per graph: the per-structure sums are over all atoms)
+  for (int k = 0; k < 4; k++)
+    if (ggml_tensor *t = interp_.aux_output(kHeadNames[k])) ggml_set_output(g->heads[k] = ggml_cont(ctx, t));
 
   g->graph = ggml_new_graph_custom(ctx, GRAPH_SIZE, backward);
   ggml_build_forward_expand(g->graph, g->energy);
   if (g->nc) ggml_build_forward_expand(g->graph, g->nc);
+  for (ggml_tensor *t : g->heads)
+    if (t) ggml_build_forward_expand(g->graph, t);
   // the same expansion as the start of `graph`, so its allocation holds
   g->forward = ggml_new_graph_custom(ctx, GRAPH_SIZE, false);
   ggml_build_forward_expand(g->forward, g->energy);
   if (g->nc) ggml_build_forward_expand(g->forward, g->nc);
+  for (ggml_tensor *t : g->heads)
+    if (t) ggml_build_forward_expand(g->forward, t);
   auto constants = std::vector<std::pair<ggml_tensor *, float>>();
   if (backward) {
     ggml_tensor *total = g->loss = ggml_sum(ctx, g->energy);
@@ -678,6 +688,21 @@ void GraphModel::read_cached_outputs(const AtomicSystem &system, ModelResult &re
   result.has_nc_forces = true;
 }
 
+void GraphModel::read_heads(ggml_tensor *const heads[4], int n, ModelResult &result) {
+  std::vector<float> v(n);
+  for (int k = 0; k < 4; k++) {
+    if (!heads[k]) continue;
+    ggml_backend_tensor_get(heads[k], v.data(), 0, n * sizeof(float));
+    if (k == 0) result.atomic_charges = v;
+    else if (k == 1) result.atomic_spins = v;
+    else { // the molecular value: the mean of the atomic contributions
+      double m = 0;
+      for (float x : v) m += x;
+      (k == 2 ? result.homo : result.gap) = static_cast<float>(m / std::max(1, n));
+    }
+  }
+}
+
 void GraphModel::read_latent_charges(ggml_tensor *q, ModelResult &result) {
   if (plato_charge_unit_ == 0.0f) {
     plato_charge_unit_ = 1.0f;
@@ -824,6 +849,7 @@ ModelResult GraphModel::predict_cached(const AtomicSystem &system, bool compute_
   ModelResult result;
   read_cached_outputs(system, result);
   if (g.latent_q) read_latent_charges(g.latent_q, result);
+  read_heads(g.heads, g.n_atoms, result);
 
   const Cell *cell = system.cell();
   const bool periodic = cell && (cell->periodic[0] || cell->periodic[1] || cell->periodic[2]);
@@ -1016,6 +1042,7 @@ ModelResult GraphModel::predict_cached_device(const AtomicSystem &system, bool c
   ModelResult result;
   read_cached_outputs(system, result);
   if (g.latent_q) read_latent_charges(g.latent_q, result);
+  read_heads(g.heads, g.n_atoms, result);
   const bool periodic = cell && (cell->periodic[0] || cell->periodic[1] || cell->periodic[2]);
   if (compute_forces) {
     md::gpu::conservative_forces(st, cut, gg, energy_scale_);

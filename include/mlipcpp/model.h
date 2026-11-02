@@ -1,6 +1,7 @@
 #pragma once
 
 #include "system.h"
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -17,6 +18,11 @@ struct ModelResult {
   // Plato-PET-LR with LES: the latent charges per atom (e: model units times charge_unit,
   // after the neutralisation / total-charge shift), first channel; empty otherwise
   std::vector<float> latent_charges;
+  // PhysNet multitask heads (single-structure predictions): per-atom charges (e, sum = Q) and
+  // spin populations (sum = 2S+1 - 1), molecular HOMO energy and HOMO-LUMO gap (eV); empty / NaN
+  // when the model has no such head
+  std::vector<float> atomic_charges, atomic_spins;
+  float homo = std::numeric_limits<float>::quiet_NaN(), gap = std::numeric_limits<float>::quiet_NaN();
 
   bool has_forces = false;
   bool has_stress = false;
