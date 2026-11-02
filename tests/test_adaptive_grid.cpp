@@ -94,3 +94,34 @@ TEST_CASE("adaptive grid: model, cached path", "[adaptive][model]") {
     }
   }
 }
+
+// "solver" method on the surface Pd atom of metatrain#1324 (PET-MAD-XS settings: 16 neighbours, 7.5 A,
+// width 1 A; distances rounded to 4 decimals): the old Newton-bisection hybrid two-cycled inside its
+// bracket and returned 4.7076 A; the exact root of n_total(r) = 16 is 4.158976470 A (fp64 bisection)
+TEST_CASE("adaptive solver: converges where Newton two-cycled (metatrain#1324)", "[adaptive]") {
+  const std::vector<double> d = {
+      2.6438, 2.6805, 2.6813, 2.6914, 2.7026, 2.7072, 2.7680, 2.7724, 2.8071, 2.8113, 2.8302, 2.8473, 3.6458, 3.7493,
+      3.8703, 3.9268, 3.9275, 3.9958, 4.5983, 4.6906, 4.6999, 4.7060, 4.7174, 4.7250, 4.7268, 4.7493, 4.7513, 4.7698,
+      4.7740, 4.7795, 4.7833, 4.8046, 4.8267, 4.8323, 4.8403, 4.8424, 4.8506, 4.8631, 5.4531, 5.4779, 5.4867, 5.5006,
+      5.5111, 5.5167, 5.5214, 5.5869, 5.6298, 5.6467, 6.0969, 6.1321, 6.1425, 6.1688, 6.1729, 6.1828, 6.1892, 6.1896,
+      6.2005, 6.2010, 6.2025, 6.2128, 6.2295, 6.2378, 6.2682, 6.2796, 6.3135, 6.6912, 6.6931, 6.7052, 6.7293, 6.7398,
+      6.8774, 7.1155, 7.1646, 7.1779, 7.1800, 7.1838, 7.1925, 7.2289, 7.2329, 7.2347, 7.2461, 7.2464, 7.2583, 7.2606,
+      7.2610, 7.2674, 7.2751, 7.3072, 7.3094, 7.3135, 7.3152, 7.3207, 7.3223, 7.3279, 7.3287, 7.3317, 7.3336, 7.3371,
+      7.3397, 7.3595, 7.3698, 7.3814, 7.3851, 7.4075, 7.4351};
+  auto at = [&](const std::vector<double> &e) {
+    return adaptive::solve(int(e.size()), [&](int k) { return e[k]; }, 7.5, 16.0, 1.0);
+  };
+  const auto a = at(d);
+  CHECK(a.r == Catch::Approx(4.158976470).margin(1e-8));
+  CHECK_FALSE(a.clamped);
+  // the cutoff's gradient against finite differences of the radius (the IFT slope is taken
+  // within cutoff / 2^16 of the root, so agreement to ~1e-3 relative)
+  for (size_t k = 0; k < d.size(); k++) {
+    const double g = adaptive::ddist(d[k], a, 1.0);
+    if (std::abs(g) < 1e-3) continue;
+    const double h = 1e-6;
+    std::vector<double> p = d, m = d;
+    p[k] += h, m[k] -= h;
+    CHECK((at(p).r - at(m).r) / (2 * h) == Catch::Approx(g).epsilon(2e-3));
+  }
+}

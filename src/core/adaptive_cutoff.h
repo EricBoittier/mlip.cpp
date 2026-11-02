@@ -7,7 +7,7 @@
 //
 // Per atom i, with the smoothed neighbour count
 //   n_i(r) = sum_k bump(d_ik; r, w) + N (r / cutoff)^3,
-// 10 Newton-bisection steps (exact 0/1 outside the taper) find r with
+// 16 bisection steps on [0, cutoff] (n_i is increasing in r) find r with
 // n_i(r) = N, then the IFT step r - (n_i(r) - N) / n_i'(r) (bump clamped
 // everywhere) is clamped to [cutoff/16, cutoff]. Its gradient, with r and
 // n_i'(r) held constant as in metatrain, is
@@ -29,7 +29,7 @@ constexpr double PI = 3.14159265358979323846;
 
 struct Radius {
   double r = 0;       // adapted cutoff
-  double root = 0;    // Newton-bisection root, before the IFT step
+  double root = 0;    // bisection root, before the IFT step
   double dn_root = 1; // max(n'(root), 1e-6): the IFT denominator
   bool clamped = false;
 };
@@ -64,14 +64,15 @@ MLIPCPP_HD inline Radius solve(int n_edges, Dist dist, double cutoff, double n_t
     cnt += N * x * x * x;
     dcnt += 3.0 * N * x * x * inv;
   };
+  // 16 bisection steps on the clamped count (metatrain#1331's _n_total), bracket
+  // cutoff / 2^16; the Newton-bisection hybrid could two-cycle inside the
+  // bracket and return an unconverged r (metatrain#1324)
   double lo = 0.0, hi = cutoff, r = 0.5 * cutoff, cnt, dcnt;
-  for (int it = 0; it < 10; it++) {
-    count(r, true, cnt, dcnt);
-    const double f = cnt - N;
-    if (f <= 0) lo = r;
+  for (int it = 0; it < 16; it++) {
+    count(r, false, cnt, dcnt);
+    if (cnt - N <= 0) lo = r;
     else hi = r;
-    const double rn = r - f / fmax(dcnt, 1e-6);
-    r = rn >= lo && rn <= hi ? rn : 0.5 * (lo + hi);
+    r = 0.5 * (lo + hi);
   }
   double dn_root, residual, unused;
   count(r, true, unused, dn_root);
