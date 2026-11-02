@@ -23,6 +23,7 @@ pair() { for s in val_sel qcell_curves; do
     $PY -I $QS/compare_paired.py $R/$2/$s.per.npz $R/$1/$s.per.npz $R/$1-minus-$2.$s.json --label "$1-$2 $s" > /dev/null
 done; }
 for X in E-s13 G1-s13 Gs2-s13; do pair $X Ectl-s13; done
+for s in 13 21 42 63; do pair Fa-s$s Ectl-s$s; pair Fb-s$s Ectl-s$s; pair Fa-s$s E-s$s; pair Fb-s$s E-s$s; done
 for s in 21 42 63 84; do pair E-s$s Ectl-s$s; done
 for X in E-s7 G1 G2 G3b G4b Gs1 Gs2 Gs3 Gs4; do pair $X Ectl-s7; done
 for X in E-s7 E-s13 Ectl-s7 Ectl-s13 G1 G2 G3b G4b G1-s13 Gs1 Gs2 Gs3 Gs4 Gs2-s13; do pair $X Z; done
@@ -34,4 +35,4 @@ done
   A=$D/abc/A B=$D/abc/B C=$D/abc/C D1=$D/abc/D1 D2=$D/abc/D2 D3=$D/abc/D3 D4=$D/abc/D4 \
   E-s7=$D/E/E-s7 E-s13=$D/E/E-s13 Ectl-s7=$D/E/Ectl-s7 Ectl-s13=$D/E/Ectl-s13 \
   $(for s in 21 42 63 84; do echo -n "E-s$s=$D/E/E-s$s Ectl-s$s=$D/E/Ectl-s$s "; done) \
-  G1=$D/G/G1 G2=$D/G/G2 G3b=$D/G/G3b G4b=$D/G/G4b G1-s13=$D/G/G1-s13 Gs2-s13=$D/G/Gs2-s13 Gs1=$D/Gsub/Gs1 Gs2=$D/Gsub/Gs2 Gs3=$D/Gsub/Gs3 Gs4=$D/Gsub/Gs4
+  G1=$D/G/G1 G2=$D/G/G2 G3b=$D/G/G3b G4b=$D/G/G4b G1-s13=$D/G/G1-s13 Gs2-s13=$D/G/Gs2-s13 Gs1=$D/Gsub/Gs1 $(for s in 13 21 42 63; do echo -n "Fa-s$s=$D/F/Fa-s$s Fb-s$s=$D/F/Fb-s$s "; done) Gs2=$D/Gsub/Gs2 Gs3=$D/Gsub/Gs3 Gs4=$D/Gsub/Gs4
