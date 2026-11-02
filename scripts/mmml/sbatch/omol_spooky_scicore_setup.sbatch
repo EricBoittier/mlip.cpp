@@ -21,9 +21,11 @@ BUILD=$M/build-sm80-90
 PY=/scicore/home/meuwly/boitti0000/mmml_new/.venv/bin/python   # orbax, jax (cpu use here), flax
 BRANCH=${BRANCH:-feat/physnet-spooky}
 mkdir -p "$M/logs" "$M/data" "$M/init"
-[ -f /etc/profile.d/soft_stacks.sh ] && source /etc/profile.d/soft_stacks.sh   # Lmod is not initialised in non-login batch shells
+set +u   # Lmod init and module() are not nounset-safe; batch shells are non-login
+[ -f /etc/profile.d/soft_stacks.sh ] && source /etc/profile.d/soft_stacks.sh
 module purge
 module load GCCcore/14.3.0 CMake/3.31.8-GCCcore-14.3.0 CUDA/12.9.1 NCCL/2.27.7-GCCcore-14.3.0-CUDA-12.9.1
+set -u
 echo "host=$(hostname) job=${SLURM_JOB_ID:-}"
 
 # 1. source
@@ -59,6 +61,8 @@ fi
 [ -d "$M/data/pilot200k_mt" ] && ln -sfn ../val50k_pilotref_mt/val "$M/data/pilot200k_mt/test" || true
 
 # 4. CUDA build (incremental: a rerun continues)
+# sciCORE compute nodes have no internet: CPM downloads time out. Configure once on the login node first
+# (bash -lc 'module load <the modules above>; cmake -S src -B build-sm80-90 <same flags>'); this step then reuses _deps.
 cmake -S "$SRC" -B "$BUILD" -DCMAKE_BUILD_TYPE=Release -DMLIPCPP_USE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="80;90" \
   -DGGML_NATIVE=OFF > "$M/logs/cmake.log" 2>&1 || { tail -30 "$M/logs/cmake.log"; exit 1; }
 cmake --build "$BUILD" -j 32 --target mlipcpp-train mlipcpp-jvp-check mlipcpp-train-check 2>&1 | grep -E "error|Built target mlipcpp" || true
