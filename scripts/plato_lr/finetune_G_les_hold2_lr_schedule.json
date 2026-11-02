@@ -14,7 +14,7 @@
   {
    "name": "les_gate",
    "match": [
-    "*plato_les_gate"
+    "backend.les.les_gate"
    ],
    "lr_mult": 1.0,
    "freeze_epochs": 2.0
