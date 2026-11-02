@@ -49,7 +49,13 @@ if [ ! -f "$M/init/spooky_f64_l1_i3_seed0.gguf" ]; then
     --num-iterations 3 --num-basis-functions 32 --n-res 2 --max-atomic-number 87 --cutoff 6.0 --seed 0 --pristine \
     -o "$M/init/spooky_f64_l1_i3_seed0.json"
   "$PY" "$SRC/scripts/convert_mmml.py" to-gguf "$M/init/spooky_f64_l1_i3_seed0.json" -o "$M/init/spooky_f64_l1_i3_seed0.gguf"
+  "$PY" "$SRC/scripts/convert_mmml.py" to-gguf "$M/init/spooky_f64_l1_i3_seed0.json" --frozen energy_bias \
+    -o "$M/init/spooky_f64_l1_i3_seed0_frozen_ebias.gguf"
 fi
+# multitask (MT=1 in omol_spooky_scicore.sbatch): the label data are not in the sciCORE caches; copy from
+# pc-studix (user terminal): mlipcpp_data/{pilot200k_mt,val50k_pilotref_mt} -> $M/data/, and
+# mlipcpp_runs/init/spooky_mt_f64_l1_i3_seed0_pilot200k.gguf -> $M/init/
+[ -d "$M/data/pilot200k_mt" ] && ln -sfn ../val50k_pilotref_mt/val "$M/data/pilot200k_mt/test" || true
 
 # 4. CUDA build (incremental: a rerun continues)
 cmake -S "$SRC" -B "$BUILD" -DCMAKE_BUILD_TYPE=Release -DMLIPCPP_USE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="80;90" \

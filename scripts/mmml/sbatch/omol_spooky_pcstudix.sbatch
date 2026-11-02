@@ -23,14 +23,24 @@ REPO=${REPO:-/mmhome/boittier/home/mlip.cpp-dev}
 OMOL=/mmhome/boittier/home/metatomic-runs/training/omol_universal
 CUDA_ENV=/mmhome/boittier/home/.conda/envs/mmml-gpu          # nvcc / cudart / cuBLAS 12.9 (no CUDA module here)
 BUILD=${BUILD:-$REPO/build-cuda-sm86}                         # CUDA_ARCHITECTURES 86;89 (3090 / 4090)
-DATA=${DATA:-$OMOL/mlipcpp_data/pilot200k}                    # train/ val/ (= the JAX 2 % valid split) test/
-INIT=${INIT:-$OMOL/mlipcpp_runs/init/spooky_f64_l1_i3_seed0.gguf}   # flax init, seed 0 (make_random_checkpoint --pristine)
+# MT=1: the multitask model (charges, spins, HOMO / gap heads; data *_mt with the npz_aux labels)
+# FROZEN_EBIAS=1: the per-element energy_bias stays at its init (0), not trained
+MT=${MT:-0}; FROZEN_EBIAS=${FROZEN_EBIAS:-0}
+SUF=$([ "$MT" = 1 ] && echo _mt || true)
+DATA=${DATA:-$OMOL/mlipcpp_data/pilot200k$SUF}                # train/ val/ (= the JAX 2 % valid split) test/
+I0=$OMOL/mlipcpp_runs/init
+if [ "$MT" = 1 ]; then INIT=${INIT:-$I0/spooky_mt_f64_l1_i3_seed0_$(basename "${DATA%_mt}").gguf}  # heads + HOMO/gap offsets
+elif [ "$FROZEN_EBIAS" = 1 ]; then INIT=${INIT:-$I0/spooky_f64_l1_i3_seed0_frozen_ebias.gguf}
+else INIT=${INIT:-$I0/spooky_f64_l1_i3_seed0.gguf}; fi        # flax init, seed 0 (make_random_checkpoint --pristine)
 ELOSS=${ELOSS:-total}     # total: mmml's default loss on E_s; peratom: on E_s / N_s (mlipcpp-train's default)
 EW=${EW:-1}; FW=${FW:-52.91}
 EPOCHS=${EPOCHS:-60}; LR=${LR:-5e-4}; WARMUP=${WARMUP:-2000}; END=${END:-0.02}
 PAIRS=${PAIRS:-210000}; CAP=${CAP:-256}
-EXTRA=${EXTRA:-}          # more mlipcpp-train flags (e.g. the multitask weights)
-NAME=${NAME:-pilot200k_ef_${ELOSS}_w${EW}}
+EXTRA=${EXTRA:-}
+# multitask loss weights (masked MSE, e^2 / e^2 / eV^2 / eV^2; mmml proposal defaults), Loewdin labels
+QW=${QW:-50}; SW=${SW:-20}; HW=${HW:-1}; GW=${GW:-1}
+[ "$MT" = 1 ] && EXTRA="$EXTRA --charge-weight $QW --spin-weight $SW --homo-weight $HW --gap-weight $GW --charge-scheme lowdin --spin-scheme lowdin"          # more mlipcpp-train flags (e.g. the multitask weights)
+NAME=${NAME:-$(basename "$DATA")_$([ "$MT" = 1 ] && echo mt || echo ef)_${ELOSS}_w${EW}$([ "$FROZEN_EBIAS" = 1 ] && echo _frozenbias || true)}
 RUN=${RUN:-$OMOL/mlipcpp_runs/$NAME}
 PY=/mmhome/boittier/home/mmml-latest/.venv-cu12/bin/python
 export PYTHONPATH=/mmhome/boittier/home/metatomic-runs/training/watmeoh/perf/no_mpi4py:/mmhome/boittier/home/mmml-perf
