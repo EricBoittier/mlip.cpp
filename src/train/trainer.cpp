@@ -672,6 +672,8 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
     g->out = interp.build(ctx);
     take_aux();
     ggml_set_output(g->out); // (an energy-only export's [n]: the source of the view below, kept too)
+    // a view's data lives in its source: keep the source too, or later nodes (the heads) reuse it
+    for (ggml_tensor *v = g->out->view_src; v; v = v->view_src) ggml_set_output(v);
     if (ggml_n_dims(g->out) == 1) g->out = ggml_reshape_2d(ctx, g->out, 1, n), ggml_set_output(g->out);
     charge_corr_graph(*g, ctx, S, false); // r for the metrics (the loss term is in MIXED)
     ggml_tensor *E = ggml_sum(ctx, ggml_cont(ctx, ggml_view_2d(ctx, g->out, 1, n, g->out->nb[1], 0)));

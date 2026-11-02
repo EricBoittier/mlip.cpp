@@ -49,6 +49,8 @@ def main():
     ap.add_argument("--orbital-hidden", type=int, default=None, help="H of the orbital MLP (default: features)")
     ap.add_argument("--homo-offset", type=float, default=0.0, help="eV; the training set's mean HOMO energy")
     ap.add_argument("--gap-offset", type=float, default=0.0, help="eV; the training set's mean HOMO-LUMO gap")
+    ap.add_argument("--offsets-from", default=None, help="mlipcpp-train split dir: --homo-offset / --gap-offset = the "
+                    "means of its labelled homo_energy.bin / homo_lumo_gap.bin (homo_mask.bin, gap_mask.bin)")
     ap.add_argument("-o", "--output", required=True)
     a = ap.parse_args()
     config = dict(
@@ -60,6 +62,13 @@ def main():
     )
     if a.model_type == "spooky":
         config["model_type"] = "spooky"
+    if a.offsets_from:
+        from pathlib import Path
+        sp = Path(a.offsets_from)
+        for key, val, msk in (("homo_offset", "homo_energy", "homo_mask"), ("gap_offset", "homo_lumo_gap", "gap_mask")):
+            v, m = np.fromfile(sp / f"{val}.bin", np.float32), np.fromfile(sp / f"{msk}.bin", np.float32) > 0.5
+            setattr(a, key, float(v[m].astype(np.float64).mean()))
+        print(f"offsets from {sp}: HOMO {a.homo_offset:.4f} eV, gap {a.gap_offset:.4f} eV")
     mt = {x for x in a.multitask.split(",") if x}
     if mt - {"charges", "spins", "orbitals"}:
         raise SystemExit(f"--multitask: unknown heads {mt - {'charges', 'spins', 'orbitals'}}")

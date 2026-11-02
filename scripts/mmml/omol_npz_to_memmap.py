@@ -27,7 +27,8 @@ rows and atoms aligned with them, checked by key) add, per split, for scheme in 
 mulliken, nbo: <scheme>_charge.bin, <scheme>_spin.bin (float32 per atom, 0 where absent),
 <scheme>_charge_mask.bin, <scheme>_spin_mask.bin (float32 per structure, 1 = labelled:
 has_q_<scheme>, has_s_<scheme>); homo_energy.bin, homo_lumo_gap.bin (eV), homo_mask.bin,
-gap_mask.bin, s_squared.bin (float32 per structure); source.npz also gets unique_id.
+gap_mask.bin (HOMO in [-20, 2] eV, gap in (0, 25] eV; outliers unlabelled), s_squared.bin
+(float32 per structure); source.npz also gets unique_id.
 
 Data files are opened read-only with allow_pickle=False.
 
@@ -52,6 +53,10 @@ AUX_SYS = tuple(f"{sc}_{t}_mask" for sc in SCHEMES for t in ("charge", "spin")) 
     "homo_energy", "homo_lumo_gap", "homo_mask", "gap_mask", "s_squared")
 
 
+HOMO_RANGE = (-20.0, 2.0)  # eV, labelled when inside [lo, hi]
+GAP_RANGE = (0.0, 25.0)    # eV, labelled when inside (lo, hi]
+
+
 def aux_arrays(z):
     """npz_aux shard (omol aux label extraction) -> the split files' arrays (atoms, structures)"""
     out = {}
@@ -62,10 +67,13 @@ def aux_arrays(z):
             atom_has = np.repeat(has, np.diff(z["mol_offsets"]))
             out[f"{sc}_{t}"] = np.where(atom_has & np.isfinite(v), v, 0.0)
             out[f"{sc}_{t}_mask"] = has.astype(np.float64)
-    for name, key in (("homo_energy", "homo"), ("homo_lumo_gap", "gap")):
+    # orbital labels: outliers masked (OMol25 has gaps up to 61 eV, HOMO down to -71 eV)
+    for name, key, mask, lo, hi in (("homo_energy", "homo", "homo_mask", HOMO_RANGE[0], HOMO_RANGE[1]),
+                                    ("homo_lumo_gap", "gap", "gap_mask", GAP_RANGE[0], GAP_RANGE[1])):
         v = np.asarray(z[key], np.float64).reshape(-1)
+        ok = np.isfinite(v) & (v >= lo) & (v <= hi) if key == "homo" else np.isfinite(v) & (v > lo) & (v <= hi)
         out[name] = np.where(np.isfinite(v), v, 0.0)
-        out[name.split("_")[0] + "_mask" if name == "homo_energy" else "gap_mask"] = np.isfinite(v).astype(np.float64)
+        out[mask] = ok.astype(np.float64)
     out["s_squared"] = np.nan_to_num(np.asarray(z["s2"], np.float64).reshape(-1))
     out["keys"] = z["keys"]
     out["unique_id"] = z["unique_id"]
