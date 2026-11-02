@@ -231,7 +231,8 @@ def tensors_to_params(config: dict, model_type: str, t: dict) -> dict:
                 dn["1-"] = {"kernel": f64(t[f"dense{d}.w1"]).T}
             p[f"Dense_{d}"] = dn
     nd = T * (R + 1)
-    p[f"Dense_{nd}"] = {"0+": {"kernel": f64(t["energy.w"]).T}}
+    # (1, F) -> (F, 1); a GGUF written by mlipcpp-train stores it 1-D (ggml drops trailing 1 dims)
+    p[f"Dense_{nd}"] = {"0+": {"kernel": f64(t["energy.w"]).reshape(1, F).T}}
     p[f"Dense_{nd + 1}"] = {"kernel": f64(t["energy.scale"]).reshape(1, 1)}
     if "energy_bias" in t:
         p["energy_bias"] = f64(t["energy_bias"]).reshape(-1)
