@@ -33,6 +33,9 @@ def main():
     ap.add_argument("--split-seed", type=int, default=0)
     ap.add_argument("--split-name", default="train")
     ap.add_argument("--chunk", type=int, default=20000)
+    ap.add_argument("--rereference", nargs=2, metavar=("FROM_META", "TO_META"), default=None,
+                    help="swap the linear reference: E + ref_FROM - ref_TO (metadata.json files holding linear_ref), "
+                         "e.g. omol_val_50k (train4M_filtered reference) -> the pilot200k reference")
     a = ap.parse_args()
     import orbax.checkpoint as ocp
 
@@ -49,6 +52,14 @@ def main():
     writers = [SplitWriter(out / s, False) for s in names]
     off = d["mol_offsets"]
     E, Q, S, N = (d[k].reshape(-1) for k in ("E", "Q", "S", "N"))
+    E = E.astype(np.float64)
+    if a.rereference:
+        mol = np.repeat(np.arange(n), N)
+        for sign, path in ((1.0, a.rereference[0]), (-1.0, a.rereference[1])):
+            lr = json.load(open(path))["linear_ref"]
+            tab = np.zeros(119)
+            tab[np.asarray(lr["Z"])] = lr["b_eV"]
+            E = E + sign * (np.bincount(mol, weights=tab[d["Z"]], minlength=n) + lr["b_Q_eV_per_e"] * Q)
     for c0 in range(0, n, a.chunk):
         rows_all = np.arange(c0, min(n, c0 + a.chunk))
         for w_idx, w in enumerate(writers):
@@ -59,7 +70,7 @@ def main():
             w.add(d["R"][atoms], d["Z"][atoms], d["F"][atoms], N[rows], E[rows], Q[rows], S[rows], 0, rows, rows,
                   np.asarray([f"cache:{i}" for i in rows]))
         print(f"  {min(n, c0 + a.chunk)}/{n}", flush=True)
-    meta = dict(source=[a.cache], valid_fraction=a.valid_fraction, split_seed=a.split_seed,
+    meta = dict(source=[a.cache], rereference=a.rereference, valid_fraction=a.valid_fraction, split_seed=a.split_seed,
                 energy="the cache's E (linear reference applied) [eV] (float32)", forces="eV/A")
     try:
         meta["cache_metadata"] = {k: v for k, v in json.load(open(Path(a.cache) / "metadata.json")).items()
