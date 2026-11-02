@@ -68,6 +68,7 @@ struct Probe {
   ggml_cgraph *gf = nullptr;
   ggml_gallocr_t galloc = nullptr;
   std::map<std::string, ggml_tensor *> in;
+  const runtime::GraphModel *model_ = nullptr;
   ggml_tensor *E = nullptr, *J = nullptr, *gv = nullptr, *gc = nullptr;
   std::vector<std::pair<ggml_tensor *, float>> constants;
   std::map<std::string, int> ops; // forward ops by name
@@ -80,6 +81,7 @@ struct Probe {
   // first derivative of the plain forward pass)
   Probe(Worker &w, const Batch &b, bool mixed, bool energy_fd = false) {
     auto &model = w.model();
+    model_ = &model;
     auto &interp = model.interpreter();
     const int64_t n = b.n_atoms, m = b.max_neighbors;
     interp.set_dimension("n_atoms", n);
@@ -102,10 +104,15 @@ struct Probe {
     interp.set_input("reverse_neighbor_index", input(GGML_TYPE_I32, {n * m}, "reverse_neighbor_index"));
     ggml_tensor *cv = input(GGML_TYPE_F32, {m, n}, "cutoff_values");
     interp.set_input("cutoff_values", cv);
+    if (model.conditioning().enabled) { // table rows (charge 0, singlet unless the batch says otherwise)
+      interp.set_input("charge_index", input(GGML_TYPE_I32, {n}, "charge_index"));
+      interp.set_input("spin_index", input(GGML_TYPE_I32, {n}, "spin_index"));
+    }
     ggml_tensor *dv = input(GGML_TYPE_F32, {3, m, n}, "dv");
     ggml_tensor *dc = input(GGML_TYPE_F32, {m, n}, "dc");
 
     ggml_tensor *out = interp.build(ctx); // (energy | force) per atom: ne = (4, n)
+    if (ggml_n_dims(out) == 1) out = ggml_reshape_2d(ctx, out, 1, n); // energy-only export: [n]
     E = ggml_sum(ctx, ggml_cont(ctx, ggml_view_2d(ctx, out, 1, n, out->nb[1], 0)));
     runtime::GraphJVP jvp(ctx);
     jvp.missing = &missing;
@@ -160,8 +167,15 @@ struct Probe {
     auto set = [&](const char *name, const void *data, size_t bytes) {
       ggml_tensor *t = in.at(name);
       if (ggml_nbytes(t) != bytes) throw std::logic_error(std::string("size of ") + name);
-      ggml_backend_tensor_set(t, data, 0, bytes);
+      if (t->buffer) ggml_backend_tensor_set(t, data, 0, bytes); // (inputs the model does not read: none)
     };
+    if (in.count("charge_index")) {
+      const auto &cond = model_->conditioning();
+      std::vector<int32_t> ci(b.atom_charge.size()), si(b.atom_charge.size());
+      for (size_t a = 0; a < ci.size(); a++) std::tie(ci[a], si[a]) = cond.rows(b.atom_charge[a], b.atom_spin[a]);
+      set("charge_index", ci.data(), ci.size() * 4);
+      set("spin_index", si.data(), si.size() * 4);
+    }
     set("species", b.species.data(), b.species.size() * 4);
     set("neighbor_species", b.neighbor_species.data(), b.neighbor_species.size() * 4);
     set("edge_vectors", b.edge_vectors.data(), b.edge_vectors.size() * 4);

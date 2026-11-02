@@ -863,8 +863,8 @@ void Worker::upload_inputs(StepGraph &g, const Batch &b, const std::vector<float
                   src[i].first, src[i].second);
     ggml_backend_tensor_set(g.blob, staging_.data(), 0, g.blob_bytes);
   } else {
-    for (size_t i = 0; i < g.inputs.size(); i++)
-      ggml_backend_tensor_set(g.inputs[i], src[i].first, 0, src[i].second);
+    for (size_t i = 0; i < g.inputs.size(); i++) // (inputs the model does not read have no buffer)
+      if (g.inputs[i]->buffer) ggml_backend_tensor_set(g.inputs[i], src[i].first, 0, src[i].second);
   }
 }
 
@@ -1145,7 +1145,7 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
     if (ggml_nbytes(tv) != dv.size() * sizeof(float) || ggml_nbytes(tc) != dc.size() * sizeof(float))
       throw std::logic_error("run_conservative: tangent inputs");
     ggml_backend_tensor_set(tv, dv.data(), 0, ggml_nbytes(tv));
-    ggml_backend_tensor_set(tc, dc.data(), 0, ggml_nbytes(tc));
+    if (tc->buffer) ggml_backend_tensor_set(tc, dc.data(), 0, ggml_nbytes(tc)); // (models without cutoff values)
     if (gf.dx) {
       ggml_backend_tensor_set(gf.dx, plato_dx_.data(), 0, ggml_nbytes(gf.dx));
       ggml_backend_tensor_set(gf.jvp_scale, &plato_jvp_scale_, 0, sizeof(float));
