@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "physnet_graph.h"
 
 #include <cmath>
@@ -117,7 +118,7 @@ ggml_tensor *build_physnet(ggml_context *ctx, const PhysNetHypers &h, const Phys
   }
   // index arithmetic in float32 is exact below 2^24
   ggml_tensor *center = nullptr;
-  if (E < (int64_t(1) << 24)) {
+  if (E < (int64_t(1) << 24) && !std::getenv("MLIPCPP_PHYSNET_REPEAT_GATHER")) { // (env: the old path, for tests)
     auto index_div_m = [&](ggml_tensor *flat) { // floor((flat + 0.5) / m), as I32
       return ggml_cast(c, ggml_floor(c, ggml_scale_bias(c, flat, 1.0f / float(m), 0.5f / float(m))), GGML_TYPE_I32);
     };

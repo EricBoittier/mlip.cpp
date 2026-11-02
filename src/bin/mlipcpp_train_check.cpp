@@ -34,7 +34,7 @@ int main(int argc, char **argv) {
   Worker::Conservative cons;
   Worker::ChargeCorr qcorr;
   std::string qtarget = "mulliken";
-  bool huber = false;
+  bool huber = false, model_baselines = false, per_structure = false;
   double de = 0.01, df = 0.02;
   double tile_ratio = 1.25, tol = 1e-3;
   for (int i = 1; i + 1 < argc; i += 2) {
@@ -59,6 +59,8 @@ int main(int argc, char **argv) {
     else if (a == "--charge-corr-min") qcorr.r_min = std::stod(v);
     else if (a == "--charge-corr-target") qtarget = v;
     else if (a == "--loss") huber = v == "huber";
+    else if (a == "--model-baselines") model_baselines = v == "1"; // --init's composition and scales
+    else if (a == "--energy-per-structure") per_structure = v == "1"; // mmml's total-energy loss
     else if (a == "--huber-delta-e") de = std::stod(v);
     else if (a == "--huber-delta-f") df = std::stod(v);
   }
@@ -77,7 +79,15 @@ int main(int argc, char **argv) {
   worker.loss.huber = huber, worker.loss.delta_e = de, worker.loss.delta_f = df;
   if (qcorr.weight > 0 && !split.load_partial_charges(qtarget))
     throw std::runtime_error(data + "/train/" + qtarget + "_charge.bin: not found");
-  const TargetScaling sc = TargetScaling::fit(split);
+  TargetScaling sc;
+  if (model_baselines) {
+    for (auto [Z, c] : worker.model().composition_energies()) sc.composition[Z] = c;
+    for (auto [Z, f] : worker.model().nc_force_scales()) sc.force_scale[Z] = f;
+    sc.energy_scale = worker.model().energy_scale();
+  } else {
+    sc = TargetScaling::fit(split);
+  }
+  sc.per_structure = per_structure;
   const AdaptiveCutoff adaptive = adaptive_cutoff(worker.model());
   NeighborCache nl = NeighborCache::load_or_build(
       split, worker.model().cutoff(), cache_path(cache_dir, split, worker.model().cutoff(), adaptive), 8, adaptive);
