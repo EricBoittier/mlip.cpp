@@ -40,15 +40,24 @@ struct Builder {
     if (v)
       v = ggml_reshape_3d(c, ggml_mul_mat(c, w(p + "w1"), ggml_reshape_2d(c, v, F, 3 * n)), F, 3, n);
   }
-  // features of the neighbour j at every slot (i, s): node features repeated
-  // over the slots, gathered at the reverse edge (j, s'), whose centre is j
+  ggml_tensor *neighbour = nullptr; // I32 [E]: the atom j of slot (i, s), or nullptr
+  // features of the neighbour j at every slot (i, s): rows of j, j the centre of
+  // the reverse edge (j, s') = floor(rev / m); for n m >= 2^24 (float32 index
+  // arithmetic) node features repeated over the slots, gathered at the reverse edge
   ggml_tensor *gather_neighbours(ggml_tensor *x, int64_t rows, ggml_tensor *rev) const {
+    if (neighbour) return ggml_get_rows(c, ggml_reshape_2d(c, x, rows, n), neighbour);
     ggml_tensor *x3 = ggml_reshape_3d(c, x, rows, 1, n);
     ggml_tensor *rep = ggml_repeat(c, x3, ggml_new_tensor_3d(c, GGML_TYPE_F32, rows, m, n));
     return ggml_get_rows(c, ggml_reshape_2d(c, rep, rows, E), rev); // [rows, E]
   }
-  // sum over the neighbour slots: [rows, m, n] -> [rows, n]
+  ggml_tensor *center = nullptr; // I32 [E]: the atom i of slot (i, s), or nullptr
+  // sum over the neighbour slots: [rows, m, n] -> [rows, n]; a scatter-add by
+  // centre (its gradient is a gather, not a single-threaded repeat), else
+  // a permuted copy and a row sum
   ggml_tensor *sum_slots(ggml_tensor *x, int64_t rows) const {
+    if (center)
+      return ggml_get_rows_back(c, ggml_reshape_2d(c, x, rows, E), center,
+                                ggml_new_tensor_2d(c, GGML_TYPE_F32, rows, n));
     ggml_tensor *x3 = ggml_reshape_3d(c, x, rows, m, n);
     ggml_tensor *t = ggml_cont(c, ggml_permute(c, x3, 1, 0, 2, 3)); // [m, rows, n]
     return ggml_reshape_2d(c, ggml_sum_rows(c, t), rows, n);
@@ -97,9 +106,24 @@ ggml_tensor *build_physnet(ggml_context *ctx, const PhysNetHypers &h, const Phys
     T.push_back(ggml_sub(c, ggml_scale(c, ggml_mul(c, y, T[k - 1]), 2.0f), T[k - 2]));
   for (auto &t : T) t = ggml_reshape_2d(c, t, 1, E);
   ggml_tensor *rbf = ggml_mul(c, b.stack(T), ggml_reshape_2d(c, cut, 1, E)); // [K, E]
-  // unit vectors [1, 3, E] (Racah l = 1 harmonics in Cartesian order)
+  // unit vectors (Racah l = 1 harmonics in Cartesian order), broadcast over the
+  // features once as an outer product (a multithreaded GEMM and its gradient,
+  // not a broadcast multiply whose gradient reduces over the features in a
+  // single thread): [F, 3, E]
   ggml_tensor *u = nullptr;
-  if (L >= 1) u = ggml_reshape_3d(c, ggml_div(c, ev, ggml_repeat(c, r, ev)), 1, 3, E);
+  if (L >= 1) {
+    ggml_tensor *u1 = ggml_reshape_2d(c, ggml_div(c, ev, ggml_repeat(c, r, ev)), 1, 3 * E);
+    u = ggml_reshape_3d(c, ggml_mul_mat(c, constant(c, {1, F}, 1.0f), u1), F, 3, E);
+  }
+  // index arithmetic in float32 is exact below 2^24
+  ggml_tensor *center = nullptr;
+  if (E < (int64_t(1) << 24)) {
+    auto index_div_m = [&](ggml_tensor *flat) { // floor((flat + 0.5) / m), as I32
+      return ggml_cast(c, ggml_floor(c, ggml_scale_bias(c, flat, 1.0f / float(m), 0.5f / float(m))), GGML_TYPE_I32);
+    };
+    b.neighbour = index_div_m(ggml_cast(c, in.reverse_index, GGML_TYPE_F32));
+    b.center = center = index_div_m(ggml_arange(c, 0.0f, float(E), 1.0f));
+  }
 
   // --- embedding (+ charge / spin conditioning) ---
   ggml_tensor *s = ggml_get_rows(c, b.w("embed"), in.species); // [F, n]
@@ -114,18 +138,38 @@ ggml_tensor *build_physnet(ggml_context *ctx, const PhysNetHypers &h, const Phys
   }
 
   // --- message passing + refinement ---
+  // every iteration's filters in one product (one GEMM and one gradient GEMM over
+  // the edges instead of two per iteration): rows of fall, [sum F, E]
+  std::vector<std::pair<int64_t, int64_t>> filters; // first row of filter.0 / filter.1
+  ggml_tensor *wall = nullptr;
+  int64_t rows_all = 0;
+  for (int t = 0; t < h.num_iterations; t++) {
+    const std::string p = "mp" + std::to_string(t) + ".";
+    std::pair<int64_t, int64_t> f{-1, -1};
+    for (int l = 0; l <= std::min(L, 1); l++) {
+      ggml_tensor *wl = b.w(p + "filter." + std::to_string(l)); // [K, F]
+      wall = wall ? ggml_concat(c, wall, wl, 1) : wl;
+      (l == 0 ? f.first : f.second) = rows_all;
+      rows_all += F;
+    }
+    filters.push_back(f);
+  }
+  ggml_tensor *fall = ggml_mul_mat(c, wall, rbf); // [rows_all, E]
+  auto filter_rows = [&](int64_t row0) {
+    return ggml_view_2d(c, fall, F, E, fall->nb[1], row0 * sizeof(float)); // (consumers: elementwise)
+  };
   const float inv_sqrt3 = static_cast<float>(1.0 / std::sqrt(3.0));
   for (int t = 0; t < h.num_iterations; t++) {
     const std::string p = "mp" + std::to_string(t) + ".";
     const int L1 = L, L2 = v ? 1 : 0, L3 = (t == h.num_iterations - 1) ? 0 : std::max(L1, L2);
-    ggml_tensor *f0 = ggml_mul_mat(c, b.w(p + "filter.0"), rbf);                // [F, E]
-    ggml_tensor *f1 = L1 >= 1 ? ggml_mul_mat(c, b.w(p + "filter.1"), rbf) : nullptr; // [F, E]
+    ggml_tensor *f0 = filter_rows(filters[t].first);                             // [F, E]
+    ggml_tensor *f1 = L1 >= 1 ? filter_rows(filters[t].second) : nullptr;       // [F, E]
     ggml_tensor *b0 = b.gather_neighbours(s, F, in.reverse_index);              // [F, E]
     ggml_tensor *b1 = v ? ggml_reshape_3d(c, b.gather_neighbours(v, 3 * F, in.reverse_index), F, 3, E) : nullptr;
     // scalar output: 00->0 and 11->0
     ggml_tensor *o0 = ggml_mul(c, ggml_mul(c, f0, b0), b.w(p + "tp.000"));
     if (f1 && b1) {
-      ggml_tensor *ub = ggml_mul(c, b1, u); // [F, 3, E]
+      ggml_tensor *ub = ggml_mul(c, b1, u); // [F, 3, E], same shapes
       ggml_tensor *dot = ggml_add(c, ggml_add(c, ggml_view_2d(c, ub, F, E, ub->nb[2], 0),
                                               ggml_view_2d(c, ub, F, E, ub->nb[2], ub->nb[1])),
                                   ggml_view_2d(c, ub, F, E, ub->nb[2], 2 * ub->nb[1]));
@@ -137,7 +181,7 @@ ggml_tensor *build_physnet(ggml_context *ctx, const PhysNetHypers &h, const Phys
       if (b1) o1 = ggml_mul(c, b1, ggml_reshape_3d(c, ggml_mul(c, f0, b.w(p + "tp.011")), F, 1, E));
       if (f1) {
         ggml_tensor *g = ggml_reshape_3d(c, ggml_mul(c, ggml_mul(c, f1, b0), b.w(p + "tp.101")), F, 1, E);
-        ggml_tensor *t1 = ggml_mul(c, ggml_repeat(c, g, ggml_new_tensor_3d(c, GGML_TYPE_F32, F, 3, E)), u);
+        ggml_tensor *t1 = ggml_mul(c, u, g); // g broadcast over the 3 components
         o1 = o1 ? ggml_add(c, o1, t1) : t1;
       }
     }
@@ -169,9 +213,17 @@ ggml_tensor *build_physnet(ggml_context *ctx, const PhysNetHypers &h, const Phys
   if (h.zbl) {
     ggml_tensor *ztab = b.w("zbl.z"), *zatab = b.w("zbl.za"); // [1, Zmax + 1]
     ggml_tensor *ns = ggml_reshape_1d(c, in.neighbor_species, E);
-    ggml_tensor *shape1mn = ggml_new_tensor_3d(c, GGML_TYPE_F32, 1, m, n);
-    ggml_tensor *zi = ggml_repeat(c, ggml_reshape_3d(c, ggml_get_rows(c, ztab, in.species), 1, 1, n), shape1mn);
-    ggml_tensor *zai = ggml_repeat(c, ggml_reshape_3d(c, ggml_get_rows(c, zatab, in.species), 1, 1, n), shape1mn);
+    ggml_tensor *zi, *zai;
+    if (center) { // the centre's species at every slot
+      ggml_tensor *cs = ggml_get_rows(c, ggml_reshape_2d(c, in.species, 1, n), center); // I32 [1, E]
+      cs = ggml_reshape_1d(c, cs, E);
+      zi = ggml_reshape_3d(c, ggml_get_rows(c, ztab, cs), 1, m, n);
+      zai = ggml_reshape_3d(c, ggml_get_rows(c, zatab, cs), 1, m, n);
+    } else {
+      ggml_tensor *shape1mn = ggml_new_tensor_3d(c, GGML_TYPE_F32, 1, m, n);
+      zi = ggml_repeat(c, ggml_reshape_3d(c, ggml_get_rows(c, ztab, in.species), 1, 1, n), shape1mn);
+      zai = ggml_repeat(c, ggml_reshape_3d(c, ggml_get_rows(c, zatab, in.species), 1, 1, n), shape1mn);
+    }
     ggml_tensor *zj = ggml_reshape_3d(c, ggml_get_rows(c, ztab, ns), 1, m, n);
     ggml_tensor *zaj = ggml_reshape_3d(c, ggml_get_rows(c, zatab, ns), 1, m, n);
     // x = r / a_ij, a_ij = 0.8854 a0 / (Zi^0.23 + Zj^0.23)

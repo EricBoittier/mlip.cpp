@@ -2,6 +2,9 @@
 #include "log.h"
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdio>
+#include <map>
 #include <cctype>
 #include <cstdlib>
 #include <ggml.h>
@@ -309,8 +312,48 @@ void BackendProvider::init_accelerators() {
   }
 }
 
+namespace {
+// MLIPCPP_PROFILE_OPS=1 (CPU backend): node by node, wall time per op type on stderr
+ggml_status compute_profiled(ggml_backend_t backend, ggml_cgraph *graph) {
+  std::map<std::string, std::pair<double, int>> by_op;
+  std::vector<std::pair<double, std::string>> nodes;
+  double total = 0;
+  ggml_context *ctx = ggml_init({ggml_graph_overhead_custom(1, false) + 1024, nullptr, true});
+  ggml_cgraph *one = ggml_new_graph_custom(ctx, 1, false);
+  for (int i = 0; i < ggml_graph_n_nodes(graph); i++) {
+    ggml_tensor *t = ggml_graph_node(graph, i);
+    ggml_graph_clear(one);
+    ggml_graph_add_node(one, t);
+    const auto t0 = std::chrono::steady_clock::now();
+    if (ggml_status s = ggml_backend_graph_compute(backend, one); s != GGML_STATUS_SUCCESS) return ggml_free(ctx), s;
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    auto &e = by_op[ggml_op_desc(t)];
+    e.first += ms, e.second++, total += ms;
+    char desc[256];
+    std::snprintf(desc, sizeof desc, "%s[%lld,%lld,%lld](%s[%lld,%lld,%lld]%s%s)", ggml_op_desc(t), (long long)t->ne[0],
+                  (long long)t->ne[1], (long long)t->ne[2], t->src[0] ? ggml_op_desc(t->src[0]) : "",
+                  t->src[0] ? (long long)t->src[0]->ne[0] : 0LL, t->src[0] ? (long long)t->src[0]->ne[1] : 0LL,
+                  t->src[0] ? (long long)t->src[0]->ne[2] : 0LL, t->src[1] ? "," : "",
+                  t->src[1] ? ggml_op_desc(t->src[1]) : "");
+    nodes.emplace_back(ms, desc);
+  }
+  std::vector<std::pair<std::string, std::pair<double, int>>> v(by_op.begin(), by_op.end());
+  std::sort(v.begin(), v.end(), [](auto &a, auto &b) { return a.second.first > b.second.first; });
+  std::fprintf(stderr, "OP_PROFILE %d nodes, %.2f ms:", ggml_graph_n_nodes(graph), total);
+  for (auto &[name, e] : v) std::fprintf(stderr, " %s=%.2f/%d", name.c_str(), e.first, e.second);
+  std::fprintf(stderr, "\n");
+  std::sort(nodes.begin(), nodes.end(), [](auto &a, auto &b) { return a.first > b.first; });
+  for (size_t k = 0; k < std::min<size_t>(nodes.size(), 25); k++)
+    std::fprintf(stderr, "  %7.2f ms %s\n", nodes[k].first, nodes[k].second.c_str());
+  ggml_free(ctx);
+  return GGML_STATUS_SUCCESS;
+}
+} // namespace
+
 ggml_status BackendProvider::compute(ggml_cgraph *graph) {
+  static const bool profile_ops = std::getenv("MLIPCPP_PROFILE_OPS") != nullptr;
   if (accel_.empty()) {
+    if (profile_ops && !is_gpu()) return compute_profiled(primary_, graph);
     return ggml_backend_graph_compute(primary_, graph);
   }
 
