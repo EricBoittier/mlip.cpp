@@ -208,6 +208,7 @@ private:
   ggml_tensor *build_sigmoid(ggml_context *ctx, const GIRNode &node);
   ggml_tensor *build_chunk(ggml_context *ctx, const GIRNode &node);
   ggml_tensor *build_rms_norm(ggml_context *ctx, const GIRNode &node);
+  ggml_tensor *build_physnet(ggml_context *ctx, const GIRNode &node);
 };
 
 } // namespace mlipcpp::runtime

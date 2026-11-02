@@ -1,4 +1,5 @@
 #include "graph_interpreter.h"
+#include "models/physnet/physnet_graph.h"
 
 #include <algorithm>
 #include <cmath>
@@ -330,6 +331,8 @@ ggml_tensor *GraphInterpreter::build_node(ggml_context *ctx,
     std::vector<ggml_tensor *> in;
     for (const auto &ref : node.inputs) in.push_back(resolve_input(ctx, ref));
     return custom_op(ctx, node, in);
+  } else if (node.op == "PHYSNET") {
+    return build_physnet(ctx, node);
   } else if (node.op == "ADD") {
     return build_add(ctx, node);
   } else if (node.op == "SUB") {
@@ -2243,6 +2246,55 @@ void GraphInterpreter::capture_all_outputs(const CaptureCallback &cb) const {
   if (output_) {
     cb(9999, "final_output", output_);
   }
+}
+
+} // namespace mlipcpp::runtime
+
+namespace mlipcpp::runtime {
+
+// mmml PhysNet / SpookyPhysNet (models/physnet/physnet_graph.h): one node, the
+// hyperparameters in its params, the weights and inputs by name
+ggml_tensor *GraphInterpreter::build_physnet(ggml_context *ctx, const GIRNode &node) {
+  physnet::PhysNetHypers h;
+  h.spooky = get_param<std::string>(node, "model_type", "physnet") == "spooky";
+  h.features = static_cast<int>(get_param<int64_t>(node, "features", 32));
+  h.max_degree = static_cast<int>(get_param<int64_t>(node, "max_degree", 1));
+  h.num_iterations = static_cast<int>(get_param<int64_t>(node, "num_iterations", 2));
+  h.num_basis = static_cast<int>(get_param<int64_t>(node, "num_basis_functions", 16));
+  h.n_res = static_cast<int>(get_param<int64_t>(node, "n_res", 3));
+  h.max_atomic_number = static_cast<int>(get_param<int64_t>(node, "max_atomic_number", 118));
+  h.cutoff = static_cast<float>(get_param<double>(node, "cutoff", 6.0));
+  h.zbl = get_param<bool>(node, "zbl", true);
+  h.zbl_cutoff = static_cast<float>(get_param<double>(node, "zbl_cutoff", 0.6));
+  h.zbl_cuton = static_cast<float>(get_param<double>(node, "zbl_cuton", 0.1));
+  h.energy_bias = get_param<bool>(node, "use_energy_bias", false);
+  auto input = [&](const char *name, bool required) -> ggml_tensor * {
+    auto it = inputs_.find(name);
+    if (it == inputs_.end()) {
+      if (required) throw std::runtime_error(std::string("PhysNet: graph input not set: ") + name);
+      return nullptr;
+    }
+    return it->second;
+  };
+  physnet::PhysNetInputs in;
+  in.species = input("species", true);
+  in.neighbor_species = input("neighbor_species", true);
+  in.edge_vectors = input("edge_vectors", true);
+  in.padding_mask = input("padding_mask", true);
+  in.reverse_index = input("reverse_neighbor_index", true);
+  in.charge_index = input("charge_index", h.spooky);
+  in.spin_index = input("spin_index", h.spooky);
+  auto weight = [&](const std::string &name) -> ggml_tensor * {
+    auto it = weights_.find(name);
+    return it == weights_.end() ? nullptr : it->second;
+  };
+  auto constant = [&](ggml_context *c, std::vector<int64_t> ne, float value) {
+    ggml_tensor *t = ggml_new_tensor(c, GGML_TYPE_F32, static_cast<int>(ne.size()), ne.data());
+    ggml_set_input(t);
+    pending_constants_.push_back({t, value});
+    return t;
+  };
+  return physnet::build_physnet(ctx, h, in, weight, constant);
 }
 
 } // namespace mlipcpp::runtime

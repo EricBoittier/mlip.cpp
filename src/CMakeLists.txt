@@ -20,6 +20,7 @@ set(MLIPCPP_MODEL_SOURCES
     models/pet/pet.cpp
     models/pet/pet_batch.cpp
     models/pet/pet_layers.cpp
+    models/physnet/physnet_graph.cpp
     models/plato/plato.cpp
 )
 
