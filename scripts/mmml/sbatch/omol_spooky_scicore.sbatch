@@ -23,12 +23,17 @@ SRC=$M/src
 B=${BUILD:-$M/build-sm80-90}/bin
 # MT=1: the multitask model (needs the *_mt data and inits copied from pc-studix, see the setup sbatch)
 # RMSNORM=1: SpookyPhysNet feature_rmsnorm (mmml 1b5f7f615); init spooky_f64_l1_i3_seed0_rms.gguf (setup sbatch / pc-studix)
-MT=${MT:-0}; FROZEN_EBIAS=${FROZEN_EBIAS:-0}; RMSNORM=${RMSNORM:-0}
-[ "$RMSNORM" = 1 ] && { [ "$MT" = 1 ] || [ "$FROZEN_EBIAS" = 1 ]; } && { echo "RMSNORM=1: no MT / FROZEN_EBIAS init yet (pass INIT=)"; [ -n "${INIT:-}" ] || exit 2; }
+# CSPA=1: + charge_spin_per_atom (mmml 0e07d196d: charge / spin inputs Q / N, (M - 1) / N per atom); implies RMSNORM=1;
+#   init spooky_f64_l1_i3_seed0_rms_cspa.gguf (setup sbatch / pc-studix)
+# EQREF=B: mlipcpp-train --energy-add-charge-ref B (target energies E + B Q; pilot200k b_Q = 5.661417917773716)
+MT=${MT:-0}; FROZEN_EBIAS=${FROZEN_EBIAS:-0}; RMSNORM=${RMSNORM:-0}; CSPA=${CSPA:-0}; EQREF=${EQREF:-}
+[ "$CSPA" = 1 ] && RMSNORM=1
+[ "$RMSNORM" = 1 ] && { [ "$MT" = 1 ] || [ "$FROZEN_EBIAS" = 1 ]; } && { echo "RMSNORM=1 / CSPA=1: no MT / FROZEN_EBIAS init yet (pass INIT=)"; [ -n "${INIT:-}" ] || exit 2; }
 SUF=$([ "$MT" = 1 ] && echo _mt || true)
 DATA=${DATA:-$M/data/pilot200k$SUF}; [[ $DATA = /* ]] || DATA=$M/$DATA
 if [ "$MT" = 1 ]; then INIT=${INIT:-$M/init/spooky_mt_f64_l1_i3_seed0_$(basename "${DATA%_mt}").gguf}
 elif [ "$FROZEN_EBIAS" = 1 ]; then INIT=${INIT:-$M/init/spooky_f64_l1_i3_seed0_frozen_ebias.gguf}
+elif [ "$CSPA" = 1 ]; then INIT=${INIT:-$M/init/spooky_f64_l1_i3_seed0_rms_cspa.gguf}
 elif [ "$RMSNORM" = 1 ]; then INIT=${INIT:-$M/init/spooky_f64_l1_i3_seed0_rms.gguf}
 else INIT=${INIT:-$M/init/spooky_f64_l1_i3_seed0.gguf}; fi
 ELOSS=${ELOSS:-total}; EW=${EW:-1}; FW=${FW:-52.91}
@@ -37,7 +42,8 @@ PAIRS=${PAIRS:-210000}; CAP=${CAP:-256}; EXTRA=${EXTRA:-}
 # multitask loss weights (masked MSE, e^2 / e^2 / eV^2 / eV^2; mmml proposal defaults), Loewdin labels
 QW=${QW:-50}; SW=${SW:-20}; HW=${HW:-1}; GW=${GW:-1}
 [ "$MT" = 1 ] && EXTRA="$EXTRA --charge-weight $QW --spin-weight $SW --homo-weight $HW --gap-weight $GW --charge-scheme lowdin --spin-scheme lowdin"
-NAME=${NAME:-$(basename "$DATA")_$([ "$MT" = 1 ] && echo mt || echo ef)_${ELOSS}_w${EW}$([ "$FROZEN_EBIAS" = 1 ] && echo _frozenbias || true)$([ "$RMSNORM" = 1 ] && echo _rms || true)}
+[ -n "$EQREF" ] && EXTRA="$EXTRA --energy-add-charge-ref $EQREF"
+NAME=${NAME:-$(basename "$DATA")_$([ "$MT" = 1 ] && echo mt || echo ef)_${ELOSS}_w${EW}$([ "$FROZEN_EBIAS" = 1 ] && echo _frozenbias || true)$([ "$RMSNORM" = 1 ] && echo _rms || true)$([ "$CSPA" = 1 ] && echo _cspa || true)$([ -n "$EQREF" ] && echo _eqref || true)}
 RUN=${RUN:-$M/runs/$NAME}
 HOURS=${HOURS:-23.0}
 PY=/scicore/home/meuwly/boitti0000/mmml_new/.venv/bin/python

@@ -53,6 +53,8 @@ def main():
                     "means of its labelled homo_energy.bin / homo_lumo_gap.bin (homo_mask.bin, gap_mask.bin)")
     ap.add_argument("--feature-rmsnorm", action="store_true",
                     help="SpookyPhysNet feature_rmsnorm (RMS-normalised features after each refinement stage)")
+    ap.add_argument("--charge-spin-per-atom", action="store_true",
+                    help="SpookyPhysNet charge_spin_per_atom (charge / spin inputs Q / N and (M - 1) / N per atom)")
     ap.add_argument("-o", "--output", required=True)
     a = ap.parse_args()
     config = dict(
@@ -66,6 +68,8 @@ def main():
         config["model_type"] = "spooky"
         if a.feature_rmsnorm:
             config["feature_rmsnorm"] = True
+        if a.charge_spin_per_atom:
+            config["charge_spin_per_atom"] = True
     if a.offsets_from:
         from pathlib import Path
         sp = Path(a.offsets_from)

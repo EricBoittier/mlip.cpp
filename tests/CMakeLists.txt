@@ -247,6 +247,11 @@ if(TARGET mlipcpp_train)
     target_link_libraries(test_lr_schedule PRIVATE mlipcpp_train Catch2::Catch2WithMain fmt::fmt)
     target_compile_definitions(test_lr_schedule PRIVATE MLIPCPP_TEST_RESOURCES="${CMAKE_CURRENT_SOURCE_DIR}/resources")
     catch_discover_tests(test_lr_schedule)
+    # mlipcpp-train --energy-add-charge-ref: the loaded target energies
+    add_executable(test_charge_ref test_charge_ref.cpp)
+    target_link_libraries(test_charge_ref PRIVATE mlipcpp_train Catch2::Catch2WithMain fmt::fmt)
+    target_include_directories(test_charge_ref PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/)
+    catch_discover_tests(test_charge_ref)
 endif()
 
 # PET's "grid" adaptive cutoff against metatrain's golden values (and, with

@@ -31,11 +31,12 @@ int main(int argc, char **argv) {
                "          [--charge-corr-weight W] [--charge-corr-target mulliken|lowdin|nbo] [--charge-corr-min R]\n"
                "          [--loss mse|huber] [--huber-delta-e D] [--huber-delta-f D]\n"
                "          [--warmup-steps N] [--cosine-end-fraction F] [--energy-per-structure] [--no-rotations]\n"
-               "          [--batch-pairs P [--bucket-width 8] [--batch-cap 256]]\n"
+               "          [--batch-pairs P [--bucket-width 8] [--batch-cap 256]] [--energy-add-charge-ref B]\n"
                "mmml (JAX) conventions: --energy-per-structure (energy loss on total energies, not per atom),\n"
                "--batch-pairs P (steps of one atom-count bucket each, min(cap, P / pad^2) structures per GPU,\n"
                "pad = atom count rounded up to --bucket-width), --warmup-steps / --cosine-end-fraction\n"
-               "(optax warmup_cosine_decay_schedule), --no-rotations (no O(3) augmentation);\n"
+               "(optax warmup_cosine_decay_schedule), --no-rotations (no O(3) augmentation), --energy-add-charge-ref B\n"
+               "(target energies E + B Q, Q = charge.bin, in every split: a linear reference term b_Q Q taken out);\n"
                "multitask PhysNet heads (GGUF node param heads): [--charge-weight W] [--spin-weight W] [--homo-weight W]\n"
                "[--gap-weight W] [--charge-scheme lowdin|mulliken|nbo] [--spin-scheme lowdin|mulliken|nbo]: squared\n"
                "errors of the per-atom charges (sum = Q), spin populations (sum = 2S+1 - 1), HOMO and HOMO-LUMO gap (eV,\n"
@@ -102,6 +103,7 @@ int main(int argc, char **argv) {
     else if (a == "--gap-weight") o.aux_weight[3] = std::stod(val());
     else if (a == "--charge-scheme") o.aux_charge_scheme = val();
     else if (a == "--spin-scheme") o.aux_spin_scheme = val();
+    else if (a == "--energy-add-charge-ref") o.energy_add_charge_ref = std::stod(val());
     else if (a == "--schedule") o.schedule = val();
     else if (a == "--decay-after") o.decay_after = std::stoi(val());
     else if (a == "--min-lr") o.min_lr = std::stod(val());

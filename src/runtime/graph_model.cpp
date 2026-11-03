@@ -885,6 +885,12 @@ ModelResult GraphModel::predict_single(
     spin_index_t = ggml_new_tensor_1d(input_ctx, GGML_TYPE_I32, n_atoms);
     ggml_set_name(spin_index_t, "spin_index");
   }
+  // PhysNet charge_spin_per_atom: the atom's structure (one: all 0)
+  ggml_tensor *system_index_t = nullptr;
+  if (interp_.needs_system_index(false)) {
+    system_index_t = ggml_new_tensor_1d(input_ctx, GGML_TYPE_I32, n_atoms);
+    ggml_set_name(system_index_t, "system_index");
+  }
 
   // Mode-specific inputs
   ggml_tensor *edge_distances_t = nullptr;
@@ -1067,6 +1073,11 @@ ModelResult GraphModel::predict_single(
     ggml_backend_tensor_set(spin_index_t, sp.data(), 0, sp.size() * sizeof(int32_t));
     interp_.set_input("charge_index", charge_index_t);
     interp_.set_input("spin_index", spin_index_t);
+  }
+  if (system_index_t) {
+    std::vector<int32_t> z(n_atoms, 0);
+    ggml_backend_tensor_set(system_index_t, z.data(), 0, z.size() * sizeof(int32_t));
+    interp_.set_input("system_index", system_index_t);
   }
 
   // Register common inputs

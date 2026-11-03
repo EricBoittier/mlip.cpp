@@ -282,6 +282,8 @@ void GraphModel::build_cached_graph(int n, int M, bool exact_mask, bool backward
     g->charge_index = input(GGML_TYPE_I32, {n}, "charge_index");
     g->spin_index = input(GGML_TYPE_I32, {n}, "spin_index");
   }
+  // charge_spin_per_atom: per-structure atom counts (the heads' sums: all atoms, one structure per graph)
+  if (interp_.needs_system_index(false)) g->system_index = input(GGML_TYPE_I32, {n}, "system_index");
   if (backward) {
     ggml_set_param(g->edge_vectors);
     if (adaptive) ggml_set_param(g->cutoff_values);
@@ -541,6 +543,10 @@ void GraphModel::upload_conditioning(CachedGraph &g, int charge, int spin_multip
   std::vector<int32_t> c(g.n_atoms, ci), s(g.n_atoms, si);
   ggml_backend_tensor_set(g.charge_index, c.data(), 0, ggml_nbytes(g.charge_index));
   ggml_backend_tensor_set(g.spin_index, s.data(), 0, ggml_nbytes(g.spin_index));
+  if (g.system_index) { // one structure
+    std::vector<int32_t> z(g.n_atoms, 0);
+    ggml_backend_tensor_set(g.system_index, z.data(), 0, ggml_nbytes(g.system_index));
+  }
   g.cond_set = true, g.cond_charge = charge, g.cond_spin = spin_multiplicity;
 }
 

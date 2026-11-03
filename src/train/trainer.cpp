@@ -644,7 +644,8 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
     interp.set_input("spin_index", in(GGML_TYPE_I32, {n}, "spin_index"));
   }
   const bool heads = physnet_heads(interp);
-  if (heads) interp.set_input("system_index", in(GGML_TYPE_I32, {n}, "system_index"));
+  // heads, charge_spin_per_atom: per-structure sums over the atoms
+  if (interp.needs_system_index()) interp.set_input("system_index", in(GGML_TYPE_I32, {n}, "system_index"));
   // the heads' outputs of this build (metrics; their loss terms in the loss graphs)
   auto take_aux = [&] {
     for (int k = 0; k < 4; k++) {
@@ -928,7 +929,7 @@ void Worker::upload_inputs(StepGraph &g, const Batch &b, const std::vector<float
       std::tie(cond_rows_[0][a], cond_rows_[1][a]) = cond.rows(b.atom_charge[a], b.atom_spin[a]);
     src.insert(src.end(), {span(cond_rows_[0]), span(cond_rows_[1])});
   }
-  if (physnet_heads(model_.interpreter())) src.push_back(span(b.system_index));
+  if (model_.interpreter().needs_system_index()) src.push_back(span(b.system_index));
   if (g.loss_inputs) {
     src.insert(src.end(), {span(b.atom_weight), span(b.energy_target), span(b.force_target),
                            span(b.force_mask), span(b.force_scale), {norms, sizeof norms}});
@@ -2091,6 +2092,15 @@ void train(const TrainOptions &o) {
       test_split(o.data_dir + "/test");
   fmt::print("data: {} train / {} val / {} test structures\n", train_split.size(),
              val_split.size(), test_split.size());
+  if (o.energy_add_charge_ref != 0.0) {
+    for (MemmapSplit *sp : {&train_split, &val_split, &test_split}) {
+      if (!sp->has_conditioning_data() && sp->size() > 0)
+        throw std::runtime_error("--energy-add-charge-ref: " + sp->dir() + " has no charge.bin");
+      sp->add_charge_reference(o.energy_add_charge_ref);
+    }
+    fmt::print("--energy-add-charge-ref {}: target energies E + {} Q (eV, Q in e)\n", o.energy_add_charge_ref,
+               o.energy_add_charge_ref);
+  }
 
   // CUDA graphs pay off only for graphs that are computed again (tiles);
   // with dynamic shapes every step would capture into a new cache entry

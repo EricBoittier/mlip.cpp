@@ -2253,6 +2253,17 @@ void GraphInterpreter::capture_all_outputs(const CaptureCallback &cb) const {
 
 namespace mlipcpp::runtime {
 
+bool GraphInterpreter::needs_system_index(bool heads) const {
+  for (const auto &node : graph_.nodes) {
+    if (node.op != "PHYSNET") continue;
+    if (get_param<bool>(node, "charge_spin_per_atom", false)) return true;
+    if (heads)
+      for (const char *k : {"multitask_charges", "multitask_spins", "multitask_orbitals"})
+        if (get_param<bool>(node, k, false)) return true;
+  }
+  return false;
+}
+
 // mmml PhysNet / SpookyPhysNet (models/physnet/physnet_graph.h): one node, the
 // hyperparameters in its params, the weights and inputs by name
 ggml_tensor *GraphInterpreter::build_physnet(ggml_context *ctx, const GIRNode &node) {
@@ -2270,6 +2281,7 @@ ggml_tensor *GraphInterpreter::build_physnet(ggml_context *ctx, const GIRNode &n
   h.zbl_cuton = static_cast<float>(get_param<double>(node, "zbl_cuton", 0.1));
   h.energy_bias = get_param<bool>(node, "use_energy_bias", false);
   h.feature_rmsnorm = get_param<bool>(node, "feature_rmsnorm", false);
+  h.charge_spin_per_atom = get_param<bool>(node, "charge_spin_per_atom", false);
   // multitask heads (mmml model fields of the same names)
   h.head_charges = get_param<bool>(node, "multitask_charges", false);
   h.head_spins = get_param<bool>(node, "multitask_spins", false);

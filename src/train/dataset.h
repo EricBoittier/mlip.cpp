@@ -47,7 +47,14 @@ public:
   const float *positions(int64_t s) const { return x_.data() + 3 * na_[s]; }
   const int32_t *numbers(int64_t s) const { return a_.data() + na_[s]; }
   const float *cell(int64_t s) const { return c_.data() + 9 * s; }
-  float energy(int64_t s) const { return energy_[s]; }
+  /// target energy: energy.bin, + B Q with add_charge_reference(B) (float64 sum, as mmml)
+  float energy(int64_t s) const {
+    return charge_ref_ == 0.0 ? energy_[s] : static_cast<float>(double(energy_[s]) + charge_ref_ * charge(s));
+  }
+  /// mlipcpp-train --energy-add-charge-ref B (mmml --energy-add-charge-ref): energy(s) = E_s + B Q_s,
+  /// i.e. a linear reference term b_Q Q taken out of the stored energies (the files are not changed)
+  void add_charge_reference(double b) { charge_ref_ = b; }
+  double charge_reference() const { return charge_ref_; }
   const float *forces(int64_t s) const { return force_.data() + 3 * na_[s]; }
   /// total charge and spin multiplicity (charge.bin / spin_multiplicity.bin,
   /// float32 [ns, 1], metatrain's extra_data; absent: 0 and 1)
@@ -88,6 +95,7 @@ private:
   Mapped<float> x_, c_, energy_, force_;
   Mapped<int32_t> a_;
   std::vector<int32_t> charge_, spin_;
+  double charge_ref_ = 0.0;
   Mapped<float> pq_;
   Mapped<float> aux_[4];
   std::vector<uint8_t> aux_ok_[4];

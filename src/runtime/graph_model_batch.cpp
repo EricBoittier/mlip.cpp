@@ -125,6 +125,11 @@ std::vector<ModelResult> GraphModel::predict_batch(const std::vector<AtomicSyste
     }
     ggml_backend_tensor_set(g.charge_index, ci.data(), 0, ggml_nbytes(g.charge_index));
     ggml_backend_tensor_set(g.spin_index, si.data(), 0, ggml_nbytes(g.spin_index));
+    if (g.system_index) {
+      std::vector<int32_t> sys(n);
+      for (int k = 0; k < S; k++) std::fill(sys.begin() + atom0[k], sys.begin() + atom0[k + 1], k);
+      ggml_backend_tensor_set(g.system_index, sys.data(), 0, ggml_nbytes(g.system_index));
+    }
     g.cond_set = false;
   }
   profile.mark("inputs");

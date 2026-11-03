@@ -126,6 +126,15 @@ ggml_tensor *build_physnet(ggml_context *ctx, const PhysNetHypers &h, const Phys
     b.center = center = index_div_m(ggml_arange(c, 0.0f, float(E), 1.0f));
   }
 
+  // per-structure sums gathered back to the atoms: [1, n] (system_index; nullptr: one structure)
+  auto structure_sum = [&](ggml_tensor *x) {
+    if (!in.system_index) return ggml_repeat(c, ggml_sum(c, x), x);
+    ggml_tensor *sums = ggml_get_rows_back(c, x, in.system_index, ggml_new_tensor_2d(c, GGML_TYPE_F32, 1, n));
+    return ggml_reshape_2d(c, ggml_get_rows(c, sums, in.system_index), 1, n);
+  };
+  ggml_tensor *count = nullptr; // [1, n]: the atom count of the atom's structure
+  auto atom_count = [&] { return count ? count : (count = structure_sum(constant(c, {1, n}, 1.0f))); };
+
   // --- embedding (+ charge / spin conditioning) ---
   ggml_tensor *s = ggml_get_rows(c, b.w("embed"), in.species); // [F, n]
   ggml_tensor *v = nullptr;                                      // [F, 3, n]
@@ -135,6 +144,11 @@ ggml_tensor *build_physnet(ggml_context *ctx, const PhysNetHypers &h, const Phys
     ggml_tensor *q = ggml_get_rows(c, b.w("cond.charge_values"), in.charge_index); // [1, n]
     ggml_tensor *sp = ggml_get_rows(c, b.w("cond.spin_values"), in.spin_index);
     q_atom = q, mult_atom = sp;
+    if (h.charge_spin_per_atom) { // mmml: Q / N and (M - 1) / N, N the structure's atom count
+      ggml_tensor *inv_n = ggml_div(c, constant(c, {1, n}, 1.0f), atom_count());
+      q = ggml_mul(c, q, inv_n);
+      sp = ggml_mul(c, ggml_scale_bias(c, sp, 1.0f, -1.0f), inv_n);
+    }
     ggml_tensor *cq = ggml_add(c, ggml_mul_mat(c, b.w("cond.charge.w"), q), b.w("cond.charge.b"));
     ggml_tensor *cs = ggml_add(c, ggml_mul_mat(c, b.w("cond.spin.w"), sp), b.w("cond.spin.b"));
     s = ggml_add(c, s, ggml_add(c, cq, cs));
@@ -222,13 +236,7 @@ ggml_tensor *build_physnet(ggml_context *ctx, const PhysNetHypers &h, const Phys
       const std::string p = std::string("mt.") + name + ".";
       return ggml_add(c, ggml_mul_mat(c, b.w(p + "w"), s), ggml_get_rows(c, b.w(p + "zbias"), in.species));
     };
-    // per-structure sums gathered back to the atoms: [1, n]
-    auto structure_sum = [&](ggml_tensor *x) {
-      if (!in.system_index) return ggml_repeat(c, ggml_sum(c, x), x);
-      ggml_tensor *sums = ggml_get_rows_back(c, x, in.system_index, ggml_new_tensor_2d(c, GGML_TYPE_F32, 1, n));
-      return ggml_reshape_2d(c, ggml_get_rows(c, sums, in.system_index), 1, n);
-    };
-    ggml_tensor *count = (h.head_charges || h.head_spins) ? structure_sum(constant(c, {1, n}, 1.0f)) : nullptr;
+    if (h.head_charges || h.head_spins) atom_count();
     // x + (target - sum_s x) / N_s
     auto constrain = [&](ggml_tensor *x, ggml_tensor *target) {
       ggml_tensor *d = ggml_neg(c, structure_sum(x));

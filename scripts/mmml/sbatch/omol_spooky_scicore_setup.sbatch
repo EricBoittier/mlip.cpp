@@ -61,6 +61,12 @@ if [ ! -f "$M/init/spooky_f64_l1_i3_seed0_rms.gguf" ]; then   # RMSNORM=1: the s
     --feature-rmsnorm -o "$M/init/spooky_f64_l1_i3_seed0_rms.json"
   "$PY" "$SRC/scripts/convert_mmml.py" to-gguf "$M/init/spooky_f64_l1_i3_seed0_rms.json" -o "$M/init/spooky_f64_l1_i3_seed0_rms.gguf"
 fi
+if [ ! -f "$M/init/spooky_f64_l1_i3_seed0_rms_cspa.gguf" ]; then   # CSPA=1: + charge_spin_per_atom
+  PYTHONPATH=$P/mmml "$PY" "$SRC/scripts/mmml/make_random_checkpoint.py" --model-type spooky --features 64 --max-degree 1 \
+    --num-iterations 3 --num-basis-functions 32 --n-res 2 --max-atomic-number 87 --cutoff 6.0 --seed 0 --pristine \
+    --feature-rmsnorm --charge-spin-per-atom -o "$M/init/spooky_f64_l1_i3_seed0_rms_cspa.json"
+  "$PY" "$SRC/scripts/convert_mmml.py" to-gguf "$M/init/spooky_f64_l1_i3_seed0_rms_cspa.json" -o "$M/init/spooky_f64_l1_i3_seed0_rms_cspa.gguf"
+fi
 # multitask (MT=1 in omol_spooky_scicore.sbatch): the label data are not in the sciCORE caches; copy from
 # pc-studix (user terminal): mlipcpp_data/{pilot200k_mt,val50k_pilotref_mt} -> $M/data/, and
 # mlipcpp_runs/init/spooky_mt_f64_l1_i3_seed0_pilot200k.gguf -> $M/init/

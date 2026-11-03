@@ -76,6 +76,9 @@ public:
 
   // Get the GIR graph for inspection
   const GIRGraph &graph() const { return graph_; }
+  /// a PHYSNET node reads the input "system_index" (I32 [n], the atom's structure): multitask heads
+  /// (heads = true) or charge_spin_per_atom (per-structure atom counts); without it all atoms are one structure
+  bool needs_system_index(bool heads = true) const;
 
   // Output tensor of every built node, by GIR node id (valid until next build)
   const std::map<int, ggml_tensor *> &node_outputs() const { return node_outputs_; }

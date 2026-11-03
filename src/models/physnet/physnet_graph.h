@@ -14,7 +14,8 @@
 // Math (mmml models/model.py, spooky_model.py; e3x 1.0, Cartesian order,
 // Racah-normalised spherical harmonics, no pseudotensors, max_degree <= 1):
 //   basis_lm,k(r_ij) = Y_lm(u) T_k(2 e^{-r} - 1) exp(1 - 1/(1 - (r/rc)^2))
-//   x_i = Embed[Z_i] (+ Wq Q + bq + Ws S + bs for Spooky)
+//   x_i = Embed[Z_i] (+ Wq Q + bq + Ws S + bs for Spooky; charge_spin_per_atom: Q / N, (S - 1) / N,
+//     N the atom count of the structure, S = 2S+1 the multiplicity)
 //   per iteration t: filter f_l = basis_l W_l (MessagePass/filter),
 //     m_i = sum_j tensor(f_ij, x_j) with the paths 00->0, 11->0 (dot / sqrt 3),
 //     01->1, 10->1 (MessagePass/tensor kernel), the last iteration to degree 0,
@@ -48,6 +49,9 @@ struct PhysNetHypers {
   // mmml SpookyPhysNet feature_rmsnorm: after each refinement stage's final silu,
   // y <- y / sqrt(mean_{degree, feature}(y^2) + 1e-6), one scalar per atom (no parameters)
   bool feature_rmsnorm = false;
+  // mmml SpookyPhysNet charge_spin_per_atom: the conditioning inputs are Q / N and (M - 1) / N per atom,
+  // N the atom count of its structure (system_index; nullptr: all atoms), M the multiplicity 2S+1
+  bool charge_spin_per_atom = false;
   // multitask heads (mmml SpookyPhysNet multitask_*, proposals/SPOOKY_MULTITASK.md) on the
   // final scalar features x_i, the energy head's input:
   //   charges q_i = q~_i + (Q - sum_s q~) / N_s, q~_i = x_i w_q + b_q[Z_i]  (mt.charge.w, mt.charge.zbias)

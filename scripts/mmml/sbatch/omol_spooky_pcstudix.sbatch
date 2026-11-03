@@ -7,6 +7,7 @@
 #   sbatch scripts/mmml/sbatch/omol_spooky_pcstudix.sbatch                         # pilot, mmml loss (total E, w_E 1)
 #   sbatch --export=ALL,ELOSS=peratom,EW=1000,NAME=pilot_peratom_w1000 scripts/mmml/sbatch/omol_spooky_pcstudix.sbatch
 #   sbatch --export=ALL,RMSNORM=1 scripts/mmml/sbatch/omol_spooky_pcstudix.sbatch            # feature_rmsnorm model
+#   sbatch --export=ALL,CSPA=1,EQREF=5.661417917773716 scripts/mmml/sbatch/omol_spooky_pcstudix.sbatch  # + Q/N, (M-1)/N inputs, no b_Q Q ref
 #   sbatch --export=ALL,DATA=$OMOL/mlipcpp_data/full,EPOCHS=40,WARMUP=5000,NAME=full_total scripts/mmml/sbatch/omol_spooky_pcstudix.sbatch
 #
 # Resumable: submitting the same command again continues from $RUN/model.gguf.state (written every
@@ -28,13 +29,19 @@ BUILD=${BUILD:-$REPO/build-cuda-sm86}                         # CUDA_ARCHITECTUR
 # FROZEN_EBIAS=1: the per-element energy_bias stays at its init (0), not trained
 # RMSNORM=1: SpookyPhysNet feature_rmsnorm (mmml 1b5f7f615: per-atom RMS-normalised features after every
 #   refinement stage; without it forces do not train on OMol25); init from a JAX init with feature_rmsnorm=True
-MT=${MT:-0}; FROZEN_EBIAS=${FROZEN_EBIAS:-0}; RMSNORM=${RMSNORM:-0}
-[ "$RMSNORM" = 1 ] && { [ "$MT" = 1 ] || [ "$FROZEN_EBIAS" = 1 ]; } && { echo "RMSNORM=1: no MT / FROZEN_EBIAS init yet (pass INIT=)"; [ -n "${INIT:-}" ] || exit 2; }
+# CSPA=1: + charge_spin_per_atom (mmml 0e07d196d: charge / spin inputs Q / N and (M - 1) / N per atom, not the
+#   broadcast Q and M); implies RMSNORM=1; init spooky_f64_l1_i3_seed0_rms_cspa.gguf (a JAX init with both flags)
+# EQREF=B: mlipcpp-train --energy-add-charge-ref B (target energies E + B Q: the linear b_Q Q reference term taken
+#   out; pilot200k meta.json linear_ref.b_Q_eV_per_e = 5.661417917773716)
+MT=${MT:-0}; FROZEN_EBIAS=${FROZEN_EBIAS:-0}; RMSNORM=${RMSNORM:-0}; CSPA=${CSPA:-0}; EQREF=${EQREF:-}
+[ "$CSPA" = 1 ] && RMSNORM=1
+[ "$RMSNORM" = 1 ] && { [ "$MT" = 1 ] || [ "$FROZEN_EBIAS" = 1 ]; } && { echo "RMSNORM=1 / CSPA=1: no MT / FROZEN_EBIAS init yet (pass INIT=)"; [ -n "${INIT:-}" ] || exit 2; }
 SUF=$([ "$MT" = 1 ] && echo _mt || true)
 DATA=${DATA:-$OMOL/mlipcpp_data/pilot200k$SUF}                # train/ val/ (= the JAX 2 % valid split) test/
 I0=$OMOL/mlipcpp_runs/init
 if [ "$MT" = 1 ]; then INIT=${INIT:-$I0/spooky_mt_f64_l1_i3_seed0_$(basename "${DATA%_mt}").gguf}  # heads + HOMO/gap offsets
 elif [ "$FROZEN_EBIAS" = 1 ]; then INIT=${INIT:-$I0/spooky_f64_l1_i3_seed0_frozen_ebias.gguf}
+elif [ "$CSPA" = 1 ]; then INIT=${INIT:-$I0/spooky_f64_l1_i3_seed0_rms_cspa.gguf}   # ... --feature-rmsnorm --charge-spin-per-atom
 elif [ "$RMSNORM" = 1 ]; then INIT=${INIT:-$I0/spooky_f64_l1_i3_seed0_rms.gguf}   # make_random_checkpoint --pristine --feature-rmsnorm
 else INIT=${INIT:-$I0/spooky_f64_l1_i3_seed0.gguf}; fi        # flax init, seed 0 (make_random_checkpoint --pristine)
 ELOSS=${ELOSS:-total}     # total: mmml's default loss on E_s; peratom: on E_s / N_s (mlipcpp-train's default)
@@ -45,7 +52,8 @@ EXTRA=${EXTRA:-}
 # multitask loss weights (masked MSE, e^2 / e^2 / eV^2 / eV^2; mmml proposal defaults), Loewdin labels
 QW=${QW:-50}; SW=${SW:-20}; HW=${HW:-1}; GW=${GW:-1}
 [ "$MT" = 1 ] && EXTRA="$EXTRA --charge-weight $QW --spin-weight $SW --homo-weight $HW --gap-weight $GW --charge-scheme lowdin --spin-scheme lowdin"          # more mlipcpp-train flags (e.g. the multitask weights)
-NAME=${NAME:-$(basename "$DATA")_$([ "$MT" = 1 ] && echo mt || echo ef)_${ELOSS}_w${EW}$([ "$FROZEN_EBIAS" = 1 ] && echo _frozenbias || true)$([ "$RMSNORM" = 1 ] && echo _rms || true)}
+[ -n "$EQREF" ] && EXTRA="$EXTRA --energy-add-charge-ref $EQREF"
+NAME=${NAME:-$(basename "$DATA")_$([ "$MT" = 1 ] && echo mt || echo ef)_${ELOSS}_w${EW}$([ "$FROZEN_EBIAS" = 1 ] && echo _frozenbias || true)$([ "$RMSNORM" = 1 ] && echo _rms || true)$([ "$CSPA" = 1 ] && echo _cspa || true)$([ -n "$EQREF" ] && echo _eqref || true)}
 RUN=${RUN:-$OMOL/mlipcpp_runs/$NAME}
 PY=/mmhome/boittier/home/mmml-latest/.venv-cu12/bin/python
 export PYTHONPATH=/mmhome/boittier/home/metatomic-runs/training/watmeoh/perf/no_mpi4py:/mmhome/boittier/home/mmml-perf

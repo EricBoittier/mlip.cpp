@@ -300,3 +300,14 @@ mmml 1b5f7f615): each refinement stage's output is divided by its per-atom RMS o
 stack grows the OMol25 features ~800x and forces do not train. Off by default (GGUFs without the
 param are unchanged); `convert_mmml.py` carries it both ways. Init:
 `make_random_checkpoint.py --pristine --feature-rmsnorm`; sbatch: `RMSNORM=1`.
+
+Per-atom charge / spin inputs (node param `charge_spin_per_atom`, mmml SpookyPhysNet
+`charge_spin_per_atom=True`, mmml 0e07d196d): the charge and spin projections read Q / N and
+(M - 1) / N per atom (N the structure's atom count, M = 2S+1) instead of the broadcast Q and M, so
+per-atom terms linear in them sum to Q and 2S. No parameters; needs the graph input `system_index`
+in packed batches (mlipcpp-train and `predict_batch` set it). Off by default; `convert_mmml.py`
+carries it both ways. Init: `make_random_checkpoint.py --pristine --feature-rmsnorm --charge-spin-per-atom`;
+sbatch: `CSPA=1` (implies `RMSNORM=1`). With mmml's `--energy-add-charge-ref B`,
+`mlipcpp-train --energy-add-charge-ref B` trains on E + B Q (Q from `charge.bin`, every split; the
+files are unchanged), i.e. without the linear b_Q Q term of the reference (pilot200k: b_Q =
+5.661417917773716 eV/e, `meta.json` `linear_ref.b_Q_eV_per_e`); sbatch: `EQREF=B`.

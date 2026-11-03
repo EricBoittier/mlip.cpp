@@ -86,6 +86,8 @@ struct TrainOptions {
   // homo_energy.bin, homo_lumo_gap.bin); weight 0 or no head: off
   double aux_weight[4] = {0, 0, 0, 0}; // charges, spins, homo, gap
   std::string aux_charge_scheme = "lowdin", aux_spin_scheme = "lowdin";
+  // mmml --energy-add-charge-ref B: the target energies are E + B Q (every split; Q from charge.bin)
+  double energy_add_charge_ref = 0.0;
   // fine-tuning: keep the composition and scales stored in --init instead of
   // fitting them on the training set
   bool model_baselines = false;

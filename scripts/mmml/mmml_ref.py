@@ -187,6 +187,8 @@ def spooky_check_supported(config: dict, model_type: str) -> list[str]:
         bad.append("interaction_trust_map=True")
     if model_type != "spooky" and config.get("feature_rmsnorm", False):
         bad.append("feature_rmsnorm=True on PhysNet (a SpookyPhysNet option)")
+    if model_type != "spooky" and config.get("charge_spin_per_atom", False):
+        bad.append("charge_spin_per_atom=True on PhysNet (a SpookyPhysNet option)")
     return bad
 
 
@@ -210,6 +212,7 @@ def hypers(config: dict, model_type: str) -> dict:
         zbl_cuton=float(config["zbl_cuton"]) if config.get("zbl_cuton", 0.1) is not None else 0.0,
         use_energy_bias=bool(config.get("use_energy_bias", False)),
         feature_rmsnorm=bool(config.get("feature_rmsnorm", False)),
+        charge_spin_per_atom=bool(config.get("charge_spin_per_atom", False)),
     )
 
 
@@ -242,6 +245,8 @@ def numpy_energy(config: dict, params: dict, model_type: str, Z, R, Q=0.0, S=1.0
     vec = None  # [n, 3, F]
     if model_type == "spooky":
         cq, cs = p["charge_feature_projection"], p["spin_feature_projection"]
+        if h["charge_spin_per_atom"]:  # mmml: per-atom densities Q / N and (M - 1) / N, M = 2S+1
+            Q, S = Q / n, (S - 1) / n
         s = s + Q * cq["kernel"][0] + cq["bias"] + S * cs["kernel"][0] + cs["bias"]
     sig = lambda a: 1 / (1 + np.exp(-a))
 

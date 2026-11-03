@@ -108,6 +108,8 @@ struct Probe {
       interp.set_input("charge_index", input(GGML_TYPE_I32, {n}, "charge_index"));
       interp.set_input("spin_index", input(GGML_TYPE_I32, {n}, "spin_index"));
     }
+    if (interp.needs_system_index()) // PhysNet heads / charge_spin_per_atom: the atom's structure
+      interp.set_input("system_index", input(GGML_TYPE_I32, {n}, "system_index"));
     ggml_tensor *dv = input(GGML_TYPE_F32, {3, m, n}, "dv");
     ggml_tensor *dc = input(GGML_TYPE_F32, {m, n}, "dc");
 
@@ -176,6 +178,7 @@ struct Probe {
       set("charge_index", ci.data(), ci.size() * 4);
       set("spin_index", si.data(), si.size() * 4);
     }
+    if (in.count("system_index")) set("system_index", b.system_index.data(), b.system_index.size() * 4);
     set("species", b.species.data(), b.species.size() * 4);
     set("neighbor_species", b.neighbor_species.data(), b.neighbor_species.size() * 4);
     set("edge_vectors", b.edge_vectors.data(), b.edge_vectors.size() * 4);
