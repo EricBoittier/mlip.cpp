@@ -459,9 +459,8 @@ class PETFullModel(torch.nn.Module):
         PET's cutoff factors (padding_mask True = padded)."""
         if self.soap is None or self.soap_node is None:
             return None
-        from metatrain.pet.modules.soap_node import weighted_power_spectrum
         return self.soap_node.features(
-            weighted_power_spectrum(self.soap, edge_vectors, padding_mask, neighbor_species, cutoff_factors))
+            self.soap(edge_vectors, padding_mask, neighbor_species, neighbor_species[:, 0], cutoff_factors))
 
     def _soap_node_update(self, x, pn, point):
         return x if pn is None else self.soap_node.update(x, pn, point)
