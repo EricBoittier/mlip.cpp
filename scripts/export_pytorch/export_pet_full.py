@@ -400,6 +400,10 @@ class PETFullModel(torch.nn.Module):
             self.plato = _plato_lr.PlatoLRParts(pet_model, self.plato_lr)
             if self.plato_lr["mesh_coupling"]:
                 self.couple_at = self.plato_lr["couple_at"]
+        # SOAP-PET (metatrain plato_lr soap*; pet/modules/soap*.py): the shared power spectrum
+        # and the variants on it, plain traced torch (no custom ops)
+        self.soap = getattr(pet_model, 'soap', None)
+        self.soap_node = getattr(pet_model, 'soap_node', None)  # variant 1
         if self.conditioning:
             self.max_charge = int(self.system_conditioning.max_charge)
             self.max_spin_multiplicity = int(self.system_conditioning.max_spin_multiplicity)
@@ -449,6 +453,18 @@ class PETFullModel(torch.nn.Module):
             self.edge_force_final = torch.nn.ModuleList([
                 pet_model.edge_last_layers[name][i][key] for i in range(self.num_readout_layers)
             ])
+
+    def _soap_node_features(self, neighbor_species, edge_vectors, padding_mask, cutoff_factors):
+        """SOAP-PET variant 1: LayerNorm(p) for the node injections, the density weighted by
+        PET's cutoff factors (padding_mask True = padded)."""
+        if self.soap is None or self.soap_node is None:
+            return None
+        from metatrain.pet.modules.soap_node import weighted_power_spectrum
+        return self.soap_node.features(
+            weighted_power_spectrum(self.soap, edge_vectors, padding_mask, neighbor_species, cutoff_factors))
+
+    def _soap_node_update(self, x, pn, point):
+        return x if pn is None else self.soap_node.update(x, pn, point)
 
     def _token_positions(self, edge_vectors):
         """plato_lr frame RoPE: the centre at the origin, then the edge vectors."""
@@ -562,11 +578,12 @@ class PETFullModel(torch.nn.Module):
 
         # Process through GNN layers with per-layer energy readout
         token_positions = self._token_positions(edge_vectors)
+        soap_pn = self._soap_node_features(neighbor_species, edge_vectors, padding_mask, cutoff_factors)
         for gnn_idx, (node_embedder, gnn_layer) in enumerate(
             zip(self.node_embedders, self.gnn_layers)
         ):
             # Get node embeddings for this layer
-            input_node_embeddings = node_embedder(species)
+            input_node_embeddings = self._soap_node_update(node_embedder(species), soap_pn, gnn_idx)
 
             # Run GNN layer
             # Note: metatrain uses True=valid, False=padded convention
@@ -633,6 +650,8 @@ class PETFullModel(torch.nn.Module):
         """Feedforward featurization: combination_mlps between layers, final-only energy (pet-omad-s style)."""
         # Single node embedder used for all layers
         input_node_embeddings = self.node_embedders[0](species)
+        soap_pn = self._soap_node_features(neighbor_species, edge_vectors, padding_mask, cutoff_factors)
+        input_node_embeddings = self._soap_node_update(input_node_embeddings, soap_pn, 0)
 
         # Zero out padded positions in initial edge embeddings
         input_messages = torch.where(
@@ -670,7 +689,7 @@ class PETFullModel(torch.nn.Module):
             if gnn_idx == self.couple_at:  # plato_lr mesh coupling
                 output_node = output_node + self.plato.mesh_update(output_node)
             # Update node embeddings for next layer
-            input_node_embeddings = output_node
+            input_node_embeddings = self._soap_node_update(output_node, soap_pn, gnn_idx + 1)
 
             # Message passing with combination MLPs
             # Reverse the edge messages
