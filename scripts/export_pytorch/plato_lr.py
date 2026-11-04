@@ -126,6 +126,30 @@ def _(q, charge_unit, sigma, kcut, total_charge_constraint):
     return q.new_empty(q.shape[0])
 
 
+@torch.library.custom_op("mlipcpp::plato_les_ds", mutates_args=())
+def plato_les_ds(q: torch.Tensor, charge_unit: torch.Tensor, ds: torch.Tensor, sigma: float, kcut: float,
+                 total_charge_constraint: int) -> torch.Tensor:
+    """:func:`plato_les` with the damped and screened open-system kernel (metatrain
+    ``les_damp_screen``): pair kernel times ``(1 - w exp(-(r / a)^4)) (1 - s + s exp(-kappa r))``,
+    ``ds = (w, a_raw, s, kappa_raw)``, ``a``, ``kappa`` softplus. Periodic structures raise."""
+    from metatrain.pet.modules.plato_lr import les_energy_finite_ds
+    if "positions" not in CONTEXT:
+        return q.new_zeros(q.shape[0])
+    if CONTEXT.get("periodic", False):
+        raise ValueError("plato_les_ds: periodic structures are not supported")
+    pos = CONTEXT["positions"].to(q.dtype)
+    shift = q.mean(0)
+    if total_charge_constraint:
+        Q = float(CONTEXT.get("charge", 0.0)) / charge_unit.to(q.dtype)
+        shift = shift - Q / q.shape[0]
+    return les_energy_finite_ds(q - shift, pos, sigma, ds.to(q.dtype))
+
+
+@plato_les_ds.register_fake
+def _(q, charge_unit, ds, sigma, kcut, total_charge_constraint):
+    return q.new_empty(q.shape[0])
+
+
 @torch.library.custom_op("mlipcpp::les_cutoff_sub", mutates_args=())
 def les_cutoff_sub(q: torch.Tensor, edge_distances: torch.Tensor, cutoff_factors: torch.Tensor,
                    charge_unit: torch.Tensor, sigma: float, total_charge_constraint: int) -> torch.Tensor:
@@ -276,6 +300,10 @@ class PlatoLRParts(torch.nn.Module):
             self.les_charge_head = les.charge_head
             self.les_gate = les.les_gate
             self.register_buffer("les_charge_unit", les.charge_unit.clone())
+            self.les_damp_screen = bool(getattr(les, "damp_screen", False))
+            if self.les_damp_screen:  # the same Parameters (GGUF plato_les_damp_* / plato_les_screen_*)
+                self.les_damp_w, self.les_damp_a_raw = les.les_damp_w, les.les_damp_a_raw
+                self.les_screen_s, self.les_screen_kappa_raw = les.les_screen_s, les.les_screen_kappa_raw
 
     def mesh_update(self, x: torch.Tensor) -> torch.Tensor:
         h = self.h
@@ -298,8 +326,13 @@ class PlatoLRParts(torch.nn.Module):
             q = qi if q is None else q + qi
         h = self.h
         sigma = float(h["les_tail_sigma"]) if h.get("les_tail_sigma", 0.0) > 0 else float(h["les_sigma"])
-        e = torch.ops.mlipcpp.plato_les(q, self.les_charge_unit, sigma, float(h["les_kcut"]),
-                                        int(h["total_charge_constraint"]))
+        if getattr(self, "les_damp_screen", False):
+            ds = torch.cat([self.les_damp_w, self.les_damp_a_raw, self.les_screen_s, self.les_screen_kappa_raw])
+            e = torch.ops.mlipcpp.plato_les_ds(q, self.les_charge_unit, ds, sigma, float(h["les_kcut"]),
+                                               int(h["total_charge_constraint"]))
+        else:
+            e = torch.ops.mlipcpp.plato_les(q, self.les_charge_unit, sigma, float(h["les_kcut"]),
+                                            int(h["total_charge_constraint"]))
         if h.get("les_tail_subtract_cutoff", False):  # the part inside the neighbour list (padded slots: f_c = 0)
             e = e - torch.ops.mlipcpp.les_cutoff_sub(q, edge_distances, cutoff_factors, self.les_charge_unit,
                                                      sigma, int(h["total_charge_constraint"]))
@@ -352,3 +385,5 @@ def gguf_metadata(writer, h: dict) -> None:
         if h.get("les_tail_sigma", 0.0) > 0:  # absent: today's LES
             writer.add_float32("pet.plato_lr.les_tail_sigma", float(h["les_tail_sigma"]))
             writer.add_int32("pet.plato_lr.les_tail_subtract_cutoff", int(h["les_tail_subtract_cutoff"]))
+        if h.get("les_damp_screen", False):  # informational: the graph carries MLIPCPP_PLATO_LES_DS
+            writer.add_int32("pet.plato_lr.les_damp_screen", 1)

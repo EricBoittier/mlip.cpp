@@ -350,7 +350,7 @@ ggml_tensor *PetPlatoLR::build(ggml_context *ctx, const GIRNode &node, const std
   if (node.op == "MLIPCPP_ROPE_FRAME_ATTN") return rope_attn(ctx, node, in);
   if (node.op == "MLIPCPP_EDGE_GROUP_SUM") return edge_sum(ctx, in);
   if (node.op == "MLIPCPP_PLATO_MESH") return mesh_op(ctx, node, in);
-  if (node.op == "MLIPCPP_PLATO_LES") return les_op(ctx, node, in);
+  if (node.op == "MLIPCPP_PLATO_LES" || node.op == "MLIPCPP_PLATO_LES_DS") return les_op(ctx, node, in);
   if (node.op == "MLIPCPP_LES_CUTOFF_SUB") return les_sub(ctx, node, in);
   throw std::runtime_error("Plato-PET-LR: unknown graph op " + node.op);
 }
@@ -697,7 +697,9 @@ ggml_tensor *PetPlatoLR::les_sub(ggml_context *ctx, const GIRNode &node, const s
 }
 
 ggml_tensor *PetPlatoLR::les_op(ggml_context *ctx, const GIRNode &node, const std::vector<ggml_tensor *> &in) {
-  if (in.size() != 2) throw std::runtime_error("PLATO_LES: 2 inputs");
+  // PLATO_LES_DS: a third input ds = (w, a_raw, s, kappa_raw), the damped and screened open-system kernel
+  //   erf(r / (sqrt 2 sigma)) / r (1 - w exp(-(r / a)^4)) (1 - s + s exp(-kappa r)), a, kappa = softplus
+  if (in.size() != 2 && in.size() != 3) throw std::runtime_error("PLATO_LES: 2 or 3 inputs");
   ggml_tensor *q = cont(ctx, in[0]);
   const int64_t Q = q->ne[0], n = q->ne[1];
   const float sigma = static_cast<float>(param_num(node, "sigma", spec_.les_energy_sigma()));
@@ -711,11 +713,27 @@ ggml_tensor *PetPlatoLR::les_op(ggml_context *ctx, const GIRNode &node, const st
   if (n_pairs_ > 0) { // open structures: the erf pair sum, per atom
     ggml_tensor *r = pair_r(ctx);
     ggml_tensor *pair = ggml_div(ctx, ggml_plato_erf(ctx, ggml_scale(ctx, r, 1.0f / (std::sqrt(2.0f) * sigma))), r); // [1, P]
+    if (in.size() == 3) {
+      ggml_tensor *ds = cont(ctx, in[2]);
+      if (ggml_nelements(ds) != 4) throw std::runtime_error("PLATO_LES_DS: ds has 4 values");
+      auto el = [&](int k) { // ds[k] on every pair, [1, P]
+        return ggml_repeat(ctx, ggml_cont(ctx, ggml_view_1d(ctx, ds, 1, k * ggml_element_size(ds))), r);
+      };
+      auto softplus = [&](ggml_tensor *x) { return ggml_log(ctx, ggml_scale_bias(ctx, ggml_exp(ctx, x), 1.0f, 1.0f)); };
+      ggml_tensor *x = ggml_div(ctx, r, softplus(el(1)));
+      ggml_tensor *damp = ggml_scale_bias(ctx, ggml_mul(ctx, el(0), ggml_exp(ctx, ggml_scale(ctx, ggml_sqr(ctx, ggml_sqr(ctx, x)), -1.0f))),
+                                          -1.0f, 1.0f); // 1 - w exp(-(r/a)^4)
+      ggml_tensor *scr = ggml_scale_bias(ctx, ggml_mul(ctx, el(2), ggml_scale_bias(ctx, ggml_exp(ctx, ggml_neg(ctx, ggml_mul(ctx, softplus(el(3)), r))),
+                                                                              1.0f, -1.0f)),
+                                         1.0f, 1.0f); // 1 + s (exp(-kappa r) - 1)
+      pair = ggml_mul(ctx, ggml_mul(ctx, pair, damp), scr);
+    }
     ggml_tensor *s = ggml_add(ctx, ggml_get_rows_back(ctx, ggml_mul(ctx, ggml_get_rows(ctx, q, pair_j_), pair), pair_i_, q),
                               ggml_get_rows_back(ctx, ggml_mul(ctx, ggml_get_rows(ctx, q, pair_i_), pair), pair_j_, q)); // [Q, n]
     acc(ggml_scale(ctx, ggml_sum_rows(ctx, ggml_mul(ctx, q, s)), static_cast<float>(0.5 * KE)));
   }
   if (!groups_.empty()) {
+    if (in.size() == 3) throw std::runtime_error("PLATO_LES_DS: periodic structures are not supported (no screened Ewald sum)");
     ggml_tensor *fr = frac(ctx);
     // the self energy of the periodic atoms, per atom: q^2 / (sqrt(2 pi) sigma)
     ggml_tensor *pmask = nullptr;
