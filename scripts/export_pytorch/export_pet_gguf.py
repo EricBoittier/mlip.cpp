@@ -36,7 +36,7 @@ GGUF_VERSION = 3
 # GGML tensor types
 GGML_TYPE_F32 = 0
 GGML_TYPE_F16 = 1
-GGML_TYPE_I32 = 4
+GGML_TYPE_I32 = 26
 
 # GGUF value types
 GGUF_TYPE_UINT32 = 4
@@ -92,6 +92,11 @@ class GGUFWriter:
         # Convert to float32 if needed
         if tensor.dtype in (torch.float16, torch.bfloat16):
             tensor = tensor.float()
+        # integer buffers (e.g. SOAP's index tables): GGML I32
+        if tensor.dtype == torch.int64:
+            if tensor.numel() and int(tensor.abs().max()) >= 2**31:
+                raise ValueError(f"{name}: int64 values beyond int32")
+            tensor = tensor.to(torch.int32)
 
         # Transpose 2D weight matrices for GGML MUL_MAT compatibility
         # GGML MUL_MAT: C = A @ B where A is [out, in] -> need [in, out] in GGML

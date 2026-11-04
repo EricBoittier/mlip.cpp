@@ -240,6 +240,9 @@ ATEN_TO_GGML = {
     "aten.masked_fill.Scalar": "MASKED_FILL",
     "aten.masked_fill": "MASKED_FILL",
     "aten.bitwise_not": "BITWISE_NOT",
+    # boolean masks: logical_not is bitwise_not (unmapped ops pass their input through)
+    "aten.logical_not.default": "BITWISE_NOT",
+    "aten.logical_not": "BITWISE_NOT",
     "aten.ge.Scalar": "GE",
     "aten.ge": "GE",
     "aten.le.Scalar": "LE",
@@ -1257,6 +1260,18 @@ def convert_exported_to_gir(
                         eps = 1e-8  # eps=None in PyTorch, use tiny value for GGML stability
                     input_refs = [r for r in [inp_ref, weight_ref] if r]
                     params["eps"] = eps
+
+            elif ggml_op == "GET_ROWS" and "index_select" in str(node.target):
+                # index_select(self, dim, index): rows along torch dim ``dim``
+                src_ref = name_map.get(node.args[0].name) if isinstance(node.args[0], fx.Node) else None
+                idx_ref = name_map.get(node.args[2].name) if isinstance(node.args[2], fx.Node) else None
+                if src_ref and idx_ref:
+                    input_refs = [src_ref, idx_ref]
+                rank = len(node.args[0].meta["val"].shape) if "val" in node.args[0].meta else None
+                dim = int(node.args[1])
+                params["dim"] = dim + rank if (dim < 0 and rank is not None) else dim
+                if rank is not None:
+                    params["rank"] = rank
 
             elif ggml_op == "GET_ROWS":
                 # embedding: weight, indices

@@ -285,7 +285,9 @@ ggml_tensor *GraphInterpreter::build(ggml_context *ctx) {
   zeros_.clear();
 
   // Build nodes in order (they should already be topologically sorted)
+  static const bool trace = std::getenv("MLIPCPP_TRACE_NODES") != nullptr;
   for (const auto &node : graph_.nodes) {
+    if (trace) std::fprintf(stderr, "[gir] node %d %s %s\n", int(node.id), node.op.c_str(), node.name.c_str());
     ggml_tensor *output = nullptr;
     try {
       output = build_node(ctx, node);
@@ -465,6 +467,29 @@ ggml_tensor *GraphInterpreter::build_node(ggml_context *ctx,
 
 // ===================== Binary Operations =====================
 
+// Two-way (numpy) broadcasting for the element-wise binary ops: ggml's add / sub /
+// mul / div broadcast only their second operand into the first. When b does not
+// repeat into a, both are repeated to the common shape (each dimension equal or 1),
+// e.g. SOAP's r[..., None] - centers: [1, m, n] and [n_max] -> [n_max, m, n].
+// grad_b: ggml's SUB / DIV backward passes the output-shaped gradient to b
+// unreduced, so a broadcast b that needs a gradient is repeated explicitly.
+static void broadcast_operands(ggml_context *ctx, ggml_tensor *&a, ggml_tensor *&b, bool grad_b = false) {
+  if (ggml_can_repeat(b, a)) {
+    if (grad_b && !ggml_are_same_shape(a, b) && depends_on_parameter(b)) b = ggml_repeat(ctx, b, a);
+    return;
+  }
+  int64_t ne[GGML_MAX_DIMS];
+  for (int i = 0; i < GGML_MAX_DIMS; i++) {
+    if (a->ne[i] != b->ne[i] && a->ne[i] != 1 && b->ne[i] != 1)
+      throw std::runtime_error("binary op: shapes do not broadcast");
+    ne[i] = std::max(a->ne[i], b->ne[i]);
+  }
+  ggml_tensor *shape = ggml_new_tensor(ctx, a->type, GGML_MAX_DIMS, ne);
+  if (!ggml_are_same_shape(a, shape)) a = ggml_repeat(ctx, a, shape);
+  if (!ggml_are_same_shape(b, shape) && (!ggml_can_repeat(b, a) || (grad_b && depends_on_parameter(b))))
+    b = ggml_repeat(ctx, b, shape);
+}
+
 ggml_tensor *GraphInterpreter::build_add(ggml_context *ctx,
                                          const GIRNode &node) {
   if (node.inputs.empty()) {
@@ -490,6 +515,7 @@ ggml_tensor *GraphInterpreter::build_add(ggml_context *ctx,
   if (ggml_nelements(a) < ggml_nelements(b)) {
     std::swap(a, b);
   }
+  broadcast_operands(ctx, a, b);
   return ggml_add(ctx, a, b);
 }
 
@@ -512,6 +538,7 @@ ggml_tensor *GraphInterpreter::build_sub(ggml_context *ctx,
     throw std::runtime_error("SUB requires 2 inputs (or 1 input with scalar param)");
   }
   ggml_tensor *b = resolve_input(ctx, node.inputs[1]);
+  broadcast_operands(ctx, a, b, true);
   return ggml_sub(ctx, a, b);
 }
 
@@ -526,6 +553,7 @@ ggml_tensor *GraphInterpreter::build_mul(ggml_context *ctx,
   // Check for scalar multiplication (tensor * scalar)
   if (node.inputs.size() == 1 && has_param(node, "scalar")) {
     float scalar = static_cast<float>(get_param<double>(node, "scalar", 1.0));
+    if (!ggml_is_contiguous(a)) a = ggml_cont(ctx, a); // ggml_scale needs a contiguous source
     return ggml_scale(ctx, a, scalar);
   }
 
@@ -540,6 +568,7 @@ ggml_tensor *GraphInterpreter::build_mul(ggml_context *ctx,
   if (ggml_nelements(a) < ggml_nelements(b)) {
     std::swap(a, b);
   }
+  broadcast_operands(ctx, a, b);
   if (fuse_glu_) {
     auto sigmoid_of = [](ggml_tensor *t) {
       return t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == GGML_UNARY_OP_SIGMOID ? t->src[0] : nullptr;
@@ -568,11 +597,13 @@ ggml_tensor *GraphInterpreter::build_div(ggml_context *ctx,
       if (scalar == 0.0f) {
         throw std::runtime_error("DIV: division by zero scalar");
       }
+      if (!ggml_is_contiguous(a)) a = ggml_cont(ctx, a);
       return ggml_scale(ctx, a, 1.0f / scalar);
     }
     throw std::runtime_error("DIV requires 2 inputs (or 1 input with scalar param)");
   }
   ggml_tensor *b = resolve_input(ctx, node.inputs[1]);
+  broadcast_operands(ctx, a, b, true);
   return ggml_div(ctx, a, b);
 }
 
@@ -903,6 +934,14 @@ ggml_tensor *GraphInterpreter::build_select(ggml_context *ctx,
   // Use expected input dims, not GGML's compressed dims
   int ggml_dim = n_dims_input - 1 - py_dim;
 
+  // one element of a 1-D tensor (e.g. a per-layer gate g[l]): a 0-d result, as [1]
+  if (n_dims_input == 1 && py_dim == 0) {
+    if (idx < 0) idx += a->ne[0];
+    if (idx < 0 || idx >= a->ne[0] || ggml_nelements(a) != a->ne[0])
+      throw std::runtime_error("SELECT: index out of range of a 1-D tensor");
+    return ggml_view_1d(ctx, a, 1, static_cast<size_t>(idx) * a->nb[0]);
+  }
+
   if (ggml_dim < 0 || ggml_dim >= n_dims_input) {
     throw std::runtime_error("SELECT: invalid dimension: py_dim=" +
                              std::to_string(py_dim) + " for " +
@@ -930,10 +969,12 @@ ggml_tensor *GraphInterpreter::build_select(ggml_context *ctx,
       return ggml_view_3d(ctx, a, a->ne[0], a->ne[1], a->ne[2],
                           a->nb[1], a->nb[2], offset);
     } else if (ggml_dim == 0) {
-      // PyTorch dim=3: select from ne0, result is [ne1, ne2, ne3]
-      // This is selecting a single element from the innermost dimension
-      return ggml_view_3d(ctx, a, a->ne[1], a->ne[2], a->ne[3],
-                          a->nb[2], a->nb[3], idx * a->nb[0]);
+      // PyTorch dim=3: select from ne0, result is [ne1, ne2, ne3]. The slice is
+      // strided along ne1 (a view's first axis must be contiguous): a [1, ne1,
+      // ne2, ne3] view, made contiguous and reshaped
+      ggml_tensor *v = ggml_view_4d(ctx, a, 1, a->ne[1], a->ne[2], a->ne[3],
+                                    a->nb[1], a->nb[2], a->nb[3], idx * a->nb[0]);
+      return ggml_reshape_3d(ctx, ggml_cont(ctx, v), a->ne[1], a->ne[2], a->ne[3]);
     }
   } else if (n_dims_input == 3) {
     if (ggml_dim == 1) {
@@ -944,15 +985,18 @@ ggml_tensor *GraphInterpreter::build_select(ggml_context *ctx,
       return ggml_view_2d(ctx, a, a->ne[0], a->ne[1], a->nb[1], offset);
     } else if (ggml_dim == 0) {
       // Selecting from first dimension (PyTorch last): [ne0, ne1, ne2] -> [ne1, ne2]
-      return ggml_view_2d(ctx, a, a->ne[1], a->ne[2], a->nb[2], idx * a->nb[0]);
+      // (strided along ne1: a [1, ne1, ne2] view, made contiguous and reshaped)
+      ggml_tensor *v = ggml_view_3d(ctx, a, 1, a->ne[1], a->ne[2], a->nb[1], a->nb[2], idx * a->nb[0]);
+      return ggml_reshape_2d(ctx, ggml_cont(ctx, v), a->ne[1], a->ne[2]);
     }
   } else if (n_dims_input == 2) {
     if (ggml_dim == 1) {
       // 2D selecting from PyTorch dim 0: [ne0, ne1] -> [ne0]
       return ggml_view_1d(ctx, a, a->ne[0], offset);
     } else if (ggml_dim == 0) {
-      // 2D selecting from PyTorch dim 1: [ne0, ne1] -> [ne1]
-      return ggml_view_1d(ctx, a, a->ne[1], idx * a->nb[0]);
+      // 2D selecting from PyTorch dim 1: [ne0, ne1] -> [ne1] (strided: a [1, ne1] view)
+      ggml_tensor *v = ggml_view_2d(ctx, a, 1, a->ne[1], a->nb[1], idx * a->nb[0]);
+      return ggml_reshape_1d(ctx, ggml_cont(ctx, v), a->ne[1]);
     }
   }
 
@@ -1262,7 +1306,18 @@ ggml_tensor *GraphInterpreter::build_sum_rows(ggml_context *ctx,
 
 ggml_tensor *GraphInterpreter::build_repeat(ggml_context *ctx,
                                             const GIRNode &node) {
-  if (node.inputs.size() < 2) {
+  // expand() with symbolic sizes: the converter adds the tensors the sizes come
+  // from as extra inputs, so a second input is a template only when its shape is
+  // the output's; otherwise the (resolved) output_shape is
+  bool from_shape = node.inputs.size() < 2;
+  if (!from_shape && !node.output_shape.empty()) {
+    auto want = resolve_shape(node.output_shape);
+    std::reverse(want.begin(), want.end());
+    ggml_tensor *b = resolve_input(ctx, node.inputs[1]);
+    for (size_t i = 0; i < GGML_MAX_DIMS; i++)
+      if ((i < want.size() ? want[i] : 1) != b->ne[i]) from_shape = true;
+  }
+  if (from_shape) {
     // Need a template tensor for repeat
     // If not provided, create one from output_shape
     ggml_tensor *a = resolve_input(ctx, node.inputs[0]);
@@ -1580,6 +1635,17 @@ ggml_tensor *GraphInterpreter::build_get_rows(ggml_context *ctx,
 
   ggml_tensor *weight_table = resolve_input(ctx, node.inputs[0]);
   ggml_tensor *indices = resolve_input(ctx, node.inputs[1]);
+
+  // index_select(x, dim, idx) with dim != 0 (rank-2 x, dim 1: columns): select
+  // the rows of x^T, then transpose back
+  if (has_param(node, "dim") && get_param<int64_t>(node, "dim", 0) != 0) {
+    const int64_t dim = get_param<int64_t>(node, "dim", 0);
+    const int64_t rank = get_param<int64_t>(node, "rank", ggml_n_dims(weight_table));
+    if (rank != 2 || dim != 1 || ggml_n_dims(indices) != 1)
+      throw std::runtime_error("GET_ROWS (index_select): only dim 1 of a rank-2 tensor with 1-D indices");
+    ggml_tensor *xt = ggml_cont(ctx, ggml_transpose(ctx, weight_table)); // [R, C] -> ne (R, C)
+    return ggml_cont(ctx, ggml_transpose(ctx, ggml_get_rows(ctx, xt, indices)));
+  }
 
 
   // Get original indices shape for later reshape

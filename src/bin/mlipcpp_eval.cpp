@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <optional>
@@ -107,6 +108,21 @@ int main(int argc, char *argv[]) {
             pbc[i] = c->periodic[i];
             for (int j = 0; j < 3; j++) cell[3 * i + j] = c->matrix[i][j];
           }
+        }
+        // MLIPCPP_DUMP_DIR=DIR (debug): the first frame's node activations (energy graph,
+        // charge 0 / spin 1) as DIR/<id>.bin plus DIR/index.json (name, dtype, shape)
+        if (const char *dd = std::getenv("MLIPCPP_DUMP_DIR"); dd && *dd && frames.empty()) {
+          ActivationResult act = model.predict_with_activations(sys.num_atoms(), sys.positions(), sys.atomic_numbers(),
+                                                                 sys.cell() ? cell : nullptr, sys.cell() ? pbc : nullptr);
+          std::filesystem::create_directories(dd);
+          nlohmann::json idx = nlohmann::json::array();
+          for (const auto &a : act.activations) {
+            std::ofstream(std::string(dd) + "/" + std::to_string(a.node_id) + ".bin", std::ios::binary)
+                .write(reinterpret_cast<const char *>(a.data.data()), static_cast<std::streamsize>(a.data.size()));
+            idx.push_back({{"id", a.node_id}, {"name", a.name}, {"dtype", a.dtype}, {"shape", a.shape}});
+          }
+          std::ofstream(std::string(dd) + "/index.json") << idx.dump(1) << "\n";
+          std::cerr << act.activations.size() << " activations -> " << dd << " (energy " << act.prediction.energy << ")\n";
         }
         Result r = model.predict(sys.num_atoms(), sys.positions(), sys.atomic_numbers(),
                                  sys.cell() ? cell : nullptr, sys.cell() ? pbc : nullptr, po);

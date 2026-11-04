@@ -497,19 +497,21 @@ bool GraphModel::load_from_gguf(const std::string &path) {
       // Use PyTorch shape from metadata, reversed for GGML convention
       auto py_shape = weight_shapes[name].get<std::vector<int64_t>>();
       std::vector<int64_t> ggml_shape(py_shape.rbegin(), py_shape.rend());
+      // F32 weights; integer buffers (e.g. SOAP index tables) stay I32
+      const ggml_type wt = temp->type == GGML_TYPE_I32 ? GGML_TYPE_I32 : GGML_TYPE_F32;
       switch (ggml_shape.size()) {
       case 0:
-        t = ggml_new_tensor_1d(ctx_weights_, GGML_TYPE_F32, 1);
+        t = ggml_new_tensor_1d(ctx_weights_, wt, 1);
         break;
       case 1:
-        t = ggml_new_tensor_1d(ctx_weights_, GGML_TYPE_F32, ggml_shape[0]);
+        t = ggml_new_tensor_1d(ctx_weights_, wt, ggml_shape[0]);
         break;
       case 2:
-        t = ggml_new_tensor_2d(ctx_weights_, GGML_TYPE_F32, ggml_shape[0],
+        t = ggml_new_tensor_2d(ctx_weights_, wt, ggml_shape[0],
                                ggml_shape[1]);
         break;
       case 3:
-        t = ggml_new_tensor_3d(ctx_weights_, GGML_TYPE_F32, ggml_shape[0],
+        t = ggml_new_tensor_3d(ctx_weights_, wt, ggml_shape[0],
                                ggml_shape[1], ggml_shape[2]);
         break;
       default:
