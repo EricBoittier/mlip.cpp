@@ -71,6 +71,14 @@ struct Batch {
   std::vector<float> ref_charge, ref_ok;
   int n_ref_skipped = 0; // structures with partial charges that were left out (NaN, constant, < 3 atoms)
   float charge_norm = 0.0f;
+  // fragment-sum charge loss (--frag-charge-weight): per atom its loss column
+  // (system k * kFragCap + fragment, -1: none), per column the DFT partial-charge sum of
+  // the fragment, the columns used in this batch and frag_norm: 1 / the columns of the whole step
+  static constexpr int kFragCap = 8;
+  std::vector<int32_t> frag_col;
+  std::vector<float> frag_target;
+  int n_frag = 0;
+  float frag_norm = 0.0f;
 
   // Loss normalisation: 1/S and 1/(3N) of the *whole* step batch, so that
   // micro-batch losses (and gradients) sum to the full-batch ones.

@@ -118,6 +118,23 @@ bool MemmapSplit::load_partial_charges(const std::string &target) {
   return true;
 }
 
+bool MemmapSplit::load_fragments() {
+  const std::string path = dir_ + "/fragment.bin";
+  if (!std::filesystem::exists(path)) return false;
+  frag_ = Mapped<int32_t>(path);
+  if (frag_.size() != static_cast<size_t>(na_.back()))
+    throw std::runtime_error(path + ": " + std::to_string(frag_.size()) + " values for " + std::to_string(na_.back()) + " atoms");
+  return true;
+}
+
+int MemmapSplit::fragment_columns(int64_t s, int cap) const {
+  if (!frag_.size() || !partial_charges_ok(s)) return 0;
+  const int32_t *f = fragments(s);
+  int32_t hi = 0;
+  for (int i = 0; i < n_atoms(s); i++) hi = std::max(hi, f[i]);
+  return hi >= 1 ? std::min<int>(hi + 1, cap) : 0;
+}
+
 bool MemmapSplit::partial_charges_ok(int64_t s) const {
   if (!pq_.size() || n_atoms(s) < 3) return false;
   const float *p = partial_charges(s);

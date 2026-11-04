@@ -62,6 +62,14 @@ public:
   /// structure s usable for the charge correlation: >= 3 atoms, every partial charge finite
   /// (NBO has NaN for failed analyses) and not all equal
   bool partial_charges_ok(int64_t s) const;
+  /// covalently bonded fragment of every atom, fragment.bin (int32 [N], 0-based per structure;
+  /// scripts/plato_lr/fragments.py), for mlipcpp-train --frag-charge-weight; false if absent
+  bool load_fragments();
+  bool has_fragments() const { return frag_.size() > 0; }
+  const int32_t *fragments(int64_t s) const { return frag_.size() ? frag_.data() + na_[s] : nullptr; }
+  /// fragment-sum loss columns of structure s: its number of fragments (at most cap; fragments
+  /// cap-1 and above share the last column) when it has two or more and usable partial charges, else 0
+  int fragment_columns(int64_t s, int cap) const;
 
   /// System s as an AtomicSystem. Zero cell rows become non-periodic vacuum
   /// vectors so the cell stays invertible for the neighbour-list grid.
@@ -77,6 +85,7 @@ private:
   Mapped<int32_t> a_;
   std::vector<int32_t> charge_, spin_;
   Mapped<float> pq_;
+  Mapped<int32_t> frag_;
 };
 
 /// Neighbour lists of every structure in a split, built once and cached on

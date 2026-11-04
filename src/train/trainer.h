@@ -75,6 +75,11 @@ struct TrainOptions {
   // them, with fewer than 3 atoms, a NaN or a constant reference are left out; weight 0: off
   double charge_corr_weight = 0.0, charge_corr_min = 1.0;
   std::string charge_corr_target = "mulliken";
+  // fragment-sum charge loss (Plato-PET-LR): weight * mean over fragment columns of
+  // (sum_{i in f} q_i - sum_{i in f} q^DFT_i)^2, e^2; q the first latent charge channel in e (after the
+  // total-charge shift), q^DFT the --charge-corr-target partial charges, fragments from <split>/fragment.bin;
+  // structures with two or more fragments only (at most Batch::kFragCap columns each); weight 0: off
+  double frag_charge_weight = 0.0;
   double energy_weight = 1.0, force_weight = 1.0, nc_force_weight = 1.0;
   // fine-tuning: keep the composition and scales stored in --init instead of
   // fitting them on the training set
@@ -127,6 +132,8 @@ struct StepStats {
   double loss_nc = 0, se_force_nc = 0; // conservative mode: the direct head's term and (eV/Å)^2
   double loss_charge = 0, sum_charge_r = 0; // charge correlation: loss term, sum of r over the structures taking part
   int64_t n_charge_r = 0, n_charge_skipped = 0;
+  double loss_frag = 0, se_frag = 0; // fragment-sum charge loss: loss term, sum of squared fragment errors (e^2)
+  int64_t n_frag = 0;
   double se_energy_per_atom = 0; // Σ_s (ΔE_s / N_s)^2, eV^2
   double se_force = 0;           // Σ_i,k ΔF_ik^2, (eV/Å)^2 (conservative mode: of -dE/dx)
   // MAE and R^2 = 1 - SSE / SST (energies per atom after the composition,
@@ -210,6 +217,7 @@ public:
   struct ChargeCorr {
     double weight = 0.0, r_min = 1.0;
   } charge_corr;
+  double frag_charge_weight = 0.0;
 
   /// Profiling: compute node by node (synchronised) and accumulate, per op
   /// ("fwd:OP" / "bwd:OP"; conservative mode "F.fwd:OP" / "F.bwd:OP" for the
@@ -274,6 +282,8 @@ private:
     ggml_tensor *grad_x = nullptr, *dx = nullptr, *jvp_scale = nullptr;
     // charge correlation: inputs (partial charges, structures taking part, weight x norm) and r [1, G]
     ggml_tensor *qref = nullptr, *qok = nullptr, *qw = nullptr, *charge_r = nullptr, *charge_loss = nullptr;
+    // fragment-sum charge loss: inputs (column one-hot [n, F], targets [F], weight x norm), error per column [F]
+    ggml_tensor *fonehot = nullptr, *ftarget = nullptr, *fw = nullptr, *frag_d = nullptr;
     ~StepGraph();
   };
   /// graph kinds: the loss (FORWARD / BACKWARD to the weights); conservative
@@ -300,6 +310,8 @@ private:
   std::vector<float> plato_dx_;
   ggml_tensor *charge_corr_graph(StepGraph &g, ggml_context *ctx, int S, bool loss); // r [1, G] (+ the loss term)
   void charge_corr_stats(StepGraph &g, const Batch &b, StepStats &st);
+  ggml_tensor *frag_charge_graph(StepGraph &g, ggml_context *ctx, int S, bool loss); // error per column (+ the loss term)
+  void frag_charge_stats(StepGraph &g, const Batch &b, StepStats &st);
   float plato_jvp_scale_ = 1.0f;
   void plato_create(StepGraph &g, ggml_context *ctx, int n, bool grad);
 

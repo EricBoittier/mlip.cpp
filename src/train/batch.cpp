@@ -212,6 +212,18 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
         if (b.ref_ok[k] != 0.0f)
           std::copy(split.partial_charges(s), split.partial_charges(s) + ns, b.ref_charge.begin() + offset);
       }
+      if (split.has_fragments()) {
+        if (b.frag_col.empty()) b.frag_col.assign(n, -1), b.frag_target.assign(size_t(b.n_systems) * Batch::kFragCap, 0.0f);
+        if (const int cols = split.fragment_columns(s, Batch::kFragCap)) {
+          const int32_t *fr = split.fragments(s);
+          const float *pq = split.partial_charges(s);
+          for (int i = 0; i < ns; i++) {
+            const int c = k * Batch::kFragCap + std::min(fr[i], cols - 1);
+            b.frag_col[offset + i] = c, b.frag_target[c] += pq[i];
+          }
+          b.n_frag += cols;
+        }
+      }
     }
     b.energy_target[k] = static_cast<float>(
         (split.energy(s) - scaling.comp(Z, ns)) / (scaling.energy_scale * ns));
@@ -254,6 +266,9 @@ std::vector<Batch> make_microbatches(const MemmapSplit &split, const NeighborCac
   int n_ok = 0;
   for (int64_t s : ids) n_ok += split.partial_charges_ok(s);
   const float charge_norm = n_ok ? 1.0f / n_ok : 0.0f;
+  int n_cols = 0;
+  for (int64_t s : ids) n_cols += split.fragment_columns(s, Batch::kFragCap);
+  const float frag_norm = n_cols ? 1.0f / n_cols : 0.0f;
   std::vector<size_t> order(ids.size());
   std::iota(order.begin(), order.end(), 0);
   std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
@@ -281,6 +296,7 @@ std::vector<Batch> make_microbatches(const MemmapSplit &split, const NeighborCac
     out.back().energy_norm = 1.0f / ids.size();
     out.back().force_norm = 1.0f / (3.0f * n_total);
     out.back().charge_norm = charge_norm;
+    out.back().frag_norm = frag_norm;
     g_ids.clear(), g_rot.clear(), g_atoms = 0;
   };
   for (size_t k : order) {
@@ -312,6 +328,9 @@ std::vector<std::vector<Batch>> make_step_batches(const MemmapSplit &split, cons
   int n_ok = 0;
   for (int64_t s : ids) n_ok += split.partial_charges_ok(s);
   const float charge_norm = n_ok ? static_cast<float>(W) / n_ok : 0.0f;
+  int n_cols = 0;
+  for (int64_t s : ids) n_cols += split.fragment_columns(s, Batch::kFragCap);
+  const float frag_norm = n_cols ? static_cast<float>(W) / n_cols : 0.0f;
   std::vector<size_t> order(K);
   std::iota(order.begin(), order.end(), 0);
   std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
@@ -399,6 +418,7 @@ std::vector<std::vector<Batch>> make_step_batches(const MemmapSplit &split, cons
       b.energy_norm = static_cast<float>(W) / K;
       b.force_norm = static_cast<float>(W) / (3.0f * atoms[K]);
       b.charge_norm = charge_norm;
+      b.frag_norm = frag_norm;
       return b;
     }));
   std::vector<std::vector<Batch>> out(W);

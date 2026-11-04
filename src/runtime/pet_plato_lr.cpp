@@ -92,7 +92,7 @@ void PetPlatoLR::create(ggml_context *ctx, const PetPlatoLRSpec &spec, const std
                         int n_atoms, bool grad) {
   spec_ = spec, st_ = structures, n_ = n_atoms;
   all_.clear(), groups_.clear();
-  frac_ = pair_r_ = charges_ = key_log_keep_ = nbr_ = nullptr;
+  frac_ = pair_r_ = charges_ = charge_unit_ = key_log_keep_ = nbr_ = nullptr;
   lazy_i32_.clear(), lazy_f32_.clear();
   swap_halves_ = rope_sign_ = slot_mask_ = nullptr;
   strain = nullptr, pair_i_ = pair_j_ = nullptr, atom_inv_cell_t_ = nullptr, open_mask_ = nullptr;
@@ -704,7 +704,7 @@ ggml_tensor *PetPlatoLR::les_op(ggml_context *ctx, const GIRNode &node, const st
   const float kcut = static_cast<float>(param_num(node, "kcut", spec_.les_kcut));
   const bool tcc = param_num(node, "total_charge_constraint", spec_.total_charge_constraint) != 0;
   q = les_shift(ctx, q, in[1], tcc);
-  charges_ = q;
+  charges_ = q, charge_unit_ = in[1];
   ggml_tensor *qt = nullptr;
   ggml_tensor *e = nullptr; // [1, n]
   auto acc = [&](ggml_tensor *t) { e = e ? ggml_add(ctx, e, t) : t; };

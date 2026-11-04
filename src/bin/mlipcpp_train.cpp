@@ -28,7 +28,7 @@ int main(int argc, char **argv) {
                "          [--conservative] [--energy-weight {}] [--force-weight {}] [--nc-force-weight {}] [--model-baselines]\n"
                "          [--allreduce {}] [--save-every N] [--log JSONL] [--state-every N] [--max-hours H] [--resume STATE]\n"
                "          [--lr-schedule FILE.json] [--dump-lr-schedule N [--dump-steps-per-epoch S]]\n"
-               "          [--charge-corr-weight W] [--charge-corr-target mulliken|lowdin|nbo] [--charge-corr-min R]\n"
+               "          [--charge-corr-weight W] [--charge-corr-target mulliken|lowdin|nbo] [--charge-corr-min R] [--frag-charge-weight W]\n"
                "          [--loss mse|huber] [--huber-delta-e D] [--huber-delta-f D]\n"
                "--loss huber: torch.nn.HuberLoss per component (metatrain's huber; 0.5 d^2 below delta, then linear), deltas in\n"
                "the loss's units: energy per atom over the energy scale (default 0.01), forces over their scale (0.02);\n"
@@ -38,6 +38,9 @@ int main(int argc, char **argv) {
                "default mulliken). A hinge on r: it rewards correlation, the magnitudes stay free; R (--charge-corr-min,\n"
                "default 1) is the correlation above which a structure adds nothing, so R = 1 gives W (1 - r). Structures\n"
                "without the file, with < 3 atoms, a constant reference or any NaN (nbo) are left out (counted as skipped);\n"
+               "--frag-charge-weight W (Plato-PET-LR with LES; default 0: off): W x mean over fragments of the squared error of\n"
+               "the fragment's summed latent charge (e) against its summed --charge-corr-target charges, structures with two or\n"
+               "more bonded fragments only (<split>/fragment.bin, int32 per atom: scripts/plato_lr/fragments.py);\n"
                "--lr-schedule: per-group learning rates (src/train/lr_schedule.h), replaces --lr, --warmup-fraction,\n"
                "--schedule, --decay-after, --min-lr and --optimizer; groups matched on metatrain state-dict names;\n"
                "--dump-lr-schedule N prints the groups' lr of the first N steps as JSON and stops (with\n"
@@ -114,6 +117,7 @@ int main(int argc, char **argv) {
     else if (a == "--huber-delta-f") o.huber_delta_f = std::stod(val());
     else if (a == "--charge-corr-target") o.charge_corr_target = val();
     else if (a == "--charge-corr-min") o.charge_corr_min = std::stod(val());
+    else if (a == "--frag-charge-weight") o.frag_charge_weight = std::stod(val());
     else if (a == "--allreduce") o.allreduce = std::stoi(val()) != 0;
     else if (a == "--save-every") o.save_every = std::stoi(val());
     else if (a == "--log") o.log_jsonl = val();

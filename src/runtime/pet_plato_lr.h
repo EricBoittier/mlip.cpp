@@ -103,6 +103,7 @@ public:
   /// the latent charges of the last MLIPCPP_PLATO_LES built ([Q, n], model units: neutralised or
   /// shifted to the total charge), or nullptr
   ggml_tensor *charges() const { return charges_; }
+  ggml_tensor *charge_unit() const { return charge_unit_; } // e per latent charge unit [1] (LES models)
   /// Pearson correlation per structure of two per-atom rows a, b [1, n]: [1, G]
   ggml_tensor *pearson(ggml_context *ctx, ggml_tensor *a, ggml_tensor *b) const;
 
@@ -134,7 +135,7 @@ private:
   std::vector<int32_t> h_sidx_, h_pi_, h_pj_;
   std::vector<float> h_onehot_, h_invc_, h_qpa_, h_aict_, h_omask_;
   ggml_tensor *frac_ = nullptr, *pair_r_ = nullptr; // built once per graph
-  ggml_tensor *charges_ = nullptr, *padding_mask_ = nullptr, *key_log_keep_ = nullptr;
+  ggml_tensor *charges_ = nullptr, *charge_unit_ = nullptr, *padding_mask_ = nullptr, *key_log_keep_ = nullptr;
   // inputs made while building (shape-dependent constants): tensor and its values
   std::vector<std::pair<ggml_tensor *, std::vector<int32_t>>> lazy_i32_;
   std::vector<std::pair<ggml_tensor *, std::vector<float>>> lazy_f32_;

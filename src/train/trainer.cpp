@@ -291,6 +291,7 @@ StepStats &StepStats::operator+=(const StepStats &o) {
   loss_nc += o.loss_nc, se_force_nc += o.se_force_nc;
   loss_charge += o.loss_charge, sum_charge_r += o.sum_charge_r;
   n_charge_r += o.n_charge_r, n_charge_skipped += o.n_charge_skipped;
+  loss_frag += o.loss_frag, se_frag += o.se_frag, n_frag += o.n_frag;
   se_energy_per_atom += o.se_energy_per_atom, se_force += o.se_force;
   ae_energy_per_atom += o.ae_energy_per_atom, ae_force += o.ae_force;
   sum_e += o.sum_e, sum2_e += o.sum2_e, sum_f += o.sum_f, sum2_f += o.sum2_f;
@@ -513,6 +514,39 @@ void Worker::charge_corr_stats(StepGraph &g, const Batch &b, StepStats &st) {
     }
 }
 
+ggml_tensor *Worker::frag_charge_graph(StepGraph &g, ggml_context *ctx, int S, bool loss) {
+  if (!(frag_charge_weight > 0)) return nullptr;
+  ggml_tensor *q = g.plato ? g.plato->charges() : nullptr;
+  ggml_tensor *unit = g.plato ? g.plato->charge_unit() : nullptr;
+  if (!q || !unit) throw std::runtime_error("--frag-charge-weight needs a Plato-PET-LR model with LES");
+  const int64_t n = q->ne[1], F = int64_t(S) * Batch::kFragCap;
+  g.fonehot = input(ctx, GGML_TYPE_F32, {n, F}, "frag_onehot");
+  g.ftarget = input(ctx, GGML_TYPE_F32, {F, 1}, "frag_target");
+  // first latent channel in e (as mlipcpp-eval's latent_charges), summed per fragment column
+  ggml_tensor *q0 = ggml_mul(ctx, ggml_cont(ctx, ggml_view_2d(ctx, q, 1, n, q->nb[1], 0)), unit); // [1, n]
+  ggml_tensor *sum = ggml_mul_mat(ctx, g.fonehot, ggml_cont(ctx, ggml_transpose(ctx, q0)));       // [F, 1]
+  ggml_mul_mat_set_prec(sum, GGML_PREC_F32);
+  g.frag_d = ggml_sub(ctx, sum, g.ftarget);
+  ggml_set_output(g.frag_d);
+  if (!loss) return nullptr;
+  g.fw = input(ctx, GGML_TYPE_F32, {1}, "frag_charge_weight");
+  return ggml_mul(ctx, ggml_sum(ctx, ggml_sqr(ctx, g.frag_d)), g.fw);
+}
+
+void Worker::frag_charge_stats(StepGraph &g, const Batch &b, StepStats &st) {
+  if (!g.frag_d || b.frag_col.empty()) return;
+  std::vector<float> d(ggml_nelements(g.frag_d));
+  ggml_backend_tensor_get(g.frag_d, d.data(), 0, d.size() * sizeof(float));
+  std::vector<uint8_t> used(d.size(), 0);
+  for (int32_t c : b.frag_col)
+    if (c >= 0 && size_t(c) < used.size()) used[c] = 1;
+  double se = 0;
+  for (size_t c = 0; c < d.size(); c++)
+    if (used[c]) se += double(d[c]) * d[c];
+  st.se_frag += se, st.n_frag += b.n_frag;
+  st.loss_frag += frag_charge_weight * (b.frag_norm > 0 ? b.frag_norm : 1.0 / std::max(1, b.n_frag)) * se;
+}
+
 void Worker::plato_create(StepGraph &g, ggml_context *ctx, int n, bool grad) {
   std::vector<runtime::PetPlatoLRStructure> st;
   if (plato_batch_ && plato_batch_->n_atoms == n) {
@@ -598,11 +632,13 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
     ggml_set_output(g->out); // (an energy-only export's [n]: the source of the view below, kept too)
     if (ggml_n_dims(g->out) == 1) g->out = ggml_reshape_2d(ctx, g->out, 1, n), ggml_set_output(g->out);
     charge_corr_graph(*g, ctx, S, false); // r for the metrics (the loss term is in MIXED)
+    frag_charge_graph(*g, ctx, S, false);  // likewise the fragment errors
     ggml_tensor *E = ggml_sum(ctx, ggml_cont(ctx, ggml_view_2d(ctx, g->out, 1, n, g->out->nb[1], 0)));
     g->gf = ggml_new_graph_custom(ctx, graph_size, true);
     ggml_build_forward_expand(g->gf, g->out);
     ggml_build_forward_expand(g->gf, E);
     if (g->charge_r) ggml_build_forward_expand(g->gf, g->charge_r);
+    if (g->frag_d) ggml_build_forward_expand(g->gf, g->frag_d);
     g->n_forward = ggml_graph_n_nodes(g->gf);
     ggml_set_loss(E);
     ggml_build_backward_expand(ctx, g->gf, nullptr);
@@ -662,6 +698,7 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
     ggml_tensor *loss_f = ggml_mul(ctx, component(d_force, loss.delta_f), f_norm);
     ggml_tensor *loss = ggml_add(ctx, loss_e, loss_f);
     if (ggml_tensor *lq = charge_corr_graph(*g, ctx, S, true)) loss = ggml_add(ctx, loss, lq);
+    if (ggml_tensor *lf = frag_charge_graph(*g, ctx, S, true)) loss = ggml_add(ctx, loss, lf);
     if (mode == MIXED) {
       // - <dE/dx, u> along the scaled residual u: its weight gradient is the
       // conservative force loss's (u held fixed)
@@ -791,6 +828,19 @@ void Worker::upload_inputs(StepGraph &g, const Batch &b, const std::vector<float
     if (g.qok->buffer) ggml_backend_tensor_set(g.qok, ok.data(), 0, ggml_nbytes(g.qok)); // (FORCES graphs: r only)
     if (g.qw->buffer) ggml_backend_tensor_set(g.qw, &w, 0, sizeof(float));
   }
+  if (g.fonehot) {
+    const int64_t n = g.fonehot->ne[0], F = g.fonehot->ne[1];
+    std::vector<float> oh(size_t(n) * F, 0.0f), t(F, 0.0f);
+    for (size_t i = 0; i < b.frag_col.size() && int64_t(i) < n; i++)
+      if (const int32_t c = b.frag_col[i]; c >= 0 && c < F) oh[size_t(c) * n + i] = 1.0f;
+    std::copy_n(b.frag_target.begin(), std::min<size_t>(F, b.frag_target.size()), t.begin());
+    ggml_backend_tensor_set(g.fonehot, oh.data(), 0, ggml_nbytes(g.fonehot));
+    ggml_backend_tensor_set(g.ftarget, t.data(), 0, ggml_nbytes(g.ftarget));
+    if (g.fw && g.fw->buffer) {
+      const float w = static_cast<float>(frag_charge_weight * (b.frag_norm > 0 ? b.frag_norm : 1.0 / std::max(1, b.n_frag)));
+      ggml_backend_tensor_set(g.fw, &w, 0, sizeof(float));
+    }
+  }
   if (g.plato) {
     if (g.plato->needs_neighbor_index()) {
       std::vector<int32_t> nbr(b.neighbor_atom.begin(), b.neighbor_atom.end());
@@ -914,6 +964,7 @@ StepStats Worker::run(const Batch &b, double energy_scale, bool backward) {
   st.se_force = stats[3];
   st.n_systems = b.n_real_systems;
   charge_corr_stats(*g, b, st);
+  frag_charge_stats(*g, b, st);
   for (float w : b.force_mask) st.n_force_components += 3 * static_cast<int64_t>(w);
   add_target_sums(b, energy_scale, st);
   if (system_errors) {
@@ -960,6 +1011,7 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
   }
   StepStats st;
   charge_corr_stats(gf, b, st);
+  frag_charge_stats(gf, b, st);
   if (gf.grad_x) { // Plato-PET-LR: the explicit position dependence (mesh, LES)
     gx.resize(3 * static_cast<size_t>(n));
     ggml_backend_tensor_get(gf.grad_x, gx.data(), 0, gx.size() * sizeof(float));
@@ -1027,7 +1079,7 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
     per_atom[a] = static_cast<float>(e2);
     fse[sys] += e2;
   }
-  st.loss = st.loss_energy + st.loss_force + st.loss_nc + st.loss_charge;
+  st.loss = st.loss_energy + st.loss_force + st.loss_nc + st.loss_charge + st.loss_frag;
   if (system_errors) {
     for (int k = 0; k < b.n_real_systems; k++)
       system_errors->push_back({b.ids[k], -1, b.n_per_system[k], static_cast<float>(d_e[k] * energy_scale),
@@ -1896,6 +1948,7 @@ void train(const TrainOptions &o) {
         o.tile_nb_ratio > 1 ? static_cast<size_t>(o.graph_cache) : 0));
   for (auto &w : workers) w->conservative = {o.conservative, o.energy_weight, o.force_weight, o.nc_force_weight};
   for (auto &w : workers) w->charge_corr = {o.charge_corr_weight, o.charge_corr_min};
+  for (auto &w : workers) w->frag_charge_weight = o.frag_charge_weight;
   if (o.loss != "mse" && o.loss != "huber") throw std::runtime_error("--loss mse|huber, not " + o.loss);
   for (auto &w : workers) w->loss.huber = o.loss == "huber", w->loss.delta_e = o.huber_delta_e, w->loss.delta_f = o.huber_delta_f;
   if (o.loss == "huber")
@@ -1914,6 +1967,21 @@ void train(const TrainOptions &o) {
     }
     fmt::print("charge correlation: weight {} x mean over structures of max(0, {} - r), r = Pearson(first latent "
                "charge channel, {} charges)\n", o.charge_corr_weight, o.charge_corr_min, o.charge_corr_target);
+  }
+  if (o.frag_charge_weight > 0) {
+    if (!workers[0]->model().plato_lr().les)
+      throw std::runtime_error("--frag-charge-weight needs a Plato-PET-LR model with LES latent charges");
+    for (MemmapSplit *sp : {&train_split, &val_split, &test_split}) {
+      if (!sp->has_partial_charges() && !sp->load_partial_charges(o.charge_corr_target))
+        throw std::runtime_error(sp->dir() + ": --frag-charge-weight needs " + o.charge_corr_target + "_charge.bin");
+      if (!sp->load_fragments()) throw std::runtime_error(sp->dir() + ": --frag-charge-weight needs fragment.bin");
+      int64_t multi = 0, cols = 0;
+      for (int64_t s = 0; s < sp->size(); s++)
+        if (const int c = sp->fragment_columns(s, Batch::kFragCap)) multi++, cols += c;
+      fmt::print("fragment charges: {}: {} structures with two or more fragments, {} fragment columns\n", sp->dir(), multi, cols);
+    }
+    fmt::print("fragment charges: weight {} x mean over fragments of (sum latent q - sum {} q)^2, e^2\n",
+               o.frag_charge_weight, o.charge_corr_target);
   }
   if (o.conservative)
     fmt::print("conservative forces -dE/dx: loss weights energy {}, forces {}, direct forces {}\n", o.energy_weight,
@@ -2279,6 +2347,10 @@ void train(const TrainOptions &o) {
                             ? fmt::format(", q {:.4g}: mean r {:.4f}, {} skipped", step_total.loss_charge / W,
                                           step_total.sum_charge_r / std::max<int64_t>(1, step_total.n_charge_r),
                                           step_total.n_charge_skipped)
+                            : std::string()) +
+                       (o.frag_charge_weight > 0
+                            ? fmt::format(", frag {:.4g}: RMSE {:.4f} e", step_total.loss_frag / W,
+                                          std::sqrt(step_total.se_frag / std::max<int64_t>(1, step_total.n_frag)))
                             : std::string()),
                    lr, norm, (step + 1) * W * B / el, 1e3 * t_wait / (step + 1),
                    1e3 * t_gpu / (step + 1), 1e3 * t_build / (step + 1),
@@ -2333,6 +2405,10 @@ void train(const TrainOptions &o) {
       fmt::print("epoch {} charge correlation ({}): mean r train {:.4f} ({} structures, {} skipped), val {:.4f} ({} structures)\n",
                  epoch, o.charge_corr_target, ep.sum_charge_r / std::max<int64_t>(1, ep.n_charge_r), ep.n_charge_r,
                  ep.n_charge_skipped, val.sum_charge_r / std::max<int64_t>(1, val.n_charge_r), val.n_charge_r);
+    if (o.frag_charge_weight > 0)
+      fmt::print("epoch {} fragment charges ({}): RMSE train {:.4f} e ({} fragments), val {:.4f} e ({} fragments)\n",
+                 epoch, o.charge_corr_target, std::sqrt(ep.se_frag / std::max<int64_t>(1, ep.n_frag)), ep.n_frag,
+                 std::sqrt(val.se_frag / std::max<int64_t>(1, val.n_frag)), val.n_frag);
     std::fflush(stdout);
     params = w0.get_params(); // the master copy lives on device 0
     const int64_t done_epochs = epoch + 1;
