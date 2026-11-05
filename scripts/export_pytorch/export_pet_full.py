@@ -73,38 +73,16 @@ def resolve_upet_checkpoint_name(model_base: str, size: str) -> str:
     return candidates[-1][1]
 
 
-def load_pet_model(model_name: str):
-    """Load a raw PET model by name.
-
-    Args:
-        model_name: One of:
-            - "pet-mad-1.0.2": Legacy pet-mad package
-            - "pet-xxx-{size}": upet model (e.g., "pet-mad-s", "pet-omat-l")
-
-    Returns:
-        The raw PET model (with gnn_layers, node_embedders, etc.)
-    """
-    if Path(model_name).is_file():
-        return _unwrap_to_pet(load_local_model(model_name))
-
-    if model_name == "pet-mad-1.0.2":
-        from pet_mad._models import get_pet_mad
-        atomistic = get_pet_mad(version="1.0.2")
-        return atomistic.module.model
-
-    # Parse upet model name: "pet-xxx-{size}" -> model="pet-xxx", size="{size}"
-    valid_sizes = {"xs", "s", "m", "l", "xl"}
+def is_upet_name(model_name: str) -> bool:
     parts = model_name.rsplit("-", 1)
-    if len(parts) != 2 or parts[1] not in valid_sizes:
-        raise ValueError(
-            f"Invalid model name '{model_name}'. Expected format: "
-            f"'pet-xxx-size' where size is one of {valid_sizes}, "
-            f"or 'pet-mad-1.0.2' for legacy."
-        )
-    model_base, size = parts[0], parts[1]
+    return (not Path(model_name).is_file() and model_name != "pet-mad-1.0.2" and len(parts) == 2
+            and parts[1] in {"xs", "s", "m", "l", "xl"})
 
+
+def upet_checkpoint_path(model_name: str) -> str:
+    """Local path of the upet checkpoint for a "pet-xxx-{size}" name (HuggingFace download or the HF cache)."""
+    model_base, size = model_name.rsplit("-", 1)
     from huggingface_hub import hf_hub_download
-    from metatrain.utils.io import load_model as load_metatrain_model
 
     path = None
     model_string = None
@@ -139,6 +117,43 @@ def load_pet_model(model_name: str):
         model_string = path_obj.name
         path = str(path_obj)
         print(f"Using cached checkpoint {model_string} at {path}")
+
+    return path
+
+
+def load_pet_model(model_name: str):
+    """Load a raw PET model by name.
+
+    Args:
+        model_name: One of:
+            - "pet-mad-1.0.2": Legacy pet-mad package
+            - "pet-xxx-{size}": upet model (e.g., "pet-mad-s", "pet-omat-l")
+
+    Returns:
+        The raw PET model (with gnn_layers, node_embedders, etc.)
+    """
+    if Path(model_name).is_file():
+        return _unwrap_to_pet(load_local_model(model_name))
+
+    if model_name == "pet-mad-1.0.2":
+        from pet_mad._models import get_pet_mad
+        atomistic = get_pet_mad(version="1.0.2")
+        return atomistic.module.model
+
+    # Parse upet model name: "pet-xxx-{size}" -> model="pet-xxx", size="{size}"
+    valid_sizes = {"xs", "s", "m", "l", "xl"}
+    parts = model_name.rsplit("-", 1)
+    if len(parts) != 2 or parts[1] not in valid_sizes:
+        raise ValueError(
+            f"Invalid model name '{model_name}'. Expected format: "
+            f"'pet-xxx-size' where size is one of {valid_sizes}, "
+            f"or 'pet-mad-1.0.2' for legacy."
+        )
+    model_base, size = parts[0], parts[1]
+
+    from metatrain.utils.io import load_model as load_metatrain_model
+
+    path = upet_checkpoint_path(model_name)
 
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore")

@@ -27,6 +27,7 @@ from export_pytorch.fx_converter import export_torch_model
 from export_pytorch.export_pet_full import (
     PETFullModel, load_pet_model, get_model_params, load_local_model,
     get_species_mapping, get_composition_energies, get_energy_scale,
+    is_upet_name, upet_checkpoint_path,
 )
 
 # GGUF format constants
@@ -436,8 +437,11 @@ def main():
     composition_energies = get_composition_energies(pet)
     energy_scale = get_energy_scale(pet)
     nc_force_scales = {}
-    if Path(args.model).is_file():  # local metatrain model: its fitted baselines
-        comp, e_scale, nc_force_scales = metatrain_baselines(load_local_model(args.model))
+    # fitted baselines live on the outer metatrain model (LLPR wrapper -> PET with additive_models/scaler), which
+    # the unwrapped `pet` no longer has: read them from the checkpoint for local files AND upet names
+    src = args.model if Path(args.model).is_file() else upet_checkpoint_path(args.model) if is_upet_name(args.model) else None
+    if src:
+        comp, e_scale, nc_force_scales = metatrain_baselines(load_local_model(src))
         composition_energies = comp or composition_energies
         energy_scale = e_scale if e_scale is not None else energy_scale
 
