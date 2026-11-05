@@ -125,10 +125,10 @@ void GraphInterpreter::set_dimension(const std::string &name, int64_t value) {
         "GraphInterpreter: dimension '" + name + "' must be positive, got " +
         std::to_string(value));
   }
-  if (value > 1000000) {
+  if (value > 100000000) {
     throw std::runtime_error(
         "GraphInterpreter: dimension '" + name + "' = " +
-        std::to_string(value) + " is unreasonably large (>1M)");
+        std::to_string(value) + " is unreasonably large (>100M)");
   }
   dimensions_[name] = value;
 }
