@@ -792,6 +792,14 @@ ggml_tensor *PetPlatoLR::les_op(ggml_context *ctx, const GIRNode &node, const st
         rec = Q == 1 ? ggml_sum_rows(ctx, ggml_mul(ctx, sk, gk)) : ggml_reshape_2d(ctx, ggml_sum(ctx, ggml_mul(ctx, sk, gk)), 1, 1);
         rec = ggml_mul(ctx, rec, ggml_scale(ctx, ivol, 4.0f * M_PI));
       }
+      // charged cells (total charge Q_c = sum_i q_ic != 0, e.g. the total-charge constraint): the Gaussian charges'
+      // neutralising-background term - pi sigma^2 sum_c Q_c^2 / V, which the k != 0 sum leaves in (metatrain
+      // charged_background): the energy then follows the sigma-independent point-charge convention; zero when neutral
+      {
+        ggml_tensor *Qs = ggml_get_rows_back(ctx, qg, g.bidx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, q->ne[0], Gq)); // [Q, Gq]
+        ggml_tensor *bg = ggml_mul(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, Qs)), ivol);                                 // [1, Gq]
+        rec = ggml_sub(ctx, rec, ggml_reshape_2d(ctx, ggml_scale(ctx, bg, static_cast<float>(M_PI * sigma * sigma)), rec->ne[0], rec->ne[1]));
+      }
       // E_rec of structure b spread evenly over its atoms
       ggml_tensor *per = ggml_get_rows(ctx, ggml_reshape_2d(ctx, ggml_mul(ctx, rec, g.inv_count), 1, Gq), g.bidx); // [1, n]
       acc(ggml_scale(ctx, ggml_mul(ctx, ggml_reshape_2d(ctx, per, 1, n), g.mask), static_cast<float>(KE)));
