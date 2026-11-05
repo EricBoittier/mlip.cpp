@@ -127,11 +127,13 @@ def _(q, charge_unit, sigma, kcut, total_charge_constraint):
 
 
 @torch.library.custom_op("mlipcpp::plato_les_ds", mutates_args=())
-def plato_les_ds(q: torch.Tensor, charge_unit: torch.Tensor, ds: torch.Tensor, sigma: float, kcut: float,
-                 total_charge_constraint: int) -> torch.Tensor:
+def plato_les_ds(q: torch.Tensor, charge_unit: torch.Tensor, ds: torch.Tensor, ia: torch.Tensor, sigma: float,
+                 kcut: float, total_charge_constraint: int) -> torch.Tensor:
     """:func:`plato_les` with the damped and screened open-system kernel (metatrain
     ``les_damp_screen``): pair kernel times ``(1 - w exp(-(r / a)^4)) (1 - s + s exp(-kappa r))``,
-    ``ds = (w, a_raw, s, kappa_raw)``, ``a``, ``kappa`` softplus. Periodic structures raise."""
+    ``ds = (w, a_raw, s, kappa_raw)``, ``a``, ``kappa`` softplus; with ``ds`` of 6 values
+    ``(.., w_T, a_T_raw)`` also the Thole damping (metatrain ``les_thole``) with the per-atom
+    ``ia = alpha^(-1/6)`` (n, 1). Periodic structures raise."""
     from metatrain.pet.modules.plato_lr import les_energy_finite_ds
     if "positions" not in CONTEXT:
         return q.new_zeros(q.shape[0])
@@ -142,11 +144,11 @@ def plato_les_ds(q: torch.Tensor, charge_unit: torch.Tensor, ds: torch.Tensor, s
     if total_charge_constraint:
         Q = float(CONTEXT.get("charge", 0.0)) / charge_unit.to(q.dtype)
         shift = shift - Q / q.shape[0]
-    return les_energy_finite_ds(q - shift, pos, sigma, ds.to(q.dtype))
+    return les_energy_finite_ds(q - shift, pos, sigma, ds.to(q.dtype), ia.reshape(-1) if ds.shape[0] == 6 else None)
 
 
 @plato_les_ds.register_fake
-def _(q, charge_unit, ds, sigma, kcut, total_charge_constraint):
+def _(q, charge_unit, ds, ia, sigma, kcut, total_charge_constraint):
     return q.new_empty(q.shape[0])
 
 
@@ -304,6 +306,11 @@ class PlatoLRParts(torch.nn.Module):
             if self.les_damp_screen:  # the same Parameters (GGUF plato_les_damp_* / plato_les_screen_*)
                 self.les_damp_w, self.les_damp_a_raw = les.les_damp_w, les.les_damp_a_raw
                 self.les_screen_s, self.les_screen_kappa_raw = les.les_screen_s, les.les_screen_kappa_raw
+            self.les_thole = bool(getattr(les, "thole", False))
+            if self.les_thole:  # GGUF plato_les_thole_w / _a_raw, and the polarisability table (a buffer)
+                self.les_thole_w, self.les_thole_a_raw = les.les_thole_w, les.les_thole_a_raw
+                # a buffer, not a Parameter: never in train.param_names
+                self.register_buffer("les_thole_ia", les.les_thole_ia.detach().clone()[:, None].float())
 
     def mesh_update(self, x: torch.Tensor) -> torch.Tensor:
         h = self.h
@@ -315,7 +322,8 @@ class PlatoLRParts(torch.nn.Module):
         return self.mesh_gate * self.mesh_up(m)
 
     def les_energy(self, nodes: List[torch.Tensor], edges: List[torch.Tensor], padding_mask: torch.Tensor,
-                   cutoff_factors: torch.Tensor, edge_distances: Optional[torch.Tensor] = None) -> torch.Tensor:
+                   cutoff_factors: torch.Tensor, edge_distances: Optional[torch.Tensor] = None,
+                   species: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Gated per-atom LES energies (n,); padding_mask True = padded (the wrapper's
         convention)."""
         q = None
@@ -327,8 +335,13 @@ class PlatoLRParts(torch.nn.Module):
         h = self.h
         sigma = float(h["les_tail_sigma"]) if h.get("les_tail_sigma", 0.0) > 0 else float(h["les_sigma"])
         if getattr(self, "les_damp_screen", False):
-            ds = torch.cat([self.les_damp_w, self.les_damp_a_raw, self.les_screen_s, self.les_screen_kappa_raw])
-            e = torch.ops.mlipcpp.plato_les_ds(q, self.les_charge_unit, ds, sigma, float(h["les_kcut"]),
+            p = [self.les_damp_w, self.les_damp_a_raw, self.les_screen_s, self.les_screen_kappa_raw]
+            if getattr(self, "les_thole", False):
+                p += [self.les_thole_w, self.les_thole_a_raw]
+                ia = torch.nn.functional.embedding(species, self.les_thole_ia)  # (n, 1)
+            else:
+                ia = q.new_zeros(q.shape[0], 1)
+            e = torch.ops.mlipcpp.plato_les_ds(q, self.les_charge_unit, torch.cat(p), ia, sigma, float(h["les_kcut"]),
                                                int(h["total_charge_constraint"]))
         else:
             e = torch.ops.mlipcpp.plato_les(q, self.les_charge_unit, sigma, float(h["les_kcut"]),

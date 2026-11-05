@@ -14,7 +14,7 @@
 //       (periodic: Ewald k-sum or smooth PME, the structure's energy spread evenly over
 //       its atoms; open: the erf pair sum per atom), neutralised per structure or shifted
 //       to the structure's total charge
-//   MLIPCPP_PLATO_LES_DS(q, charge_unit, ds)  the same, open structures only, with the pair kernel
+//   MLIPCPP_PLATO_LES_DS(q, charge_unit, ds[, ia])  the same (ds of 6 values + ia: also Thole), open structures only, with the pair kernel
 //       times (1 - w exp(-(r/a)^4)) (1 - s + s exp(-kappa r)), ds = (w, a_raw, s, kappa_raw), a, kappa softplus
 //
 // The long-range ops depend on the absolute positions (input `positions`, [3, n]) and,
