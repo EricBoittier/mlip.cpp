@@ -528,7 +528,8 @@ void GraphModel::upload_conditioning(CachedGraph &g, int charge, int spin_multip
   if (!g.charge_index) return;
   const auto [ci, si] = conditioning_.rows(charge, spin_multiplicity);
   if (g.cond_set && g.cond_charge == charge && g.cond_spin == spin_multiplicity) return;
-  std::vector<int32_t> c(g.n_atoms, ci), s(g.n_atoms, si);
+  // [n] per atom (padded graph) or [1] per structure (ragged graph)
+  std::vector<int32_t> c(ggml_nelements(g.charge_index), ci), s(ggml_nelements(g.spin_index), si);
   ggml_backend_tensor_set(g.charge_index, c.data(), 0, ggml_nbytes(g.charge_index));
   ggml_backend_tensor_set(g.spin_index, s.data(), 0, ggml_nbytes(g.spin_index));
   g.cond_set = true, g.cond_charge = charge, g.cond_spin = spin_multiplicity;
@@ -541,10 +542,10 @@ bool GraphModel::use_ragged() {
   const char *e = std::getenv("MLIPCPP_RAGGED");
   if (!e || !*e || *e == '0') return false;
   std::string why;
-  if (conditioning_.enabled) {
-    why = "does not implement charge / spin conditioning";
-  } else if (cutoff_function_ != "bump" || nc_forces_ || long_range_ || !forces_mode_) {
-    why = "needs a forces-mode model with the bump cutoff, no direct forces and no long range";
+  // a model with direct-force heads (pet.nc_forces) runs without them: the ragged graph gives the
+  // energy and its gradient only (unset MLIPCPP_RAGGED for the non-conservative forces)
+  if (cutoff_function_ != "bump" || long_range_ || !forces_mode_) {
+    why = "needs a forces-mode model with the bump cutoff and no long range";
   } else {
     ragged_weights_.clear();
     for (auto &[name, t] : weights()) ragged_weights_[name] = t;
@@ -569,7 +570,10 @@ bool GraphModel::use_ragged() {
         break;
       }
     }
-    if (pet_ragged_spec(ragged_weights_, d_pet, heads, cutoff_width_, ragged_spec_, why)) {
+    bool ok = pet_ragged_spec(ragged_weights_, d_pet, heads, cutoff_width_, ragged_spec_, why);
+    if (ok && ragged_spec_.conditioning != conditioning_.enabled)
+      ok = false, why = "conditioning weights and pet.system_conditioning disagree";
+    if (ok) {
       ragged_state_ = 1;
       // MLIPCPP_RAGGED_GRAPH_FOLD=1: the folded weight products as matmuls in the graph
       const char *f = std::getenv("MLIPCPP_RAGGED_GRAPH_FOLD");
@@ -611,6 +615,10 @@ void GraphModel::build_ragged_graph(int n, int64_t e_cap, int max_len, bool back
   in.reverse = g->reverse = input(GGML_TYPE_I32, e_cap, 0, "reverse_edge");
   in.offsets = g->offsets = input(GGML_TYPE_I32, n + 1, 0, "offsets");
   in.centers = g->centers = input(GGML_TYPE_I32, e_cap, 0, "centers");
+  if (ragged_spec_.conditioning) { // one row per structure (upload_conditioning fills every element)
+    in.charge_index = g->charge_index = input(GGML_TYPE_I32, 1, 0, "charge_index");
+    in.spin_index = g->spin_index = input(GGML_TYPE_I32, 1, 0, "spin_index");
+  }
   if (backward) {
     ggml_set_param(g->edge_vectors);
     if (adaptive) ggml_set_param(g->cutoff_values);
@@ -1067,7 +1075,8 @@ ModelResult GraphModel::predict_cached_device(const AtomicSystem &system, bool c
 
 bool GraphModel::device_step_supported() const {
 #ifdef MLIPCPP_HAVE_CUDA_INPUTS
-  return cached_path_supported() && !nc_forces_ && !plato_lr_.enabled && compute_backend_ &&
+  // direct-force heads (pet.nc_forces) are computed and left unread: the device step gives conservative forces
+  return cached_path_supported() && !plato_lr_.enabled && compute_backend_ &&
          std::string_view(ggml_backend_name(compute_backend_)).rfind("CUDA", 0) == 0;
 #else
   return false;
