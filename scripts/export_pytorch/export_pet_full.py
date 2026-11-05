@@ -624,7 +624,7 @@ class PETFullModel(torch.nn.Module):
                 node, edge, padding_mask, cutoff_factors).squeeze(-1)
         if self.plato_lr is not None and self.plato_lr["les"]:
             atomic_energies = atomic_energies + self.plato.les_energy(nodes, edges, padding_mask, cutoff_factors,
-                                                                      edge_distances)
+                                                                      edge_distances, species)
         return atomic_energies
 
     def _forward_feedforward(self, species, neighbor_species, edge_vectors, edge_distances,
@@ -725,7 +725,7 @@ class PETFullModel(torch.nn.Module):
         atomic_energies = node_e.squeeze(-1) + edge_e_sum
         if self.plato_lr is not None and self.plato_lr["les"]:
             atomic_energies = atomic_energies + self.plato.les_energy(
-                [input_node_embeddings], [input_messages], padding_mask, cutoff_factors, edge_distances)
+                [input_node_embeddings], [input_messages], padding_mask, cutoff_factors, edge_distances, species)
         if not self.nc_forces:
             return atomic_energies
         forces = self._readout(self.node_force_heads, self.node_force_final,
