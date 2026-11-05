@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace mlipcpp {
@@ -58,12 +59,20 @@ public:
   void set_charge(int charge) { charge_ = charge; }
   void set_spin_multiplicity(int spin_multiplicity) { spin_multiplicity_ = spin_multiplicity; }
 
+  /// Per-atom formal charges (e; extxyz per-atom array formal_charges), read by models with
+  /// fragment-constrained charges (pet.plato_lr.frag_charges): only their sums over each bonded
+  /// fragment matter. Empty: none (whole-structure conditioning). Ignored by other models.
+  const std::vector<float> &formal_charges() const { return formal_charges_; }
+  bool has_formal_charges() const { return !formal_charges_.empty(); }
+  void set_formal_charges(std::vector<float> q) { formal_charges_ = std::move(q); }
+
 private:
   int n_atoms_ = 0;
   std::vector<float> positions_; // [n_atoms * 3], flattened (x,y,z) per atom
   std::vector<int32_t> atomic_numbers_;
   std::optional<Cell> cell_;
   int charge_ = 0, spin_multiplicity_ = 1;
+  std::vector<float> formal_charges_;
 };
 
 } // namespace mlipcpp

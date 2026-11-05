@@ -5,7 +5,7 @@
 screened LES kernel (--damp-screen: metatrain les_damp_screen, new parameters at their start
 values w = s = 0, so the energy is unchanged; --damp-w / --screen-s / --damp-a / --screen-kappa
 set them, e.g. for parity checks; --thole adds metatrain les_thole, w_T = 0, a_T = --thole-a0,
-and --thole-w / --thole-a set them).
+and --thole-w / --thole-a set them; --frag-charges adds metatrain frag_charges).
 
     python les_tail_variant.py --ckpt C.ckpt -o out.pt [--tail-sigma 3] [--subtract]
         [--les-gate 1] [--charge-scale 0.5] [--damp-screen [--damp-w 0.5 --screen-s 0.5 ...]]
@@ -34,6 +34,8 @@ def main():
     ap.add_argument("--thole-a0", type=float, default=0.39, help="les_thole_a hyper (start a_T)")
     ap.add_argument("--thole-w", type=float, default=None)
     ap.add_argument("--thole-a", type=float, default=None, help="a_T (softplus applied)")
+    ap.add_argument("--frag-charges", action="store_true",
+                    help="metatrain frag_charges (fragment-constrained charges; no new tensors)")
     args = ap.parse_args()
     import metatomic.torch  # noqa: F401
     from metatrain.pet import PET
@@ -49,6 +51,8 @@ def main():
         if not h.get("les_damp_screen", False):
             raise SystemExit("--thole needs --damp-screen")
         h["les_thole"], h["les_thole_a"] = True, args.thole_a0
+    if args.frag_charges:
+        h["frag_charges"] = True
     hypers["plato_lr"] = h
     new = PET(hypers, model.dataset_info).to(next(model.parameters()).dtype)
     missing, unexpected = new.load_state_dict(model.state_dict(), strict=False)

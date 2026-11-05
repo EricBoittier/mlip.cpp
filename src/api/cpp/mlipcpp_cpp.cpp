@@ -282,6 +282,11 @@ struct Predictor::Impl {
     AtomicSystem system = system_in;
     system.set_charge(options.charge);
     system.set_spin_multiplicity(options.spin_multiplicity);
+    if (!options.formal_charges.empty()) {
+      if (options.formal_charges.size() != static_cast<size_t>(system.num_atoms()))
+        throw std::invalid_argument("formal_charges: one value per atom");
+      system.set_formal_charges(options.formal_charges);
+    }
     // Use predict_batch for NC forces support
     auto *pet_model = dynamic_cast<pet::PETModel *>(model.get());
     if (pet_model) {

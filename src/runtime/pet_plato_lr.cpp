@@ -83,6 +83,11 @@ PetPlatoLRSpec PetPlatoLRSpec::from_gguf(const GGUFLoader &L) {
   s.les_method = L.get_string("pet.plato_lr.les_method", "auto");
   s.les_pme_atoms = L.get_int32("pet.plato_lr.les_pme_atoms", 128);
   if (const char *e = std::getenv("MLIPCPP_PLATO_LES_METHOD"); e && *e) s.les_method = e;
+  s.frag.enabled = L.get_int32("pet.plato_lr.frag_charges", 0) != 0;
+  s.frag.R = L.get_float32("pet.plato_lr.frag_R", 8.0f);
+  s.frag.t = L.get_float32("pet.plato_lr.frag_t", 0.5f);
+  s.frag.sigma = L.get_float32("pet.plato_lr.frag_sigma", 4.0f);
+  s.frag.scale = L.get_float32("pet.plato_lr.frag_scale", 1.0f);
   if (s.les_method != "ewald" && s.les_method != "pme" && s.les_method != "auto")
     throw std::runtime_error("Plato-PET-LR: les_method must be ewald, pme or auto, not " + s.les_method);
   return s;

@@ -22,6 +22,8 @@
 // gradients complete the forces (-dE/dx) and the virial (-dE/d eps) of the graph's
 // edge-vector terms, as in runtime/plato_graph.
 
+#include "frag_charges.h"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -52,6 +54,9 @@ struct PetPlatoLRSpec {
   std::string les_method = "auto";
   int les_pme_order = 8, les_pme_atoms = 128;
   double les_pme_spacing = 0.5; // in units of les_sigma
+  // fragment-constrained charges (runtime/frag_charges.h): pet.plato_lr.frag_charges, frag_R, frag_t, frag_sigma,
+  // frag_scale; host-side (per-atom unit conditioning and the beyond-R Coulomb term of the formal unit charges)
+  FragChargesSpec frag;
   bool long_range() const { return mesh || les; }
   static PetPlatoLRSpec from_gguf(const GGUFLoader &loader);
 };

@@ -80,6 +80,10 @@ struct TrainOptions {
   // total-charge shift), q^DFT the --charge-corr-target partial charges, fragments from <split>/fragment.bin;
   // structures with two or more fragments only (at most Batch::kFragCap columns each); weight 0: off
   double frag_charge_weight = 0.0;
+  // fragment-constrained charges (runtime/frag_charges.h) on, also for a model without the
+  // pet.plato_lr.frag_charges key (then written into the saved GGUFs): <split>/fragunit.bin,
+  // fragq.bin, frag_ok.bin (agents/petlr/frag/frag_labels.py)
+  bool frag_charges = false;
   double energy_weight = 1.0, force_weight = 1.0, nc_force_weight = 1.0;
   // fine-tuning: keep the composition and scales stored in --init instead of
   // fitting them on the training set

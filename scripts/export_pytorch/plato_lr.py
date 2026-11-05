@@ -222,6 +222,7 @@ def plato_lr_hypers(pet_model) -> Optional[dict]:
     frame_rope = bool(getattr(pet_model, "frame_rope", False))
     mesh = getattr(pet_model, "mesh", None)
     les = getattr(pet_model, "les", None)
+    frag = getattr(pet_model, "frag", None)
     edge = any(type(g.edge_embedder).__name__ == "GroupSumEdgeEmbedder" for g in pet_model.gnn_layers)
     if not (frame_rope or mesh is not None or les is not None or edge):
         return None
@@ -244,6 +245,10 @@ def plato_lr_hypers(pet_model) -> Optional[dict]:
         total_charge_constraint=bool(les.total_charge_constraint) if les is not None else False,
         les_tail_sigma=float(getattr(les, "tail_sigma", 0.0)) if les is not None else 0.0,
         les_tail_subtract_cutoff=bool(getattr(les, "tail_subtract_cutoff", False)) if les is not None else False,
+        # fragment-constrained charges (metatrain PETFragCharges): host-side in mlip.cpp, keys only
+        frag_charges=frag is not None,
+        frag_R=float(frag.R) if frag is not None else 0.0, frag_t=float(frag.t) if frag is not None else 0.0,
+        frag_sigma=float(frag.sigma) if frag is not None else 0.0, frag_scale=float(frag.scale) if frag is not None else 0.0,
     )
 
 
@@ -400,3 +405,7 @@ def gguf_metadata(writer, h: dict) -> None:
             writer.add_int32("pet.plato_lr.les_tail_subtract_cutoff", int(h["les_tail_subtract_cutoff"]))
         if h.get("les_damp_screen", False):  # informational: the graph carries MLIPCPP_PLATO_LES_DS
             writer.add_int32("pet.plato_lr.les_damp_screen", 1)
+    if h.get("frag_charges", False):  # absent: off (runtime/frag_charges.h; the graph is unchanged)
+        writer.add_int32("pet.plato_lr.frag_charges", 1)
+        for k in ("frag_R", "frag_t", "frag_sigma", "frag_scale"):
+            writer.add_float32("pet.plato_lr." + k, float(h[k]))

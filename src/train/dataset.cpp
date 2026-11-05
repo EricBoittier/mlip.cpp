@@ -52,6 +52,7 @@ template <typename T> Mapped<T>::~Mapped() {
 
 template class Mapped<float>;
 template class Mapped<int32_t>;
+template class Mapped<uint8_t>;
 
 std::vector<int64_t> read_npy_i64(const std::string &path) {
   std::ifstream f(path, std::ios::binary);
@@ -124,6 +125,27 @@ bool MemmapSplit::load_fragments() {
   frag_ = Mapped<int32_t>(path);
   if (frag_.size() != static_cast<size_t>(na_.back()))
     throw std::runtime_error(path + ": " + std::to_string(frag_.size()) + " values for " + std::to_string(na_.back()) + " atoms");
+  return true;
+}
+
+bool MemmapSplit::load_frag_charges(const runtime::FragChargesSpec &spec) {
+  fq_spec_ = spec;
+  for (const char *f : {"/fragunit.bin", "/fragq.bin", "/frag_ok.bin"})
+    if (!std::filesystem::exists(dir_ + f)) return false;
+  fq_unit_ = Mapped<int32_t>(dir_ + "/fragunit.bin");
+  fq_q_ = Mapped<int32_t>(dir_ + "/fragq.bin");
+  fq_ok_ = Mapped<uint8_t>(dir_ + "/frag_ok.bin");
+  const size_t N = static_cast<size_t>(na_.back());
+  if (fq_unit_.size() != N || fq_q_.size() != N || fq_ok_.size() != static_cast<size_t>(n_systems_))
+    throw std::runtime_error(dir_ + ": fragunit.bin / fragq.bin / frag_ok.bin sizes do not match the split");
+  return true;
+}
+
+bool MemmapSplit::frag_ok(int64_t s) const {
+  if (!fq_ok_.size() || !fq_ok_[s]) return false;
+  const float *c = cell(s);
+  for (int k = 0; k < 9; k++)
+    if (c[k] != 0) return false;
   return true;
 }
 

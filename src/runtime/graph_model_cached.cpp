@@ -527,11 +527,13 @@ bool GraphModel::fit_cached_graph(int n, int max_kept) {
 void GraphModel::upload_conditioning(CachedGraph &g, int charge, int spin_multiplicity) const {
   if (!g.charge_index) return;
   const auto [ci, si] = conditioning_.rows(charge, spin_multiplicity);
-  if (g.cond_set && g.cond_charge == charge && g.cond_spin == spin_multiplicity) return;
-  std::vector<int32_t> c(g.n_atoms, ci), s(g.n_atoms, si);
+  (void)ci;
+  if (frag_cond_.empty() && g.cond_set && g.cond_charge == charge && g.cond_spin == spin_multiplicity) return;
+  std::vector<int32_t> c = charge_rows(g.n_atoms, charge, spin_multiplicity), s(g.n_atoms, si);
   ggml_backend_tensor_set(g.charge_index, c.data(), 0, ggml_nbytes(g.charge_index));
   ggml_backend_tensor_set(g.spin_index, s.data(), 0, ggml_nbytes(g.spin_index));
-  g.cond_set = true, g.cond_charge = charge, g.cond_spin = spin_multiplicity;
+  // per-atom (fragment) rows: not a structure charge, uploaded again next call
+  g.cond_set = frag_cond_.empty(), g.cond_charge = charge, g.cond_spin = spin_multiplicity;
 }
 
 bool GraphModel::use_ragged() {

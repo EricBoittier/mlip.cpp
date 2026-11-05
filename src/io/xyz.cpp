@@ -92,6 +92,24 @@ void read_exyz_conditioning(const std::string &comment_line, AtomicSystem &syste
     system.set_spin_multiplicity(integer_value(v, "spin_multiplicity"));
 }
 
+// the token column of a per-atom extxyz array (Properties=name:type:count:...), -1 if absent
+static int exyz_property_column(const std::string &comment_line, const std::string &name) {
+  size_t pos = comment_line.find("Properties=");
+  if (pos == std::string::npos || (pos > 0 && !std::isspace(static_cast<unsigned char>(comment_line[pos - 1])))) return -1;
+  pos += 11;
+  size_t end = comment_line.find_first_of(" \t\r", pos);
+  std::string spec = comment_line.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+  std::vector<std::string> f;
+  std::stringstream ss(spec);
+  for (std::string x; std::getline(ss, x, ':');) f.push_back(x);
+  int col = 0;
+  for (size_t k = 0; k + 2 < f.size(); k += 3) {
+    if (f[k] == name) return col;
+    col += std::stoi(f[k + 2]);
+  }
+  return -1;
+}
+
 AtomicSystem read_xyz(std::istream &stream) {
   std::string line;
 
@@ -114,6 +132,9 @@ AtomicSystem read_xyz(std::istream &stream) {
   // Read atoms
   std::vector<int> atomic_numbers;
   std::vector<double> positions;
+  // per-atom formal charges (fragment-constrained charges), Properties=...:formal_charges:R:1 (or I)
+  const int fq_col = exyz_property_column(comment, "formal_charges");
+  std::vector<float> formal;
 
   atomic_numbers.reserve(n_atoms);
   positions.reserve(n_atoms * 3);
@@ -133,6 +154,12 @@ AtomicSystem read_xyz(std::istream &stream) {
     }
 
     atomic_numbers.push_back(element_to_atomic_number(element));
+    if (fq_col >= 4) {
+      std::string tok;
+      for (int c = 4; c <= fq_col; c++)
+        if (!(iss >> tok)) throw std::runtime_error("XYZ: no formal_charges column in: " + line);
+      formal.push_back(std::stof(tok));
+    }
     positions.push_back(x);
     positions.push_back(y);
     positions.push_back(z);
@@ -154,12 +181,14 @@ AtomicSystem read_xyz(std::istream &stream) {
 
     AtomicSystem system(n_atoms, positions_f.data(), atomic_numbers.data(), &cell_obj);
     read_exyz_conditioning(comment, system);
+    if (!formal.empty()) system.set_formal_charges(std::move(formal));
     return system;
   } else {
     // No cell - non-periodic
     std::vector<float> positions_f(positions.begin(), positions.end());
     AtomicSystem system(n_atoms, positions_f.data(), atomic_numbers.data(), nullptr);
     read_exyz_conditioning(comment, system);
+    if (!formal.empty()) system.set_formal_charges(std::move(formal));
     return system;
   }
 }

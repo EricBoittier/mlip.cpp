@@ -609,7 +609,50 @@ ModelResult GraphModel::predict_with_parameter_gradients(
   return predict_single(system, true, nullptr, &gradients);
 }
 
+std::vector<int32_t> GraphModel::charge_rows(int n_atoms, int charge, int spin_multiplicity) const {
+  const int32_t ci = conditioning_.rows(charge, spin_multiplicity).first;
+  std::vector<int32_t> c(n_atoms, ci);
+  if (!frag_cond_.empty()) {
+    if (frag_cond_.size() != static_cast<size_t>(n_atoms)) throw std::logic_error("frag_charges: atom count");
+    for (int i = 0; i < n_atoms; i++) c[i] = conditioning_.rows(frag_cond_[i], spin_multiplicity).first;
+  }
+  return c;
+}
+
+// Fragment-constrained charges (runtime/frag_charges.h): an open structure with formal charges
+// and a model with pet.plato_lr.frag_charges gets per-atom (bonded-unit) conditioning and the
+// beyond-R Coulomb term of the unit charges (host, float64), added to the energy and forces.
+// Anything else is the plain model, unchanged.
 ModelResult GraphModel::predict_single(
+    const AtomicSystem &system, bool compute_forces,
+    const std::function<void()> &post_compute_hook,
+    std::vector<float> *parameter_gradients) {
+  bool open = !system.cell();
+  if (const Cell *c = system.cell()) open = !c->periodic[0] && !c->periodic[1] && !c->periodic[2];
+  const int n = system.num_atoms();
+  if (!(plato_lr_.frag.enabled && conditioning_.enabled && open && system.has_formal_charges() && n > 0))
+    return predict_single_impl(system, compute_forces, post_compute_hook, parameter_gradients);
+  if (system.formal_charges().size() != static_cast<size_t>(n))
+    throw std::runtime_error("formal_charges: one value per atom");
+  const std::vector<int32_t> units = frag_bonded_units(n, system.atomic_numbers(), system.positions());
+  std::vector<double> q;
+  std::vector<int32_t> unit_charge;
+  frag_unit_charges(n, units, system.formal_charges().data(), unit_charge, q);
+  struct Reset {
+    std::vector<int32_t> &v;
+    ~Reset() { v.clear(); }
+  } reset{frag_cond_};
+  frag_cond_ = unit_charge;
+  ModelResult r = predict_single_impl(system, compute_forces, post_compute_hook, parameter_gradients);
+  std::vector<double> F(compute_forces ? 3 * size_t(n) : 0);
+  const double E = frag_coulomb(plato_lr_.frag, n, system.positions(), q.data(), compute_forces ? F.data() : nullptr);
+  r.energy = static_cast<float>(double(r.energy) + E);
+  if (compute_forces && r.forces.size() == F.size())
+    for (size_t k = 0; k < F.size(); k++) r.forces[k] = static_cast<float>(double(r.forces[k]) + F[k]);
+  return r;
+}
+
+ModelResult GraphModel::predict_single_impl(
     const AtomicSystem &system, bool compute_forces,
     const std::function<void()> &post_compute_hook,
     std::vector<float> *parameter_gradients) {
@@ -1062,7 +1105,8 @@ ModelResult GraphModel::predict_single(
 
   if (conditioning_.enabled) {
     const auto [ci, si] = conditioning_.rows(system.charge(), system.spin_multiplicity());
-    std::vector<int32_t> c(n_atoms, ci), sp(n_atoms, si);
+    (void)ci;
+    std::vector<int32_t> c = charge_rows(n_atoms, system.charge(), system.spin_multiplicity()), sp(n_atoms, si);
     ggml_backend_tensor_set(charge_index_t, c.data(), 0, c.size() * sizeof(int32_t));
     ggml_backend_tensor_set(spin_index_t, sp.data(), 0, sp.size() * sizeof(int32_t));
     interp_.set_input("charge_index", charge_index_t);
