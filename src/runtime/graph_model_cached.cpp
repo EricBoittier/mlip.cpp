@@ -1261,6 +1261,7 @@ GraphModel::DeviceTotals GraphModel::predict_device_step(const DeviceStep &in) {
     if (o[11] != 0) throw std::runtime_error("GraphModel: an atom type has no element of the model");
     if (ragged) d.last_total = int64_t(o[8]);
     d.last_max_kept = int(o[9]);
+    d.have_sizes = true; // padded: size M from this count next time (it stayed at 16 and never settled)
     const bool over = o[7] != 0, moved = o[10] > 0.25 * skin * skin;
     if (moved) stale = true; // an atom moved more than half the skin since the list was built
     if (over || moved) continue;
