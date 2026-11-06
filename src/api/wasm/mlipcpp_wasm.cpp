@@ -73,6 +73,9 @@ public:
         const int32_t* nums = system.atomic_numbers();
         wrapper.atomic_numbers_.assign(nums, nums + wrapper.n_atoms_);
         wrapper.periodic_ = system.is_periodic();
+        wrapper.charge_ = system.charge();
+        wrapper.spin_multiplicity_ = system.spin_multiplicity();
+        if (system.has_formal_charges()) wrapper.formal_charges_ = system.formal_charges();
 
         if (system.is_periodic() && system.cell()) {
             wrapper.cell_.resize(9);
@@ -90,6 +93,22 @@ public:
 
     size_t numAtoms() const { return n_atoms_; }
     bool isPeriodic() const { return periodic_; }
+
+    // Total charge (e) and spin multiplicity (2S+1), read by conditioned models
+    void setCharge(int q) { charge_ = q; }
+    void setSpinMultiplicity(int m) { spin_multiplicity_ = m; }
+    int charge() const { return charge_; }
+    int spinMultiplicity() const { return spin_multiplicity_; }
+    // Per-atom formal charges (e), read by fragment-constrained-charge models
+    // (pet.plato_lr.frag_charges); an empty / null array clears them
+    void setFormalCharges(const val& q) {
+        formal_charges_.clear();
+        if (q.isNull() || q.isUndefined()) return;
+        formal_charges_ = convertJSArrayToNumberVector<float>(q);
+        if (!formal_charges_.empty() && formal_charges_.size() != n_atoms_)
+            throw std::runtime_error("formal charges: length != number of atoms");
+    }
+    const std::vector<float>& formalCharges() const { return formal_charges_; }
 
     val getPositions() const {
         val result = val::global("Float32Array").new_(positions_.size());
@@ -131,6 +150,9 @@ private:
     std::vector<float> cell_;
     std::array<bool, 3> pbc_ = {false, false, false};
     bool periodic_ = false;
+    int charge_ = 0;
+    int spin_multiplicity_ = 1;
+    std::vector<float> formal_charges_;
 };
 
 // Wrapper class for Predictor - uses shared_ptr for Embind compatibility
@@ -195,6 +217,21 @@ public:
         return PredictorWrapper(std::move(predictor));
     }
 
+    // Load a GGUF the caller wrote into the virtual FS (Module.FS.writeFile,
+    // one bulk copy; loadFromBuffer copies through embind one byte at a time)
+    static PredictorWrapper loadFileWithBackend(const std::string& path,
+                                                const std::string& backend) {
+        mlipcpp::set_backend(parseBackend(backend));
+        return PredictorWrapper(std::make_shared<mlipcpp::Predictor>(path));
+    }
+
+    bool conditioned() const { return predictor_ && predictor_->conditioned(); }
+    int maxCharge() const { return predictor_ ? predictor_->max_charge() : 0; }
+    int maxSpinMultiplicity() const {
+        return predictor_ ? predictor_->max_spin_multiplicity() : 0;
+    }
+    bool hasNcForces() const { return predictor_ && predictor_->has_nc_forces(); }
+
     std::string modelType() const {
         return predictor_ ? std::string(predictor_->model_type()) : "";
     }
@@ -232,9 +269,24 @@ public:
             throw std::runtime_error("Model not loaded");
         }
 
+        return predictFull(system, true, useNCForces);
+    }
+
+    // Energy (and forces unless computeForces is false) with the system's
+    // charge, spin multiplicity and formal charges; latent charges if the
+    // model has an LES head
+    val predictFull(const AtomicSystemWrapper& system, bool computeForces,
+                    bool useNCForces) {
+        if (!predictor_) {
+            throw std::runtime_error("Model not loaded");
+        }
+
         mlipcpp::PredictOptions options;
-        options.compute_forces = true;
+        options.compute_forces = computeForces;
         options.use_nc_forces = useNCForces;
+        options.charge = system.charge();
+        options.spin_multiplicity = system.spinMultiplicity();
+        options.formal_charges = system.formalCharges();
 
         auto result = predictor_->predict(
             system.numAtoms(),
@@ -250,10 +302,17 @@ public:
 
         // Return forces as Float32Array (native precision — no double-widening copy)
         val forces = val::global("Float32Array").new_(result.forces.size());
-        for (size_t i = 0; i < result.forces.size(); ++i) {
-            forces.set(i, result.forces[i]);
-        }
+        if (!result.forces.empty())
+            forces.call<void>("set", val(typed_memory_view(result.forces.size(),
+                                                           result.forces.data())));
         output.set("forces", forces);
+
+        if (!result.latent_charges.empty()) {
+            val q = val::global("Float32Array").new_(result.latent_charges.size());
+            q.call<void>("set", val(typed_memory_view(result.latent_charges.size(),
+                                                      result.latent_charges.data())));
+            output.set("latentCharges", q);
+        }
 
         if (result.has_stress()) {
             val stress = val::global("Float32Array").new_(6);
@@ -368,7 +427,12 @@ EMSCRIPTEN_BINDINGS(mlipcpp) {
         .function("isPeriodic", &AtomicSystemWrapper::isPeriodic)
         .function("getPositions", &AtomicSystemWrapper::getPositions)
         .function("getAtomicNumbers", &AtomicSystemWrapper::getAtomicNumbers)
-        .function("getCell", &AtomicSystemWrapper::getCell);
+        .function("getCell", &AtomicSystemWrapper::getCell)
+        .function("setCharge", &AtomicSystemWrapper::setCharge)
+        .function("setSpinMultiplicity", &AtomicSystemWrapper::setSpinMultiplicity)
+        .function("charge", &AtomicSystemWrapper::charge)
+        .function("spinMultiplicity", &AtomicSystemWrapper::spinMultiplicity)
+        .function("setFormalCharges", &AtomicSystemWrapper::setFormalCharges);
 
     // Predictor wrapper (named Model for JS API simplicity)
     class_<PredictorWrapper>("Model")
@@ -376,6 +440,12 @@ EMSCRIPTEN_BINDINGS(mlipcpp) {
         .class_function("load", &PredictorWrapper::load)
         .class_function("loadFromBuffer", &PredictorWrapper::loadFromBuffer)
         .class_function("loadFromBufferWithBackend", &PredictorWrapper::loadFromBufferWithBackend)
+        .class_function("loadFileWithBackend", &PredictorWrapper::loadFileWithBackend)
+        .function("conditioned", &PredictorWrapper::conditioned)
+        .function("maxCharge", &PredictorWrapper::maxCharge)
+        .function("maxSpinMultiplicity", &PredictorWrapper::maxSpinMultiplicity)
+        .function("hasNcForces", &PredictorWrapper::hasNcForces)
+        .function("predictFull", &PredictorWrapper::predictFull)
         .function("modelType", &PredictorWrapper::modelType)
         .function("cutoff", &PredictorWrapper::cutoff)
         .function("predictEnergy", &PredictorWrapper::predictEnergy)
