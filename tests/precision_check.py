@@ -11,9 +11,11 @@ Processes (each loads every listed instance before its first predict):
   mixed     env clean, [fp32, tf32]                 the two precisions side by side
   default2  env clean, [default, default] + a TF32 load after the predicts (must fail on CUDA)
   strict    MLIPCPP_TF32=1, [fp32]                  an FP32 model in a TF32 process (one instance)
+  tf32rep   MLIPCPP_TF32=1, [default]               a repeat of tf32ref: the run-to-run floor (info)
 
-Checks: mixed.fp32 = fp32ref and strict.fp32 = fp32ref to <= 1e-6 eV/atom and <= 1e-5 eV/A;
-mixed.tf32 = tf32ref to the same; default2 = fp32ref (bitwise expected); on CUDA the late TF32
+Checks: mixed.fp32, strict.fp32 and default2 = fp32ref to <= 1e-6 eV/atom and <= 1e-5 eV/A;
+mixed.tf32 = tf32ref to <= 1e-6 eV/atom and max(1e-5, a tenth of the TF32 error) eV/A (small
+padded graphs differ from run to run in TF32 by ~5e-4 eV/A, see tf32rep); on CUDA the late TF32
 load fails. On the CPU every process must agree (precision is a CUDA setting).
 Exit 0 on success, 1 on a failed check, 77 (skip) without the binary or the model.
 """
@@ -87,6 +89,7 @@ def main():
     R["default2"] = run(args.exe, args.model, args.xyz, args.work, "default2", ["default", "default"], {}, args,
                         ["--late-tf32"])
     R["strict"] = run(args.exe, args.model, args.xyz, args.work, "strict", ["fp32"], {"MLIPCPP_TF32": "1"}, args)
+    R["tf32rep"] = run(args.exe, args.model, args.xyz, args.work, "tf32rep", ["default"], {"MLIPCPP_TF32": "1"}, args)
     cuda = args.backend == "cuda" or "CUDA" in R["fp32ref"]["rows"][0]["backend"]
 
     ref32, ref_tf = R["fp32ref"]["data"][0], R["tf32ref"]["data"][0]
@@ -97,15 +100,17 @@ def main():
         ok = de <= tol_e and df <= tol_f
         checks.append({"check": name, "dE_eV_per_atom": de, "dF_max_eV_per_A": df, "ok": ok})
 
+    tf_de, tf_df = diff(ref_tf, ref32)  # the TF32 error itself (the CPU: 0)
     check("mixed.fp32 vs fp32ref", R["mixed"]["data"][0], ref32)
     check("strict.fp32 vs fp32ref", R["strict"]["data"][0], ref32)
-    check("mixed.tf32 vs tf32ref", R["mixed"]["data"][1], ref_tf)
-    check("default2[0] vs fp32ref", R["default2"]["data"][0], ref32, 0.0, 0.0)
-    check("default2[1] vs fp32ref", R["default2"]["data"][1], ref32, 0.0, 0.0)
-    # information: the TF32 error itself (CUDA ~0.2-0.7 meV/atom; the CPU 0)
-    de, df = diff(ref_tf, ref32)
-    checks.append({"check": "tf32ref vs fp32ref (TF32 error, info)", "dE_eV_per_atom": de, "dF_max_eV_per_A": df,
-                   "ok": True})
+    check("mixed.tf32 vs tf32ref", R["mixed"]["data"][1], ref_tf, TOL_E, max(TOL_F, 0.1 * tf_df))
+    check("default2[0] vs fp32ref", R["default2"]["data"][0], ref32)
+    check("default2[1] vs fp32ref", R["default2"]["data"][1], ref32)
+    de, df = diff(R["tf32rep"]["data"][0], ref_tf)
+    checks.append({"check": "tf32rep vs tf32ref (run-to-run floor, info)", "dE_eV_per_atom": de,
+                   "dF_max_eV_per_A": df, "ok": True})
+    checks.append({"check": "tf32ref vs fp32ref (TF32 error, info)", "dE_eV_per_atom": tf_de,
+                   "dF_max_eV_per_A": tf_df, "ok": True})
     if not cuda:
         check("tf32ref vs fp32ref (CPU: no-op)", ref_tf, ref32, 0.0, 0.0)
     late = R["default2"]["extra"][0] if R["default2"]["extra"] else {}

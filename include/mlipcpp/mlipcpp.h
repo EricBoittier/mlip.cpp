@@ -145,7 +145,7 @@ void mlipcpp_suppress_logging(void);
  * On CUDA, TF32 is a process-wide setting that ggml reads once, at the first
  * matmul. The process runs its CUDA matmuls in TF32 when MLIPCPP_TF32 is set
  * or a model created with MLIPCPP_PRECISION_TF32 was loaded before the first
- * predict; otherwise in full FP32 (the fast FP32 kernels). In a TF32 process
+ * predict; otherwise in full FP32 (GGML_CUDA_NO_TF32). In a TF32 process
  * a model in FP32 has every product of its graphs (and their gradients) run
  * in full FP32. So two models of one process can differ: load all of them
  * before the first predict (loading a TF32 model after a predict in full FP32

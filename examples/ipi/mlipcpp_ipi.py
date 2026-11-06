@@ -19,8 +19,8 @@ precision (CUDA matmuls of this model; needs feat/model-precision or later):
 TF32 is a process-wide CUDA setting read once at the first matmul. Two <ffdirect> force fields of one i-PI run can
 differ (say a TF32 model on the full ring polymer and an FP32 one on the contracted beads): i-PI builds every
 force field before the first step, which is what mlip.cpp needs (a TF32 model loaded after the first FP32 predict
-is an error). In a process that runs TF32 an fp32 model loses the fast FP32-only kernels (cuBLAS full-FP32 GEMMs
-instead), so prefer default for a process with FP32 models only.
+is an error). An fp32 model in a process that runs TF32 gives the same numbers as in an FP32-only process, at the
+same speed (PET-OMol-S / PET-MAD-s on an RTX PRO 6000, padded and ragged graphs).
 """
 import ctypes
 import os

@@ -3,7 +3,7 @@
 // Per-model CUDA matmul precision in one process (MatmulPrecision, model.h).
 //
 // ggml reads GGML_CUDA_NO_TF32 once, at the first CUDA product, so the process
-// decides between full FP32 (GGML_CUDA_NO_TF32 set: the fast FP32 kernels) and
+// decides between full FP32 (GGML_CUDA_NO_TF32 set) and
 // TF32 once: commit(), called when the first graph is built. It runs TF32 when
 // MLIPCPP_TF32 is set or some model asked for TF32 (request_tf32) before then.
 // In a TF32 process a model in FP32 has its graphs tagged (tag_graph): every

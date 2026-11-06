@@ -29,8 +29,8 @@ struct ModelResult {
 /// the first CUDA matmul); within a TF32 process a model in FP32 has every matrix
 /// product of its graphs (and their gradients) tagged GGML_PREC_F32, which runs it
 /// in full FP32. The process runs TF32 when MLIPCPP_TF32 is set or some model asked
-/// for TF32 before the first graph was built; otherwise it runs in full FP32 (the
-/// fast FP32 kernels), as without this option. So set the precision of every model
+/// for TF32 before the first graph was built; otherwise it runs in full FP32
+/// (GGML_CUDA_NO_TF32), as without this option. So set the precision of every model
 /// (load them) before the first predict: asking for TF32 once the process has
 /// committed to full FP32 throws.
 enum class MatmulPrecision {
