@@ -121,6 +121,13 @@ public:
     bool rebuilt = false;                  // the neighbour list was built in this call
     int attempts = 1;                      // > 1: computed again (graph too small, list stale)
   };
+  /// Several independent systems (e.g. the beads of a path integral) in one
+  /// graph compute: their neighbour lists are built one by one (each with its own
+  /// cell) and packed as one disconnected graph, so the result of each system is
+  /// that of predict(system, compute_forces). Host inputs (vesin), cached path
+  /// models without Plato-PET-LR; other models fall back to one predict per system.
+  std::vector<ModelResult> predict_batch(const std::vector<AtomicSystem> &systems, bool compute_forces);
+
   bool device_step_supported() const;
   DeviceTotals predict_device_step(const DeviceStep &step);
 

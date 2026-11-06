@@ -18,12 +18,14 @@
 #include "mlipcpp/system.h"
 #include "models/pet/pet.h"
 #include "runtime/graph_model.h"
+#include <algorithm>
 #include <cstring>
 #include <exception>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 /**
  * @brief Internal model implementation
@@ -651,6 +653,98 @@ mlipcpp_error_t mlipcpp_predict_ptr_with_options(mlipcpp_model_t model, int32_t 
   system.pbc = pbc;
 
   return mlipcpp_predict_with_options(model, &system, options, result);
+}
+
+mlipcpp_error_t mlipcpp_predict_batch(mlipcpp_model_t model, int32_t n_systems,
+                                      const int32_t *n_atoms, const float *positions,
+                                      const int32_t *atomic_numbers, const float *cells,
+                                      const bool *pbc,
+                                      const mlipcpp_predict_options_t *options,
+                                      float *energies, float *forces, float *stress) {
+  if (!model) {
+    set_error("Invalid model handle");
+    return MLIPCPP_ERROR_INVALID_HANDLE;
+  }
+  if (!model->weights_loaded) {
+    set_error("Model weights not loaded");
+    return MLIPCPP_ERROR_MODEL_NOT_LOADED;
+  }
+  if (n_systems <= 0 || !n_atoms || !positions || !atomic_numbers || !energies) {
+    set_error("mlipcpp_predict_batch: n_systems > 0 and non-NULL n_atoms, positions, atomic_numbers, energies");
+    return MLIPCPP_ERROR_INVALID_PARAMETER;
+  }
+  mlipcpp_predict_options_t default_opts;
+  if (!options) {
+    mlipcpp_predict_options_default(&default_opts);
+    options = &default_opts;
+  }
+  try {
+    std::vector<mlipcpp::AtomicSystem> systems;
+    systems.reserve(n_systems);
+    size_t atom0 = 0;
+    for (int32_t s = 0; s < n_systems; ++s) {
+      if (n_atoms[s] <= 0) {
+        set_error("mlipcpp_predict_batch: every system needs at least one atom");
+        return MLIPCPP_ERROR_INVALID_PARAMETER;
+      }
+      mlipcpp::Cell cell;
+      const mlipcpp::Cell *cell_ptr = nullptr;
+      if (cells) {
+        float lattice[3][3];
+        for (int i = 0; i < 3; ++i)
+          for (int j = 0; j < 3; ++j) lattice[i][j] = cells[9 * size_t(s) + 3 * i + j];
+        const bool *p = pbc ? pbc + 3 * size_t(s) : nullptr;
+        cell = mlipcpp::Cell(lattice, p ? p[0] : true, p ? p[1] : true, p ? p[2] : true);
+        cell_ptr = &cell;
+      }
+      systems.emplace_back(n_atoms[s], positions + 3 * atom0, atomic_numbers + atom0, cell_ptr);
+      systems.back().set_charge(options->charge);
+      systems.back().set_spin_multiplicity(options->spin_multiplicity);
+      atom0 += size_t(n_atoms[s]);
+    }
+
+    const bool want_grad = options->compute_forces || options->compute_stress;
+    std::vector<mlipcpp::ModelResult> results;
+    if (auto *graph = dynamic_cast<mlipcpp::runtime::GraphModel *>(model->model.get())) {
+      if (options->use_nc_forces) {
+        set_error("mlipcpp_predict_batch: use_nc_forces is not supported for graph models");
+        return MLIPCPP_ERROR_UNSUPPORTED;
+      }
+      results = graph->predict_batch(systems, want_grad);
+    } else if (auto *pet = dynamic_cast<mlipcpp::pet::PETModel *>(model->model.get())) {
+      results = pet->predict_batch(systems, want_grad && !options->use_nc_forces, options->use_nc_forces);
+    } else {
+      for (const auto &sys : systems) results.push_back(model->model->predict(sys, want_grad));
+    }
+
+    atom0 = 0;
+    for (int32_t s = 0; s < n_systems; ++s) {
+      const auto &r = results[s];
+      energies[s] = r.energy;
+      const size_t k = 3 * size_t(n_atoms[s]);
+      if (forces && options->compute_forces) {
+        const std::vector<float> &f = options->use_nc_forces ? r.nc_forces : r.forces;
+        if (f.size() != k) {
+          set_error("mlipcpp_predict_batch: no forces for system " + std::to_string(s));
+          return MLIPCPP_ERROR_COMPUTATION;
+        }
+        std::copy(f.begin(), f.end(), forces + 3 * atom0);
+      }
+      if (stress) {
+        for (int c = 0; c < 6; ++c)
+          stress[6 * size_t(s) + c] = options->compute_stress && r.stress.size() == 6 ? r.stress[c] : 0.0f;
+      }
+      atom0 += size_t(n_atoms[s]);
+    }
+    clear_error();
+    return MLIPCPP_OK;
+  } catch (const std::exception &e) {
+    set_error(std::string("Prediction failed: ") + e.what());
+    return MLIPCPP_ERROR_COMPUTATION;
+  } catch (...) {
+    set_error("Prediction failed: unknown error");
+    return MLIPCPP_ERROR_INTERNAL;
+  }
 }
 
 // ============================================================================
