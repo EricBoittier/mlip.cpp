@@ -2,6 +2,7 @@
 #include "graph_cache.h"
 #include "core/adaptive_cutoff.h"
 #include "core/gguf_loader.h"
+#include "core/matmul_precision.h"
 #include "core/padding.h"
 #include "core/p3m.h"
 
@@ -615,14 +616,11 @@ ModelResult GraphModel::predict_single(
     std::vector<float> *parameter_gradients) {
   // Full FP32 on CUDA, as the MD engine: TF32 GEMMs (cuBLAS and ggml's mmf
   // kernels) put energies up to 14 meV/atom off the CPU / metatrain values on
-  // MPtrj test structures, at no measurable speed gain here. MLIPCPP_TF32=1
-  // keeps TF32. (A process-wide setting, read by the CUDA kernels per call.)
-  static const bool full_fp32 = [] {
-    if (std::getenv("MLIPCPP_TF32")) return false;
-    setenv("GGML_CUDA_NO_TF32", "1", 0);
-    return true;
-  }();
-  (void)full_fp32;
+  // MPtrj test structures, at no measurable speed gain here. MLIPCPP_TF32=1, or
+  // a model of the process with MatmulPrecision::TF32, keeps TF32 (a
+  // process-wide setting, read once by the CUDA kernels; a model in FP32 then
+  // has its products tagged GGML_PREC_F32: matmul_precision.h)
+  matmul_precision::commit();
   static const bool no_cache = [] {
     const char *e = std::getenv("MLIPCPP_NO_GRAPH_CACHE");
     return e && *e && *e != '0';
@@ -1204,6 +1202,8 @@ ModelResult GraphModel::predict_single(
     charge_graph = ggml_new_graph_custom(compute_ctx, 32768, false);
     ggml_build_forward_expand(charge_graph, lr_charges);
   }
+  matmul_precision::tag_graph(cgraph, matmul_precision_, compute_backend_);
+  matmul_precision::tag_graph(charge_graph, matmul_precision_, compute_backend_);
   ggml_backend_buffer_t compute_buffer =
       ggml_backend_alloc_ctx_tensors(compute_ctx, compute_backend_);
   std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)>

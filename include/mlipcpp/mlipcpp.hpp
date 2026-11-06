@@ -63,9 +63,24 @@ struct Result {
 /**
  * @brief Model configuration options
  */
+/**
+ * @brief CUDA matmul precision of a model (no effect on other backends)
+ *
+ * TF32 is a process-wide CUDA setting read once at the first matmul: the
+ * process runs TF32 when MLIPCPP_TF32 is set or a TF32 model was loaded
+ * before the first predict, and a model in FP32 then runs every product in
+ * full FP32. Load all models before the first predict.
+ */
+enum class Precision {
+  Default = 0, ///< full FP32, or TF32 when MLIPCPP_TF32 is set
+  TF32 = 2,    ///< TF32 tensor cores (the geometry products pinned to FP32)
+  FP32 = 3,    ///< every product in full FP32, also when MLIPCPP_TF32 is set
+};
+
 struct ModelOptions {
   Backend backend = Backend::Auto;
   float cutoff_override = 0.0f; ///< 0 = use model default
+  Precision precision = Precision::Default; ///< CUDA matmul precision
 };
 
 /**

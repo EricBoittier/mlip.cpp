@@ -130,6 +130,20 @@ to_compute_precision(mlipcpp_precision_t precision) {
   }
 }
 
+/**
+ * @brief CUDA matmul precision of a model from the options' precision
+ */
+mlipcpp::MatmulPrecision to_matmul_precision(mlipcpp_precision_t precision) {
+  switch (precision) {
+  case MLIPCPP_PRECISION_TF32:
+    return mlipcpp::MatmulPrecision::TF32;
+  case MLIPCPP_PRECISION_F32_EXACT:
+    return mlipcpp::MatmulPrecision::FP32;
+  default:
+    return mlipcpp::MatmulPrecision::Default;
+  }
+}
+
 } // anonymous namespace
 
 // ============================================================================
@@ -294,6 +308,8 @@ mlipcpp_error_t mlipcpp_model_load(mlipcpp_model_t model, const char *path) {
       // Set compute precision
       pet_model->set_precision(
           to_compute_precision(model->options.precision));
+      pet_model->set_matmul_precision(
+          to_matmul_precision(model->options.precision));
 
       // Override cutoff if requested
       if (model->options.cutoff_override > 0.0f) {
@@ -319,6 +335,8 @@ mlipcpp_error_t mlipcpp_model_load(mlipcpp_model_t model, const char *path) {
         graph_pref = g_backend_preference;
       }
       graph_model->set_backend_preference(graph_pref);
+      graph_model->set_matmul_precision(
+          to_matmul_precision(model->options.precision));
 
       if (!graph_model->load_from_gguf(path)) {
         set_error(std::string("Failed to load graph model from: ") + path);

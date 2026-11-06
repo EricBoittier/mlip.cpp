@@ -297,6 +297,9 @@ else()
         # energy of a half spectrum with its gradient w.r.t. the spectrum and the cell metric
         # (GGML_OP_PLATO_PME / _BACK); CPU + CUDA
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-plato-pme.patch"
+        # CUDA ragged PET attention: op_params[3] == GGML_PREC_F32 turns off the TF32 tensor-core
+        # kernels for that node in a TF32 process (a model in full FP32 next to a TF32 one)
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-pet-ragged-prec.patch"
     )
     # the source cache is keyed by the ggml tag and the patches' contents:
     # CPM's default key hashes the arguments, i.e. the patch paths, so every

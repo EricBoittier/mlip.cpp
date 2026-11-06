@@ -56,10 +56,17 @@ NB_MODULE(_mlipcpp, m) {
       .value("SYCL", mlipcpp::Backend::SYCL, "Intel SYCL (oneAPI)")
       .value("CANN", mlipcpp::Backend::CANN, "Huawei Ascend NPU");
 
+  nb::enum_<mlipcpp::Precision>(m, "Precision", "CUDA matmul precision of a model")
+      .value("Default", mlipcpp::Precision::Default, "Full FP32, or TF32 when MLIPCPP_TF32 is set")
+      .value("TF32", mlipcpp::Precision::TF32, "TF32 tensor cores (geometry products in FP32)")
+      .value("FP32", mlipcpp::Precision::FP32, "Every product in full FP32, also in a TF32 process");
+
   // ModelOptions
   nb::class_<mlipcpp::ModelOptions>(m, "ModelOptions", "Model configuration options")
       .def(nb::init<>())
       .def_rw("backend", &mlipcpp::ModelOptions::backend, "Compute backend")
+      .def_rw("precision", &mlipcpp::ModelOptions::precision,
+              "CUDA matmul precision (set before the first predict of the process)")
       .def_rw("cutoff_override", &mlipcpp::ModelOptions::cutoff_override,
               "Override model cutoff (0 = use default)");
 

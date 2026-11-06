@@ -38,6 +38,18 @@ static std::shared_ptr<BackendProvider> get_global_backend() {
   return g_backend_provider;
 }
 
+// Convert public Precision enum to the model's CUDA matmul precision
+static MatmulPrecision to_internal(Precision p) {
+  switch (p) {
+  case Precision::TF32:
+    return MatmulPrecision::TF32;
+  case Precision::FP32:
+    return MatmulPrecision::FP32;
+  default:
+    return MatmulPrecision::Default;
+  }
+}
+
 // Convert public Backend enum to internal BackendPreference
 static BackendPreference to_internal(Backend b) {
   switch (b) {
@@ -127,6 +139,7 @@ struct Predictor::Impl {
         set_backend(options.backend);
       }
       pet_model->set_backend(get_global_backend());
+      pet_model->set_matmul_precision(to_internal(options.precision));
 
       // Now load the model
       if (!pet_model->load_from_gguf(path)) {
@@ -151,6 +164,7 @@ struct Predictor::Impl {
         graph_pref = g_backend_preference;
       }
       graph_model->set_backend_preference(graph_pref);
+      graph_model->set_matmul_precision(to_internal(options.precision));
 
       if (!graph_model->load_from_gguf(path)) {
         throw std::runtime_error("Failed to load graph model from: " + path);
@@ -163,6 +177,7 @@ struct Predictor::Impl {
       plato::PlatoOptions po;
       po.backend = to_internal(options.backend);
       auto plato_model = std::make_unique<plato::PlatoModel>(po);
+      plato_model->set_matmul_precision(to_internal(options.precision));
       plato_model->load_from_gguf(path);
       for (const auto &[z, i] : plato_model->species_index()) atomic_types.push_back(z);
       std::sort(atomic_types.begin(), atomic_types.end());

@@ -1,4 +1,5 @@
 #include "train/conservative.h"
+#include "core/matmul_precision.h"
 #include "core/p3m.h"
 #include "runtime/graph_jvp.h"
 #include <algorithm>
@@ -139,6 +140,8 @@ struct ConservativeTrainer::Impl {
         ggml_set_loss(t);
         ggml_build_backward_expand(c, gr, nullptr);
       }
+      // a model set to MatmulPrecision::FP32 in a TF32 process: every product in full FP32
+      matmul_precision::tag_graph(gr, model.matmul_precision(), model.backend(), false);
       return gr;
     };
     g->charge = graph(g->q, false);

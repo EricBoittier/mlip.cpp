@@ -23,6 +23,22 @@ struct ModelResult {
   bool has_nc_forces = false;
 };
 
+/// Matrix-multiply precision of one model on CUDA (no effect on other backends).
+///
+/// TF32 is a process-wide CUDA setting (GGML_CUDA_NO_TF32, read once by ggml at
+/// the first CUDA matmul); within a TF32 process a model in FP32 has every matrix
+/// product of its graphs (and their gradients) tagged GGML_PREC_F32, which runs it
+/// in full FP32. The process runs TF32 when MLIPCPP_TF32 is set or some model asked
+/// for TF32 before the first graph was built; otherwise it runs in full FP32
+/// (GGML_CUDA_NO_TF32), as without this option. So set the precision of every model
+/// (load them) before the first predict: asking for TF32 once the process has
+/// committed to full FP32 throws.
+enum class MatmulPrecision {
+  Default, ///< MLIPCPP_TF32 set: TF32 (geometry products pinned to FP32); otherwise FP32
+  FP32,    ///< every product in full FP32, also in a TF32 process
+  TF32,    ///< TF32 tensor cores except the FP32-pinned geometry products
+};
+
 /// Base interface for all MLIP models
 class Model {
 public:
@@ -47,6 +63,14 @@ public:
   virtual bool conditioned() const { return false; }
   virtual int max_charge() const { return 0; }
   virtual int max_spin_multiplicity() const { return 0; }
+
+  /// CUDA matmul precision of this model (see MatmulPrecision). TF32 throws
+  /// std::runtime_error if the process already committed to full FP32.
+  void set_matmul_precision(MatmulPrecision precision);
+  MatmulPrecision matmul_precision() const { return matmul_precision_; }
+
+protected:
+  MatmulPrecision matmul_precision_ = MatmulPrecision::Default;
 };
 
 /// Load a model from GGUF file

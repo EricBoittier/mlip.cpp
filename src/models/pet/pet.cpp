@@ -1,5 +1,6 @@
 #include "pet.h"
 #include "core/gguf_loader.h"
+#include "core/matmul_precision.h"
 #include "core/log.h"
 #include "mlipcpp/timer.h"
 #include "pet_batch.h"
@@ -318,6 +319,9 @@ PETModel::predict_batch(const std::vector<AtomicSystem> &systems,
         ggml_set_output(grad_tensor);
       }
     }
+    // a model in FP32 in a TF32 process: its products in full FP32 (no commit:
+    // this model's TF32 default is unchanged)
+    matmul_precision::tag_graph(gf, matmul_precision_, backend_provider_->primary(), false);
   }
 
   // Log graph size for tuning allocation (info level for investigation)

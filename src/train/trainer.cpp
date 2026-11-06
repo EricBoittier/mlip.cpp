@@ -1,4 +1,5 @@
 #include "train/trainer.h"
+#include "core/matmul_precision.h"
 #include "train/lr_schedule.h"
 
 #include "runtime/graph_jvp.h"
@@ -703,6 +704,8 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
     }
   }
   g->constants = interp.take_constants();
+  // a model set to MatmulPrecision::FP32 in a TF32 process: every product in full FP32
+  matmul_precision::tag_graph(g->gf, model_.matmul_precision(), model_.backend(), false);
   if (g->loss_grad) g->constants.emplace_back(g->loss_grad, 1.0f);
   for (auto &c : g->constants) ggml_set_input(c.first);
 

@@ -1,4 +1,5 @@
 #include "plato.h"
+#include "core/matmul_precision.h"
 
 #include <ggml-alloc.h>
 #include <ggml-backend.h>
@@ -618,6 +619,10 @@ ModelResult PlatoModel::predict(const AtomicSystem &system, bool compute_forces)
         g->inputs.push_back(g->loss_grad);
       }
     }
+    // a model in FP32 in a TF32 process: its products in full FP32 (no commit:
+    // this model's TF32 default is unchanged)
+    matmul_precision::tag_graph(g->graph, matmul_precision_, backend_->primary(), false);
+    matmul_precision::tag_graph(g->forward, matmul_precision_, backend_->primary(), false);
     // inputs in a buffer of their own, the rest through the allocator
     ggml_backend_buffer_type_t buft = backend_->buffer_type();
     const size_t align = ggml_backend_buft_get_alignment(buft);
