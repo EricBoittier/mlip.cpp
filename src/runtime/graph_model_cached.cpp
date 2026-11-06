@@ -101,6 +101,8 @@ struct DeviceInputs {
 
   // predict_device_step
   double *shift = nullptr;             // [n, 3]: what build_list's wrap added to the caller's positions
+  double *raw = nullptr;               // [n, 3]: predict_cached_device: the caller's positions as given
+  bool host_shift = false;             // predict_cached_device: st.x_ref is from its own list build
   int32_t *flags = nullptr;            // [4]: graph overflow, bad type, step good
   double *out = nullptr, *out_host = nullptr; // [16] the totals (out_host pinned)
   int32_t *type_species = nullptr;     // [n_types + 1]
@@ -121,7 +123,7 @@ struct DeviceInputs {
       dalloc(st.count, n_cap), dalloc(st.nkept, n_cap), dalloc(st.r, n_cap), dalloc(st.root, n_cap);
       dalloc(st.dn_root, n_cap), dalloc(st.clamped, n_cap), dalloc(st.dEdr, n_cap);
       dalloc(st.f_cons, 3 * n_cap), dalloc(virial, 6 * n_cap), dalloc(st.offsets, n_cap + 1);
-      dalloc(shift, 3 * n_cap);
+      dalloc(shift, 3 * n_cap), dalloc(raw, 3 * n_cap);
     }
     if (!st.scalars) dalloc(st.scalars, 3);
     candidates(st.K ? st.K : 64);
@@ -136,7 +138,7 @@ struct DeviceInputs {
   }
   ~DeviceInputs() {
     md::gpu::free_cells(st);
-    for (void *p : {(void *)shift, (void *)flags, (void *)out, (void *)type_species, (void *)type_energy})
+    for (void *p : {(void *)shift, (void *)raw, (void *)flags, (void *)out, (void *)type_species, (void *)type_energy})
       if (p) cudaFree(p);
     if (out_host) cudaFreeHost(out_host);
     if (ev_in) ggml_backend_event_free(ev_in);
@@ -964,12 +966,27 @@ ModelResult GraphModel::predict_cached_device(const AtomicSystem &system, bool c
     set_device_cell(st, nullptr, nullptr, cutoff_ + skin);
   }
   std::vector<double> x(system.positions(), system.positions() + 3 * size_t(n));
-  upload(st.x, x.data(), x.size());
+  upload(d.raw, x.data(), x.size());
   upload(st.species, species.data(), species.size());
-  const bool same_system = d.list_built && skin > 0 && d.list_species == species &&
+  const bool same_system = d.list_built && d.host_shift && skin > 0 && d.list_species == species &&
                            std::equal(std::begin(st.cell), std::end(st.cell), std::begin(d.list_cell)) &&
                            std::equal(std::begin(st.pbc), std::end(st.pbc), std::begin(d.list_pbc));
-  if (!(same_system && md::gpu::list_valid(st, skin))) {
+  // the caller's positions continued from those the list was built from (minimum image of the change): an atom
+  // that crossed a cell face since then, wrapped by the caller (i-PI) or not, is not a jump of a box length. With a
+  // fresh wrap every call, MD in a periodic box rebuilt the list whenever an atom had crossed a face: every other
+  // i-PI step for 3,000 waters (18 ms of a 58 ms step on an RTX PRO 6000)
+  bool reuse = false;
+  if (same_system) {
+    md::gpu::unwrap_to_ref(st, d.raw);
+    md::gpu::displacement(st);
+    int32_t bits = 0;
+    download(&bits, st.scalars + 2, 1);
+    float d2;
+    std::memcpy(&d2, &bits, sizeof d2);
+    reuse = d2 <= 0.25 * skin * skin;
+  }
+  if (!reuse) {
+    cuda_check(cudaMemcpy(st.x, d.raw, 3 * size_t(n) * sizeof(double), cudaMemcpyDeviceToDevice), "positions");
     for (;;) {
       md::gpu::reset_scalars(st);
       md::gpu::build_list(st, cut);
@@ -979,6 +996,7 @@ ModelResult GraphModel::predict_cached_device(const AtomicSystem &system, bool c
       d.candidates(overflow + overflow / 4 + 8);
     }
     d.list_built = true, d.list_species = species;
+    d.host_shift = true; // st.x_ref: this path's list (predict_device_step clears it)
     std::copy(std::begin(st.cell), std::end(st.cell), std::begin(d.list_cell));
     std::copy(std::begin(st.pbc), std::end(st.pbc), std::begin(d.list_pbc));
     profile.mark("neighbor_list");
@@ -1181,6 +1199,7 @@ GraphModel::DeviceTotals GraphModel::predict_device_step(const DeviceStep &in) {
         d.candidates(overflow + overflow / 4 + 8);
       }
       md::gpu::store_shift(st, in.positions, xs[0], xs[1], d.shift);
+      d.host_shift = false;
       d.list_built = true, d.list_skin = skin, stale = false, result.rebuilt = true;
       d.list_species.clear(); // predict_cached_device: not its list
       std::copy(std::begin(st.cell), std::end(st.cell), std::begin(d.list_cell));
