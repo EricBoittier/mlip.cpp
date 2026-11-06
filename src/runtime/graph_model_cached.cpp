@@ -824,6 +824,257 @@ ModelResult GraphModel::predict_cached(const AtomicSystem &system, bool compute_
   return result;
 }
 
+std::vector<ModelResult> GraphModel::predict_batch(const std::vector<AtomicSystem> &systems, bool compute_forces) {
+  static const bool full_fp32 = [] { // as predict_single
+    if (std::getenv("MLIPCPP_TF32")) return false;
+    setenv("GGML_CUDA_NO_TF32", "1", 0);
+    return true;
+  }();
+  (void)full_fp32;
+  const int n_sys = static_cast<int>(systems.size());
+  std::vector<ModelResult> results;
+  if (n_sys == 0) return results;
+  static const bool no_cache = [] {
+    const char *e = std::getenv("MLIPCPP_NO_GRAPH_CACHE");
+    return e && *e && *e != '0';
+  }();
+  bool merged = n_sys > 1 && !no_cache && cached_path_supported();
+  for (const AtomicSystem &s : systems) merged = merged && s.num_atoms() > 0;
+  if (!merged) { // one call per system
+    results.reserve(n_sys);
+    for (const AtomicSystem &s : systems) results.push_back(predict_single(s, compute_forces));
+    return results;
+  }
+#ifdef MLIPCPP_HAVE_CUDA_INPUTS
+  // cached_ is replaced below: predict_cached_device must not continue its list
+  if (device_inputs_) static_cast<DeviceInputs *>(device_inputs_)->list_built = false;
+#endif
+
+  GraphProfile profile;
+  const bool adaptive = num_neighbors_adaptive_ > 0.0f;
+  const double cutoff = cutoff_, width = cutoff_width_adaptive_;
+  const int nt = std::max(1, backend_provider_->n_threads());
+
+  // atoms of system s: [off[s], off[s + 1]) of the packed graph
+  std::vector<int> off(n_sys + 1, 0);
+  for (int s = 0; s < n_sys; s++) off[s + 1] = off[s] + systems[s].num_atoms();
+  const int n = off[n_sys];
+  std::vector<int32_t> species(n), Z(n);
+  for (int s = 0; s < n_sys; s++) {
+    const int32_t *z = systems[s].atomic_numbers();
+    for (int i = 0; i < systems[s].num_atoms(); i++) {
+      auto it = species_to_index_.find(z[i]);
+      if (it == species_to_index_.end())
+        throw std::runtime_error("Atomic number " + std::to_string(z[i]) + " not in species map");
+      Z[off[s] + i] = z[i], species[off[s] + i] = it->second;
+    }
+  }
+
+  // one neighbour list per system (its own cell), concatenated: no edge joins two systems
+  HostEdges edges;
+  edges.start.assign(n + 1, 0);
+  for (int s = 0; s < n_sys; s++) {
+    const HostEdges h = host_edges(systems[s], cutoff, nt, vesin_);
+    const int64_t e0 = static_cast<int64_t>(edges.j.size());
+    const int ns = systems[s].num_atoms();
+    for (int i = 0; i < ns; i++) edges.start[off[s] + i + 1] = e0 + h.start[i + 1];
+    for (size_t e = 0; e < h.j.size(); e++) {
+      edges.j.push_back(h.j[e] + off[s]);
+      edges.rev.push_back(h.rev[e] >= 0 ? static_cast<int32_t>(h.rev[e] + e0) : -1);
+    }
+    edges.shift.insert(edges.shift.end(), h.shift.begin(), h.shift.end());
+    edges.v.insert(edges.v.end(), h.v.begin(), h.v.end());
+    edges.d.insert(edges.d.end(), h.d.begin(), h.d.end());
+  }
+  const int64_t E = static_cast<int64_t>(edges.j.size());
+  profile.mark("neighbor_list");
+
+  // from here as predict_cached, on n atoms of n_sys systems
+  std::vector<adaptive::Radius> radii(n);
+  // the cached path takes the "solver" adaptive cutoff only (cached_path_supported)
+  const bool grid = false;
+  std::vector<double> jac;
+  if (adaptive) {
+#pragma omp parallel for num_threads(nt) schedule(dynamic, 16)
+    for (int i = 0; i < n; i++) {
+      const double *d = edges.d.data() + edges.start[i];
+      const int ne = static_cast<int>(edges.start[i + 1] - edges.start[i]);
+      auto dist = [&](int k) { return d[k] < cutoff ? d[k] : 1e30; };
+      radii[i] = adaptive::solve(ne, dist, cutoff, num_neighbors_adaptive_, width);
+    }
+  }
+  profile.mark("adaptive_cutoff");
+
+  auto pair_cutoff = [&](int i, int j) { return adaptive ? 0.5 * (radii[i].r + radii[j].r) : cutoff; };
+  std::vector<int32_t> slot(E, -1), nkept(n, 0);
+#pragma omp parallel for num_threads(nt) schedule(static)
+  for (int i = 0; i < n; i++) {
+    int k = 0;
+    for (int64_t e = edges.start[i]; e < edges.start[i + 1]; e++) {
+      const double d = edges.d[e];
+      if (d < cutoff && edges.rev[e] >= 0 && (!adaptive || d <= pair_cutoff(i, edges.j[e]))) slot[e] = k++;
+    }
+    nkept[i] = k;
+  }
+  const int max_kept = *std::max_element(nkept.begin(), nkept.end());
+  const bool no_edges = max_kept == 0, forces_requested = compute_forces;
+  if (no_edges) compute_forces = false;
+  const bool ragged = use_ragged();
+  std::vector<int64_t> first(n + 1, 0);
+  if (ragged) {
+    for (int i = 0; i < n; i++) first[i + 1] = first[i] + nkept[i];
+    if (fit_ragged_graph(n, first[n], max_kept)) profile.mark("build_graph");
+  } else if (fit_cached_graph(n, max_kept)) {
+    profile.mark("build_graph");
+  }
+  CachedGraph &g = *cached_;
+  const int M = g.M;
+  if (!ragged)
+    for (int i = 0; i <= n; i++) first[i] = int64_t(i) * M;
+  const size_t S = ragged ? size_t(g.e_cap) : size_t(n) * M;
+
+  std::vector<int32_t> ns(S, padding::kSpecies), rev(S, 0), centers(ragged ? S : 0, 0);
+  std::vector<float> ev(3 * S), pm(ragged ? 0 : S, 1.0f), cv(S, static_cast<float>(cutoff));
+  if (ragged)
+    for (size_t f = first[n]; f < S; f++) rev[f] = static_cast<int32_t>(f), padding::edge(static_cast<float>(cutoff), &ev[3 * f]);
+#pragma omp parallel for num_threads(nt) schedule(static)
+  for (int i = 0; i < n; i++) {
+    if (!ragged)
+      for (int s = nkept[i]; s < M; s++) padding::edge(static_cast<float>(cutoff), &ev[3 * (size_t(i) * M + s)]);
+    for (int64_t e = edges.start[i]; e < edges.start[i + 1]; e++) {
+      if (slot[e] < 0) continue;
+      const int j = edges.j[e];
+      const size_t f = first[i] + slot[e];
+      ns[f] = species[j];
+      for (int c = 0; c < 3; c++) ev[3 * f + c] = static_cast<float>(edges.v[3 * e + c]);
+      if (!ragged) pm[f] = 0.0f;
+      cv[f] = static_cast<float>(pair_cutoff(i, j));
+      rev[f] = static_cast<int32_t>(first[j] + slot[edges.rev[e]]);
+      if (ragged) centers[f] = i;
+    }
+  }
+  ggml_backend_tensor_set(g.species, species.data(), 0, ggml_nbytes(g.species));
+  ggml_backend_tensor_set(g.neighbor_species, ns.data(), 0, ggml_nbytes(g.neighbor_species));
+  ggml_backend_tensor_set(g.edge_vectors, ev.data(), 0, ggml_nbytes(g.edge_vectors));
+  if (!ragged) ggml_backend_tensor_set(g.padding_mask, pm.data(), 0, ggml_nbytes(g.padding_mask));
+  ggml_backend_tensor_set(g.reverse, rev.data(), 0, ggml_nbytes(g.reverse));
+  ggml_backend_tensor_set(g.cutoff_values, cv.data(), 0, ggml_nbytes(g.cutoff_values));
+  if (ragged) {
+    std::vector<int32_t> o(first.begin(), first.end());
+    ggml_backend_tensor_set(g.offsets, o.data(), 0, ggml_nbytes(g.offsets));
+    ggml_backend_tensor_set(g.centers, centers.data(), 0, ggml_nbytes(g.centers));
+  }
+  profile.mark("inputs");
+
+  if (backend_provider_->compute(compute_forces ? g.graph : g.forward) != GGML_STATUS_SUCCESS)
+    throw std::runtime_error("Graph computation failed");
+  profile.mark("compute");
+
+  results.assign(n_sys, ModelResult());
+  {
+    std::vector<float> atomic(n);
+    ggml_backend_tensor_get(g.energy, atomic.data(), 0, atomic.size() * sizeof(float));
+    for (int s = 0; s < n_sys; s++) {
+      double model = 0, composition = 0;
+      for (int i = off[s]; i < off[s + 1]; i++) {
+        model += atomic[i];
+        if (auto c = composition_energies_.find(Z[i]); c != composition_energies_.end()) composition += c->second;
+      }
+      results[s].energy = static_cast<float>(energy_scale_ * model + composition);
+    }
+    if (g.nc) {
+      std::vector<float> nc(3 * size_t(n));
+      ggml_backend_tensor_get(g.nc, nc.data(), 0, nc.size() * sizeof(float));
+      for (int s = 0; s < n_sys; s++) {
+        auto &r = results[s];
+        r.nc_forces.resize(3 * size_t(off[s + 1] - off[s]));
+        for (int i = off[s]; i < off[s + 1]; i++) {
+          auto it = nc_force_scales_.find(Z[i]);
+          const float sc = it != nc_force_scales_.end() ? it->second : 1.0f;
+          for (int c = 0; c < 3; c++) r.nc_forces[3 * (i - off[s]) + c] = nc[3 * size_t(i) + c] * sc;
+        }
+        r.has_nc_forces = true;
+      }
+    }
+  }
+
+  auto periodic_of = [&](int s) {
+    const Cell *c = systems[s].cell();
+    return c && (c->periodic[0] || c->periodic[1] || c->periodic[2]);
+  };
+  bool any_periodic = false;
+  for (int s = 0; s < n_sys; s++) any_periodic = any_periodic || periodic_of(s);
+  if (compute_forces) {
+    std::vector<float> G(3 * S), C;
+    ggml_backend_tensor_get(g.grad_ev, G.data(), 0, G.size() * sizeof(float));
+    if (g.grad_cv) {
+      C.resize(S);
+      ggml_backend_tensor_get(g.grad_cv, C.data(), 0, C.size() * sizeof(float));
+    }
+    std::vector<double> F(3 * size_t(n), 0.0), chain(C.empty() ? 0 : 3 * E, 0.0);
+    std::vector<std::array<double, 6>> virial(any_periodic ? n : 0, std::array<double, 6>{});
+    auto add_virial = [&](int i, const double r[3], const double gr[3]) {
+      auto &w = virial[i];
+      w[0] += r[0] * gr[0], w[1] += r[1] * gr[1], w[2] += r[2] * gr[2];
+      w[3] += 0.5 * (r[1] * gr[2] + r[2] * gr[1]);
+      w[4] += 0.5 * (r[0] * gr[2] + r[2] * gr[0]);
+      w[5] += 0.5 * (r[0] * gr[1] + r[1] * gr[0]);
+    };
+#pragma omp parallel for num_threads(nt) schedule(static)
+    for (int k = 0; k < n; k++) {
+      double dEdr = 0;
+      for (int s = 0; s < nkept[k]; s++) {
+        const size_t a = first[k] + s, b = rev[a];
+        double ga[3], ra[3];
+        for (int c = 0; c < 3; c++) {
+          ga[c] = G[3 * a + c], ra[c] = ev[3 * a + c];
+          F[3 * k + c] += ga[c] - double(G[3 * b + c]);
+        }
+        if (!C.empty()) dEdr += 0.5 * (double(C[a]) + double(C[b]));
+        if (any_periodic) add_virial(k, ra, ga);
+      }
+      if (chain.empty()) continue;
+      for (int64_t e = edges.start[k]; e < edges.start[k + 1]; e++) {
+        const double d = edges.d[e];
+        if (!(d < cutoff)) continue;
+        const double coef = dEdr * (grid ? jac[e] : adaptive::ddist(d, radii[k], width)) / d;
+        for (int c = 0; c < 3; c++) chain[3 * e + c] = coef * edges.v[3 * e + c];
+        if (any_periodic) add_virial(k, &edges.v[3 * e], &chain[3 * e]);
+      }
+    }
+    if (!chain.empty()) {
+#pragma omp parallel for num_threads(nt) schedule(static)
+      for (int k = 0; k < n; k++)
+        for (int64_t e = edges.start[k]; e < edges.start[k + 1]; e++) {
+          const int64_t b = edges.rev[e];
+          if (b < 0) continue;
+          for (int c = 0; c < 3; c++) F[3 * k + c] += chain[3 * e + c] - chain[3 * b + c];
+        }
+    }
+    for (int s = 0; s < n_sys; s++) {
+      auto &r = results[s];
+      r.forces.resize(3 * size_t(off[s + 1] - off[s]));
+      for (size_t k = 0; k < r.forces.size(); k++)
+        r.forces[k] = static_cast<float>(energy_scale_ * F[3 * size_t(off[s]) + k]);
+      r.has_forces = true;
+      if (periodic_of(s)) {
+        std::array<double, 6> w{};
+        for (int i = off[s]; i < off[s + 1]; i++)
+          for (int c = 0; c < 6; c++) w[c] += virial[i][c];
+        set_stress(*systems[s].cell(), energy_scale_, w, r);
+      }
+    }
+  }
+  if (no_edges && forces_requested)
+    for (int s = 0; s < n_sys; s++) {
+      results[s].forces.assign(3 * size_t(off[s + 1] - off[s]), 0.0f);
+      results[s].has_forces = true;
+      if (systems[s].cell()) results[s].stress.assign(6, 0.0f), results[s].has_stress = true;
+    }
+  profile.mark("readback");
+  return results;
+}
+
 #ifdef MLIPCPP_HAVE_CUDA_INPUTS
 ModelResult GraphModel::predict_cached_device(const AtomicSystem &system, bool compute_forces,
                                               const std::vector<int32_t> &species) {
