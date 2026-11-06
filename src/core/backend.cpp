@@ -183,8 +183,9 @@ BackendProvider::create(BackendPreference pref, int device) {
     }
   };
 
-  // For WASM/Emscripten, set threads to 1 (no pthread support)
-#ifdef __EMSCRIPTEN__
+  // WASM without pthreads: one thread. A pthread build (MLIPCPP_WASM_THREADS)
+  // reads MLIPCPP_NUM_THREADS like native builds (set it in Module.ENV).
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
   ggml_backend_cpu_set_n_threads(provider->cpu_, 1);
 #else
   // ggml defaults to GGML_DEFAULT_N_THREADS (4) CPU threads

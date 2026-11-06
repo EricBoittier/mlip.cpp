@@ -63,6 +63,13 @@ if(EMSCRIPTEN)
     # Enable SIMD128 globally for all WASM compilation
     add_compile_options(-msimd128)
     add_link_options(-msimd128)
+    # Multi-threaded CPU build (needs SharedArrayBuffer, i.e. a cross-origin
+    # isolated page: COOP same-origin + COEP require-corp / credentialless)
+    option(MLIPCPP_WASM_THREADS "Build the WASM module with pthreads" OFF)
+    if(MLIPCPP_WASM_THREADS)
+        add_compile_options(-pthread)
+        add_link_options(-pthread)
+    endif()
 endif()
 
 # Enable Fortran if requested
@@ -524,7 +531,8 @@ if(EMSCRIPTEN)
         "-s ALLOW_MEMORY_GROWTH=1 "
         "-s MAXIMUM_MEMORY=4GB "
         "-s STACK_SIZE=1MB "
-        "-s EXPORTED_RUNTIME_METHODS=['FS','cwrap','ccall'] "
+        "-s EXPORTED_RUNTIME_METHODS=['FS','cwrap','ccall','HEAPU8','ENV'] "
+        "-s EXPORTED_FUNCTIONS=['_malloc','_free'] "
         "-s FORCE_FILESYSTEM=1 "
         "--bind "
         "-O3 "
@@ -541,6 +549,11 @@ if(EMSCRIPTEN)
         # emdawnwebgpu's callback plumbing). Leave it off until we can
         # enumerate those with ASYNCIFY_ADD.
         list(APPEND MLIPCPP_WASM_LINK_FLAGS "-s ASYNCIFY_STACK_SIZE=65536 ")
+    endif()
+
+    if(MLIPCPP_WASM_THREADS)
+        # workers are spawned on demand; the page sets MLIPCPP_NUM_THREADS
+        list(APPEND MLIPCPP_WASM_LINK_FLAGS "-s PTHREAD_POOL_SIZE=navigator.hardwareConcurrency ")
     endif()
 
     string(REPLACE ";" "" MLIPCPP_WASM_LINK_FLAGS "${MLIPCPP_WASM_LINK_FLAGS}")
