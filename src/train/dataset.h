@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mlipcpp/system.h"
+#include "runtime/frag_charges.h"
 
 #include <array>
 #include <cstdint>
@@ -70,6 +71,17 @@ public:
   /// fragment-sum loss columns of structure s: its number of fragments (at most cap; fragments
   /// cap-1 and above share the last column) when it has two or more and usable partial charges, else 0
   int fragment_columns(int64_t s, int cap) const;
+  /// fragment-constrained charges (mlipcpp-train with a pet.plato_lr.frag_charges model or
+  /// --frag-charges; agents/petlr/frag/frag_labels.py): fragunit.bin (int32 [N], bonded unit within
+  /// the structure), fragq.bin (int32 [N], its integer charge) and frag_ok.bin (uint8 [ns], 0:
+  /// fallback to whole-structure conditioning, no term); false if any is absent
+  bool load_frag_charges(const runtime::FragChargesSpec &spec);
+  const runtime::FragChargesSpec &frag_spec() const { return fq_spec_; }
+  bool has_frag_charges() const { return fq_unit_.size() > 0; }
+  /// structure s uses fragment charges (labels present and frag_ok, open structure)
+  bool frag_ok(int64_t s) const;
+  const int32_t *frag_units(int64_t s) const { return fq_unit_.data() + na_[s]; }
+  const int32_t *frag_unit_charge(int64_t s) const { return fq_q_.data() + na_[s]; }
 
   /// System s as an AtomicSystem. Zero cell rows become non-periodic vacuum
   /// vectors so the cell stays invertible for the neighbour-list grid.
@@ -86,6 +98,9 @@ private:
   std::vector<int32_t> charge_, spin_;
   Mapped<float> pq_;
   Mapped<int32_t> frag_;
+  Mapped<int32_t> fq_unit_, fq_q_;
+  Mapped<uint8_t> fq_ok_;
+  runtime::FragChargesSpec fq_spec_;
 };
 
 /// Neighbour lists of every structure in a split, built once and cached on

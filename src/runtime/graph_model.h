@@ -279,6 +279,16 @@ private:
       const AtomicSystem &system, bool compute_forces,
       const std::function<void()> &post_compute_hook = nullptr,
       std::vector<float> *parameter_gradients = nullptr);
+  ModelResult predict_single_impl(
+      const AtomicSystem &system, bool compute_forces,
+      const std::function<void()> &post_compute_hook,
+      std::vector<float> *parameter_gradients);
+  // fragment-constrained charges (plato_lr_.frag): during a call on an open structure with formal
+  // charges, the per-atom conditioning charge (its bonded unit's charge); empty otherwise
+  std::vector<int32_t> frag_cond_;
+  /// the conditioning table rows of every atom (frag_cond_ or the structure's charge)
+  /// (unit: the rows of the input charge_index_unit of a frag_cond_gate model)
+  std::vector<int32_t> charge_rows(int n_atoms, int charge, int spin_multiplicity, bool unit = false) const;
 };
 
 } // namespace mlipcpp::runtime

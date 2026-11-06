@@ -37,6 +37,7 @@ set(MLIPCPP_RUNTIME_SOURCES
     runtime/pet_ragged.cpp
     runtime/plato_graph.cpp
     runtime/pet_plato_lr.cpp
+    runtime/frag_charges.cpp
 )
 
 # Utilities

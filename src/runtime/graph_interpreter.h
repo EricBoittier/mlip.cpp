@@ -47,6 +47,21 @@ public:
   std::function<ggml_tensor *(ggml_context *, const GIRNode &, const std::vector<ggml_tensor *> &)>
       custom_op;
 
+  // Optional hook on every built node's output (e.g. the gated unit-charge conditioning of
+  // fragment-constrained charges); returns the tensor that replaces it. Unset: none.
+  std::function<ggml_tensor *(ggml_context *, const GIRNode &, ggml_tensor *)> post_node;
+
+  // The output of node `target_id` rebuilt with every reference `from` (e.g. "input:charge_index")
+  // replaced by `to`, through the nodes that depend on it (the others keep their built outputs).
+  // For use inside post_node / custom_op while building; the built outputs are left unchanged.
+  ggml_tensor *rebuild_substituted(ggml_context *ctx, int target_id, const std::string &from, const std::string &to);
+
+  // A registered weight, or nullptr
+  ggml_tensor *find_weight(const std::string &name) const {
+    auto it = weights_.find(name);
+    return it == weights_.end() ? nullptr : it->second;
+  }
+
   // Optional native replacement for the PET-LR matrix application.
   std::function<ggml_tensor *(ggml_context *, ggml_tensor *)>
       coulomb_application;

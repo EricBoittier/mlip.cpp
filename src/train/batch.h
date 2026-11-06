@@ -58,6 +58,9 @@ struct Batch {
   // charge and spin multiplicity of each atom's structure (padding atoms: 0, 1),
   // the conditioned model's table rows are made from them at upload
   std::vector<int32_t> atom_charge, atom_spin; // [n_atoms]
+  // gated unit conditioning (frag_cond_gate): each atom's bonded-unit charge (input charge_index_unit;
+  // the structure's charge where there are no unit labels), empty otherwise
+  std::vector<int32_t> atom_unit_charge;
   // Plato-PET-LR long range (mesh, LES): rotated positions [n_atoms, 3] (padding
   // atoms: 0) and per real structure its rotated cell (rows, zeros: open), whether
   // it is periodic (every cell row nonzero) and its total charge

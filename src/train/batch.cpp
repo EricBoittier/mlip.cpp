@@ -162,6 +162,7 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
   b.species.assign(n, 0);
   b.atom_charge.assign(n, 0);
   b.atom_spin.assign(n, 1);
+  if (split.has_frag_charges() && split.frag_spec().cond_gate) b.atom_unit_charge.assign(n, 0);
   b.positions.assign(static_cast<size_t>(n) * 3, 0.0f);
   b.cells.assign(b.n_real_systems, {});
   b.periodic.assign(b.n_real_systems, 0);
@@ -186,6 +187,7 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
       const int a = offset + i;
       b.species[a] = index_of(Z[i]);
       b.atom_charge[a] = split.charge(s);
+      if (!b.atom_unit_charge.empty()) b.atom_unit_charge[a] = split.charge(s);
       b.atom_spin[a] = split.spin_multiplicity(s);
       b.atom_weight[static_cast<size_t>(k) * n + a] = 1.0f / ns;
       const double fs = scaling.fscale(Z[i]);
@@ -227,6 +229,26 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
     }
     b.energy_target[k] = static_cast<float>(
         (split.energy(s) - scaling.comp(Z, ns)) / (scaling.energy_scale * ns));
+    if (split.has_frag_charges() && split.frag_ok(s)) {
+      // fragment-constrained charges: each atom conditioned on its bonded unit's charge, and the
+      // beyond-R Coulomb term of the unit charges (no weights) taken out of the targets, i.e. the
+      // model's prediction plus the term is fitted (same residuals, loss and gradients)
+      const int32_t *U = split.frag_units(s), *QU = split.frag_unit_charge(s);
+      for (int i = 0; i < ns; i++) (split.frag_spec().cond_gate ? b.atom_unit_charge : b.atom_charge)[offset + i] = QU[i];
+      const std::vector<double> q = runtime::frag_atom_charges(ns, U, QU);
+      std::vector<double> FF(3 * size_t(ns));
+      const double Ef = runtime::frag_coulomb(split.frag_spec(), ns, split.positions(s), q.data(), FF.data());
+      if (Ef != 0) {
+        b.energy_target[k] = static_cast<float>((double(split.energy(s)) - scaling.comp(Z, ns) - Ef) / (scaling.energy_scale * ns));
+        for (int i = 0; i < ns; i++) {
+          const float f[3] = {float(FF[3 * i]), float(FF[3 * i + 1]), float(FF[3 * i + 2])};
+          float fr[3];
+          rotate(f, fr);
+          const double fs = scaling.fscale(Z[i]);
+          for (int r = 0; r < 3; r++) b.force_target[3 * size_t(offset + i) + r] -= static_cast<float>(fr[r] / fs);
+        }
+      }
+    }
     b.n_per_system[k] = ns;
 
     const int64_t e0 = nl.edge_offset[s], e1 = nl.edge_offset[s + 1];

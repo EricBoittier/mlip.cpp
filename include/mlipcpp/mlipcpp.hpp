@@ -120,6 +120,10 @@ struct PredictOptions {
   /// the model's range is an error. Other models ignore them.
   int charge = 0;
   int spin_multiplicity = 1;
+  /// Per-atom formal charges (e), for models with fragment-constrained charges
+  /// (pet.plato_lr.frag_charges; only their sums over each bonded fragment matter); empty: none,
+  /// the model is then exactly the plain one. Other models ignore them.
+  std::vector<float> formal_charges;
 };
 
 /**

@@ -77,6 +77,9 @@ double lr_factor_linear(int64_t step, int64_t total, int64_t constant, double mi
 }
 
 
+// fragment-constrained charges of this run, written into every saved GGUF (pet.plato_lr.frag_*)
+runtime::FragChargesSpec g_frag_out;
+
 void write_gguf(const std::string &src, const std::string &dst, Worker &w,
                 const std::vector<float> &flat, const TargetScaling &sc) {
   // Copy the source GGUF (metadata and every tensor) into a fresh context,
@@ -100,6 +103,14 @@ void write_gguf(const std::string &src, const std::string &dst, Worker &w,
   for (int64_t i = 0; i < gguf_get_n_tensors(in); i++)
     gguf_add_tensor(g, ggml_get_tensor(data_ctx, gguf_get_tensor_name(in, i)));
   gguf_set_val_f32(g, "pet.energy_scale", static_cast<float>(sc.energy_scale));
+  if (g_frag_out.enabled) {
+    gguf_set_val_i32(g, "pet.plato_lr.frag_charges", 1);
+    if (g_frag_out.cond_gate) gguf_set_val_i32(g, "pet.plato_lr.frag_cond_gate", 1);
+    gguf_set_val_f32(g, "pet.plato_lr.frag_R", static_cast<float>(g_frag_out.R));
+    gguf_set_val_f32(g, "pet.plato_lr.frag_t", static_cast<float>(g_frag_out.t));
+    gguf_set_val_f32(g, "pet.plato_lr.frag_sigma", static_cast<float>(g_frag_out.sigma));
+    gguf_set_val_f32(g, "pet.plato_lr.frag_scale", static_cast<float>(g_frag_out.scale));
+  }
   std::vector<int32_t> ck, fk;
   std::vector<float> cv, fv;
   for (auto [Z, c] : sc.composition) ck.push_back(Z), cv.push_back(static_cast<float>(c));
@@ -612,6 +623,10 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
   if (model_.conditioning().enabled) { // table rows of each atom's structure
     interp.set_input("charge_index", in(GGML_TYPE_I32, {n}, "charge_index"));
     interp.set_input("spin_index", in(GGML_TYPE_I32, {n}, "spin_index"));
+    if (frag_cond_gate) { // gated unit conditioning: the units' rows
+      interp.set_input("charge_index_unit", in(GGML_TYPE_I32, {n}, "charge_index_unit"));
+      runtime::install_frag_cond_gate(interp);
+    }
   }
   if (model_.plato_lr().enabled) {
     plato_create(*g, ctx, n, mode == FORCES);
@@ -621,7 +636,7 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
   }
   struct ClearHook {
     runtime::GraphInterpreter &i;
-    ~ClearHook() { i.custom_op = {}; }
+    ~ClearHook() { i.custom_op = {}, i.post_node = {}; }
   } clear_hook{interp};
   if (mode == FORCES) {
     // dE/d(edge vectors, cutoff values) of E = sum of the atomic energies;
@@ -811,6 +826,12 @@ void Worker::upload_inputs(StepGraph &g, const Batch &b, const std::vector<float
     for (size_t a = 0; a < b.atom_charge.size(); a++)
       std::tie(cond_rows_[0][a], cond_rows_[1][a]) = cond.rows(b.atom_charge[a], b.atom_spin[a]);
     src.insert(src.end(), {span(cond_rows_[0]), span(cond_rows_[1])});
+    if (frag_cond_gate) {
+      cond_rows_[2].resize(b.atom_charge.size());
+      for (size_t a = 0; a < b.atom_charge.size(); a++)
+        cond_rows_[2][a] = cond.rows(b.atom_unit_charge.empty() ? b.atom_charge[a] : b.atom_unit_charge[a], b.atom_spin[a]).first;
+      src.insert(src.end(), {span(cond_rows_[2])});
+    }
   }
   if (g.inputs.size() > src.size())
     src.insert(src.end(), {span(b.atom_weight), span(b.energy_target), span(b.force_target),
@@ -2008,6 +2029,48 @@ void train(const TrainOptions &o) {
     }
   } else if (train_split.has_conditioning_data()) {
     fmt::print("warning: the data has charge / spin multiplicity, the model is not conditioned on them\n");
+  }
+
+  // fragment-constrained charges (a pet.plato_lr.frag_charges model, or --frag-charges: switched on and
+  // written into the saved GGUFs): per-atom unit conditioning and the beyond-R Coulomb term from the labels
+  {
+    runtime::FragChargesSpec fs = w0.model().plato_lr().frag;
+    if (o.frag_charges) fs.enabled = true;
+    if (o.frag_cond_gate) fs.enabled = fs.cond_gate = true;
+    if (fs.enabled) {
+      if (!w0.model().plato_lr().enabled || !w0.model().conditioning().enabled)
+        throw std::runtime_error("fragment-constrained charges need a Plato-PET-LR model with charge conditioning");
+      for (MemmapSplit *sp : {&train_split, &val_split, &test_split}) {
+        if (!sp->load_frag_charges(fs)) {
+          if (sp == &train_split) throw std::runtime_error(sp->dir() + ": fragment charges need fragunit.bin, fragq.bin, frag_ok.bin");
+          fmt::print("fragment charges: {}: no labels, whole-structure conditioning\n", sp->dir());
+          continue;
+        }
+        int64_t ok = 0, multi = 0, charged_multi = 0;
+        int qmin = 0, qmax = 0;
+        for (int64_t k = 0; k < sp->size(); k++) {
+          if (!sp->frag_ok(k)) continue;
+          ok++;
+          const int32_t *U = sp->frag_units(k), *QU = sp->frag_unit_charge(k);
+          int hi = 0;
+          bool charged = false;
+          for (int i = 0; i < sp->n_atoms(k); i++) {
+            hi = std::max(hi, U[i]), charged |= QU[i] != 0;
+            qmin = std::min(qmin, QU[i]), qmax = std::max(qmax, QU[i]);
+            w0.model().conditioning().check(QU[i], sp->spin_multiplicity(k));
+          }
+          multi += hi > 0, charged_multi += hi > 0 && charged;
+        }
+        fmt::print("fragment charges ({}): {} of {} structures with unit labels ({} multi-unit, {} of them with a charged unit), "
+                   "unit charges in [{}, {}]; the rest whole-structure\n", sp->dir(), ok, sp->size(), multi, charged_multi, qmin, qmax);
+      }
+      fmt::print("fragment charges: beyond-R Coulomb of Q_u / n_u, R {} A, switch {} A, sigma {} A, scale {}\n", fs.R, fs.t,
+                 fs.sigma, fs.scale);
+    }
+    g_frag_out = fs;
+    for (auto &w : workers) w->frag_cond_gate = fs.enabled && fs.cond_gate;
+    if (fs.enabled && fs.cond_gate)
+      fmt::print("fragment charges: gated unit conditioning c(Q_s) + g (c(Q_u) - c(Q_s)), g = plato_frag_cond_gate\n");
   }
 
   // --epochs 0 evaluates a trained model with the baselines stored in it
