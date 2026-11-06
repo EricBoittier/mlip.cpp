@@ -33,7 +33,7 @@ def cmd_write(a):
     bk = pet.backend
     zs = [z for z, i in sorted(((z, int(i)) for z, i in enumerate(bk.species_to_species_index.tolist()) if int(i) >= 0),
                                key=lambda t: t[1])]
-    bk.sqe = PETSQE(zs, None, a.q0, a.backbone_charge)
+    bk.sqe = PETSQE(zs, {"lr_R": a.lr_R, "lr_t": a.lr_t} if a.lr_R > 0 else None, a.q0, a.backbone_charge)
     if a.perturb is not None:
         g = torch.Generator().manual_seed(a.perturb)
         with torch.no_grad():
@@ -77,6 +77,7 @@ def main():
     w = sub.add_parser("write"); w.add_argument("--model", required=True); w.add_argument("--out", required=True)
     w.add_argument("--perturb", type=int); w.add_argument("--q0", default="uniform")
     w.add_argument("--backbone-charge", default="input")
+    w.add_argument("--lr-R", type=float, default=0.0); w.add_argument("--lr-t", type=float, default=1.0)
     c = sub.add_parser("compare"); c.add_argument("--out", required=True); c.add_argument("--eval", required=True)
     c.add_argument("--json")
     a = ap.parse_args()

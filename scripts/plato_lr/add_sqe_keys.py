@@ -24,10 +24,13 @@ def main():
     ap.add_argument("--q0", choices=["uniform", "formal", "learned"], default="uniform")
     ap.add_argument("--backbone-charge", choices=["input", "neutral"], default="input")
     ap.add_argument("--lr-R", type=float, default=None, help="override the spec's lr_R (long-range-only SQE energy)")
+    ap.add_argument("--lr-t", type=float, default=None, help="override the spec's lr_t (switch width)")
     a = ap.parse_args()
     sp = json.load(open(a.spec))
     if a.lr_R is not None:
         sp["cfg"]["lr_R"] = a.lr_R
+    if a.lr_t is not None:
+        sp["cfg"]["lr_t"] = a.lr_t
     data = open(a.input, "rb").read()
     pos = 0
 
