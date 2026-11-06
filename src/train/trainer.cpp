@@ -717,6 +717,10 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
     ggml_tensor *loss = ggml_add(ctx, loss_e, loss_f);
     if (ggml_tensor *lq = charge_corr_graph(*g, ctx, S, true)) loss = ggml_add(ctx, loss, lq);
     if (ggml_tensor *lf = frag_charge_graph(*g, ctx, S, true)) loss = ggml_add(ctx, loss, lf);
+    if (tail_cotangent && mode == BACKWARD) { // tail loss: its gradient through the energies, c = dL/d(d_energy)
+      g->ecot = input(ctx, GGML_TYPE_F32, {S, 1}, "tail_cotangent");
+      loss = ggml_add(ctx, loss, ggml_sum(ctx, ggml_mul(ctx, d_energy, g->ecot)));
+    }
     if (mode == MIXED) {
       // - <dE/dx, u> along the scaled residual u: its weight gradient is the
       // conservative force loss's (u held fixed)
@@ -816,6 +820,7 @@ void Worker::upload_inputs(StepGraph &g, const Batch &b, const std::vector<float
                            const std::vector<float> *dc) {
   auto [e_norm, f_norm] = loss_norms(b);
   if (conservative.on) e_norm *= conservative.energy, f_norm *= conservative.nc_force;
+  if (zero_norms_) e_norm = f_norm = 0.0f;
   const float norms[2] = {e_norm, f_norm};
   auto span = [](const auto &v) {
     return std::pair<const void *, size_t>(v.data(), v.size() * sizeof(v[0]));
@@ -841,6 +846,11 @@ void Worker::upload_inputs(StepGraph &g, const Batch &b, const std::vector<float
                            span(b.force_mask), span(b.force_scale), {norms, sizeof norms}});
   if (dv) src.insert(src.end(), {span(*dv), span(*dc)});
   if (src.size() != g.inputs.size()) throw std::logic_error("upload_inputs: input count");
+  if (g.ecot) {
+    std::vector<float> c(ggml_nelements(g.ecot), 0.0f);
+    std::copy_n(ecot_.begin(), std::min(c.size(), ecot_.size()), c.begin());
+    ggml_backend_tensor_set(g.ecot, c.data(), 0, ggml_nbytes(g.ecot));
+  }
   if (g.qref) {
     std::vector<float> ref(ggml_nelements(g.qref), 0.0f), ok(ggml_nelements(g.qok), 0.0f);
     std::copy_n(b.ref_charge.begin(), std::min(ref.size(), b.ref_charge.size()), ref.begin());
@@ -1007,6 +1017,47 @@ StepStats Worker::run(const Batch &b, double energy_scale, bool backward) {
   }
   t_download = seconds_since(t0);
   return st;
+}
+
+double Worker::run_tail(const Batch &b, double energy_scale, const std::vector<TailPair> &pairs, const TailLoss &tl,
+                        double mult, std::vector<double> *r) {
+  if (!tail_cotangent) throw std::logic_error("run_tail: tail_cotangent is off");
+  if (sqe) throw std::runtime_error("--tail-data: not with --sqe (its energy is host-side)");
+  t_build = t_alloc = t_upload = t_compute = t_download = t_cpu = 0;
+  plato_batch_ = &b;
+  const int n = b.n_atoms, m = b.max_neighbors, S = b.n_systems;
+  // 1. the model energies (eV, without the composition: it cancels within a scan)
+  std::vector<double> E(b.n_real_systems);
+  {
+    std::unique_ptr<StepGraph> once;
+    StepGraph &g = graph(n, m, S, FORWARD, once);
+    upload_inputs(g, b);
+    compute(g);
+    std::vector<float> ps(2 * static_cast<size_t>(S));
+    ggml_backend_tensor_get(g.per_system, ps.data(), 0, ps.size() * sizeof(float));
+    for (int k = 0; k < b.n_real_systems; k++)
+      E[k] = energy_scale * b.n_per_system[k] * (double(ps[k]) + double(b.energy_target[k]));
+  }
+  for (const TailPair &p : pairs)
+    if (b.n_per_system.at(p.k) != b.n_per_system.at(p.l)) throw std::runtime_error("tail pair of different sizes");
+  // 2. the loss and dL/dE; dE_k / d(d_energy_k) = s_E N_k
+  std::vector<double> dLdE;
+  const double L = tl.eval(pairs, E, &dLdE);
+  if (r) {
+    r->clear();
+    for (const TailPair &p : pairs) r->push_back(tl.residual(p, E));
+  }
+  ecot_.assign(S, 0.0f);
+  for (int k = 0; k < b.n_real_systems; k++)
+    ecot_[k] = static_cast<float>(mult * dLdE[k] * energy_scale * b.n_per_system[k]);
+  // 3. backward of sum_k c_k d_energy_k alone
+  std::unique_ptr<StepGraph> once;
+  zero_norms_ = true;
+  StepGraph &g = graph(n, m, S, BACKWARD, once);
+  upload_inputs(g, b);
+  zero_norms_ = false;
+  compute(g);
+  return L;
 }
 
 StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool backward) {
@@ -2400,6 +2451,47 @@ void train(const TrainOptions &o) {
     return out;
   };
 
+  // --tail-data: the pulled-apart scans (a MemmapSplit) and their pairs; one scan per step, classes in turn
+  std::unique_ptr<MemmapSplit> tail_split;
+  NeighborCache nl_tail;
+  TailSet tail_set;
+  TailLoss tail_loss{o.tail_weight, o.tail_floor_mev * 1e-3, o.tail_delta};
+  const bool tail_on = !o.tail_data.empty() && o.tail_weight > 0 && !eval_only;
+  if (tail_on) {
+    if (!o.conservative) throw std::runtime_error("--tail-data: conservative training only");
+    tail_split = std::make_unique<MemmapSplit>(o.tail_data);
+    tail_set = TailSet::load(o.tail_data + "/tail_pairs.tsv");
+    for (const auto &g : tail_set.groups)
+      for (int64_t s : g.ids)
+        if (s < 0 || s >= tail_split->size()) throw std::runtime_error("--tail-data: structure index out of range");
+    nl_tail = NeighborCache::load_or_build(*tail_split, cutoff, cache_path(o.cache_dir, *tail_split, cutoff, adaptive),
+                                           o.n_threads, adaptive);
+    nl_tail.taper = false; // energies only
+    for (auto &wk : workers) wk->tail_cotangent = true;
+    std::string per;
+    for (size_t c = 0; c < tail_set.classes.size(); c++)
+      per += fmt::format("{}{} {}", c ? ", " : "", tail_set.classes[c], tail_set.by_class[c].size());
+    fmt::print("tail loss: {} structures, {} groups ({}), {} pairs; weight {} x mean over a group's pairs of "
+               "Huber_{}((dE_model - dE_DFT) / max(|dE_ref|, {} meV)); one group per step, classes in turn\n",
+               tail_split->size(), tail_set.groups.size(), per, tail_set.n_pairs(), o.tail_weight, o.tail_delta,
+               o.tail_floor_mev);
+  }
+  std::vector<double> tail_log_l(tail_set.classes.size(), 0.0), tail_log_r(tail_set.classes.size(), 0.0);
+  std::vector<int64_t> tail_log_n(tail_set.classes.size(), 0), tail_log_np(tail_set.classes.size(), 0);
+  double tail_ep_l = 0;
+  int64_t tail_ep_n = 0;
+  // the group of step s and its batch (one random rotation for the whole scan); its own stream, so the
+  // OMol25 batches are those of the run without the tail loss
+  auto tail_batch = [&](int64_t s, int &cls) {
+    cls = int(s % int64_t(tail_set.classes.size()));
+    std::mt19937_64 rng((o.seed + 0x7A11ULL) * 0x9E3779B97F4A7C15ULL + uint64_t(s));
+    const auto &gs = tail_set.by_class[cls];
+    const TailGroup &g = tail_set.groups[gs[std::uniform_int_distribution<size_t>(0, gs.size() - 1)(rng)]];
+    const auto R = random_o3(rng);
+    std::vector<std::array<float, 9>> rot(g.ids.size(), R);
+    return std::make_pair(&g, make_batch(*tail_split, nl_tail, g.ids, rot, species, scaling, cutoff));
+  };
+
   // --log-errors: each training structure's errors before the update it takes part in
   std::unique_ptr<std::FILE, int (*)(std::FILE *)> log_file(nullptr, std::fclose);
   if (!o.log_errors.empty() && !eval_only) {
@@ -2437,6 +2529,10 @@ void train(const TrainOptions &o) {
     };
     refill();
     for (int64_t step = 0; step < steps_per_epoch && global_step != o.max_steps; step++, global_step++) {
+      if (o.checkpoint_steps > 0 && global_step > 0 && global_step % o.checkpoint_steps == 0) {
+        params = w0.get_params();
+        write_gguf(o.init_gguf, fmt::format("{}.step{:06d}.gguf", o.output, global_step), w0, params, scaling);
+      }
       auto t = clock_type::now();
       std::vector<std::vector<Batch>> batches = ahead.front().get();
       ahead.pop_front();
@@ -2458,6 +2554,14 @@ void train(const TrainOptions &o) {
           wb[w] += workers[w]->t_build, wc[w] += workers[w]->t_compute;
           samples[w].push_back({double(mb.n_atoms), double(mb.max_neighbors), 1e3 * seconds_since(t_mb),
                                 1e3 * (workers[w]->t_build + workers[w]->t_alloc)});
+        }
+        if (tail_on && w == 0) { // the tail group (on worker 0; the DDP mean divides by W, so x W)
+          int cls = 0;
+          auto [g, tb] = tail_batch(global_step, cls);
+          std::vector<double> r;
+          const double L = workers[0]->run_tail(tb, scaling.energy_scale, g->pairs, tail_loss, double(W), &r);
+          tail_log_l[cls] += L, tail_log_n[cls]++, tail_ep_l += L, tail_ep_n++;
+          for (double x : r) tail_log_r[cls] += std::abs(x), tail_log_np[cls]++;
         }
         optimizer.stage(w); // ship the gradients while the other workers still compute
       });
@@ -2549,6 +2653,16 @@ void train(const TrainOptions &o) {
                    1e3 * t_compute / (step + 1), 1e3 * t_sync / (step + 1),
                    double(n_micro) / ((step + 1) * W), w0.cache_size(), w0.compute_buffer_bytes() / 1e9,
                    w0.cache_misses, w0.cache_flushes);
+        if (tail_on) {
+          std::string per;
+          for (size_t c = 0; c < tail_set.classes.size(); c++) {
+            per += fmt::format("{}{} {:.4g} (mean |r| {:.3f})", c ? ", " : "", tail_set.classes[c],
+                               tail_log_l[c] / std::max<int64_t>(1, tail_log_n[c]),
+                               tail_log_r[c] / std::max<int64_t>(1, tail_log_np[c]));
+            tail_log_l[c] = tail_log_r[c] = 0, tail_log_n[c] = tail_log_np[c] = 0;
+          }
+          fmt::print("  tail loss per group: {}\n", per);
+        }
         // MLIPCPP_LOG_PARAMS=a,b: mean |x| and max |x| of those tensors (GGUF names) at each log line
         if (const char *lp = std::getenv("MLIPCPP_LOG_PARAMS"); lp && *lp) {
           std::string names = lp, out;
@@ -2614,7 +2728,9 @@ void train(const TrainOptions &o) {
                                               : lr_at(global_step),
                          ep.loss / done, tre, trf, t_train, t_val, best) +
                  (grouped ? ",\"lr_groups\":" + grouped->lr_json(std::max<int64_t>(0, global_step - 1), steps_per_epoch, total_steps)
-                          : std::string()));
+                          : std::string()) +
+                 (tail_on ? fmt::format(",\"train_tail_loss\":{}", tail_ep_l / std::max<int64_t>(1, tail_ep_n)) : std::string()));
+    tail_ep_l = 0, tail_ep_n = 0;
     if (o.save_every <= 0)
       write_gguf(o.init_gguf, fmt::format("{}.epoch{}", o.output, epoch), w0, params, scaling);
     else if (done_epochs % o.save_every == 0)
