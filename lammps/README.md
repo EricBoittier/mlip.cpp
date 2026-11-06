@@ -29,7 +29,7 @@ against the C header only.
 
 ```
 units       metal
-pair_style  mlipcpp pet-mad-s-v1.6.0.gguf [backend auto|cpu|cuda|...] [charge Q] [spin 2S+1]
+pair_style  mlipcpp pet-mad-s-v1.6.0.gguf [backend auto|cpu|cuda|...] [charge Q] [spin 2S+1] [precision default|fp32|tf32]
 pair_coeff  * * Pd                     # an element per atom type
 ```
 
@@ -38,6 +38,12 @@ defaults 0 and 1) are for models conditioned on them (metatrain PET with
 `system_conditioning: true`); given to another model, or out of the model's
 range, they are an error. One value for the whole simulation (no per-molecule
 charges).
+
+`precision` sets the CUDA matmul precision of this model: `default` (full FP32,
+or TF32 with `MLIPCPP_TF32=1`), `fp32` (full FP32 also in a process that runs
+TF32) or `tf32` (TF32 tensor cores, the edge-geometry product in FP32). TF32 is
+process-wide in CUDA, decided at the first force call, so two mlip.cpp pair
+styles of one run (`pair_style hybrid/overlay`) can differ.
 
 One MPI rank. Each step the owned atoms, LAMMPS's box (as the cell) and its
 periodicity go to mlip.cpp, which builds its own neighbour list (on the GPU,

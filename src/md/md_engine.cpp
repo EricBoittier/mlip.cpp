@@ -1,4 +1,5 @@
 #include "md/md_engine.h"
+#include "core/matmul_precision.h"
 
 #include <cuda_runtime.h>
 #include <ggml-backend.h>
@@ -154,6 +155,10 @@ void Engine::build_graph(int M) {
   ggml_build_forward_expand(gf_, total);
   const int n_forward = ggml_graph_n_nodes(gf_);
   ggml_build_backward_expand(ctx_, gf_, nullptr);
+  // the process decision (GGML_CUDA_NO_TF32 set above unless MLIPCPP_MD_TF32),
+  // and this model's products in full FP32 if it asked for FP32 in TF32
+  matmul_precision::commit();
+  matmul_precision::tag_graph(gf_, model_.matmul_precision(), model_.backend());
   ggml_tensor *loss_grad = ggml_graph_get_grad_acc(gf_, total);
   ggml_tensor *gev = ggml_graph_get_grad(gf_, ev), *gcv = adaptive ? ggml_graph_get_grad(gf_, cv) : nullptr;
   if (!gev) throw std::runtime_error("md: the energy does not depend on the edge vectors");

@@ -10,6 +10,7 @@ set(MLIPCPP_CORE_SOURCES
     core/neighbor_list.cpp
     core/gguf_loader.cpp
     core/backend.cpp
+    core/matmul_precision.cpp
     core/ggml_utils.cpp
     core/timer.cpp
 )
@@ -123,6 +124,12 @@ set_target_properties(mlipcpp PROPERTIES
     SOVERSION ${PROJECT_VERSION_MAJOR}
     EXPORT_NAME mlipcpp
 )
+
+# per-model CUDA matmul precision in one process (tests/precision_check.py)
+if(NOT EMSCRIPTEN)
+    add_executable(mlipcpp-precision-check bin/mlipcpp_precision_check.cpp)
+    target_link_libraries(mlipcpp-precision-check PRIVATE mlipcpp)
+endif()
 
 # =============================================================================
 # metatomic plugin (optional)

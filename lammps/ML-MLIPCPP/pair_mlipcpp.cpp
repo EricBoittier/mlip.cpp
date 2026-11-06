@@ -176,7 +176,8 @@ void PairMLIPCPP::settings(int narg, char **arg)
 {
   if (narg < 1 || narg % 2 == 0)
     error->all(FLERR, "Illegal pair_style mlipcpp command: pair_style mlipcpp MODEL.gguf "
-                      "[backend auto|cpu|cuda|hip|metal|vulkan|sycl] [charge Q] [spin 2S+1]");
+                      "[backend auto|cpu|cuda|hip|metal|vulkan|sycl] [charge Q] [spin 2S+1] "
+                      "[precision default|fp32|tf32]");
   mlipcpp_model_options_t opts;
   mlipcpp_model_options_default(&opts);
   for (int k = 1; k < narg; k += 2) {
@@ -185,6 +186,15 @@ void PairMLIPCPP::settings(int narg, char **arg)
     // spin conditioning (an error with other models, out of the model's range too)
     if (key == "charge") { charge = utils::inumeric(FLERR, val, false, lmp); continue; }
     if (key == "spin") { spin_multiplicity = utils::inumeric(FLERR, val, false, lmp); continue; }
+    // CUDA matmuls of this model: default (full FP32, TF32 with MLIPCPP_TF32=1), fp32 (full FP32
+    // also in a TF32 process), tf32 (TF32 tensor cores, the geometry products in FP32)
+    if (key == "precision") {
+      if (val == "default") opts.precision = MLIPCPP_PRECISION_F32;
+      else if (val == "fp32") opts.precision = MLIPCPP_PRECISION_F32_EXACT;
+      else if (val == "tf32") opts.precision = MLIPCPP_PRECISION_TF32;
+      else error->all(FLERR, "Illegal pair_style mlipcpp precision: {} (default, fp32 or tf32)", val);
+      continue;
+    }
     if (key != "backend") error->all(FLERR, "Illegal pair_style mlipcpp keyword: {}", key);
     if (val == "auto") opts.backend = MLIPCPP_BACKEND_AUTO;
     else if (val == "cpu") opts.backend = MLIPCPP_BACKEND_CPU;

@@ -256,3 +256,27 @@ target_link_libraries(test_adaptive_grid PRIVATE mlipcpp ggml fmt::fmt Catch2::C
 target_include_directories(test_adaptive_grid PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/)
 target_compile_definitions(test_adaptive_grid PRIVATE MLIPCPP_TEST_RESOURCES="${CMAKE_CURRENT_SOURCE_DIR}/resources")
 catch_discover_tests(test_adaptive_grid)
+
+# Per-model CUDA matmul precision (MLIPCPP_PRECISION_TF32 / _F32_EXACT): the same model
+# in FP32 and in TF32 in one process against FP32-only and MLIPCPP_TF32=1 processes
+# (tests/precision_check.py; skipped without MLIPCPP_PRECISION_TEST_MODEL or numpy)
+set(MLIPCPP_PRECISION_TEST_MODEL "" CACHE FILEPATH "pet-graph GGUF for the precision_per_model test")
+set(MLIPCPP_PRECISION_TEST_XYZ "${CMAKE_CURRENT_SOURCE_DIR}/../geometries/water.xyz" CACHE FILEPATH
+    "structure for the precision_per_model test")
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND AND TARGET mlipcpp-precision-check)
+    if(MLIPCPP_USE_CUDA)
+        set(_prec_backend cuda)
+    else()
+        set(_prec_backend cpu)
+    endif()
+    set(_prec_model "${MLIPCPP_PRECISION_TEST_MODEL}")
+    if(NOT _prec_model)
+        set(_prec_model "${CMAKE_CURRENT_BINARY_DIR}/no-precision-test-model.gguf")
+    endif()
+    add_test(NAME precision_per_model
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/precision_check.py
+                     $<TARGET_FILE:mlipcpp-precision-check> ${_prec_model} ${MLIPCPP_PRECISION_TEST_XYZ}
+                     ${CMAKE_CURRENT_BINARY_DIR}/precision_check --backend ${_prec_backend} --reps 1 --warmup 0)
+    set_tests_properties(precision_per_model PROPERTIES SKIP_RETURN_CODE 77)
+endif()

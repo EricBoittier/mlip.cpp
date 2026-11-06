@@ -11,6 +11,7 @@
 #include "graph_cache.h"
 #include "graph_model.h"
 #include "core/adaptive_cutoff.h"
+#include "core/matmul_precision.h"
 #include "core/padding.h"
 
 #include <ggml-alloc.h>
@@ -374,6 +375,10 @@ void GraphModel::finish_cached_graph(std::unique_ptr<CachedGraph, CachedGraphDel
   if (!g->inputs) throw std::runtime_error("GraphModel: cannot allocate the graph inputs");
   char *base = static_cast<char *>(ggml_backend_buffer_get_base(g->inputs));
   for (auto &[t, offset] : place) ggml_backend_tensor_alloc(g->inputs, t, base + offset);
+  // this model's products in full FP32 if it runs in FP32 in a TF32 process
+  // (g->forward: a subgraph of the same nodes)
+  matmul_precision::tag_graph(g->graph, matmul_precision_, compute_backend_);
+  matmul_precision::tag_graph(g->forward, matmul_precision_, compute_backend_);
   if (!galloc_) galloc_ = ggml_gallocr_new(buft);
   if (!ggml_gallocr_alloc_graph(galloc_, g->graph))
     throw std::runtime_error("GraphModel: cannot allocate the graph (" + std::to_string(n) + " atoms x " +
@@ -1117,12 +1122,7 @@ GraphModel::DeviceTotals GraphModel::predict_device_step(const DeviceStep &) {
 // again before anything is added into the caller's forces (added by a kernel
 // that reads the same verdict on the device).
 GraphModel::DeviceTotals GraphModel::predict_device_step(const DeviceStep &in) {
-  static const bool full_fp32 = [] { // as predict(): TF32 only with MLIPCPP_TF32
-    if (std::getenv("MLIPCPP_TF32")) return false;
-    setenv("GGML_CUDA_NO_TF32", "1", 0);
-    return true;
-  }();
-  (void)full_fp32;
+  matmul_precision::commit(); // as predict(): TF32 only with MLIPCPP_TF32 or a TF32 model
   if (!device_step_supported())
     throw std::runtime_error("GraphModel: device arrays need a forces-mode model of the cached path on CUDA");
   const int n = in.n_atoms;

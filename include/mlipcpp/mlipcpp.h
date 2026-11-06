@@ -141,11 +141,26 @@ void mlipcpp_suppress_logging(void);
 
 /**
  * @brief Precision for computation
+ *
+ * On CUDA, TF32 is a process-wide setting that ggml reads once, at the first
+ * matmul. The process runs its CUDA matmuls in TF32 when MLIPCPP_TF32 is set
+ * or a model created with MLIPCPP_PRECISION_TF32 was loaded before the first
+ * predict; otherwise in full FP32 (the fast FP32 kernels). In a TF32 process
+ * a model in FP32 has every product of its graphs (and their gradients) run
+ * in full FP32. So two models of one process can differ: load all of them
+ * before the first predict (loading a TF32 model after a predict in full FP32
+ * fails with an error). No effect on other backends.
  */
 typedef enum {
-  MLIPCPP_PRECISION_F32 = 0, /**< 32-bit floating point */
+  /** 32-bit floating point; on CUDA: full FP32 matmuls, or TF32 when
+      MLIPCPP_TF32 is set (the behaviour without per-model precision) */
+  MLIPCPP_PRECISION_F32 = 0,
   MLIPCPP_PRECISION_F16 =
-      1 /**< 16-bit floating point (if supported by backend) */
+      1, /**< 16-bit floating point (if supported by backend; CUDA matmuls as F32) */
+  /** CUDA: TF32 tensor-core matmuls (the geometry products pinned to FP32) */
+  MLIPCPP_PRECISION_TF32 = 2,
+  /** CUDA: every matmul in full FP32, also when MLIPCPP_TF32 is set */
+  MLIPCPP_PRECISION_F32_EXACT = 3
 } mlipcpp_precision_t;
 
 /* ============================================================================

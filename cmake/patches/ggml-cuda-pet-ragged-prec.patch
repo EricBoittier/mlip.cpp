@@ -1,0 +1,17 @@
+diff --git a/src/ggml-cuda/pet-ragged.cu b/src/ggml-cuda/pet-ragged.cu
+index 2c3c9330..f8f8fd4f 100644
+--- a/src/ggml-cuda/pet-ragged.cu
++++ b/src/ggml-cuda/pet-ragged.cu
+@@ -1423,7 +1423,11 @@ static void pet_ragged_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+             const int Lm = a.max_len, nt = (Lm + 31) / 32 * 32;
+             const size_t P = d + 1;
+             const int3 sp = back ? split_bwd : split_fwd;
+-            const int mm = back ? mma_bwd : mma_fwd;
++            // op_params[3] == GGML_PREC_F32 (set by the caller on the forward and
++            // backward nodes): no TF32 tensor-core kernels for this product, as with
++            // GGML_CUDA_NO_TF32, so that a model in full FP32 can share a TF32 process
++            const bool exact = ggml_get_op_params_i32(dst, 3) == GGML_PREC_F32;
++            const int mm = exact ? 0 : back ? mma_bwd : mma_fwd;
+             if (!back) {
+                 float * out = (float *) dst->data, * lse = out + a.D*a.T;
+                 pet_ragged_zero_tail_launch(a.off, a.N, a.T, tail, out, (int) a.D, lse, a.H, stream);
