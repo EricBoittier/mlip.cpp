@@ -84,6 +84,9 @@ struct TrainOptions {
   // pet.plato_lr.frag_charges key (then written into the saved GGUFs): <split>/fragunit.bin,
   // fragq.bin, frag_ok.bin (agents/petlr/frag/frag_labels.py)
   bool frag_charges = false;
+  // --frag-cond-gate: the gated unit conditioning (runtime/frag_charges.h); the GGUF needs the tensor
+  // plato_frag_cond_gate (scripts/plato_lr/add_frag_keys.py --cond-gate)
+  bool frag_cond_gate = false;
   double energy_weight = 1.0, force_weight = 1.0, nc_force_weight = 1.0;
   // fine-tuning: keep the composition and scales stored in --init instead of
   // fitting them on the training set
@@ -221,6 +224,7 @@ public:
   struct ChargeCorr {
     double weight = 0.0, r_min = 1.0;
   } charge_corr;
+  bool frag_cond_gate = false; // gated unit conditioning (input charge_index_unit)
   double frag_charge_weight = 0.0;
 
   /// Profiling: compute node by node (synchronised) and accumulate, per op
@@ -307,7 +311,7 @@ private:
   uint64_t clock_ = 0;
   size_t ctx_bytes_[4] = {0, 0, 0, 0};  // graph context size per Mode; measured on the first build
   std::vector<uint8_t> staging_;   // host side of the input blob
-  std::vector<int32_t> cond_rows_[2]; // charge / spin table rows of the batch's atoms (conditioned models)
+  std::vector<int32_t> cond_rows_[3]; // charge / spin (/ unit charge) table rows of the batch's atoms (conditioned models)
   // Plato-PET-LR: the batch the next graph is built for (structures, cells, charges),
   // the MIXED graph's position tangent and tangent scale
   const Batch *plato_batch_ = nullptr;

@@ -249,6 +249,7 @@ def plato_lr_hypers(pet_model) -> Optional[dict]:
         frag_charges=frag is not None,
         frag_R=float(frag.R) if frag is not None else 0.0, frag_t=float(frag.t) if frag is not None else 0.0,
         frag_sigma=float(frag.sigma) if frag is not None else 0.0, frag_scale=float(frag.scale) if frag is not None else 0.0,
+        frag_cond_gate=frag is not None and getattr(frag, "cond_gate", None) is not None,
     )
 
 
@@ -303,6 +304,9 @@ class PlatoLRParts(torch.nn.Module):
             self.mesh_key = f"mesh{id(mesh)}"
             _REGISTRY[self.mesh_key] = mesh
             self.__dict__["_mesh_module"] = mesh
+        frag = getattr(pet_model, "frag", None)
+        if frag is not None and getattr(frag, "cond_gate", None) is not None:  # GGUF plato_frag_cond_gate
+            self.frag_cond_gate = frag.cond_gate
         if les is not None:
             self.les_charge_head = les.charge_head
             self.les_gate = les.les_gate
@@ -409,3 +413,5 @@ def gguf_metadata(writer, h: dict) -> None:
         writer.add_int32("pet.plato_lr.frag_charges", 1)
         for k in ("frag_R", "frag_t", "frag_sigma", "frag_scale"):
             writer.add_float32("pet.plato_lr." + k, float(h[k]))
+        if h.get("frag_cond_gate", False):  # the graph is unchanged: mlip.cpp adds the gated mix natively
+            writer.add_int32("pet.plato_lr.frag_cond_gate", 1)

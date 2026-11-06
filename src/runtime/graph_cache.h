@@ -58,7 +58,7 @@ struct CachedGraph {
               *padding_mask = nullptr, *reverse = nullptr, *cutoff_values = nullptr;
   // charge / spin conditioning: I32 [n] table rows (nullptr: an unconditioned model),
   // and the (charge, spin multiplicity) last uploaded to them
-  ggml_tensor *charge_index = nullptr, *spin_index = nullptr;
+  ggml_tensor *charge_index = nullptr, *spin_index = nullptr, *charge_index_unit = nullptr;
   int cond_charge = 0, cond_spin = 0;
   bool cond_set = false;
   ggml_tensor *energy = nullptr, *nc = nullptr;            // [1, n], [3, n] (unscaled)

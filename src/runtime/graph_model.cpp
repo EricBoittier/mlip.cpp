@@ -609,10 +609,11 @@ ModelResult GraphModel::predict_with_parameter_gradients(
   return predict_single(system, true, nullptr, &gradients);
 }
 
-std::vector<int32_t> GraphModel::charge_rows(int n_atoms, int charge, int spin_multiplicity) const {
+std::vector<int32_t> GraphModel::charge_rows(int n_atoms, int charge, int spin_multiplicity, bool unit) const {
   const int32_t ci = conditioning_.rows(charge, spin_multiplicity).first;
   std::vector<int32_t> c(n_atoms, ci);
-  if (!frag_cond_.empty()) {
+  // gated: charge_index keeps the structure's row, charge_index_unit gets the units' rows
+  if (!frag_cond_.empty() && unit == plato_lr_.frag.cond_gate) {
     if (frag_cond_.size() != static_cast<size_t>(n_atoms)) throw std::logic_error("frag_charges: atom count");
     for (int i = 0; i < n_atoms; i++) c[i] = conditioning_.rows(frag_cond_[i], spin_multiplicity).first;
   }
@@ -921,7 +922,11 @@ ModelResult GraphModel::predict_single_impl(
   }
 
   // charge / spin conditioning: the table rows of the structure, per atom
-  ggml_tensor *charge_index_t = nullptr, *spin_index_t = nullptr;
+  ggml_tensor *charge_index_t = nullptr, *spin_index_t = nullptr, *charge_index_unit_t = nullptr;
+  if (conditioning_.enabled && plato_lr_.frag.cond_gate) {
+    charge_index_unit_t = ggml_new_tensor_1d(input_ctx, GGML_TYPE_I32, n_atoms);
+    ggml_set_name(charge_index_unit_t, "charge_index_unit");
+  }
   if (conditioning_.enabled) {
     charge_index_t = ggml_new_tensor_1d(input_ctx, GGML_TYPE_I32, n_atoms);
     ggml_set_name(charge_index_t, "charge_index");
@@ -1111,6 +1116,12 @@ ModelResult GraphModel::predict_single_impl(
     ggml_backend_tensor_set(spin_index_t, sp.data(), 0, sp.size() * sizeof(int32_t));
     interp_.set_input("charge_index", charge_index_t);
     interp_.set_input("spin_index", spin_index_t);
+    if (charge_index_unit_t) {
+      const std::vector<int32_t> cu = charge_rows(n_atoms, system.charge(), system.spin_multiplicity(), true);
+      ggml_backend_tensor_set(charge_index_unit_t, cu.data(), 0, cu.size() * sizeof(int32_t));
+      interp_.set_input("charge_index_unit", charge_index_unit_t);
+      install_frag_cond_gate(interp_);
+    }
   }
 
   // Register common inputs
@@ -1171,11 +1182,13 @@ ModelResult GraphModel::predict_single_impl(
   } catch (...) {
     interp_.coulomb_application = {};
     interp_.custom_op = {};
+    interp_.post_node = {};
     interp_.set_input_gradients(false);
     throw;
   }
   interp_.coulomb_application = {};
   interp_.custom_op = {};
+  interp_.post_node = {};
   interp_.set_input_gradients(false);
   if (p3m_ && !lr_charges)
     throw std::runtime_error("Missing PET-LR charge application");

@@ -105,6 +105,7 @@ void write_gguf(const std::string &src, const std::string &dst, Worker &w,
   gguf_set_val_f32(g, "pet.energy_scale", static_cast<float>(sc.energy_scale));
   if (g_frag_out.enabled) {
     gguf_set_val_i32(g, "pet.plato_lr.frag_charges", 1);
+    if (g_frag_out.cond_gate) gguf_set_val_i32(g, "pet.plato_lr.frag_cond_gate", 1);
     gguf_set_val_f32(g, "pet.plato_lr.frag_R", static_cast<float>(g_frag_out.R));
     gguf_set_val_f32(g, "pet.plato_lr.frag_t", static_cast<float>(g_frag_out.t));
     gguf_set_val_f32(g, "pet.plato_lr.frag_sigma", static_cast<float>(g_frag_out.sigma));
@@ -622,6 +623,10 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
   if (model_.conditioning().enabled) { // table rows of each atom's structure
     interp.set_input("charge_index", in(GGML_TYPE_I32, {n}, "charge_index"));
     interp.set_input("spin_index", in(GGML_TYPE_I32, {n}, "spin_index"));
+    if (frag_cond_gate) { // gated unit conditioning: the units' rows
+      interp.set_input("charge_index_unit", in(GGML_TYPE_I32, {n}, "charge_index_unit"));
+      runtime::install_frag_cond_gate(interp);
+    }
   }
   if (model_.plato_lr().enabled) {
     plato_create(*g, ctx, n, mode == FORCES);
@@ -631,7 +636,7 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
   }
   struct ClearHook {
     runtime::GraphInterpreter &i;
-    ~ClearHook() { i.custom_op = {}; }
+    ~ClearHook() { i.custom_op = {}, i.post_node = {}; }
   } clear_hook{interp};
   if (mode == FORCES) {
     // dE/d(edge vectors, cutoff values) of E = sum of the atomic energies;
@@ -821,6 +826,12 @@ void Worker::upload_inputs(StepGraph &g, const Batch &b, const std::vector<float
     for (size_t a = 0; a < b.atom_charge.size(); a++)
       std::tie(cond_rows_[0][a], cond_rows_[1][a]) = cond.rows(b.atom_charge[a], b.atom_spin[a]);
     src.insert(src.end(), {span(cond_rows_[0]), span(cond_rows_[1])});
+    if (frag_cond_gate) {
+      cond_rows_[2].resize(b.atom_charge.size());
+      for (size_t a = 0; a < b.atom_charge.size(); a++)
+        cond_rows_[2][a] = cond.rows(b.atom_unit_charge.empty() ? b.atom_charge[a] : b.atom_unit_charge[a], b.atom_spin[a]).first;
+      src.insert(src.end(), {span(cond_rows_[2])});
+    }
   }
   if (g.inputs.size() > src.size())
     src.insert(src.end(), {span(b.atom_weight), span(b.energy_target), span(b.force_target),
@@ -2025,6 +2036,7 @@ void train(const TrainOptions &o) {
   {
     runtime::FragChargesSpec fs = w0.model().plato_lr().frag;
     if (o.frag_charges) fs.enabled = true;
+    if (o.frag_cond_gate) fs.enabled = fs.cond_gate = true;
     if (fs.enabled) {
       if (!w0.model().plato_lr().enabled || !w0.model().conditioning().enabled)
         throw std::runtime_error("fragment-constrained charges need a Plato-PET-LR model with charge conditioning");
@@ -2056,6 +2068,9 @@ void train(const TrainOptions &o) {
                  fs.sigma, fs.scale);
     }
     g_frag_out = fs;
+    for (auto &w : workers) w->frag_cond_gate = fs.enabled && fs.cond_gate;
+    if (fs.enabled && fs.cond_gate)
+      fmt::print("fragment charges: gated unit conditioning c(Q_s) + g (c(Q_u) - c(Q_s)), g = plato_frag_cond_gate\n");
   }
 
   // --epochs 0 evaluates a trained model with the baselines stored in it

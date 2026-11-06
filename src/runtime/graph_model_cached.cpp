@@ -278,6 +278,10 @@ void GraphModel::build_cached_graph(int n, int M, bool exact_mask, bool backward
   if (conditioning_.enabled) {
     g->charge_index = input(GGML_TYPE_I32, {n}, "charge_index");
     g->spin_index = input(GGML_TYPE_I32, {n}, "spin_index");
+    if (plato_lr_.frag.cond_gate) {
+      g->charge_index_unit = input(GGML_TYPE_I32, {n}, "charge_index_unit");
+      install_frag_cond_gate(interp_);
+    }
   }
   if (backward) {
     ggml_set_param(g->edge_vectors);
@@ -294,7 +298,7 @@ void GraphModel::build_cached_graph(int n, int M, bool exact_mask, bool backward
   }
   struct ClearHook {
     GraphInterpreter &i;
-    ~ClearHook() { i.custom_op = {}; }
+    ~ClearHook() { i.custom_op = {}, i.post_node = {}; }
   } clear_hook{interp_};
 
   interp_.coulomb_application = {};
@@ -532,6 +536,10 @@ void GraphModel::upload_conditioning(CachedGraph &g, int charge, int spin_multip
   std::vector<int32_t> c = charge_rows(g.n_atoms, charge, spin_multiplicity), s(g.n_atoms, si);
   ggml_backend_tensor_set(g.charge_index, c.data(), 0, ggml_nbytes(g.charge_index));
   ggml_backend_tensor_set(g.spin_index, s.data(), 0, ggml_nbytes(g.spin_index));
+  if (g.charge_index_unit) {
+    const std::vector<int32_t> cu = charge_rows(g.n_atoms, charge, spin_multiplicity, true);
+    ggml_backend_tensor_set(g.charge_index_unit, cu.data(), 0, ggml_nbytes(g.charge_index_unit));
+  }
   // per-atom (fragment) rows: not a structure charge, uploaded again next call
   g.cond_set = frag_cond_.empty(), g.cond_charge = charge, g.cond_spin = spin_multiplicity;
 }

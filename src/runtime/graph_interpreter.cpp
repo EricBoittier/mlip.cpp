@@ -1,5 +1,7 @@
 #include "graph_interpreter.h"
 
+#include <set>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -289,6 +291,7 @@ ggml_tensor *GraphInterpreter::build(ggml_context *ctx) {
     ggml_tensor *output = nullptr;
     try {
       output = build_node(ctx, node);
+      if (output && post_node) output = post_node(ctx, node, output);
     } catch (const std::exception &e) {
       throw std::runtime_error("Failed building node " +
                                std::to_string(node.id) + " (" + node.op +
@@ -320,6 +323,35 @@ ggml_tensor *GraphInterpreter::build(ggml_context *ctx) {
   }
 
   return output_;
+}
+
+ggml_tensor *GraphInterpreter::rebuild_substituted(ggml_context *ctx, int target_id, const std::string &from,
+                                                  const std::string &to) {
+  const std::map<int, ggml_tensor *> saved = node_outputs_;
+  std::set<std::string> dirty = {from};
+  ggml_tensor *out = nullptr;
+  try {
+    for (const auto &node : graph_.nodes) {
+      bool hit = false;
+      for (const auto &r : node.inputs) hit |= dirty.count(r) > 0;
+      if (hit) {
+        GIRNode copy = node;
+        for (auto &r : copy.inputs)
+          if (r == from) r = to;
+        ggml_tensor *t = build_node(ctx, copy);
+        node_outputs_[node.id] = t;
+        dirty.insert("node:" + std::to_string(node.id));
+        if (node.id == target_id) out = t;
+      }
+      if (node.id == target_id) break;
+    }
+  } catch (...) {
+    node_outputs_ = saved;
+    throw;
+  }
+  node_outputs_ = saved;
+  if (!out) throw std::runtime_error("rebuild_substituted: node " + std::to_string(target_id) + " does not depend on " + from);
+  return out;
 }
 
 ggml_tensor *GraphInterpreter::build_node(ggml_context *ctx,

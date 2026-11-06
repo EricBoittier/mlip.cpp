@@ -22,7 +22,18 @@ namespace mlipcpp::runtime {
 struct FragChargesSpec {
   bool enabled = false;
   double R = 8.0, t = 0.5, sigma = 4.0, scale = 1.0;
+  // gated unit conditioning (pet.plato_lr.frag_cond_gate): the conditioning stays on the structure's charge and
+  // the unit-charge conditioning enters as c(Q_s) + g * (c(Q_u) - c(Q_s)), g the per-channel weight
+  // plato_frag_cond_gate (zero-initialised: the start is exactly the base model); graph input charge_index_unit.
+  // Off: every atom's charge_index is its unit's row (c(Q_u), the first design).
+  bool cond_gate = false;
 };
+
+class GraphInterpreter;
+/// installs interp.post_node for the gated unit conditioning: the output of the conditioning projection (the
+/// LINEAR with system_conditioning_project_2_weight) becomes c + g * (c_u - c), c_u the same nodes rebuilt on
+/// input charge_index_unit, g the weight plato_frag_cond_gate (one value per channel, broadcast over atoms)
+void install_frag_cond_gate(GraphInterpreter &interp);
 
 /// unit label per atom (0..U-1, numbered by first atom) by the bond rule; positions [n][3]
 std::vector<int32_t> frag_bonded_units(int n, const int32_t *Z, const float *positions, int *n_units = nullptr);

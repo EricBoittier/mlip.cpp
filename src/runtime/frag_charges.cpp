@@ -1,4 +1,7 @@
 #include "frag_charges.h"
+#include "graph_interpreter.h"
+
+#include <ggml.h>
 
 #include <algorithm>
 #include <cmath>
@@ -121,6 +124,20 @@ double frag_coulomb(const FragChargesSpec &s, int n, const float *x, const doubl
     }
   }
   return E;
+}
+
+void install_frag_cond_gate(GraphInterpreter &interp) {
+  interp.post_node = [&interp](ggml_context *ctx, const GIRNode &node, ggml_tensor *out) -> ggml_tensor * {
+    if (node.op != "LINEAR") return out;
+    bool proj = false;
+    for (const auto &r : node.inputs) proj |= r == "weight:system_conditioning_project_2_weight";
+    if (!proj) return out;
+    ggml_tensor *g = interp.find_weight("plato_frag_cond_gate");
+    if (!g) throw std::runtime_error("frag_cond_gate: the GGUF has no plato_frag_cond_gate tensor");
+    if (ggml_nelements(g) != out->ne[0]) throw std::runtime_error("frag_cond_gate: gate size != conditioning width");
+    ggml_tensor *cu = interp.rebuild_substituted(ctx, node.id, "input:charge_index", "input:charge_index_unit");
+    return ggml_add(ctx, out, ggml_mul(ctx, ggml_sub(ctx, cu, out), ggml_reshape_1d(ctx, g, out->ne[0])));
+  };
 }
 
 } // namespace mlipcpp::runtime
