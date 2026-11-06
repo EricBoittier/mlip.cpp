@@ -68,6 +68,11 @@ struct Batch {
   std::vector<std::array<float, 9>> cells;
   std::vector<uint8_t> periodic;
   std::vector<int32_t> system_charge;
+  // split-charge equilibration: atomic numbers [n_atoms] and per atom the reference charge q0 of structures with
+  // unit labels (Q_u / n_u, q0 formal), per real structure whether it has them (else Q / N)
+  std::vector<int32_t> atomic_number;
+  std::vector<double> sqe_q0;
+  std::vector<uint8_t> sqe_q0_ok;
   // auxiliary charge correlation (--charge-corr-weight): DFT partial charges [n_atoms]
   // (0 where absent) and per real structure whether it takes part; charge_norm: 1 / the
   // structures taking part in the whole step (0: those of this batch)

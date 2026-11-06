@@ -17,6 +17,8 @@ struct ModelResult {
   // Plato-PET-LR with LES: the latent charges per atom (e: model units times charge_unit,
   // after the neutralisation / total-charge shift), first channel; empty otherwise
   std::vector<float> latent_charges;
+  // split-charge equilibration (pet.plato_lr.sqe): the SQE charges per atom (e); empty otherwise
+  std::vector<float> sqe_charges;
 
   bool has_forces = false;
   bool has_stress = false;

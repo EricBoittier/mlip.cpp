@@ -127,6 +127,7 @@ int main(int argc, char *argv[]) {
         f["forces"] = r.forces;
         if (r.has_stress()) f["stress"] = r.stress;
         if (!r.latent_charges.empty()) f["latent_charges"] = r.latent_charges; // Plato-PET-LR LES (e)
+        if (!r.sqe_charges.empty()) f["sqe_charges"] = r.sqe_charges;           // pet.plato_lr.sqe (e)
       } catch (const std::exception &e) {
         f["error"] = e.what();
       }

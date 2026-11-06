@@ -23,6 +23,7 @@
 // edge-vector terms, as in runtime/plato_graph.
 
 #include "frag_charges.h"
+#include "sqe.h"
 
 #include <cstdint>
 #include <string>
@@ -57,6 +58,8 @@ struct PetPlatoLRSpec {
   // fragment-constrained charges (runtime/frag_charges.h): pet.plato_lr.frag_charges, frag_R, frag_t, frag_sigma,
   // frag_scale; host-side (per-atom unit conditioning and the beyond-R Coulomb term of the formal unit charges)
   FragChargesSpec frag;
+  // split-charge equilibration (runtime/sqe.h): pet.plato_lr.sqe*; host side, float64
+  SqeSpec sqe;
   bool long_range() const { return mesh || les; }
   static PetPlatoLRSpec from_gguf(const GGUFLoader &loader);
 };

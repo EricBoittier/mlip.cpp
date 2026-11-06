@@ -624,7 +624,43 @@ std::vector<int32_t> GraphModel::charge_rows(int n_atoms, int charge, int spin_m
 // and a model with pet.plato_lr.frag_charges gets per-atom (bonded-unit) conditioning and the
 // beyond-R Coulomb term of the unit charges (host, float64), added to the energy and forces.
 // Anything else is the plain model, unchanged.
+// Split-charge equilibration (runtime/sqe.h): with pet.plato_lr.sqe the SQE energy and Hellmann-Feynman forces
+// (host, float64) are added to the model's; q0 from the per-atom formal charges when the model says sqe_q0 formal and
+// the structure has them (else Q / N). sqe_backbone_charge neutral: the backbone is evaluated at charge 0.
 ModelResult GraphModel::predict_single(
+    const AtomicSystem &system, bool compute_forces,
+    const std::function<void()> &post_compute_hook,
+    std::vector<float> *parameter_gradients) {
+  const SqeSpec &sq = plato_lr_.sqe;
+  if (!sq.enabled || system.num_atoms() == 0)
+    return predict_single_frag(system, compute_forces, post_compute_hook, parameter_gradients);
+  bool periodic = false;
+  if (const Cell *c = system.cell()) periodic = c->periodic[0] || c->periodic[1] || c->periodic[2];
+  if (periodic) throw std::runtime_error("sqe: periodic structures are not implemented in mlip.cpp yet");
+  const int n = system.num_atoms();
+  std::vector<double> q0;
+  if (sq.q0_formal && system.has_formal_charges()) {
+    if (system.formal_charges().size() != static_cast<size_t>(n)) throw std::runtime_error("formal_charges: one value per atom");
+    q0.assign(system.formal_charges().begin(), system.formal_charges().end());
+  }
+  const SqeOutput s = sqe_compute(sq, n, system.atomic_numbers(), system.positions(), double(system.charge()),
+                                  q0.empty() ? nullptr : q0.data(), compute_forces);
+  ModelResult r;
+  if (sq.backbone_neutral && system.charge() != 0) {
+    AtomicSystem neutral = system;
+    neutral.set_charge(0);
+    r = predict_single_frag(neutral, compute_forces, post_compute_hook, parameter_gradients);
+  } else {
+    r = predict_single_frag(system, compute_forces, post_compute_hook, parameter_gradients);
+  }
+  r.energy = static_cast<float>(double(r.energy) + s.energy);
+  if (compute_forces && r.forces.size() == s.forces.size())
+    for (size_t k = 0; k < s.forces.size(); k++) r.forces[k] = static_cast<float>(double(r.forces[k]) + s.forces[k]);
+  r.sqe_charges.assign(s.q.begin(), s.q.end());
+  return r;
+}
+
+ModelResult GraphModel::predict_single_frag(
     const AtomicSystem &system, bool compute_forces,
     const std::function<void()> &post_compute_hook,
     std::vector<float> *parameter_gradients) {

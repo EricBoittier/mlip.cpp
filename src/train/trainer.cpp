@@ -79,6 +79,8 @@ double lr_factor_linear(int64_t step, int64_t total, int64_t constant, double mi
 
 // fragment-constrained charges of this run, written into every saved GGUF (pet.plato_lr.frag_*)
 runtime::FragChargesSpec g_frag_out;
+// split-charge equilibration of this run (the trained parameters), written into every saved GGUF
+runtime::SqeSpec g_sqe;
 
 void write_gguf(const std::string &src, const std::string &dst, Worker &w,
                 const std::vector<float> &flat, const TargetScaling &sc) {
@@ -103,6 +105,7 @@ void write_gguf(const std::string &src, const std::string &dst, Worker &w,
   for (int64_t i = 0; i < gguf_get_n_tensors(in); i++)
     gguf_add_tensor(g, ggml_get_tensor(data_ctx, gguf_get_tensor_name(in, i)));
   gguf_set_val_f32(g, "pet.energy_scale", static_cast<float>(sc.energy_scale));
+  if (g_sqe.enabled) g_sqe.to_gguf(g);
   if (g_frag_out.enabled) {
     gguf_set_val_i32(g, "pet.plato_lr.frag_charges", 1);
     if (g_frag_out.cond_gate) gguf_set_val_i32(g, "pet.plato_lr.frag_cond_gate", 1);
@@ -963,6 +966,7 @@ StepStats Worker::run(const Batch &b, double energy_scale, bool backward) {
   t_build = t_alloc = t_upload = t_compute = t_download = t_cpu = 0;
   plato_batch_ = &b;
   if (conservative.on) return run_conservative(b, energy_scale, backward);
+  if (sqe) throw std::runtime_error("sqe: training needs conservative forces");
   if (!model_.nc_forces()) throw std::runtime_error("an energy-only model trains with conservative forces only");
   const int n = b.n_atoms, m = b.max_neighbors, S = b.n_systems;
   std::unique_ptr<StepGraph> once;
@@ -1067,6 +1071,29 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
     }
   }
 
+  // split-charge equilibration: its energy and forces (eV, eV/A; host float64) join the model's, in scaled units
+  std::vector<double> sqe_e(S, 0.0);
+  std::vector<int> sys_off(S + 1, 0);
+  for (int k = 0; k < S; k++) sys_off[k + 1] = sys_off[k] + b.n_per_system[k];
+  auto sqe_inputs = [&](int k, std::vector<double> &x, const double *&q0) {
+    const int a0 = sys_off[k], ns = b.n_per_system[k];
+    x.assign(b.positions.begin() + 3 * size_t(a0), b.positions.begin() + 3 * size_t(a0 + ns));
+    q0 = !b.sqe_q0_ok.empty() && b.sqe_q0_ok[k] ? b.sqe_q0.data() + a0 : nullptr;
+  };
+  if (sqe) {
+    for (int k = 0; k < b.n_real_systems; k++) {
+      if (b.periodic[k]) throw std::runtime_error("sqe: periodic training structures are not supported");
+      std::vector<double> x;
+      const double *q0;
+      sqe_inputs(k, x, q0);
+      const int a0 = sys_off[k], ns = b.n_per_system[k];
+      const runtime::SqeOutput so = runtime::sqe_compute(*sqe, ns, b.atomic_number.data() + a0, x.data(),
+                                                         double(b.system_charge[k]), q0, true);
+      sqe_e[k] = so.energy, sqe_abs_energy += std::abs(so.energy) / ns, sqe_n++;
+      for (int i = 0; i < 3 * ns; i++) F[3 * size_t(a0) + i] += so.forces[i] / energy_scale;
+    }
+  }
+
   // the loss terms and metrics; force targets are physical F / s_Z, the
   // conservative ones F / s_E (the gradient of the scaled energy)
   st.n_systems = b.n_real_systems;
@@ -1074,6 +1101,7 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
   for (int k = 0; k < S; k++) {
     for (int a = 0; a < n; a++) d_e[k] += double(b.atom_weight[static_cast<size_t>(k) * n + a]) * out[ow * a];
     d_e[k] -= b.energy_target[k];
+    if (sqe && k < b.n_real_systems) d_e[k] += sqe_e[k] / (energy_scale * b.n_per_system[k]);
     st.loss_energy += w.energy * e_norm * loss.value(d_e[k], loss.delta_e);
     st.se_energy_per_atom += d_e[k] * d_e[k] * energy_scale * energy_scale;
     if (k < b.n_real_systems) st.ae_energy_per_atom += std::abs(d_e[k]) * energy_scale;
@@ -1111,6 +1139,20 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
     }
   }
   if (!backward) return t_cpu = seconds_since(t_host), st;
+  if (sqe) { // the SQE parameters' gradient (energy loss, and the force loss with its implicit term)
+    if (sqe_grad.size() != sqe->n_params()) sqe_grad.assign(sqe->n_params(), 0.0);
+    for (int k = 0; k < b.n_real_systems; k++) {
+      std::vector<double> x;
+      const double *q0;
+      sqe_inputs(k, x, q0);
+      const int a0 = sys_off[k], ns = b.n_per_system[k];
+      const double dLdE = w.energy * e_norm * loss.slope(d_e[k], loss.delta_e) / (energy_scale * ns);
+      std::vector<double> dLdF(u.begin() + 3 * size_t(a0), u.begin() + 3 * size_t(a0 + ns));
+      for (double &v : dLdF) v /= energy_scale;
+      runtime::sqe_train_grad(*sqe, ns, b.atomic_number.data() + a0, x.data(), double(b.system_charge[k]), q0, dLdE,
+                              dLdF.data(), sqe_grad);
+    }
+  }
 
   // 3. tangents along u (atoms): edge (i -> k) moves by u_k - u_i, a pair
   // cutoff by (dr_i + dr_k) / 2, dr_k = sum over taper edges (k -> l) of
@@ -2072,6 +2114,33 @@ void train(const TrainOptions &o) {
     if (fs.enabled && fs.cond_gate)
       fmt::print("fragment charges: gated unit conditioning c(Q_s) + g (c(Q_u) - c(Q_s)), g = plato_frag_cond_gate\n");
   }
+  // split-charge equilibration (a pet.plato_lr.sqe model): the term in every step, its parameters trained with --sqe
+  bool sqe_train = false;
+  {
+    g_sqe = w0.model().plato_lr().sqe;
+    if (o.sqe && !g_sqe.enabled)
+      throw std::runtime_error("--sqe needs a model with pet.plato_lr.sqe keys (scripts/plato_lr/add_sqe_keys.py)");
+    if (g_sqe.enabled) {
+      if (g_frag_out.enabled) throw std::runtime_error("sqe and fragment-constrained charges cannot be combined");
+      if (!o.conservative) throw std::runtime_error("sqe needs conservative forces (--conservative)");
+      for (MemmapSplit *sp : {&train_split, &val_split, &test_split}) {
+        bool labels = false;
+        if (g_sqe.q0_formal) {
+          runtime::FragChargesSpec off; // labels only: no unit conditioning, no Coulomb term
+          labels = sp->load_frag_charges(off);
+          if (!labels) fmt::print("sqe: {}: no unit labels, q0 = Q / N\n", sp->dir());
+        }
+        sp->set_sqe(labels, g_sqe.backbone_neutral);
+      }
+      for (auto &w : workers) w->sqe = &g_sqe;
+      sqe_train = o.sqe;
+      fmt::print("sqe: {} elements, {} parameters ({}), q0 {}, backbone conditioned on {}, r_ct {} A, dchi_max {} eV, "
+                 "J in [{}, {}] J0, kappa0 in [{}, {}] eV, w in [{}, {}] A\n", g_sqe.Z.size(), g_sqe.n_params(),
+                 sqe_train ? "trained" : "frozen", g_sqe.q0_formal ? "formal (unit labels Q_u / n_u)" : "Q / N",
+                 g_sqe.backbone_neutral ? "charge 0" : "the input charge", g_sqe.r_ct, g_sqe.dchi_max, g_sqe.J_lo,
+                 g_sqe.J_hi, g_sqe.kappa_lo, g_sqe.kappa_hi, g_sqe.w_lo, g_sqe.w_hi);
+    }
+  }
 
   // --epochs 0 evaluates a trained model with the baselines stored in it
   const bool eval_only = o.epochs == 0;
@@ -2327,6 +2396,9 @@ void train(const TrainOptions &o) {
 
   int64_t global_step = state.step;
   if (jsonl && o.resume.empty()) log_line(-1, evaluate(val_split, nl_val, ids_val), ",\"init\":true"); // the initial model (epoch -1: before any training)
+  std::vector<double> sqe_m, sqe_v; // host Adam state of the SQE parameters (not in the resume state)
+  int64_t sqe_t = 0;
+  double sqe_gnorm = 0, sqe_lr = 0;
   const auto t_run = clock_type::now();
   for (int epoch = static_cast<int>(state.epoch); epoch < o.epochs && global_step != o.max_steps; epoch++) {
     const bool logging = log_file && epoch < o.log_errors_epochs;
@@ -2386,6 +2458,37 @@ void train(const TrainOptions &o) {
       const double norm = grouped ? grouped->step(global_step, steps_per_epoch, total_steps)
                                   : optimizer.plain->step(lr);
       if (!std::isfinite(norm)) throw std::runtime_error(fmt::format("non-finite gradient at step {}", global_step));
+      if (sqe_train) { // host Adam on the bounded SQE parameters: mean over the workers, clipped like the model's
+        std::vector<double> g(g_sqe.n_params(), 0.0);
+        for (auto &wk : workers) {
+          for (size_t k = 0; k < wk->sqe_grad.size(); k++) g[k] += wk->sqe_grad[k] / W;
+          std::fill(wk->sqe_grad.begin(), wk->sqe_grad.end(), 0.0);
+        }
+        double gn = 0;
+        for (double v : g) gn += v * v;
+        gn = std::sqrt(gn);
+        if (!std::isfinite(gn)) throw std::runtime_error(fmt::format("non-finite SQE gradient at step {}", global_step));
+        double slr = lr;
+        bool frozen = false;
+        if (grouped) {
+          const LrSchedule &sc = grouped->opt->schedule();
+          std::tie(slr, frozen) = sc.group_lr(sc.group_of("sqe.params"), global_step, steps_per_epoch, total_steps);
+        }
+        if (!frozen) {
+          const double c = o.grad_clip > 0 && gn > o.grad_clip ? o.grad_clip / gn : 1.0;
+          if (sqe_m.empty()) sqe_m.assign(g.size(), 0.0), sqe_v.assign(g.size(), 0.0);
+          sqe_t++;
+          std::vector<double> p = g_sqe.flat();
+          const double b1 = 0.9, b2 = 0.999, eps = 1e-8;
+          for (size_t k = 0; k < p.size(); k++) {
+            const double gk = c * g[k];
+            sqe_m[k] = b1 * sqe_m[k] + (1 - b1) * gk, sqe_v[k] = b2 * sqe_v[k] + (1 - b2) * gk * gk;
+            p[k] -= slr * (sqe_m[k] / (1 - std::pow(b1, sqe_t))) / (std::sqrt(sqe_v[k] / (1 - std::pow(b2, sqe_t))) + eps);
+          }
+          g_sqe.set_flat(p);
+        }
+        sqe_gnorm = gn, sqe_lr = frozen ? 0.0 : slr;
+      }
       t_sync += seconds_since(t);
       if (step_pack) {
         for (auto &sw : samples)
@@ -2398,6 +2501,13 @@ void train(const TrainOptions &o) {
 
       StepStats step_total;
       for (auto &s : st) ep += s, step_total += s;
+      if (g_sqe.enabled && (step + 1) % o.log_every == 0) {
+        double ae = 0;
+        int64_t ne = 0;
+        for (auto &wk : workers) ae += wk->sqe_abs_energy, ne += wk->sqe_n, wk->sqe_abs_energy = 0, wk->sqe_n = 0;
+        fmt::print("sqe step {}: mean |E_SQE| {:.4g} eV/atom over {} structures; |g| {:.3g}, lr {:.3g}; {}\n", global_step + 1,
+                   ae / std::max<int64_t>(1, ne), ne, sqe_gnorm, sqe_lr, g_sqe.summary());
+      }
       if ((step + 1) % o.log_every == 0) {
         const double el = seconds_since(t_epoch);
         fmt::print("epoch {} step {}/{}: loss {:.4g} (E {:.4g}, F {:.4g}{}) lr {:.3g} |g| {:.3g} | "

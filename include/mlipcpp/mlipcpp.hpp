@@ -50,6 +50,8 @@ struct Result {
   std::vector<float> stress; ///< [6] Voigt notation (xx, yy, zz, yz, xz, xy)
   /// Plato-PET-LR models with LES: latent charges per atom (e, first channel); empty otherwise
   std::vector<float> latent_charges;
+  // split-charge equilibration charges (e), pet.plato_lr.sqe models; empty otherwise
+  std::vector<float> sqe_charges;
 
   bool has_forces() const { return !forces.empty(); }
   bool has_stress() const { return !stress.empty(); }

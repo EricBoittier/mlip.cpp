@@ -2,6 +2,7 @@
 
 #include "runtime/graph_model.h"
 #include "train/batch.h"
+#include "runtime/sqe.h"
 
 #include <ggml-alloc.h>
 
@@ -84,6 +85,10 @@ struct TrainOptions {
   // pet.plato_lr.frag_charges key (then written into the saved GGUFs): <split>/fragunit.bin,
   // fragq.bin, frag_ok.bin (agents/petlr/frag/frag_labels.py)
   bool frag_charges = false;
+  // split-charge equilibration (runtime/sqe.h): train the bounded SQE parameters of a pet.plato_lr.sqe model (keys
+  // from scripts/plato_lr/add_sqe_keys.py) with a host Adam at the lr of the --lr-schedule group matching "sqe."
+  // (or the base lr); conservative forces only. q0 formal: from fragunit.bin / fragq.bin / frag_ok.bin (Q_u / n_u)
+  bool sqe = false;
   // --frag-cond-gate: the gated unit conditioning (runtime/frag_charges.h); the GGUF needs the tensor
   // plato_frag_cond_gate (scripts/plato_lr/add_frag_keys.py --cond-gate)
   bool frag_cond_gate = false;
@@ -225,6 +230,12 @@ public:
     double weight = 0.0, r_min = 1.0;
   } charge_corr;
   bool frag_cond_gate = false; // gated unit conditioning (input charge_index_unit)
+  // split-charge equilibration: the shared spec (updated between steps) and this worker's gradient
+  // accumulator (summed over its micro-batches); sqe_energy_sum: sum of the SQE energies seen (eV), for the log
+  const runtime::SqeSpec *sqe = nullptr;
+  std::vector<double> sqe_grad;
+  double sqe_abs_energy = 0;
+  int64_t sqe_n = 0;
   double frag_charge_weight = 0.0;
 
   /// Profiling: compute node by node (synchronised) and accumulate, per op
