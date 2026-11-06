@@ -31,6 +31,10 @@ namespace mlipcpp::runtime {
 struct SqeSpec {
   bool enabled = false;
   bool q0_formal = false;        // pet.plato_lr.sqe_q0 == "formal"
+  // pet.plato_lr.sqe_q0 == "learned": q0_i = lo + (hi - lo) sigmoid(f_i + t), f_i = q0_a[Z_i] + sum_Z' q0_b[Z_i, Z']
+  // CN_{i,Z'} (element-resolved D3 coordination numbers), t the common shift with sum q0 = Q (bisection + Newton,
+  // implicit derivatives); formal charges are then never an input (only optional training supervision)
+  bool q0_learned = false;
   bool backbone_neutral = false; // pet.plato_lr.sqe_backbone_charge == "neutral": the backbone sees charge 0
   double r_ct = 6.0, r_ct_width = 1.0, dchi_max = 2.0, J_lo = 0.75, J_hi = 2.0, kappa_lo = 1.0, kappa_hi = 100.0,
          w_lo = 0.2, w_hi = 2.0, cn_on = 4.0, cn_off = 5.0, ewald_alpha = 0.0;
@@ -39,10 +43,11 @@ struct SqeSpec {
   std::vector<double> chi0, J0, rcov, sigma;
   std::vector<double> chi_a, chi_b, j_z, kappa_z;
   double w_raw = 0.0;
+  std::vector<double> q0_lo, q0_hi, q0_a, q0_b; // per element; q0_b E x E (row: the atom's element)
   double cg_tol = 1e-12; // relative residual
   int index_of(int z) const; // -1: not in the table
-  size_t n_params() const { return 4 * Z.size() + 1; }
-  // flat order: chi_a, chi_b, j_z, kappa_z (each per element), w_raw
+  size_t n_params() const { return 5 * Z.size() + 1 + Z.size() * Z.size(); }
+  // flat order: chi_a, chi_b, j_z, kappa_z (each per element), w_raw, q0_a (per element), q0_b (E x E)
   std::vector<double> flat() const;
   void set_flat(const std::vector<double> &v);
   std::vector<std::string> flat_names() const; // "sqe.chi_a.<Z>", ...
@@ -61,6 +66,8 @@ struct SqeOutput {
   std::vector<double> q;      // e
   std::vector<double> forces; // -dE/dx, eV/A [3n] (when asked)
   std::vector<double> chi, J; // per atom
+  std::vector<double> q0;     // reference charges (given or learned)
+  double q0_loss = 0;         // sqe_train_grad with supervision: weight * mean over units of (sum q0 - Q_u)^2
   int cg_iters = 0;
 };
 
@@ -71,9 +78,19 @@ SqeOutput sqe_compute(const SqeSpec &spec, int n, const int32_t *Z, const double
 SqeOutput sqe_compute(const SqeSpec &spec, int n, const int32_t *Z, const float *x, double Q, const double *q0,
                       bool forces, const double *cell = nullptr);
 
+/// optional supervision of a learned q0 (training only): unit index per atom (0..n_units-1), the units' integer
+/// charges, the loss weight, and `scale` (the loss normalisation, e.g. 1 / structures of the step) on the gradient
+struct SqeQ0Supervision {
+  const int32_t *unit = nullptr;
+  const double *Qu = nullptr;
+  int n_units = 0;
+  double weight = 0, scale = 1;
+};
+
 /// training: adds to grad (size n_params) dE/dtheta * dL_dE + d(sum_a w_a . F_a)/dtheta with w = dL_dF [3n] (nullptr:
 /// no force term); also returns the forward output (energy, forces). Open structures only.
 SqeOutput sqe_train_grad(const SqeSpec &spec, int n, const int32_t *Z, const double *x, double Q, const double *q0,
-                         double dL_dE, const double *dL_dF, std::vector<double> &grad);
+                         double dL_dE, const double *dL_dF, std::vector<double> &grad,
+                         const SqeQ0Supervision *sup = nullptr);
 
 } // namespace mlipcpp::runtime

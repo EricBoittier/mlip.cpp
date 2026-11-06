@@ -1078,7 +1078,7 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
   auto sqe_inputs = [&](int k, std::vector<double> &x, const double *&q0) {
     const int a0 = sys_off[k], ns = b.n_per_system[k];
     x.assign(b.positions.begin() + 3 * size_t(a0), b.positions.begin() + 3 * size_t(a0 + ns));
-    q0 = !b.sqe_q0_ok.empty() && b.sqe_q0_ok[k] ? b.sqe_q0.data() + a0 : nullptr;
+    q0 = !sqe->q0_learned && !b.sqe_q0_ok.empty() && b.sqe_q0_ok[k] ? b.sqe_q0.data() + a0 : nullptr;
   };
   if (sqe) {
     for (int k = 0; k < b.n_real_systems; k++) {
@@ -1149,8 +1149,21 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
       const double dLdE = w.energy * e_norm * loss.slope(d_e[k], loss.delta_e) / (energy_scale * ns);
       std::vector<double> dLdF(u.begin() + 3 * size_t(a0), u.begin() + 3 * size_t(a0 + ns));
       for (double &v : dLdF) v /= energy_scale;
-      runtime::sqe_train_grad(*sqe, ns, b.atomic_number.data() + a0, x.data(), double(b.system_charge[k]), q0, dLdE,
-                              dLdF.data(), sqe_grad);
+      // learned q0: optional supervision by the unit labels (training only)
+      runtime::SqeQ0Supervision sup;
+      std::vector<int32_t> uidx;
+      std::vector<double> Qu;
+      if (sqe->q0_learned && sqe_q0_weight > 0 && !b.sqe_q0_ok.empty() && b.sqe_q0_ok[k]) {
+        uidx.assign(b.sqe_unit.begin() + a0, b.sqe_unit.begin() + a0 + ns);
+        const int U = 1 + *std::max_element(uidx.begin(), uidx.end());
+        Qu.assign(U, 0.0);
+        for (int i = 0; i < ns; i++) Qu[uidx[i]] = b.sqe_unitq[a0 + i];
+        sup.unit = uidx.data(), sup.Qu = Qu.data(), sup.n_units = U, sup.weight = sqe_q0_weight, sup.scale = e_norm;
+      }
+      const runtime::SqeOutput so = runtime::sqe_train_grad(*sqe, ns, b.atomic_number.data() + a0, x.data(),
+                                                            double(b.system_charge[k]), q0, dLdE, dLdF.data(), sqe_grad,
+                                                            sup.unit ? &sup : nullptr);
+      if (sup.unit) sqe_q0_loss += so.q0_loss, sqe_q0_n++;
     }
   }
 
@@ -2125,18 +2138,20 @@ void train(const TrainOptions &o) {
       if (!o.conservative) throw std::runtime_error("sqe needs conservative forces (--conservative)");
       for (MemmapSplit *sp : {&train_split, &val_split, &test_split}) {
         bool labels = false;
-        if (g_sqe.q0_formal) {
+        if (g_sqe.q0_formal || (g_sqe.q0_learned && o.sqe_q0_weight > 0)) {
           runtime::FragChargesSpec off; // labels only: no unit conditioning, no Coulomb term
           labels = sp->load_frag_charges(off);
           if (!labels) fmt::print("sqe: {}: no unit labels, q0 = Q / N\n", sp->dir());
         }
         sp->set_sqe(labels, g_sqe.backbone_neutral);
       }
-      for (auto &w : workers) w->sqe = &g_sqe;
+      for (auto &w : workers) w->sqe = &g_sqe, w->sqe_q0_weight = o.sqe_q0_weight;
       sqe_train = o.sqe;
       fmt::print("sqe: {} elements, {} parameters ({}), q0 {}, backbone conditioned on {}, r_ct {} A, dchi_max {} eV, "
                  "J in [{}, {}] J0, kappa0 in [{}, {}] eV, w in [{}, {}] A\n", g_sqe.Z.size(), g_sqe.n_params(),
-                 sqe_train ? "trained" : "frozen", g_sqe.q0_formal ? "formal (unit labels Q_u / n_u)" : "Q / N",
+                 sqe_train ? "trained" : "frozen",
+                 g_sqe.q0_learned ? fmt::format("learned (bounded, CN-resolved; supervision weight {})", o.sqe_q0_weight)
+                 : g_sqe.q0_formal ? "formal (unit labels Q_u / n_u)" : "Q / N",
                  g_sqe.backbone_neutral ? "charge 0" : "the input charge", g_sqe.r_ct, g_sqe.dchi_max, g_sqe.J_lo,
                  g_sqe.J_hi, g_sqe.kappa_lo, g_sqe.kappa_hi, g_sqe.w_lo, g_sqe.w_hi);
     }
@@ -2504,9 +2519,13 @@ void train(const TrainOptions &o) {
       if (g_sqe.enabled && (step + 1) % o.log_every == 0) {
         double ae = 0;
         int64_t ne = 0;
+        double ql = 0;
+        int64_t qn = 0;
         for (auto &wk : workers) ae += wk->sqe_abs_energy, ne += wk->sqe_n, wk->sqe_abs_energy = 0, wk->sqe_n = 0;
-        fmt::print("sqe step {}: mean |E_SQE| {:.4g} eV/atom over {} structures; |g| {:.3g}, lr {:.3g}; {}\n", global_step + 1,
-                   ae / std::max<int64_t>(1, ne), ne, sqe_gnorm, sqe_lr, g_sqe.summary());
+        for (auto &wk : workers) ql += wk->sqe_q0_loss, qn += wk->sqe_q0_n, wk->sqe_q0_loss = 0, wk->sqe_q0_n = 0;
+        fmt::print("sqe step {}: mean |E_SQE| {:.4g} eV/atom over {} structures; |g| {:.3g}, lr {:.3g}; {}{}\n", global_step + 1,
+                   ae / std::max<int64_t>(1, ne), ne, sqe_gnorm, sqe_lr, g_sqe.summary(),
+                   qn ? fmt::format("; q0 unit loss {:.4g} over {} structures", ql / qn, qn) : std::string());
       }
       if ((step + 1) % o.log_every == 0) {
         const double el = seconds_since(t_epoch);

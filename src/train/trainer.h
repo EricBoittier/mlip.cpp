@@ -89,6 +89,9 @@ struct TrainOptions {
   // from scripts/plato_lr/add_sqe_keys.py) with a host Adam at the lr of the --lr-schedule group matching "sqe."
   // (or the base lr); conservative forces only. q0 formal: from fragunit.bin / fragq.bin / frag_ok.bin (Q_u / n_u)
   bool sqe = false;
+  // --sqe-q0-weight W: a learned q0 (sqe_q0 learned) is supervised by the unit labels, W x mean over units of
+  // (sum_{i in u} q0_i - Q_u)^2 per structure (training only; never an input)
+  double sqe_q0_weight = 0.0;
   // --frag-cond-gate: the gated unit conditioning (runtime/frag_charges.h); the GGUF needs the tensor
   // plato_frag_cond_gate (scripts/plato_lr/add_frag_keys.py --cond-gate)
   bool frag_cond_gate = false;
@@ -236,6 +239,8 @@ public:
   std::vector<double> sqe_grad;
   double sqe_abs_energy = 0;
   int64_t sqe_n = 0;
+  double sqe_q0_weight = 0, sqe_q0_loss = 0; // learned q0: supervision weight; summed loss for the log
+  int64_t sqe_q0_n = 0;
   double frag_charge_weight = 0.0;
 
   /// Profiling: compute node by node (synchronised) and accumulate, per op

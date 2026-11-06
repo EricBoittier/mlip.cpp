@@ -164,7 +164,8 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
   b.atom_spin.assign(n, 1);
   if (split.has_frag_charges() && split.frag_spec().enabled && split.frag_spec().cond_gate) b.atom_unit_charge.assign(n, 0);
   b.atomic_number.assign(n, 0);
-  if (split.sqe_q0_labels()) b.sqe_q0.assign(n, 0.0), b.sqe_q0_ok.assign(b.n_real_systems, 0);
+  if (split.sqe_q0_labels())
+    b.sqe_q0.assign(n, 0.0), b.sqe_q0_ok.assign(b.n_real_systems, 0), b.sqe_unit.assign(n, 0), b.sqe_unitq.assign(n, 0);
   b.positions.assign(static_cast<size_t>(n) * 3, 0.0f);
   b.cells.assign(b.n_real_systems, {});
   b.periodic.assign(b.n_real_systems, 0);
@@ -235,6 +236,8 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
     if (split.sqe_q0_labels() && split.has_frag_charges() && split.frag_ok(s)) {
       const std::vector<double> q = runtime::frag_atom_charges(ns, split.frag_units(s), split.frag_unit_charge(s));
       std::copy(q.begin(), q.end(), b.sqe_q0.begin() + offset);
+      std::copy_n(split.frag_units(s), ns, b.sqe_unit.begin() + offset);
+      std::copy_n(split.frag_unit_charge(s), ns, b.sqe_unitq.begin() + offset);
       b.sqe_q0_ok[k] = 1;
     }
     if (split.has_frag_charges() && split.frag_spec().enabled && split.frag_ok(s)) {

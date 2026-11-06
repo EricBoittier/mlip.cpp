@@ -73,6 +73,9 @@ struct Batch {
   std::vector<int32_t> atomic_number;
   std::vector<double> sqe_q0;
   std::vector<uint8_t> sqe_q0_ok;
+  // the same labels as unit index (within the structure) and unit charge per atom: the optional supervision of a
+  // learned q0 (never an input)
+  std::vector<int32_t> sqe_unit, sqe_unitq;
   // auxiliary charge correlation (--charge-corr-weight): DFT partial charges [n_atoms]
   // (0 where absent) and per real structure whether it takes part; charge_norm: 1 / the
   // structures taking part in the whole step (0: those of this batch)

@@ -4,7 +4,7 @@ keys already present are replaced). Tensors unchanged: the SQE parameters are fl
 
     python add_sqe_keys.py IN.gguf OUT.gguf --spec SPEC.json [--q0 uniform|formal] [--backbone-charge input|neutral]
 
-SPEC.json: {"Z": [...], "chi0", "J0", "rcov", "sigma", "chi_a", "chi_b", "j_z", "kappa_z": [per element], "w_raw": x,
+SPEC.json: {"Z": [...], "chi0", "J0", "rcov", "sigma", "chi_a", "chi_b", "j_z", "kappa_z", "q0_lo", "q0_hi", "q0_a": [per element], "q0_b": [E x E, row-major], "w_raw": x,
 "cfg": {"r_ct", "r_ct_width", "dchi_max", "J_lo", "J_hi", "kappa_lo", "kappa_hi", "w_lo", "w_hi", "cn_on", "cn_off",
 "ewald_alpha"}}, written by metatrain's ``metatrain.pet.modules.sqe.spec_json`` (tabulated start: a fresh
 ``SQEParams(atomic_numbers)``).
@@ -21,7 +21,7 @@ CFG = ["r_ct", "r_ct_width", "dchi_max", "J_lo", "J_hi", "kappa_lo", "kappa_hi",
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("input"); ap.add_argument("output"); ap.add_argument("--spec", required=True)
-    ap.add_argument("--q0", choices=["uniform", "formal"], default="uniform")
+    ap.add_argument("--q0", choices=["uniform", "formal", "learned"], default="uniform")
     ap.add_argument("--backbone-charge", choices=["input", "neutral"], default="input")
     a = ap.parse_args()
     sp = json.load(open(a.spec))
@@ -58,8 +58,12 @@ def main():
     new[P + "_w_raw"] = enc(P + "_w_raw") + struct.pack("<Id", 12, float(sp["w_raw"]))
     Z = [int(z) for z in sp["Z"]]
     new[P + "_Z"] = enc(P + "_Z") + struct.pack("<IIQ", 9, 5, len(Z)) + struct.pack(f"<{len(Z)}i", *Z)
-    for k in ("chi0", "J0", "rcov", "sigma", "chi_a", "chi_b", "j_z", "kappa_z"):
-        v = [float(x) for x in sp[k]]; assert len(v) == len(Z), k
+    for k in ("chi0", "J0", "rcov", "sigma", "chi_a", "chi_b", "j_z", "kappa_z", "q0_lo", "q0_hi", "q0_a", "q0_b"):
+        if k not in sp:
+            if k.startswith("q0") and a.q0 != "learned":
+                continue
+            raise SystemExit(f"{a.spec}: no {k}")
+        v = [float(x) for x in sp[k]]; assert len(v) == len(Z) * (len(Z) if k == "q0_b" else 1), k
         new[f"{P}_{k}"] = enc(f"{P}_{k}") + struct.pack("<IIQ", 9, 12, len(v)) + struct.pack(f"<{len(v)}d", *v)
     magic, version = take("I"), take("I")
     assert magic == 0x46554747 and version == 3, (hex(magic), version)
