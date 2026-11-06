@@ -38,6 +38,7 @@ set(MLIPCPP_RUNTIME_SOURCES
     runtime/plato_graph.cpp
     runtime/pet_plato_lr.cpp
     runtime/frag_charges.cpp
+    runtime/sqe.cpp
 )
 
 # Utilities
@@ -259,6 +260,9 @@ if(MLIPCPP_BUILD_TRAINING AND UNIX AND NOT EMSCRIPTEN)
     target_link_libraries(mlipcpp-predict PRIVATE mlipcpp_train)
     add_executable(mlipcpp-eval bin/mlipcpp_eval.cpp)
     target_link_libraries(mlipcpp-eval PRIVATE mlipcpp_train)
+
+    add_executable(mlipcpp-sqe-check bin/mlipcpp_sqe_check.cpp)
+    target_link_libraries(mlipcpp-sqe-check PRIVATE mlipcpp_train)
 
     add_executable(mlipcpp-jvp-check bin/mlipcpp_jvp_check.cpp)
     target_link_libraries(mlipcpp-jvp-check PRIVATE mlipcpp_train)

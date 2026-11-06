@@ -76,6 +76,11 @@ public:
   /// the structure), fragq.bin (int32 [N], its integer charge) and frag_ok.bin (uint8 [ns], 0:
   /// fallback to whole-structure conditioning, no term); false if any is absent
   bool load_frag_charges(const runtime::FragChargesSpec &spec);
+  /// split-charge equilibration: q0 from the unit labels (load_frag_charges with a disabled spec), and the
+  /// backbone conditioned on charge 0 (sqe_backbone_charge neutral)
+  void set_sqe(bool q0_labels, bool backbone_neutral) { sqe_q0_labels_ = q0_labels, sqe_neutral_ = backbone_neutral; }
+  bool sqe_q0_labels() const { return sqe_q0_labels_; }
+  bool sqe_backbone_neutral() const { return sqe_neutral_; }
   const runtime::FragChargesSpec &frag_spec() const { return fq_spec_; }
   bool has_frag_charges() const { return fq_unit_.size() > 0; }
   /// structure s uses fragment charges (labels present and frag_ok, open structure)
@@ -97,6 +102,7 @@ private:
   Mapped<int32_t> a_;
   std::vector<int32_t> charge_, spin_;
   Mapped<float> pq_;
+  bool sqe_q0_labels_ = false, sqe_neutral_ = false;
   Mapped<int32_t> frag_;
   Mapped<int32_t> fq_unit_, fq_q_;
   Mapped<uint8_t> fq_ok_;

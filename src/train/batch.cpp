@@ -162,7 +162,10 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
   b.species.assign(n, 0);
   b.atom_charge.assign(n, 0);
   b.atom_spin.assign(n, 1);
-  if (split.has_frag_charges() && split.frag_spec().cond_gate) b.atom_unit_charge.assign(n, 0);
+  if (split.has_frag_charges() && split.frag_spec().enabled && split.frag_spec().cond_gate) b.atom_unit_charge.assign(n, 0);
+  b.atomic_number.assign(n, 0);
+  if (split.sqe_q0_labels())
+    b.sqe_q0.assign(n, 0.0), b.sqe_q0_ok.assign(b.n_real_systems, 0), b.sqe_unit.assign(n, 0), b.sqe_unitq.assign(n, 0);
   b.positions.assign(static_cast<size_t>(n) * 3, 0.0f);
   b.cells.assign(b.n_real_systems, {});
   b.periodic.assign(b.n_real_systems, 0);
@@ -186,7 +189,8 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
     for (int i = 0; i < ns; i++) {
       const int a = offset + i;
       b.species[a] = index_of(Z[i]);
-      b.atom_charge[a] = split.charge(s);
+      b.atomic_number[a] = Z[i];
+      b.atom_charge[a] = split.sqe_backbone_neutral() ? 0 : split.charge(s);
       if (!b.atom_unit_charge.empty()) b.atom_unit_charge[a] = split.charge(s);
       b.atom_spin[a] = split.spin_multiplicity(s);
       b.atom_weight[static_cast<size_t>(k) * n + a] = 1.0f / ns;
@@ -229,7 +233,14 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
     }
     b.energy_target[k] = static_cast<float>(
         (split.energy(s) - scaling.comp(Z, ns)) / (scaling.energy_scale * ns));
-    if (split.has_frag_charges() && split.frag_ok(s)) {
+    if (split.sqe_q0_labels() && split.has_frag_charges() && split.frag_ok(s)) {
+      const std::vector<double> q = runtime::frag_atom_charges(ns, split.frag_units(s), split.frag_unit_charge(s));
+      std::copy(q.begin(), q.end(), b.sqe_q0.begin() + offset);
+      std::copy_n(split.frag_units(s), ns, b.sqe_unit.begin() + offset);
+      std::copy_n(split.frag_unit_charge(s), ns, b.sqe_unitq.begin() + offset);
+      b.sqe_q0_ok[k] = 1;
+    }
+    if (split.has_frag_charges() && split.frag_spec().enabled && split.frag_ok(s)) {
       // fragment-constrained charges: each atom conditioned on its bonded unit's charge, and the
       // beyond-R Coulomb term of the unit charges (no weights) taken out of the targets, i.e. the
       // model's prediction plus the term is fitted (same residuals, loss and gradients)

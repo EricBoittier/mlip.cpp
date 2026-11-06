@@ -28,7 +28,7 @@ int main(int argc, char **argv) {
                "          [--conservative] [--energy-weight {}] [--force-weight {}] [--nc-force-weight {}] [--model-baselines]\n"
                "          [--allreduce {}] [--save-every N] [--log JSONL] [--state-every N] [--max-hours H] [--resume STATE]\n"
                "          [--lr-schedule FILE.json] [--dump-lr-schedule N [--dump-steps-per-epoch S]]\n"
-               "          [--charge-corr-weight W] [--charge-corr-target mulliken|lowdin|nbo] [--charge-corr-min R] [--frag-charge-weight W] [--frag-charges [--frag-cond-gate]]\n"
+               "          [--charge-corr-weight W] [--charge-corr-target mulliken|lowdin|nbo] [--charge-corr-min R] [--frag-charge-weight W] [--frag-charges [--frag-cond-gate]] [--sqe [--sqe-q0-weight W]]\n"
                "          [--loss mse|huber] [--huber-delta-e D] [--huber-delta-f D]\n"
                "--loss huber: torch.nn.HuberLoss per component (metatrain's huber; 0.5 d^2 below delta, then linear), deltas in\n"
                "the loss's units: energy per atom over the energy scale (default 0.01), forces over their scale (0.02);\n"
@@ -45,6 +45,11 @@ int main(int argc, char **argv) {
                "fragment-constrained charges from <split>/fragunit.bin, fragq.bin, frag_ok.bin: every atom conditioned on its\n"
                "bonded unit's charge and the beyond-R Coulomb term of the unit charges added (taken out of the targets);\n"
                "frag_ok 0: whole-structure conditioning, no term; the saved GGUFs get pet.plato_lr.frag_*;\n"
+               "--sqe (a pet.plato_lr.sqe model, keys from scripts/plato_lr/add_sqe_keys.py; conservative forces): train the\n"
+               "bounded split-charge equilibration parameters (host float64, Hellmann-Feynman forces, implicit gradients) with\n"
+               "a host Adam at the lr of the --lr-schedule group matching 'sqe.'; without --sqe a sqe model keeps them fixed;\n"
+               "--sqe-q0-weight W (sqe_q0 learned): supervise the learned reference charges by the unit labels (fragunit.bin,\n"
+               "fragq.bin, frag_ok.bin), W x mean over units of (sum q0 - Q_u)^2 per structure; training only;\n"
                "--frag-cond-gate: keep the structure-charge conditioning c and add g (c_unit - c), g the zero-initialised\n"
                "per-channel tensor plato_frag_cond_gate (scripts/plato_lr/add_frag_keys.py --cond-gate);\n"
                "--lr-schedule: per-group learning rates (src/train/lr_schedule.h), replaces --lr, --warmup-fraction,\n"
@@ -126,6 +131,8 @@ int main(int argc, char **argv) {
     else if (a == "--frag-charge-weight") o.frag_charge_weight = std::stod(val());
     else if (a == "--frag-charges") o.frag_charges = true;
     else if (a == "--frag-cond-gate") o.frag_cond_gate = true;
+    else if (a == "--sqe") o.sqe = true;
+    else if (a == "--sqe-q0-weight") o.sqe_q0_weight = std::stod(val());
     else if (a == "--allreduce") o.allreduce = std::stoi(val()) != 0;
     else if (a == "--save-every") o.save_every = std::stoi(val());
     else if (a == "--log") o.log_jsonl = val();

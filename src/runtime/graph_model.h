@@ -279,6 +279,10 @@ private:
       const AtomicSystem &system, bool compute_forces,
       const std::function<void()> &post_compute_hook = nullptr,
       std::vector<float> *parameter_gradients = nullptr);
+  ModelResult predict_single_frag(
+      const AtomicSystem &system, bool compute_forces,
+      const std::function<void()> &post_compute_hook,
+      std::vector<float> *parameter_gradients);
   ModelResult predict_single_impl(
       const AtomicSystem &system, bool compute_forces,
       const std::function<void()> &post_compute_hook,
