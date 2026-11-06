@@ -69,7 +69,7 @@ template <class T> struct Geo {
 
 template <class T>
 Geo<T> geometry(const SqeSpec &S, int n, const std::vector<int> &e, const std::vector<T> &x, const std::vector<Pair> &pr,
-                const std::vector<double> &q0_given, double Q) {
+                const std::vector<double> &q0_given, double Q, bool local = false) {
   Geo<T> g;
   const size_t E = S.Z.size();
   g.learned = S.q0_learned;
@@ -97,7 +97,9 @@ Geo<T> geometry(const SqeSpec &S, int n, const std::vector<int> &e, const std::v
         if (g.learned) g.cnp[size_t(i) * E + e[j]] += w, g.cnp[size_t(j) * E + e[i]] += w;
       }
       const double sij = std::sqrt(S.sigma[e[i]] * S.sigma[e[i]] + S.sigma[e[j]] * S.sigma[e[j]]);
-      g.gam[size_t(i) * n + j] = g.gam[size_t(j) * n + i] = T(KE) * erf(r / sij) / r;
+      T gm = T(KE) * erf(r / sij) / r;
+      if (local) gm = gm * (T(1.0) - smootherstep((r - (S.lr_R - S.lr_t)) / S.lr_t)); // gamma (1 - T(r))
+      g.gam[size_t(i) * n + j] = g.gam[size_t(j) * n + i] = gm;
     }
   g.c.resize(n), g.th.resize(n), g.chi.resize(n), g.J.resize(n);
   for (int i = 0; i < n; i++) {
@@ -413,7 +415,7 @@ SqeSpec SqeSpec::from_gguf(const GGUFLoader &L) {
   scalar("r_ct", s.r_ct), scalar("r_ct_width", s.r_ct_width), scalar("dchi_max", s.dchi_max);
   scalar("J_lo", s.J_lo), scalar("J_hi", s.J_hi), scalar("kappa_lo", s.kappa_lo), scalar("kappa_hi", s.kappa_hi);
   scalar("w_lo", s.w_lo), scalar("w_hi", s.w_hi), scalar("cn_on", s.cn_on), scalar("cn_off", s.cn_off);
-  scalar("ewald_alpha", s.ewald_alpha), scalar("w_raw", s.w_raw);
+  scalar("ewald_alpha", s.ewald_alpha), scalar("w_raw", s.w_raw), scalar("lr_R", s.lr_R), scalar("lr_t", s.lr_t);
   s.Z = L.get_array_int32("pet.plato_lr.sqe_Z");
   s.chi0 = get_f64(L, "pet.plato_lr.sqe_chi0"), s.J0 = get_f64(L, "pet.plato_lr.sqe_J0");
   s.rcov = get_f64(L, "pet.plato_lr.sqe_rcov"), s.sigma = get_f64(L, "pet.plato_lr.sqe_sigma");
@@ -441,7 +443,7 @@ void SqeSpec::to_gguf(gguf_context *g) const {
   scalar("r_ct", r_ct), scalar("r_ct_width", r_ct_width), scalar("dchi_max", dchi_max), scalar("J_lo", J_lo);
   scalar("J_hi", J_hi), scalar("kappa_lo", kappa_lo), scalar("kappa_hi", kappa_hi), scalar("w_lo", w_lo);
   scalar("w_hi", w_hi), scalar("cn_on", cn_on), scalar("cn_off", cn_off), scalar("ewald_alpha", ewald_alpha);
-  scalar("w_raw", w_raw);
+  scalar("w_raw", w_raw), scalar("lr_R", lr_R), scalar("lr_t", lr_t);
   gguf_set_arr_data(g, "pet.plato_lr.sqe_Z", GGUF_TYPE_INT32, Z.data(), Z.size());
   auto arr = [&](const char *k, const std::vector<double> &v) {
     gguf_set_arr_data(g, (std::string("pet.plato_lr.sqe_") + k).c_str(), GGUF_TYPE_FLOAT64, v.data(), v.size());
@@ -457,14 +459,14 @@ SqeOutput sqe_compute(const SqeSpec &S, int n, const int32_t *Z, const float *x,
   return sqe_compute(S, n, Z, xd.data(), Q, q0, forces, cell);
 }
 
-SqeOutput sqe_compute(const SqeSpec &S, int n, const int32_t *Z, const double *x, double Q, const double *q0,
-                      bool forces, const double *cell) {
-  if (cell) throw std::runtime_error("sqe: periodic structures are not implemented in mlip.cpp (metatrain only)");
+namespace {
+SqeOutput compute_one(const SqeSpec &S, int n, const int32_t *Z, const double *x, double Q, const double *q0,
+                      bool forces, bool local) {
   SqeOutput out;
   if (n == 0) return out;
   const Prepared p = prepare(S, n, Z, x, Q, q0);
   const std::vector<double> xv(x, x + 3 * size_t(n));
-  const Geo<double> g = geometry(S, n, p.e, xv, p.pr, p.q0, Q);
+  const Geo<double> g = geometry(S, n, p.e, xv, p.pr, p.q0, Q, local);
   std::vector<double> b = grad_u(g, std::vector<double>(p.pr.size(), 0.0));
   for (double &v : b) v = -v;
   const std::vector<double> u = cg(g, b, S.cg_tol, out.cg_iters);
@@ -506,6 +508,13 @@ SqeOutput sqe_compute(const SqeSpec &S, int n, const int32_t *Z, const double *x
       const double sij = std::sqrt(S.sigma[ei] * S.sigma[ei] + S.sigma[ej] * S.sigma[ej]);
       double dEdr = out.q[i] * out.q[j] * KE *
                     (2.0 / SQRT_PI / sij * std::exp(-r * r / (sij * sij)) / r - std::erf(r / sij) / (r * r));
+      if (local) { // gamma (1 - T): gamma' (1 - T) - gamma T'
+        const double t = (r - (S.lr_R - S.lr_t)) / S.lr_t;
+        double Tv = 0, dT = 0;
+        if (t >= 1) Tv = 1;
+        else if (t > 0) Tv = t * t * t * (t * (6 * t - 15) + 10), dT = 30 * t * t * (t - 1) * (t - 1) / S.lr_t;
+        dEdr = dEdr * (1 - Tv) - out.q[i] * out.q[j] * KE * std::erf(r / sij) / r * dT;
+      }
       if (r < S.cn_off) { // d(cnt * sw)/dr
         const double R = S.rcov[ei] + S.rcov[ej];
         const double z = 16.0 * (4.0 / 3.0 * R / r - 1.0), sg = 1.0 / (1.0 + std::exp(-z));
@@ -544,14 +553,31 @@ SqeOutput sqe_compute(const SqeSpec &S, int n, const int32_t *Z, const double *x
   return out;
 }
 
-SqeOutput sqe_train_grad(const SqeSpec &S, int n, const int32_t *Z, const double *x, double Q, const double *q0,
-                         double dL_dE, const double *dL_dF, std::vector<double> &grad, const SqeQ0Supervision *sup) {
-  SqeOutput out = sqe_compute(S, n, Z, x, Q, q0, true, nullptr);
+} // namespace
+
+// lr_R > 0: the long-range part E*(gamma) - E*(gamma (1 - T)) (two minima; charges from the full one)
+SqeOutput sqe_compute(const SqeSpec &S, int n, const int32_t *Z, const double *x, double Q, const double *q0,
+                      bool forces, const double *cell) {
+  if (cell) throw std::runtime_error("sqe: periodic structures are not implemented in mlip.cpp (metatrain only)");
+  SqeOutput out = compute_one(S, n, Z, x, Q, q0, forces, false);
+  if (S.lr_R > 0 && n > 0) {
+    const SqeOutput loc = compute_one(S, n, Z, x, Q, q0, forces, true);
+    out.energy -= loc.energy;
+    for (size_t k = 0; k < out.forces.size(); k++) out.forces[k] -= loc.forces[k];
+  }
+  return out;
+}
+
+namespace {
+SqeOutput train_one(const SqeSpec &S, int n, const int32_t *Z, const double *x, double Q, const double *q0,
+                    double dL_dE, const double *dL_dF, std::vector<double> &grad, const SqeQ0Supervision *sup, bool local,
+                    double sign) {
+  SqeOutput out = compute_one(S, n, Z, x, Q, q0, true, local);
   if (n == 0) return out;
   if (grad.size() != S.n_params()) grad.assign(S.n_params(), 0.0);
   const Prepared p = prepare(S, n, Z, x, Q, q0);
   const std::vector<double> xv(x, x + 3 * size_t(n));
-  const Geo<double> g = geometry(S, n, p.e, xv, p.pr, p.q0, Q);
+  const Geo<double> g = geometry(S, n, p.e, xv, p.pr, p.q0, Q, local);
   if (sup && sup->unit && g.learned && sup->weight > 0) { // optional supervision of the learned q0 by unit charges
     std::vector<double> su(sup->n_units, 0.0), c(n, 0.0);
     for (int i = 0; i < n; i++) su[sup->unit[i]] += g.q0[i];
@@ -569,7 +595,7 @@ SqeOutput sqe_train_grad(const SqeSpec &S, int n, const int32_t *Z, const double
   int it = 0;
   const std::vector<double> u = cg(g, b, S.cg_tol, it);
   const std::vector<double> G = grad_theta(S, g, u);
-  for (size_t k = 0; k < G.size(); k++) grad[k] += dL_dE * G[k];
+  for (size_t k = 0; k < G.size(); k++) grad[k] += sign * dL_dE * G[k];
   if (!dL_dF) return out;
   // force loss: d(sum_a w_a . F_a)/dtheta = -D_x G[w], with the implicit du = -H^-1 dg/dx[w]
   std::vector<Dual> xd(3 * size_t(n));
@@ -577,7 +603,7 @@ SqeOutput sqe_train_grad(const SqeSpec &S, int n, const int32_t *Z, const double
   for (size_t k = 0; k < xd.size(); k++) wn += dL_dF[k] * dL_dF[k];
   if (wn == 0) return out;
   for (size_t k = 0; k < xd.size(); k++) xd[k] = Dual(x[k], dL_dF[k]);
-  const Geo<Dual> gd = geometry(S, n, p.e, xd, p.pr, p.q0, Q);
+  const Geo<Dual> gd = geometry(S, n, p.e, xd, p.pr, p.q0, Q, local);
   std::vector<Dual> ud(u.size());
   for (size_t k = 0; k < u.size(); k++) ud[k] = Dual(u[k], 0.0);
   const std::vector<Dual> gdot = grad_u(gd, ud);
@@ -586,7 +612,20 @@ SqeOutput sqe_train_grad(const SqeSpec &S, int n, const int32_t *Z, const double
   const std::vector<double> udot = cg(g, rhs, S.cg_tol, it);
   for (size_t k = 0; k < u.size(); k++) ud[k] = Dual(u[k], udot[k]);
   const std::vector<Dual> Gd = grad_theta(S, gd, ud);
-  for (size_t k = 0; k < Gd.size(); k++) grad[k] -= Gd[k].d;
+  for (size_t k = 0; k < Gd.size(); k++) grad[k] -= sign * Gd[k].d;
+  return out;
+}
+} // namespace
+
+SqeOutput sqe_train_grad(const SqeSpec &S, int n, const int32_t *Z, const double *x, double Q, const double *q0,
+                         double dL_dE, const double *dL_dF, std::vector<double> &grad, const SqeQ0Supervision *sup) {
+  if (grad.size() != S.n_params()) grad.assign(S.n_params(), 0.0);
+  SqeOutput out = train_one(S, n, Z, x, Q, q0, dL_dE, dL_dF, grad, sup, false, 1.0);
+  if (S.lr_R > 0 && n > 0) {
+    const SqeOutput loc = train_one(S, n, Z, x, Q, q0, dL_dE, dL_dF, grad, nullptr, true, -1.0);
+    out.energy -= loc.energy;
+    for (size_t k = 0; k < out.forces.size(); k++) out.forces[k] -= loc.forces[k];
+  }
   return out;
 }
 

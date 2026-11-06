@@ -15,7 +15,7 @@ import struct
 
 SC = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?", 10: "Q", 11: "q", 12: "d"}
 CFG = ["r_ct", "r_ct_width", "dchi_max", "J_lo", "J_hi", "kappa_lo", "kappa_hi", "w_lo", "w_hi", "cn_on", "cn_off",
-       "ewald_alpha"]
+       "ewald_alpha", "lr_R", "lr_t"]
 
 
 def main():
@@ -23,8 +23,11 @@ def main():
     ap.add_argument("input"); ap.add_argument("output"); ap.add_argument("--spec", required=True)
     ap.add_argument("--q0", choices=["uniform", "formal", "learned"], default="uniform")
     ap.add_argument("--backbone-charge", choices=["input", "neutral"], default="input")
+    ap.add_argument("--lr-R", type=float, default=None, help="override the spec's lr_R (long-range-only SQE energy)")
     a = ap.parse_args()
     sp = json.load(open(a.spec))
+    if a.lr_R is not None:
+        sp["cfg"]["lr_R"] = a.lr_R
     data = open(a.input, "rb").read()
     pos = 0
 
@@ -54,7 +57,7 @@ def main():
            P + "_q0": enc(P + "_q0") + struct.pack("<I", 8) + enc(a.q0),
            P + "_backbone_charge": enc(P + "_backbone_charge") + struct.pack("<I", 8) + enc(a.backbone_charge)}
     for k in CFG:
-        new[f"{P}_{k}"] = enc(f"{P}_{k}") + struct.pack("<Id", 12, float(sp["cfg"][k]))
+        new[f"{P}_{k}"] = enc(f"{P}_{k}") + struct.pack("<Id", 12, float(sp["cfg"].get(k, {"lr_R": 0.0, "lr_t": 1.0}.get(k, 0.0))))
     new[P + "_w_raw"] = enc(P + "_w_raw") + struct.pack("<Id", 12, float(sp["w_raw"]))
     Z = [int(z) for z in sp["Z"]]
     new[P + "_Z"] = enc(P + "_Z") + struct.pack("<IIQ", 9, 5, len(Z)) + struct.pack(f"<{len(Z)}i", *Z)

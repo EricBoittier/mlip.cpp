@@ -7,6 +7,8 @@ torch.set_default_dtype(torch.float64); torch.manual_seed(1)
 idx = json.load(open("/home/boittier/data/petlr-lrd/lrdall_index.json"))
 Zs = [1, 3, 6, 7, 8, 9, 11, 15, 17]
 P = SQEParams(Zs)
+import os
+if os.environ.get("LR_R"): P.cfg["lr_R"] = float(os.environ["LR_R"])
 with torch.no_grad():
     for p in P.parameters(): p.add_(0.4 * torch.randn_like(p))
 P.learned_q0 = LEARNED
@@ -38,5 +40,5 @@ spec = dict(Z=Zs, chi0=P.chi0.tolist(), J0=P.J0.tolist(), rcov=P.rcov.tolist(), 
             chi_a=P.chi_a.tolist(), chi_b=P.chi_b.tolist(), j_z=P.j_z.tolist(), kappa_z=P.kappa_z.tolist(), w_raw=float(P.w_raw),
             cfg=P.cfg, q0_lo=P.q0_lo.tolist(), q0_hi=P.q0_hi.tolist(), q0_a=P.q0_a.tolist(),
             q0_b=P.q0_b.reshape(-1).tolist(), learned=LEARNED)
-json.dump(dict(spec=spec, cases=cases), open("/home/boittier/data/petlr-sqe/parity/cases%s.json" % ("_learned" if LEARNED else ""), "w"))
+json.dump(dict(spec=spec, cases=cases), open("/home/boittier/data/petlr-sqe/parity/cases%s%s.json" % ("_learned" if LEARNED else "", "_lr" if os.environ.get("LR_R") else ""), "w"))
 print(len(cases), "cases")

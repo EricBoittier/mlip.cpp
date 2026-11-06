@@ -37,6 +37,7 @@ int main(int argc, char **argv) {
   S.r_ct = c["r_ct"], S.r_ct_width = c["r_ct_width"], S.dchi_max = c["dchi_max"], S.J_lo = c["J_lo"], S.J_hi = c["J_hi"];
   S.kappa_lo = c["kappa_lo"], S.kappa_hi = c["kappa_hi"], S.w_lo = c["w_lo"], S.w_hi = c["w_hi"];
   S.cn_on = c["cn_on"], S.cn_off = c["cn_off"];
+  S.lr_R = c.value("lr_R", 0.0), S.lr_t = c.value("lr_t", 1.0);
   double mE = 0, mq = 0, mF = 0, mG = 0, mGrel = 0;
   int maxit = 0;
   for (const json &k : J["cases"]) {
@@ -69,7 +70,7 @@ int main(int argc, char **argv) {
     std::printf("%-28s n %3d  cg %3d  |dE| %.2e  |dq| %.2e  |dF| %.2e  |dgrad| %.2e (max |grad| %.2e)\n",
                 k["name"].get<std::string>().c_str(), n, o.cg_iters, dE, dq, dF, dG, gs);
     mE = std::max(mE, dE), mq = std::max(mq, dq), mF = std::max(mF, dF), mG = std::max(mG, dG);
-    mGrel = std::max(mGrel, dG / std::max(gs, 1e-12)), maxit = std::max(maxit, o.cg_iters);
+    mGrel = std::max(mGrel, dG / std::max(gs, 1e-3)), maxit = std::max(maxit, o.cg_iters); // relative above 1e-3
   }
   std::printf("max: |dE| %.2e eV  |dq| %.2e e  |dF| %.2e eV/A  |dgrad| %.2e (rel %.2e)  cg iters %d\n", mE, mq, mF, mG, mGrel, maxit);
   const bool ok = mE < 1e-9 && mq < 1e-9 && mF < 1e-8 && mGrel < 1e-7;

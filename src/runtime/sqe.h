@@ -38,6 +38,9 @@ struct SqeSpec {
   bool backbone_neutral = false; // pet.plato_lr.sqe_backbone_charge == "neutral": the backbone sees charge 0
   double r_ct = 6.0, r_ct_width = 1.0, dchi_max = 2.0, J_lo = 0.75, J_hi = 2.0, kappa_lo = 1.0, kappa_hi = 100.0,
          w_lo = 0.2, w_hi = 2.0, cn_on = 4.0, cn_off = 5.0, ewald_alpha = 0.0;
+  // lr_R > 0: only the long-range part E*(gamma) - E*(gamma (1 - T)), T the smootherstep from 0 at lr_R - lr_t to 1
+  // at lr_R (zero for structures without pairs beyond lr_R - lr_t); charges from the full minimum
+  double lr_R = 0.0, lr_t = 1.0;
   // per element (sqe_Z order): tabulated data (fixed) and the raw learned parameters
   std::vector<int32_t> Z;
   std::vector<double> chi0, J0, rcov, sigma;
