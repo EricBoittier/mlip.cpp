@@ -14,6 +14,10 @@ struct ModelResult {
   std::vector<float> stress; // [6] in Voigt notation (xx, yy, zz, yz, xz, xy)
 
   std::vector<float> nc_forces; // [n_atoms * 3], direct force head
+  // per-atom model output, scale * y_i + composition[Z_i] (graph models): the
+  // atomic energies, or the per-atom target of a non-energy export (e.g. the
+  // ShiftML isotropic shielding, export_nanopet_gguf.py); empty otherwise
+  std::vector<float> atomic_values;
 
   bool has_forces = false;
   bool has_stress = false;
