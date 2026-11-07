@@ -15,7 +15,9 @@ Sets
 Per checkpoint x set x class: median eps per r bin (IQR, 95% bootstrap CI over scans), and over all points at r >= 8 A the
 Theil-Sen slopes of eps vs r_COM (deps/dr, 1/A) and of ln|eps| vs ln r_COM (k in |eps| ~ r^k), bootstrap CIs over scans.
 
-Charges (when the evals dump latent_charges): lam = local ion charge / formal (sum over the ion's atoms, after the
+Model-agnostic: any mlipcpp-eval json; the charge source is sqe_charges, latent_charges or charges (--charge-key).
+Charge-state offset (optional third file): mean signed val_sel error per total charge Q and its slope in Q.
+Charges (when the evals dump per-atom charges): lam = local ion charge / formal (sum over the ion's atoms, after the
 total-charge shift) and qN/qI = the neutral partner's net latent charge over the ion's formal charge (ion-neutral classes;
 the shift q_i - mean(q) + Q/N puts (n_N/N)(1 - lam)Q on it, a spurious 1/R tail); medians at r >= 8 A with CIs.
 
@@ -27,6 +29,7 @@ Flags go into the jsonl rows ("flags") and a summary row; --stop-exit returns 3 
 
     eps_monitor.py --out eps.jsonl [--eval-bin mlipcpp-eval --workdir W] NAME=GGUF ...       (evaluates missing jsons)
     eps_monitor.py --out eps.jsonl NAME=dimers.json[,pulled.json] ...                       (scores existing evals)
+    NAME=dimers.json,pulled.json,val_sel.per.npz  adds the charge-state offset on val_sel (eval_omol per-structure npz)
     NAME=A.json+B.json+...  averages the energies of several checkpoints (ensembles; normalised.py's 4-seed eps)"""
 import argparse, json, os, subprocess, sys, collections, numpy as np
 from scipy.stats import theilslopes
@@ -45,6 +48,9 @@ ap.add_argument("--workdir", default=".")
 ap.add_argument("--boot", type=int, default=200)
 ap.add_argument("--tol", type=float, default=0.02, help="minimum change counted as growth (eps units; 1/A for slopes)")
 ap.add_argument("--stop-exit", action="store_true")
+ap.add_argument("--charge-key", default=None, help="eval-json per-atom charge field (default: sqe_charges, latent_charges, charges, first present)")
+ap.add_argument("--valsel-charges", default=f"{H}/data/petlr-tail/data/val_sel_charge.npy",
+                help="total charge per val_sel structure (omol25_val_sel.npz 'charge'), for the charge-state offset")
 ap.add_argument("--les-gate", type=float, default=None, help="held LES gate g: also report the identity g lam^2 - 1")
 a = ap.parse_args()
 RNG = np.random.default_rng(5)
@@ -105,15 +111,16 @@ def charge_stats(paths, kind, P):
     charge; ion pairs: both ions; ion-neutral: the ion) and qN = sum_neutral q / Q_ion (the neutral partner's spurious
     monopole, ion-neutral classes). None where the eval has no latent charges."""
     fr = [json.load(open(p))["frames"] for p in paths.split("+")]
-    if "latent_charges" not in fr[0][0]: return None
+    key = a.charge_key or next((k for k in ("sqe_charges", "latent_charges", "charges") if k in fr[0][0]), None)
+    if key is None or key not in fr[0][0]: return None
     out = []
     for p in P:
         if kind == "dimers":
-            nA, qA, qB = DIMER_FRAG[p["k"]]; q = np.mean([np.array(f[3 * p["k"]]["latent_charges"])[:, 0] if np.ndim(f[3 * p["k"]]["latent_charges"]) == 2
-                                                        else np.array(f[3 * p["k"]]["latent_charges"]) for f in fr], axis=0)
+            nA, qA, qB = DIMER_FRAG[p["k"]]; q = np.mean([np.array(f[3 * p["k"]][key])[:, 0] if np.ndim(f[3 * p["k"]][key]) == 2
+                                                        else np.array(f[3 * p["k"]][key]) for f in fr], axis=0)
             m = np.arange(len(q)) < nA; QA, QB = qA, qB
         else:
-            q = np.mean([np.array(f[p["k"]]["latent_charges"]).reshape(len(p["frag"]), -1)[:, 0] for f in fr], axis=0)
+            q = np.mean([np.array(f[p["k"]][key]).reshape(len(p["frag"]), -1)[:, 0] for f in fr], axis=0)
             m = np.array(p["frag"]) == 1; QA, QB = p["QU"], p["QR"]
         sA, sB = q[m].sum(), q[~m].sum()
         lam = [s_ / Q for s_, Q in ((sA, QA), (sB, QB)) if Q != 0]
@@ -142,8 +149,9 @@ def evaluate(name, gguf):
 def parse(spec):
     name, v = spec.split("=", 1)
     if v.endswith(".gguf") or ".gguf." in v or v.endswith("gguf"): return name, evaluate(name, v)
-    parts = v.split(","); d = {"dimers": parts[0]}
+    parts = v.split(","); d = {"dimers": parts[0]} if parts[0] else {}
     if len(parts) > 1 and parts[1]: d["pulled"] = parts[1]
+    if len(parts) > 2 and parts[2]: d["valsel"] = parts[2]
     return name, d
 
 
@@ -209,6 +217,23 @@ def score(name, paths):
     return rows
 
 
+def valsel_offset(name, per):
+    """Charge-state offset: mean signed val_sel energy error per total charge Q (eval_omol --per-structure npz, dE in eV
+    after the per-element refit), meV/structure and meV/atom, 95% bootstrap CIs; and its least-squares slope in Q
+    (meV per unit charge). A structure-wide Q artefact shows as a trend of the signed error with Q."""
+    d = np.load(per); Q = np.load(a.valsel_charges).astype(int); dE, n = 1e3 * d["dE"], d["n"]
+    if len(Q) != len(dE): sys.exit(f"{per}: {len(dE)} structures, {a.valsel_charges}: {len(Q)}")
+    rows = []
+    for q in sorted(set(Q)):
+        m = np.where(Q == q)[0]
+        if len(m) < 5: continue
+        bs = [RNG.choice(m, len(m)) for _ in range(a.boot)]
+        rows.append(dict(Q=int(q), n=int(len(m)), mse_meV=float(dE[m].mean()), mse_meV_ci95=[float(np.percentile([dE[b].mean() for b in bs], p)) for p in (2.5, 97.5)],
+                         mse_meV_atom=float((dE[m] / n[m]).mean()), mae_meV_atom=float(np.abs(dE[m] / n[m]).mean())))
+    w = np.isfinite(dE); sl = np.polyfit(Q[w], (dE / n)[w], 1)[0]
+    return dict(ckpt=name, set="val_sel", cls="charge-state offset", per_Q=rows, slope_meV_atom_per_e=float(sl))
+
+
 def flags(history, tol):
     """history: list of row lists in checkpoint order -> flags per (set, cls) at each checkpoint."""
     out = []
@@ -232,7 +257,9 @@ def flags(history, tol):
 POINTS = {k: f() for k, (f, _) in SETS.items() if k == "dimers" or os.path.exists(f"{a.pulled}/val/points.jsonl")}
 history, names = [], []
 for spec in a.ckpts:
-    name, paths = parse(spec); names.append(name); history.append(score(name, paths))
+    name, paths = parse(spec); names.append(name); rows = score(name, paths)
+    if "valsel" in paths: rows.append(valsel_offset(name, paths["valsel"]))
+    history.append(rows)
 fl = flags(history, a.tol)
 with open(a.out, "w") as f:
     for name, rows, fs in zip(names, history, fl):
@@ -240,6 +267,9 @@ with open(a.out, "w") as f:
     f.write(json.dumps(dict(summary=True, ckpts=names, flagged=[dict(ckpt=n, **x) for n, fs in zip(names, fl) for x in fs])) + "\n")
 for name, rows in zip(names, history):
     for row in rows:
+        if row.get("cls") == "charge-state offset":
+            print(f'{name:14s} val_sel signed error per Q (meV/atom): ' + " ".join(f'{r["Q"]:+d}:{r["mse_meV_atom"]:+.2f}' for r in row["per_Q"])
+                  + f'  slope {row["slope_meV_atom_per_e"]:+.3f} meV/atom/e')
         if "eps_median" in row:
             b = " ".join(f'{x["rbin"]}:{x["eps_median"]:+.3f}' for x in row["bins"])
             print(f'{name:14s} {row["set"]:7s} {row["cls"]:15s} eps(>=8) {row["eps_median"]:+.3f} [{row["ci95"][0]:+.3f},{row["ci95"][1]:+.3f}] '

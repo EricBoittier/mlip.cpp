@@ -1022,7 +1022,6 @@ StepStats Worker::run(const Batch &b, double energy_scale, bool backward) {
 double Worker::run_tail(const Batch &b, double energy_scale, const std::vector<TailPair> &pairs, const TailLoss &tl,
                         double mult, std::vector<double> *r) {
   if (!tail_cotangent) throw std::logic_error("run_tail: tail_cotangent is off");
-  if (sqe) throw std::runtime_error("--tail-data: not with --sqe (its energy is host-side)");
   t_build = t_alloc = t_upload = t_compute = t_download = t_cpu = 0;
   plato_batch_ = &b;
   const int n = b.n_atoms, m = b.max_neighbors, S = b.n_systems;
@@ -1038,6 +1037,22 @@ double Worker::run_tail(const Batch &b, double energy_scale, const std::vector<T
     for (int k = 0; k < b.n_real_systems; k++)
       E[k] = energy_scale * b.n_per_system[k] * (double(ps[k]) + double(b.energy_target[k]));
   }
+  // split-charge equilibration (host-side energy): its energy joins E, its parameter gradient comes after the loss
+  std::vector<int> sys_off(S + 1, 0);
+  for (int k = 0; k < S; k++) sys_off[k + 1] = sys_off[k] + b.n_per_system[k];
+  auto sqe_q0 = [&](int k) {
+    return !sqe->q0_learned && !b.sqe_q0_ok.empty() && b.sqe_q0_ok[k] ? b.sqe_q0.data() + sys_off[k] : nullptr;
+  };
+  auto sqe_x = [&](int k) {
+    return std::vector<double>(b.positions.begin() + 3 * size_t(sys_off[k]), b.positions.begin() + 3 * size_t(sys_off[k + 1]));
+  };
+  if (sqe)
+    for (int k = 0; k < b.n_real_systems; k++) {
+      if (b.periodic[k]) throw std::runtime_error("sqe: periodic tail structures are not supported");
+      const auto x = sqe_x(k);
+      E[k] += runtime::sqe_compute(*sqe, b.n_per_system[k], b.atomic_number.data() + sys_off[k], x.data(),
+                                   double(b.system_charge[k]), sqe_q0(k), false).energy;
+    }
   for (const TailPair &p : pairs)
     if (b.n_per_system.at(p.k) != b.n_per_system.at(p.l)) throw std::runtime_error("tail pair of different sizes");
   // 2. the loss and dL/dE; dE_k / d(d_energy_k) = s_E N_k
@@ -1046,6 +1061,16 @@ double Worker::run_tail(const Batch &b, double energy_scale, const std::vector<T
   if (r) {
     r->clear();
     for (const TailPair &p : pairs) r->push_back(tl.residual(p, E));
+  }
+  if (sqe) { // the SQE parameters' gradient of the tail loss (energy only: no force term)
+    if (sqe_grad.size() != sqe->n_params()) sqe_grad.assign(sqe->n_params(), 0.0);
+    for (int k = 0; k < b.n_real_systems; k++) {
+      if (dLdE[k] == 0.0) continue;
+      const auto x = sqe_x(k);
+      std::vector<double> dLdF(x.size(), 0.0);
+      runtime::sqe_train_grad(*sqe, b.n_per_system[k], b.atomic_number.data() + sys_off[k], x.data(),
+                              double(b.system_charge[k]), sqe_q0(k), mult * dLdE[k], dLdF.data(), sqe_grad, nullptr);
+    }
   }
   ecot_.assign(S, 0.0f);
   for (int k = 0; k < b.n_real_systems; k++)
@@ -2460,6 +2485,11 @@ void train(const TrainOptions &o) {
   if (tail_on) {
     if (!o.conservative) throw std::runtime_error("--tail-data: conservative training only");
     tail_split = std::make_unique<MemmapSplit>(o.tail_data);
+    // the same conditioning convention as the training split (SQE: backbone at charge 0 or the input charge; q0
+    // labels are absent, so formal q0 falls back to Q / N and learned q0 is unaffected)
+    tail_split->set_sqe(false, train_split.sqe_backbone_neutral());
+    if (o.frag_charges || o.frag_cond_gate)
+      fmt::print("tail loss: the scans carry no unit labels (fragunit.bin), so they use whole-structure conditioning\n");
     tail_set = TailSet::load(o.tail_data + "/tail_pairs.tsv");
     for (const auto &g : tail_set.groups)
       for (int64_t s : g.ids)
