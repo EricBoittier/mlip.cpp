@@ -7,6 +7,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <random>
 
@@ -101,7 +102,7 @@ TEST_CASE("tail loss: gradient matches central differences and stays finite", "[
 }
 
 TEST_CASE("tail loss: pair file", "[tail]") {
-  const std::string path = "test_tail_pairs.tsv";
+  const std::string path = (std::filesystem::temp_directory_path() / "mlipcpp_test_tail_pairs.tsv").string();
   {
     std::ofstream f(path);
     f << "group\tclass\tk\tl\tdE_dft_eV\tdE_ref_eV\td_A\n"
