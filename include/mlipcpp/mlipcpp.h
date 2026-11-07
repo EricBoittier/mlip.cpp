@@ -438,6 +438,19 @@ mlipcpp_error_t mlipcpp_result_get_stress(mlipcpp_result_t result,
                                           float stress[6]);
 
 /**
+ * @brief Get the per-atom model output
+ * @param result Result handle from mlipcpp_predict()
+ * @param values Buffer for [n_atoms] values: scale * y_i + composition[Z_i],
+ * the atomic energies of an energy model, or the per-atom target of a
+ * non-energy export (e.g. the ShiftML isotropic shielding in ppm,
+ * scripts/export_pytorch/export_nanopet_gguf.py)
+ * @return MLIPCPP_OK on success; MLIPCPP_ERROR_UNSUPPORTED when the model
+ * does not report per-atom values (currently only "pet-graph" GGUFs do)
+ */
+mlipcpp_error_t mlipcpp_result_get_atomic_values(mlipcpp_result_t result,
+                                                 float *values);
+
+/**
  * @brief Get the number of atoms in the result
  * @param result Result handle from mlipcpp_predict()
  * @param n_atoms Pointer to store number of atoms

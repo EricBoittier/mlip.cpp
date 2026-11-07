@@ -1065,6 +1065,9 @@ def convert_exported_to_gir(
                 continue
             target_name = get_aten_op_name(node.target)
             ggml_op = ATEN_TO_GGML.get(target_name)
+            # exact (erf) GELU, torch's default; ggml's GELU is the tanh form
+            if ggml_op == "UNARY_GELU" and node.kwargs.get("approximate", "none") == "none":
+                ggml_op = "UNARY_GELU_ERF"
 
             # Handle special cases
             if node.target == operator.getitem:

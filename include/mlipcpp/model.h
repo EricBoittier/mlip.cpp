@@ -17,6 +17,10 @@ struct ModelResult {
   // Plato-PET-LR with LES: the latent charges per atom (e: model units times charge_unit,
   // after the neutralisation / total-charge shift), first channel; empty otherwise
   std::vector<float> latent_charges;
+  // per-atom model output, scale * y_i + composition[Z_i] (graph models): the
+  // atomic energies, or the per-atom target of a non-energy export (e.g. the
+  // ShiftML isotropic shielding, export_nanopet_gguf.py); empty otherwise
+  std::vector<float> atomic_values;
 
   bool has_forces = false;
   bool has_stress = false;

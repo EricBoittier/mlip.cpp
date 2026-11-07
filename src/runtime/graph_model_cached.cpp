@@ -512,7 +512,7 @@ bool GraphModel::fit_cached_graph(int n, int max_kept) {
   // backward pass, zero forces and stress)
   const bool no_edges = max_kept == 0;
   const bool exact = no_edges && !std::getenv("MLIPCPP_PAD_EMPTY");
-  const bool backward = !no_edges;
+  const bool backward = !no_edges && !forward_only_;
   // neighbour slots beyond the largest count (exact by default on the CPU,
   // where every slot costs compute; on a GPU a few spare slots avoid
   // rebuilding the graph whenever the largest count moves by one)
@@ -672,9 +672,13 @@ void GraphModel::read_cached_outputs(const AtomicSystem &system, ModelResult &re
   std::vector<float> atomic(n);
   ggml_backend_tensor_get(g.energy, atomic.data(), 0, atomic.size() * sizeof(float));
   double model = 0, composition = 0;
+  result.atomic_values.resize(n);
   for (int i = 0; i < n; i++) {
     model += atomic[i];
-    if (auto c = composition_energies_.find(Z[i]); c != composition_energies_.end()) composition += c->second;
+    double c0 = 0;
+    if (auto c = composition_energies_.find(Z[i]); c != composition_energies_.end()) c0 = c->second;
+    composition += c0;
+    result.atomic_values[i] = static_cast<float>(energy_scale_ * atomic[i] + c0);
   }
   result.energy = static_cast<float>(energy_scale_ * model + composition);
   if (!g.nc) return;
@@ -1018,7 +1022,7 @@ ModelResult GraphModel::predict_cached_device(const AtomicSystem &system, bool c
   } else {
     // pack into the current graph; rebuild it (and pack again) if the largest
     // neighbour count does not fit
-    if (!cached_ || cached_->n_atoms != n || cached_->ragged) build_cached_graph(n, cached_ && !cached_->ragged ? cached_->M : 16, false, true);
+    if (!cached_ || cached_->n_atoms != n || cached_->ragged) build_cached_graph(n, cached_ && !cached_->ragged ? cached_->M : 16, false, !forward_only_);
     for (;;) {
       st.M = cached_->M;
       gg = device_graph(*cached_);
@@ -1227,7 +1231,7 @@ GraphModel::DeviceTotals GraphModel::predict_device_step(const DeviceStep &in) {
       total = st.offsets + n;
     } else {
       if (!cached_ || cached_->n_atoms != n || cached_->ragged)
-        build_cached_graph(n, cached_ && !cached_->ragged ? cached_->M : 16, false, true);
+        build_cached_graph(n, cached_ && !cached_->ragged ? cached_->M : 16, false, !forward_only_);
       if (d.have_sizes) fit_cached_graph(n, std::max(d.last_max_kept, 1)); // always with the backward pass
       st.M = cached_->M;
       gg = device_graph(*cached_);

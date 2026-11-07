@@ -187,6 +187,9 @@ private:
   float energy_scale_ = 1.0f;
   std::string cutoff_function_ = "cosine";
   bool forces_mode_ = false;
+  // pet.forward_only: a per-atom target without gradients (e.g. ShiftML shieldings,
+  // export_nanopet_gguf.py): the cached graph has no backward pass, no forces
+  bool forward_only_ = false;
   bool nc_forces_ = false;
   PetPlatoLRSpec plato_lr_;
   std::vector<PetPlatoLRStructure> plato_st_; // the cached path's structure (set before fit_cached_graph)

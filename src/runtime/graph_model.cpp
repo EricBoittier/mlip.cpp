@@ -384,6 +384,7 @@ bool GraphModel::load_from_gguf(const std::string &path) {
   energy_scale_ = loader.get_float32("pet.energy_scale", 1.0f);
   cutoff_function_ = loader.get_string("pet.cutoff_function", "cosine");
   forces_mode_ = (loader.get_int32("pet.forces_mode", 0) != 0);
+  forward_only_ = (loader.get_int32("pet.forward_only", 0) != 0);
   nc_forces_ = (loader.get_int32("pet.nc_forces", 0) != 0);
   param_names_ = json::parse(loader.get_string("train.param_names", "[]"))
                      .get<std::vector<std::string>>();
@@ -627,6 +628,9 @@ ModelResult GraphModel::predict_single(
     const char *e = std::getenv("MLIPCPP_NO_GRAPH_CACHE");
     return e && *e && *e != '0';
   }();
+  if (compute_forces && forward_only_)
+    throw std::runtime_error("GraphModel: this model has a per-atom target only (pet.forward_only); "
+                             "predict without forces");
   if (!no_cache && !post_compute_hook && !parameter_gradients && cached_path_supported() &&
       system.num_atoms() > 0)
     return predict_cached(system, compute_forces);
@@ -1312,6 +1316,13 @@ ModelResult GraphModel::predict_single(
   }
 
   result.energy = scaled_energy + composition_energy;
+  result.atomic_values.resize(n_atoms);
+  for (int i = 0; i < n_atoms; i++) {
+    auto it = composition_energies_.find(atomic_numbers[i]);
+    result.atomic_values[i] = static_cast<float>(
+        double(energy_scale_) * atomic_energies[i] +
+        (it != composition_energies_.end() ? it->second : 0.0));
+  }
 
   if (nc_output) {
     result.nc_forces.resize(n_atoms * 3);
