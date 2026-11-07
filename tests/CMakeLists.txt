@@ -250,6 +250,9 @@ if(TARGET mlipcpp_train)
     add_executable(test_tail_loss test_tail_loss.cpp)
     target_link_libraries(test_tail_loss PRIVATE mlipcpp_train Catch2::Catch2WithMain)
     catch_discover_tests(test_tail_loss)
+    add_executable(test_muon test_muon.cpp)
+    target_link_libraries(test_muon PRIVATE mlipcpp_train Catch2::Catch2WithMain)
+    catch_discover_tests(test_muon)
 endif()
 
 # PET's "grid" adaptive cutoff against metatrain's golden values (and, with

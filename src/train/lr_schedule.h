@@ -89,6 +89,8 @@ public:
   double step(int64_t n, int64_t steps_per_epoch, int64_t total);
   const LrSchedule &schedule() const { return schedule_; }
   const std::vector<int> &group_of_param() const { return group_; }
+  const std::vector<bool> &muon_param() const { return use_muon_; } // per parameter: a Muon step
+  size_t param_values(size_t k) const;
   std::vector<size_t> group_sizes() const; // values per group
   /// "name: lr (frozen)" of every group at step n
   std::string describe(int64_t n, int64_t steps_per_epoch, int64_t total) const;

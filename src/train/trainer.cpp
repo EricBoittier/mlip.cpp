@@ -1416,6 +1416,9 @@ bool allow_cuda_graph(ggml_backend_t backend, ggml_cgraph *graph) {
 }
 } // namespace
 
+bool is_muon_matrix(const ggml_tensor *p) { return is_muon_param(p); }
+ggml_tensor *muon_orthogonalize(ggml_context *ctx, ggml_tensor *g, int steps) { return orthogonalize(ctx, g, steps); }
+
 #ifdef MLIPCPP_NCCL
 namespace {
 void nccl_check(ncclResult_t r, const char *what) {
@@ -2060,7 +2063,13 @@ struct GroupScheduled {
     const LrSchedule &s = opt->schedule();
     const auto sizes = opt->group_sizes();
     std::vector<int> tensors(s.groups.size(), 0);
-    for (int g : opt->group_of_param()) tensors[g]++;
+    std::vector<int> muon(s.groups.size(), 0);
+    std::vector<size_t> muon_values(s.groups.size(), 0);
+    for (size_t k = 0; k < opt->group_of_param().size(); k++) {
+      const int g = opt->group_of_param()[k];
+      tensors[g]++;
+      if (opt->muon_param()[k]) muon[g]++, muon_values[g] += opt->param_values(k);
+    }
     std::string out = fmt::format("base {:g}, min {:g}, {} after {} epochs, warmup {} epochs, {} steps/epoch, {} steps{}",
                                   s.base, s.min, s.shape, s.decay_after_epochs, s.warmup_epochs, S, T,
                                   unmapped ? " (GGUF without train.state_dict_names: GGUF names matched)" : "");
@@ -2069,7 +2078,8 @@ struct GroupScheduled {
       out += fmt::format("\n  group {}: {} tensors, {} values; lr x{:g}, frozen {} epochs, warmup {} epochs, "
                          "weight decay {:g}, {}",
                          x.name, tensors[g], sizes[g], x.lr_mult, x.freeze_epochs, x.warmup_epochs, x.weight_decay,
-                         x.muon ? "Muon (matrices) + AdamW" : "AdamW");
+                         x.muon ? fmt::format("Muon ({} matrices, {} values) + AdamW", muon[g], muon_values[g])
+                                : std::string("AdamW"));
     }
     return out;
   }

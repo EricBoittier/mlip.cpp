@@ -198,6 +198,8 @@ GroupOptimizer::~GroupOptimizer() {
   if (ctx_state_) ggml_free(ctx_state_);
 }
 
+size_t GroupOptimizer::param_values(size_t k) const { return ggml_nelements(params_[k].param); }
+
 std::vector<size_t> GroupOptimizer::group_sizes() const {
   std::vector<size_t> n(schedule_.groups.size(), 0);
   for (size_t k = 0; k < params_.size(); k++) n[group_[k]] += ggml_nelements(params_[k].param);
