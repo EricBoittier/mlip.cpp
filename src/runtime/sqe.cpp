@@ -69,7 +69,8 @@ template <class T> struct Geo {
 
 template <class T>
 Geo<T> geometry(const SqeSpec &S, int n, const std::vector<int> &e, const std::vector<T> &x, const std::vector<Pair> &pr,
-                const std::vector<double> &q0_given, double Q, bool local = false) {
+                const std::vector<double> &q0_given, double Q, bool local = false,
+                const SqeClusterMask *mask = nullptr) {
   Geo<T> g;
   const size_t E = S.Z.size();
   g.learned = S.q0_learned;
@@ -98,7 +99,10 @@ Geo<T> geometry(const SqeSpec &S, int n, const std::vector<int> &e, const std::v
       }
       const double sij = std::sqrt(S.sigma[e[i]] * S.sigma[e[i]] + S.sigma[e[j]] * S.sigma[e[j]]);
       T gm = T(KE) * erf(r / sij) / r;
-      if (local) gm = gm * (T(1.0) - smootherstep((r - (S.lr_R - S.lr_t)) / S.lr_t)); // gamma (1 - T(r))
+      if (local) { // gamma (1 - T(r)), or with a cluster mask gamma (1 - T(r) (1 - R))
+        const double mr = mask ? 1.0 - mask->R[size_t(mask->sn[i]) * mask->s + mask->sn[j]] : 1.0;
+        gm = gm * (T(1.0) - smootherstep((r - (S.lr_R - S.lr_t)) / S.lr_t) * mr);
+      }
       g.gam[size_t(i) * n + j] = g.gam[size_t(j) * n + i] = gm;
     }
   g.c.resize(n), g.th.resize(n), g.chi.resize(n), g.J.resize(n);
@@ -461,12 +465,12 @@ SqeOutput sqe_compute(const SqeSpec &S, int n, const int32_t *Z, const float *x,
 
 namespace {
 SqeOutput compute_one(const SqeSpec &S, int n, const int32_t *Z, const double *x, double Q, const double *q0,
-                      bool forces, bool local) {
+                      bool forces, bool local, const SqeClusterMask *mask = nullptr) {
   SqeOutput out;
   if (n == 0) return out;
   const Prepared p = prepare(S, n, Z, x, Q, q0);
   const std::vector<double> xv(x, x + 3 * size_t(n));
-  const Geo<double> g = geometry(S, n, p.e, xv, p.pr, p.q0, Q, local);
+  const Geo<double> g = geometry(S, n, p.e, xv, p.pr, p.q0, Q, local, local ? mask : nullptr);
   std::vector<double> b = grad_u(g, std::vector<double>(p.pr.size(), 0.0));
   for (double &v : b) v = -v;
   const std::vector<double> u = cg(g, b, S.cg_tol, out.cg_iters);
@@ -477,6 +481,8 @@ SqeOutput compute_one(const SqeSpec &S, int n, const int32_t *Z, const double *x
   for (int i = 0; i < n; i++) mu[i] = g.chi[i] + Aq[i], out.energy += g.chi[i] * out.q[i] + 0.5 * out.q[i] * Aq[i];
   for (double v : u) out.energy += 0.5 * v * v;
   out.chi = g.chi, out.J = g.J;
+  out.dE_dq0 = mu;
+  if (mask && local) out.dE_dR.assign(size_t(mask->s) * mask->s, 0.0);
   if (!forces) return out;
   // learned q0: dE/dq0 = mu, so the weight on df_i (f the q0 logits) is w_i (mu_i - m), as in q0_backprop
   std::vector<double> gq(n, 0.0);
@@ -513,7 +519,13 @@ SqeOutput compute_one(const SqeSpec &S, int n, const int32_t *Z, const double *x
         double Tv = 0, dT = 0;
         if (t >= 1) Tv = 1;
         else if (t > 0) Tv = t * t * t * (t * (6 * t - 15) + 10), dT = 30 * t * t * (t - 1) * (t - 1) / S.lr_t;
-        dEdr = dEdr * (1 - Tv) - out.q[i] * out.q[j] * KE * std::erf(r / sij) / r * dT;
+        const double mr = mask ? 1.0 - mask->R[size_t(mask->sn[i]) * mask->s + mask->sn[j]] : 1.0;
+        const double gq = out.q[i] * out.q[j] * KE * std::erf(r / sij) / r;
+        dEdr = dEdr * (1 - Tv * mr) - gq * dT * mr;
+        if (mask && mask->sn[i] != mask->sn[j] && Tv > 0) { // d/dR of gamma (1 - T (1 - R)) = gamma T
+          const size_t a = mask->sn[i], b2 = mask->sn[j];
+          out.dE_dR[a * mask->s + b2] += 0.5 * gq * Tv, out.dE_dR[b2 * mask->s + a] += 0.5 * gq * Tv;
+        }
       }
       if (r < S.cn_off) { // d(cnt * sw)/dr
         const double R = S.rcov[ei] + S.rcov[ej];
@@ -565,6 +577,21 @@ SqeOutput sqe_compute(const SqeSpec &S, int n, const int32_t *Z, const double *x
     out.energy -= loc.energy;
     for (size_t k = 0; k < out.forces.size(); k++) out.forces[k] -= loc.forces[k];
   }
+  return out;
+}
+
+SqeOutput sqe_compute_masked(const SqeSpec &S, int n, const int32_t *Z, const double *x, double Q, const double *q0,
+                             bool forces, const SqeClusterMask &mask) {
+  if (!(S.lr_R > 0)) throw std::runtime_error("sqe_compute_masked: needs lr_R > 0");
+  if (S.q0_learned) throw std::runtime_error("sqe_compute_masked: q0 must be given");
+  SqeOutput out = compute_one(S, n, Z, x, Q, q0, forces, false);
+  if (n == 0) return out;
+  const SqeOutput loc = compute_one(S, n, Z, x, Q, q0, forces, true, &mask);
+  out.energy -= loc.energy;
+  for (size_t k = 0; k < out.forces.size(); k++) out.forces[k] -= loc.forces[k];
+  for (int i = 0; i < n; i++) out.dE_dq0[i] -= loc.dE_dq0[i];
+  out.dE_dR.assign(loc.dE_dR.size(), 0.0);
+  for (size_t k = 0; k < loc.dE_dR.size(); k++) out.dE_dR[k] = -loc.dE_dR[k];
   return out;
 }
 

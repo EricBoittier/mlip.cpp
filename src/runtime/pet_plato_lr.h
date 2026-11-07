@@ -23,6 +23,7 @@
 // edge-vector terms, as in runtime/plato_graph.
 
 #include "frag_charges.h"
+#include "lr_combined.h"
 #include "sqe.h"
 
 #include <cstdint>
@@ -60,6 +61,8 @@ struct PetPlatoLRSpec {
   FragChargesSpec frag;
   // split-charge equilibration (runtime/sqe.h): pet.plato_lr.sqe*; host side, float64
   SqeSpec sqe;
+  // combined long-range model (runtime/lr_combined.h): pet.plato_lr.lrc*, with the sqe keys
+  LrcSpec lrc;
   bool long_range() const { return mesh || les; }
   static PetPlatoLRSpec from_gguf(const GGUFLoader &loader);
 };

@@ -281,6 +281,10 @@ void GraphModel::build_cached_graph(int n, int M, bool exact_mask, bool backward
     if (plato_lr_.frag.cond_gate) {
       g->charge_index_unit = input(GGML_TYPE_I32, {n}, "charge_index_unit");
       install_frag_cond_gate(interp_);
+    } else if (plato_lr_.lrc.enabled) { // local-charge blend of two rows
+      g->charge_index_unit = input(GGML_TYPE_I32, {n}, "charge_index_unit");
+      g->cond_blend = input(GGML_TYPE_F32, {n}, "cond_blend");
+      install_lrc_blend(interp_, g->cond_blend);
     }
   }
   if (backward) {
@@ -539,6 +543,14 @@ void GraphModel::upload_conditioning(CachedGraph &g, int charge, int spin_multip
   if (g.charge_index_unit) {
     const std::vector<int32_t> cu = charge_rows(g.n_atoms, charge, spin_multiplicity, true);
     ggml_backend_tensor_set(g.charge_index_unit, cu.data(), 0, ggml_nbytes(g.charge_index_unit));
+  }
+  if (g.cond_blend) {
+    std::vector<float> b(g.n_atoms, 0.0f);
+    if (!lrc_blend_.empty()) {
+      if (lrc_blend_.size() != static_cast<size_t>(g.n_atoms)) throw std::logic_error("lrc: blend size");
+      b = lrc_blend_;
+    }
+    ggml_backend_tensor_set(g.cond_blend, b.data(), 0, ggml_nbytes(g.cond_blend));
   }
   // per-atom (fragment) rows: not a structure charge, uploaded again next call
   g.cond_set = frag_cond_.empty(), g.cond_charge = charge, g.cond_spin = spin_multiplicity;

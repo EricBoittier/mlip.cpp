@@ -17,6 +17,8 @@
 #include <cstdint>
 #include <vector>
 
+struct ggml_tensor;
+
 namespace mlipcpp::runtime {
 
 struct FragChargesSpec {
@@ -34,6 +36,10 @@ class GraphInterpreter;
 /// LINEAR with system_conditioning_project_2_weight) becomes c + g * (c_u - c), c_u the same nodes rebuilt on
 /// input charge_index_unit, g the weight plato_frag_cond_gate (one value per channel, broadcast over atoms)
 void install_frag_cond_gate(GraphInterpreter &interp);
+/// installs interp.post_node for the combined model's local-charge conditioning (runtime/lr_combined.h): the
+/// conditioning projection c (rows of input charge_index) becomes c + S (c_hi - c), c_hi the same nodes rebuilt on input
+/// charge_index_unit (the next row up), S = `blend` (F32 [n], one value per atom, broadcast over channels)
+void install_lrc_blend(GraphInterpreter &interp, ggml_tensor *blend);
 
 /// unit label per atom (0..U-1, numbered by first atom) by the bond rule; positions [n][3]
 std::vector<int32_t> frag_bonded_units(int n, const int32_t *Z, const float *positions, int *n_units = nullptr);

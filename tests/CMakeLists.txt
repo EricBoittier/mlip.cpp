@@ -241,6 +241,11 @@ target_link_libraries(test_conditioning PRIVATE mlipcpp Catch2::Catch2WithMain f
 target_include_directories(test_conditioning PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/)
 catch_discover_tests(test_conditioning)
 
+add_executable(test_lr_combined test_lr_combined.cpp)
+target_link_libraries(test_lr_combined PRIVATE mlipcpp Catch2::Catch2WithMain)
+target_include_directories(test_lr_combined PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/)
+catch_discover_tests(test_lr_combined)
+
 # Per-group learning-rate schedules against metatrain's golden tables
 if(TARGET mlipcpp_train)
     add_executable(test_lr_schedule test_lr_schedule.cpp)

@@ -629,6 +629,11 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
     if (frag_cond_gate) { // gated unit conditioning: the units' rows
       interp.set_input("charge_index_unit", in(GGML_TYPE_I32, {n}, "charge_index_unit"));
       runtime::install_frag_cond_gate(interp);
+    } else if (lrc) { // combined model: local-charge blend of two rows
+      interp.set_input("charge_index_unit", in(GGML_TYPE_I32, {n}, "charge_index_unit"));
+      ggml_tensor *bl = in(GGML_TYPE_F32, {n}, "cond_blend");
+      interp.set_input("cond_blend", bl);
+      runtime::install_lrc_blend(interp, bl);
     }
   }
   if (model_.plato_lr().enabled) {
@@ -839,6 +844,14 @@ void Worker::upload_inputs(StepGraph &g, const Batch &b, const std::vector<float
       for (size_t a = 0; a < b.atom_charge.size(); a++)
         cond_rows_[2][a] = cond.rows(b.atom_unit_charge.empty() ? b.atom_charge[a] : b.atom_unit_charge[a], b.atom_spin[a]).first;
       src.insert(src.end(), {span(cond_rows_[2])});
+    } else if (lrc) {
+      if (lrc_batch_ != &b) throw std::logic_error("lrc: upload before lrc_prepare");
+      cond_rows_[2].resize(b.atom_charge.size());
+      for (size_t a = 0; a < b.atom_charge.size(); a++) {
+        cond_rows_[0][a] = cond.rows(lrc_lo_[a], b.atom_spin[a]).first;
+        cond_rows_[2][a] = cond.rows(lrc_hi_[a], b.atom_spin[a]).first;
+      }
+      src.insert(src.end(), {span(cond_rows_[2]), span(lrc_blend_)});
     }
   }
   if (g.inputs.size() > src.size())
@@ -977,6 +990,7 @@ StepStats Worker::run(const Batch &b, double energy_scale, bool backward) {
   plato_batch_ = &b;
   if (conservative.on) return run_conservative(b, energy_scale, backward);
   if (sqe) throw std::runtime_error("sqe: training needs conservative forces");
+  if (lrc) throw std::runtime_error("lrc: training needs conservative forces");
   if (!model_.nc_forces()) throw std::runtime_error("an energy-only model trains with conservative forces only");
   const int n = b.n_atoms, m = b.max_neighbors, S = b.n_systems;
   std::unique_ptr<StepGraph> once;
@@ -1019,12 +1033,45 @@ StepStats Worker::run(const Batch &b, double energy_scale, bool backward) {
   return st;
 }
 
+// combined model: per real structure the local-charge conditioning and the inter-cluster long-range energy / forces
+// (eV, eV/A; host float64, frozen charge model). The conditioning's own position dependence (dE/dS dS/dx) is not in
+// the training forces; it is nonzero only inside a cluster transition (counted in lrc_transition).
+void Worker::lrc_prepare(const Batch &b, bool forces) {
+  const int n = b.n_atoms, S = b.n_systems;
+  lrc_lo_.assign(b.atom_charge.begin(), b.atom_charge.end());
+  lrc_hi_ = lrc_lo_;
+  lrc_blend_.assign(n, 0.0f);
+  lrc_e_.assign(S, 0.0), lrc_f_.assign(forces ? 3 * size_t(n) : 0, 0.0);
+  const int maxq = model_.conditioning().max_charge;
+  int a0 = 0;
+  for (int k = 0; k < b.n_real_systems; k++) {
+    const int ns = b.n_per_system[k];
+    if (b.periodic[k]) throw std::runtime_error("lrc: periodic structures are not supported");
+    std::vector<double> x(b.positions.begin() + 3 * size_t(a0), b.positions.begin() + 3 * size_t(a0 + ns));
+    const int32_t *Z = b.atomic_number.data() + a0;
+    const runtime::LrcCondition c = runtime::lrc_condition(*lrc, *lrc_sqe, ns, Z, x.data(), double(b.system_charge[k]), maxq);
+    lrc_seen++;
+    if (c.cl.s > 1) {
+      lrc_multi++;
+      if (c.needs_cond_forces()) lrc_transition++;
+      for (int i = 0; i < ns; i++)
+        lrc_lo_[a0 + i] = c.row_charge[i], lrc_hi_[a0 + i] = c.row_charge_hi[i], lrc_blend_[a0 + i] = c.blend[i];
+      const runtime::LrcEnergy le = runtime::lrc_energy(*lrc, *lrc_sqe, c, ns, Z, x.data(), double(b.system_charge[k]), forces);
+      lrc_e_[k] = le.energy;
+      if (forces) std::copy(le.forces.begin(), le.forces.end(), lrc_f_.begin() + 3 * size_t(a0));
+    }
+    a0 += ns;
+  }
+  lrc_batch_ = &b;
+}
+
 double Worker::run_tail(const Batch &b, double energy_scale, const std::vector<TailPair> &pairs, const TailLoss &tl,
                         double mult, std::vector<double> *r) {
   if (!tail_cotangent) throw std::logic_error("run_tail: tail_cotangent is off");
   t_build = t_alloc = t_upload = t_compute = t_download = t_cpu = 0;
   plato_batch_ = &b;
   const int n = b.n_atoms, m = b.max_neighbors, S = b.n_systems;
+  if (lrc) lrc_prepare(b, false);
   // 1. the model energies (eV, without the composition: it cancels within a scan)
   std::vector<double> E(b.n_real_systems);
   {
@@ -1036,6 +1083,8 @@ double Worker::run_tail(const Batch &b, double energy_scale, const std::vector<T
     ggml_backend_tensor_get(g.per_system, ps.data(), 0, ps.size() * sizeof(float));
     for (int k = 0; k < b.n_real_systems; k++)
       E[k] = energy_scale * b.n_per_system[k] * (double(ps[k]) + double(b.energy_target[k]));
+    if (lrc)
+      for (int k = 0; k < b.n_real_systems; k++) E[k] += lrc_e_[k];
   }
   // split-charge equilibration (host-side energy): its energy joins E, its parameter gradient comes after the loss
   std::vector<int> sys_off(S + 1, 0);
@@ -1087,6 +1136,7 @@ double Worker::run_tail(const Batch &b, double energy_scale, const std::vector<T
 
 StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool backward) {
   const int n = b.n_atoms, m = b.max_neighbors, S = b.n_systems;
+  if (lrc) lrc_prepare(b, true);
   const auto [e_norm, f_norm] = loss_norms(b);
   const Conservative &w = conservative;
   plato_batch_ = &b;
@@ -1170,6 +1220,9 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
     }
   }
 
+  if (lrc) // the combined model's long-range term (frozen): forces join the model's, in scaled units
+    for (size_t k = 0; k < lrc_f_.size(); k++) F[k] += lrc_f_[k] / energy_scale;
+
   // the loss terms and metrics; force targets are physical F / s_Z, the
   // conservative ones F / s_E (the gradient of the scaled energy)
   st.n_systems = b.n_real_systems;
@@ -1178,6 +1231,7 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
     for (int a = 0; a < n; a++) d_e[k] += double(b.atom_weight[static_cast<size_t>(k) * n + a]) * out[ow * a];
     d_e[k] -= b.energy_target[k];
     if (sqe && k < b.n_real_systems) d_e[k] += sqe_e[k] / (energy_scale * b.n_per_system[k]);
+    if (lrc && k < b.n_real_systems) d_e[k] += lrc_e_[k] / (energy_scale * b.n_per_system[k]);
     st.loss_energy += w.energy * e_norm * loss.value(d_e[k], loss.delta_e);
     st.se_energy_per_atom += d_e[k] * d_e[k] * energy_scale * energy_scale;
     if (k < b.n_real_systems) st.ae_energy_per_atom += std::abs(d_e[k]) * energy_scale;
@@ -2209,7 +2263,17 @@ void train(const TrainOptions &o) {
     g_sqe = w0.model().plato_lr().sqe;
     if (o.sqe && !g_sqe.enabled)
       throw std::runtime_error("--sqe needs a model with pet.plato_lr.sqe keys (scripts/plato_lr/add_sqe_keys.py)");
-    if (g_sqe.enabled) {
+    if (g_sqe.enabled && w0.model().plato_lr().lrc.enabled) { // combined model: frozen charge model, no SQE training
+      if (o.sqe) throw std::runtime_error("--sqe: the combined model (pet.plato_lr.lrc) keeps its charge model frozen");
+      if (g_frag_out.enabled) throw std::runtime_error("lrc and fragment-constrained charges cannot be combined");
+      if (!o.conservative) throw std::runtime_error("lrc needs conservative forces (--conservative)");
+      for (auto &w : workers) w->lrc = &w->model().plato_lr().lrc, w->lrc_sqe = &w->model().plato_lr().sqe;
+      const auto &L = w0.model().plato_lr().lrc;
+      fmt::print("lrc: combined model, frozen charge model: two-level Fermi q0 (T {} eV, D {} eV), clusters a_on {} A, "
+                 "a_off {} A, inter-cluster SQE long range lr_R {} A (switch {} A), local-charge conditioning\n",
+                 L.T, L.D, L.a_on, L.a_off, g_sqe.lr_R, g_sqe.lr_t);
+      g_sqe.enabled = false; // the keys stay in the copied GGUF metadata
+    } else if (g_sqe.enabled) {
       if (g_frag_out.enabled) throw std::runtime_error("sqe and fragment-constrained charges cannot be combined");
       if (!o.conservative) throw std::runtime_error("sqe needs conservative forces (--conservative)");
       for (MemmapSplit *sp : {&train_split, &val_split, &test_split}) {

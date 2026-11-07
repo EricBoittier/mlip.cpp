@@ -39,6 +39,7 @@ set(MLIPCPP_RUNTIME_SOURCES
     runtime/pet_plato_lr.cpp
     runtime/frag_charges.cpp
     runtime/sqe.cpp
+    runtime/lr_combined.cpp
 )
 
 # Utilities
