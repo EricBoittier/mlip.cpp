@@ -2,7 +2,14 @@
 // Combined long-range model (GGUF pet.plato_lr.lrc*, with pet.plato_lr.sqe*). Host side, float64. Three pieces, none
 // of them gated or zero-initialised, no bonding topology and no formal charges as inputs:
 //
-// 1. Two-level Fermi reference charges (one chemical potential, gapped levels; no structure-wide uniform shift):
+// 1. Reference charges q0, two modes (pet.plato_lr.lrc_q0_mode):
+//    "round" (option, ~/data/lr-sqe-pol RECOMMENDATION FINAL; imposes integers, so not used under the DFT-emulation rule): s = the learned logistic head of sqe.cpp (sqe_q0_a / _b,
+//      bounded per element, one shift to Q); components c = connected at r < r_ct; merge weight w_c = prod over the pairs
+//      (i in c, j not in c) of smootherstep((r_ij - r_ct) / merge_w); <n_c> over integer partitions with sum n = Q,
+//      P ~ exp(-sum (n_c - s_c)^2 / 2 tau^2); shift d_c = w_c (<n_c> - s_c) - w_c sum_e d_e / sum_e w_e (sum 0), spread
+//      uniformly over the component: q0_i = s_i + d_c / n_c. One component: q0 = s (sum Q, no rounding).
+//    "head": the learned logistic head s alone (one global shift to Q, as DFT gets only Q).
+//    "fermi2" (default): two-level Fermi reference charges (one chemical potential, gapped levels; no structure-wide uniform shift):
 //      q0_i = h_Z sigmoid(t - I_i / T) - l_Z sigmoid(A_i / T - t),   sum_i q0_i = Q  (t = -mu / T, by bisection + Newton)
 //      I_i = IP_Z - D tanh(f+_i),  A_i = EA_Z + D tanh(f-_i),  f+-_i = a+-_Z + sum_Z' b+-_{Z Z'} CN_{i,Z'}
 //    h_Z / l_Z the cation / anion capacities (sqe_q0_hi, -sqe_q0_lo), CN the element-resolved D3 coordination numbers
@@ -35,6 +42,9 @@ struct LrcSpec {
   double a_on = 5.0, a_off = 6.0; // cluster link window (A)
   double T = 0.25, D = 5.0;       // Fermi temperature (eV), bound of the level shifts (eV)
   int max_super_edges = 22;       // exact reliability enumeration limit per weak component
+  bool round = false;             // q0 mode "round": soft-rounded component reference (option; imposes integers)
+  bool head_only = false;         // q0 mode "head": the learned logistic head alone (sum Q, no rounding)
+  double tau = 0.25, merge_w = 2.0; // round: Gaussian width (e) and the merge switch width beyond r_ct (A)
   // per element in SqeSpec::Z order
   std::vector<double> ip, ea, h, l, ap, am, bp, bm; // bp, bm: E x E (row: the atom's element)
   static LrcSpec from_gguf(const GGUFLoader &L, const SqeSpec &sqe);
@@ -43,8 +53,13 @@ struct LrcSpec {
 
 struct LrcQ0 {
   std::vector<double> q0;
-  std::vector<double> wt, wp, wm; // dq0/dt, dq0/df+, dq0/df-
+  std::vector<double> wt, wp, wm; // fermi2: dq0/dt, dq0/df+, dq0/df-; round: wt = the head's dq/dt (= dq/df)
   bool feasible = true;
+  // round: components, merge weights, partition moments
+  int K = 1;
+  std::vector<int32_t> comp;           // per atom
+  std::vector<double> sc, w, nbar, cov; // per component; cov K x K (of the partition distribution)
+  std::vector<int> ncomp;              // atoms per component
 };
 
 struct LrcClusters {

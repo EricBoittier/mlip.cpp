@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -17,6 +18,10 @@ namespace {
 
 inline double sstep(double x) { return x <= 0 ? 0.0 : x >= 1 ? 1.0 : x * x * x * (x * (x * 6.0 - 15.0) + 10.0); }
 inline double dsstep(double x) { return x <= 0 || x >= 1 ? 0.0 : 30.0 * x * x * (x - 1) * (x - 1); }
+int uf_find(std::vector<int> &p, int i) {
+  while (p[i] != i) i = p[i] = p[p[i]];
+  return i;
+}
 inline double sig(double z) { return z >= 0 ? 1.0 / (1.0 + std::exp(-z)) : std::exp(z) / (1.0 + std::exp(z)); }
 
 double dist(const double *x, int i, int j) {
@@ -108,7 +113,21 @@ LrcSpec LrcSpec::from_gguf(const GGUFLoader &G, const SqeSpec &S) {
     if (!a.empty()) v = a[0];
   };
   scalar("a_on", L.a_on), scalar("a_off", L.a_off), scalar("T", L.T), scalar("D", L.D);
+  scalar("tau", L.tau), scalar("merge_w", L.merge_w);
+  {
+    const std::string mode = G.get_string("pet.plato_lr.lrc_q0_mode", "fermi2");
+    if (mode != "fermi2" && mode != "round" && mode != "head") throw std::runtime_error("lrc: unknown q0 mode " + mode);
+    L.round = mode == "round", L.head_only = mode == "head";
+  }
   const size_t E = S.Z.size();
+  if (!(L.a_off > L.a_on)) throw std::runtime_error("lrc: bad a_on / a_off");
+  if (L.round || L.head_only) {
+    double hs = 0;
+    for (size_t k = 0; k < E; k++) hs += S.q0_hi[k] - S.q0_lo[k];
+    if (!(hs > 0) || !(L.tau > 0) || !(L.merge_w > 0))
+      throw std::runtime_error("lrc round: needs the learned q0 head tables (sqe_q0_*) and tau, merge_w > 0");
+    return L;
+  }
   L.ip = get_f64(G, "pet.plato_lr.lrc_ip"), L.ea = get_f64(G, "pet.plato_lr.lrc_ea");
   L.h = get_f64(G, "pet.plato_lr.lrc_h"), L.l = get_f64(G, "pet.plato_lr.lrc_l");
   L.ap = get_f64(G, "pet.plato_lr.lrc_ap"), L.am = get_f64(G, "pet.plato_lr.lrc_am");
@@ -124,7 +143,10 @@ void LrcSpec::to_gguf(gguf_context *g) const {
   if (!enabled) return;
   gguf_set_val_i32(g, "pet.plato_lr.lrc", 1);
   auto scalar = [&](const char *k, double v) { gguf_set_val_f64(g, (std::string("pet.plato_lr.lrc_") + k).c_str(), v); };
-  scalar("a_on", a_on), scalar("a_off", a_off), scalar("T", T), scalar("D", D);
+  scalar("a_on", a_on), scalar("a_off", a_off), scalar("T", T), scalar("D", D), scalar("tau", tau);
+  scalar("merge_w", merge_w);
+  gguf_set_val_str(g, "pet.plato_lr.lrc_q0_mode", round ? "round" : head_only ? "head" : "fermi2");
+  if (round || head_only) return;
   auto arr = [&](const char *k, const std::vector<double> &v) {
     gguf_set_arr_data(g, (std::string("pet.plato_lr.lrc_") + k).c_str(), GGUF_TYPE_FLOAT64, v.data(), v.size());
   };
@@ -132,7 +154,7 @@ void LrcSpec::to_gguf(gguf_context *g) const {
 }
 
 // ---- reference charges -------------------------------------------------------------------------------------------------
-LrcQ0 lrc_q0(const LrcSpec &L, const SqeSpec &S, int n, const int32_t *Z, const double *x, double Q) {
+LrcQ0 q0_fermi2(const LrcSpec &L, const SqeSpec &S, int n, const int32_t *Z, const double *x, double Q) {
   LrcQ0 out;
   if (n == 0) return out;
   const std::vector<int> e = elements(S, n, Z);
@@ -183,7 +205,7 @@ LrcQ0 lrc_q0(const LrcSpec &L, const SqeSpec &S, int n, const int32_t *Z, const 
   return out;
 }
 
-void lrc_q0_vjp(const LrcSpec &L, const SqeSpec &S, int n, const int32_t *Z, const double *x, const LrcQ0 &q,
+void vjp_fermi2(const LrcSpec &L, const SqeSpec &S, int n, const int32_t *Z, const double *x, const LrcQ0 &q,
                 const double *c, double *g) {
   if (n == 0) return;
   const std::vector<int> e = elements(S, n, Z);
@@ -207,14 +229,233 @@ void lrc_q0_vjp(const LrcSpec &L, const SqeSpec &S, int n, const int32_t *Z, con
     }
 }
 
+namespace {
+// learned logistic head of sqe.cpp (q0 = lo + d sigmoid(f + t), sum = Q): values, dq/dt per atom, CN pairs for the VJP
+void head(const SqeSpec &S, int n, const std::vector<int> &e, const double *x, double Q, LrcQ0 &o) {
+  const size_t E = S.Z.size();
+  std::vector<double> f(n), cnp(size_t(n) * E, 0.0);
+  for (int i = 0; i < n; i++)
+    for (int j = i + 1; j < n; j++) {
+      const double r = dist(x, i, j);
+      if (!(r < S.cn_off)) continue;
+      double w, dw;
+      cn_count(S, S.rcov[e[i]] + S.rcov[e[j]], r, w, dw);
+      cnp[size_t(i) * E + e[j]] += w, cnp[size_t(j) * E + e[i]] += w;
+    }
+  double slo = 0, shi = 0;
+  for (int i = 0; i < n; i++) {
+    f[i] = S.q0_a[e[i]];
+    for (size_t k = 0; k < E; k++) f[i] += S.q0_b[size_t(e[i]) * E + k] * cnp[size_t(i) * E + k];
+    slo += S.q0_lo[e[i]], shi += S.q0_hi[e[i]];
+  }
+  auto tot = [&](double t, double *d) {
+    double v = 0, dv = 0;
+    for (int i = 0; i < n; i++) {
+      const double dd = S.q0_hi[e[i]] - S.q0_lo[e[i]], sg = sig(f[i] + t);
+      v += S.q0_lo[e[i]] + dd * sg, dv += dd * sg * (1 - sg);
+    }
+    if (d) *d = dv;
+    return v;
+  };
+  o.feasible = slo < Q && Q < shi;
+  double t;
+  if (o.feasible) {
+    double a = -60, b = 60;
+    for (int it = 0; it < 200; it++) {
+      const double m = 0.5 * (a + b);
+      (tot(m, nullptr) < Q ? a : b) = m;
+    }
+    t = 0.5 * (a + b);
+    for (int it = 0; it < 6; it++) {
+      double d;
+      const double v = tot(t, &d);
+      if (d > 0) t -= (v - Q) / d;
+    }
+  } else {
+    t = Q >= shi ? 60.0 : -60.0;
+  }
+  o.q0.resize(n), o.wt.resize(n);
+  double sum = 0;
+  for (int i = 0; i < n; i++) {
+    const double dd = S.q0_hi[e[i]] - S.q0_lo[e[i]], sg = sig(f[i] + t);
+    o.q0[i] = S.q0_lo[e[i]] + dd * sg, o.wt[i] = dd * sg * (1 - sg), sum += o.q0[i];
+  }
+  if (!o.feasible)
+    for (int i = 0; i < n; i++) o.q0[i] += (Q - sum) / n;
+}
+
+// dE/dx of sum_i h_i s_i(x) for the logistic head (weight on df_i: wt_i (h_i - m))
+void head_vjp(const SqeSpec &S, int n, const std::vector<int> &e, const double *x, const LrcQ0 &o, const double *h,
+              double *g) {
+  const size_t E = S.Z.size();
+  double sw = 0, swh = 0, sh = 0;
+  for (int i = 0; i < n; i++) sw += o.wt[i], swh += o.wt[i] * h[i], sh += h[i];
+  const double m = o.feasible && sw > 0 ? swh / sw : sh / n;
+  std::vector<double> k(n);
+  for (int i = 0; i < n; i++) k[i] = o.wt[i] * (h[i] - m);
+  for (int i = 0; i < n; i++)
+    for (int j = i + 1; j < n; j++) {
+      const double r = dist(x, i, j);
+      if (!(r < S.cn_off)) continue;
+      double w, dw;
+      cn_count(S, S.rcov[e[i]] + S.rcov[e[j]], r, w, dw);
+      const double c = k[i] * S.q0_b[size_t(e[i]) * E + e[j]] + k[j] * S.q0_b[size_t(e[j]) * E + e[i]];
+      if (c != 0) add_pair(g, x, i, j, r, c * dw);
+    }
+}
+
+// merge switch S(r) = smootherstep((r - r_ct) / merge_w) of a cross-component pair, and dS/dr
+inline void merge_s(const LrcSpec &L, const SqeSpec &S, double r, double &v, double &d) {
+  const double u = (r - S.r_ct) / L.merge_w;
+  v = sstep(u), d = dsstep(u) / L.merge_w;
+}
+
+LrcQ0 q0_round(const LrcSpec &L, const SqeSpec &S, int n, const int32_t *Z, const double *x, double Q) {
+  LrcQ0 o;
+  if (n == 0) return o;
+  const std::vector<int> e = elements(S, n, Z);
+  head(S, n, e, x, Q, o);
+  o.comp.assign(n, 0), o.K = 1;
+  if (L.head_only) return o;
+  // components at r < r_ct
+  std::vector<int> par(n);
+  std::iota(par.begin(), par.end(), 0);
+  for (int i = 0; i < n; i++)
+    for (int j = i + 1; j < n; j++)
+      if (dist(x, i, j) < S.r_ct) {
+        const int a = uf_find(par, i), b = uf_find(par, j);
+        if (a != b) par[std::max(a, b)] = std::min(a, b);
+      }
+  std::vector<int> lab(n, -1);
+  o.comp.resize(n), o.K = 0;
+  for (int i = 0; i < n; i++) {
+    const int r = uf_find(par, i);
+    if (lab[r] < 0) lab[r] = o.K++;
+    o.comp[i] = lab[r];
+  }
+  const int K = o.K;
+  if (K == 1) return o;
+  o.sc.assign(K, 0.0), o.w.assign(K, 1.0), o.ncomp.assign(K, 0);
+  for (int i = 0; i < n; i++) o.sc[o.comp[i]] += o.q0[i], o.ncomp[o.comp[i]]++;
+  for (int i = 0; i < n; i++)
+    for (int j = i + 1; j < n; j++) {
+      if (o.comp[i] == o.comp[j]) continue;
+      const double r = dist(x, i, j);
+      if (r >= S.r_ct + L.merge_w) continue;
+      double v, d;
+      merge_s(L, S, r, v, d);
+      o.w[o.comp[i]] *= v, o.w[o.comp[j]] *= v;
+    }
+  // partitions sum n = Q around round(s_c)
+  const int Qi = static_cast<int>(std::lround(Q));
+  const int W = K <= 5 ? 2 : K <= 10 ? 1 : 0;
+  if (K > 16) throw std::runtime_error("lrc round: more than 16 components");
+  std::vector<int> base(K), lo(K), span(K);
+  for (int c = 0; c < K; c++) {
+    base[c] = static_cast<int>(std::lround(o.sc[c]));
+    lo[c] = W > 0 ? base[c] - W : static_cast<int>(std::floor(o.sc[c]));
+    span[c] = W > 0 ? 2 * W + 1 : 2;
+  }
+  std::vector<std::vector<int>> combos;
+  std::vector<double> lw;
+  std::vector<int> cur(K);
+  double lmax = -1e300;
+  std::function<void(int, int)> rec = [&](int c, int s) {
+    if (c == K) {
+      if (s != Qi) return;
+      double l = 0;
+      for (int k = 0; k < K; k++) l -= (cur[k] - o.sc[k]) * (cur[k] - o.sc[k]);
+      l /= 2 * L.tau * L.tau;
+      combos.push_back(cur), lw.push_back(l), lmax = std::max(lmax, l);
+      return;
+    }
+    for (int v = lo[c]; v < lo[c] + span[c]; v++) cur[c] = v, rec(c + 1, s + v);
+  };
+  rec(0, 0);
+  o.nbar.assign(K, 0.0), o.cov.assign(size_t(K) * K, 0.0);
+  if (combos.empty()) { // no partition in the window: no rounding
+    for (int c = 0; c < K; c++) o.nbar[c] = o.sc[c], o.w[c] = 0.0;
+  } else {
+    double Zs = 0;
+    for (double &l : lw) l = std::exp(l - lmax), Zs += l;
+    for (size_t p = 0; p < combos.size(); p++)
+      for (int a = 0; a < K; a++) o.nbar[a] += lw[p] / Zs * combos[p][a];
+    for (size_t p = 0; p < combos.size(); p++)
+      for (int a = 0; a < K; a++)
+        for (int b = 0; b < K; b++)
+          o.cov[size_t(a) * K + b] += lw[p] / Zs * (combos[p][a] - o.nbar[a]) * (combos[p][b] - o.nbar[b]);
+  }
+  double U = 0, Wsum = 0;
+  std::vector<double> d(K);
+  for (int c = 0; c < K; c++) d[c] = o.w[c] * (o.nbar[c] - o.sc[c]), U += d[c], Wsum += o.w[c];
+  for (int c = 0; c < K; c++)
+    if (Wsum > 0) d[c] -= o.w[c] * U / Wsum;
+  for (int i = 0; i < n; i++) o.q0[i] += d[o.comp[i]] / o.ncomp[o.comp[i]];
+  return o;
+}
+
+void vjp_round(const LrcSpec &L, const SqeSpec &S, int n, const int32_t *Z, const double *x, const LrcQ0 &o,
+               const double *c, double *g) {
+  if (n == 0) return;
+  const std::vector<int> e = elements(S, n, Z);
+  const int K = o.K;
+  std::vector<double> h(c, c + n);
+  if (K > 1) {
+    std::vector<double> gc(K, 0.0), gam(K), u(K);
+    double U = 0, Wsum = 0, gw = 0;
+    for (int i = 0; i < n; i++) gc[o.comp[i]] += c[i] / o.ncomp[o.comp[i]];
+    for (int k = 0; k < K; k++) u[k] = o.w[k] * (o.nbar[k] - o.sc[k]), U += u[k], Wsum += o.w[k], gw += gc[k] * o.w[k];
+    for (int k = 0; k < K; k++) gam[k] = Wsum > 0 ? gc[k] - gw / Wsum : gc[k];
+    // dE/dw (explicit through the zero-sum correction, and through u = w (nbar - s))
+    std::vector<double> dw(K), ds(K, 0.0);
+    for (int k = 0; k < K; k++)
+      dw[k] = (Wsum > 0 ? -gc[k] * U / Wsum + gw * U / (Wsum * Wsum) : 0.0) + gam[k] * (o.nbar[k] - o.sc[k]);
+    for (int b = 0; b < K; b++) {
+      ds[b] = -gam[b] * o.w[b];
+      for (int a = 0; a < K; a++) ds[b] += gam[a] * o.w[a] * o.cov[size_t(a) * K + b] / (L.tau * L.tau);
+    }
+    for (int i = 0; i < n; i++) h[i] += ds[o.comp[i]];
+    // w_c = prod S(r_ij) over cross pairs: dw_c/dr_ij = (prod of the others) S'(r_ij)
+    std::vector<std::vector<std::pair<int, int>>> pairs(K);
+    std::vector<std::vector<double>> sv(K), sd(K);
+    for (int i = 0; i < n; i++)
+      for (int j = i + 1; j < n; j++) {
+        if (o.comp[i] == o.comp[j]) continue;
+        const double r = dist(x, i, j);
+        if (r >= S.r_ct + L.merge_w) continue;
+        double v, d;
+        merge_s(L, S, r, v, d);
+        for (int k : {o.comp[i], o.comp[j]}) pairs[k].push_back({i, j}), sv[k].push_back(v), sd[k].push_back(d);
+      }
+    for (int k = 0; k < K; k++) {
+      if (dw[k] == 0) continue;
+      const size_t m = pairs[k].size();
+      std::vector<double> pre(m + 1, 1.0), suf(m + 1, 1.0);
+      for (size_t q = 0; q < m; q++) pre[q + 1] = pre[q] * sv[k][q];
+      for (size_t q = m; q-- > 0;) suf[q] = suf[q + 1] * sv[k][q];
+      for (size_t q = 0; q < m; q++) {
+        const double dd = pre[q] * suf[q + 1] * sd[k][q];
+        if (dd != 0) add_pair(g, x, pairs[k][q].first, pairs[k][q].second, dist(x, pairs[k][q].first, pairs[k][q].second), dw[k] * dd);
+      }
+    }
+  }
+  head_vjp(S, n, e, x, o, h.data(), g);
+}
+} // namespace
+
+LrcQ0 lrc_q0(const LrcSpec &L, const SqeSpec &S, int n, const int32_t *Z, const double *x, double Q) {
+  return L.round || L.head_only ? q0_round(L, S, n, Z, x, Q) : q0_fermi2(L, S, n, Z, x, Q);
+}
+void lrc_q0_vjp(const LrcSpec &L, const SqeSpec &S, int n, const int32_t *Z, const double *x, const LrcQ0 &q,
+                const double *c, double *g) {
+  if (L.round || L.head_only) vjp_round(L, S, n, Z, x, q, c, g);
+  else vjp_fermi2(L, S, n, Z, x, q, c, g);
+}
+
 // ---- smooth clusters -------------------------------------------------------------------------------------------------
 bool LrcClusters::trivial() const { return s == 1 || se.empty(); }
 
 namespace {
-int uf_find(std::vector<int> &p, int i) {
-  while (p[i] != i) i = p[i] = p[p[i]];
-  return i;
-}
 // weak components over super-nodes: the super-edges of each
 std::vector<std::vector<int>> weak_components(const LrcClusters &c) {
   std::vector<int> p(c.s);

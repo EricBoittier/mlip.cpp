@@ -180,3 +180,56 @@ TEST_CASE("lrc: long-range and conditioning forces match central differences", "
   CHECK(fmax > 1e-3);
   CHECK(err < 1e-6 * std::max(1.0, fmax));
 }
+
+TEST_CASE("lrc: head and soft-rounded q0 modes, forces match central differences", "[lrc]") {
+  SqeSpec S = sqe_spec();
+  for (int k = 0; k < 9; k++) S.q0_a[k] = 0.3 * (k % 3) - 0.3;
+  S.q0_b[6 * 9 + 4] = 0.8, S.q0_b[8 * 9 + 0] = -0.4, S.q0_b[4 * 9 + 0] = 0.2; // Na-O, Cl-H, O-H
+  // Cl- 6.6 A from the water H (a cross pair inside the 6-8 A merge switch), 9.9 A from Na+
+  const auto x0 = std::vector<double>{0, 0, 0, 2.4, 0.1, 0.2, 3.3, 0.3, 0.1, 2.1, 1.0, -0.2, 9.5, 2.5, 0.4};
+  for (int mode = 0; mode < 2; mode++) {
+    LrcSpec L = lrc_spec();
+    (mode == 0 ? L.head_only : L.round) = true;
+    const LrcQ0 q = lrc_q0(L, S, 5, ZG, x0.data(), 0.0);
+    double sum = 0;
+    for (double v : q.q0) sum += v;
+    CHECK(sum == Approx(0.0).margin(1e-9));
+    if (mode == 1) {
+      REQUIRE(q.K == 2);
+      CHECK(q.w[0] > 0.0);
+      CHECK(q.w[0] < 1.0);
+    }
+    auto energy = [&](const std::vector<double> &x) {
+      const LrcCondition c = lrc_condition(L, S, 5, ZG, x.data(), 0.0, 10);
+      return lrc_energy(L, S, c, 5, ZG, x.data(), 0.0, false).energy;
+    };
+    const LrcCondition c0 = lrc_condition(L, S, 5, ZG, x0.data(), 0.0, 10);
+    REQUIRE(c0.cl.s == 2);
+    const LrcEnergy e0 = lrc_energy(L, S, c0, 5, ZG, x0.data(), 0.0, true);
+    double fmax = 0, err = 0;
+    for (size_t k = 0; k < x0.size(); k++) {
+      const double num = -fd(energy, x0, k, 1e-5);
+      fmax = std::max(fmax, std::abs(num)), err = std::max(err, std::abs(num - e0.forces[k]));
+    }
+    INFO("mode " << mode << " long-range force: max |F| " << fmax << ", max error " << err);
+    CHECK(fmax > 1e-4);
+    CHECK(err < 1e-6 * std::max(1.0, fmax));
+    const double g[5] = {0.7, -0.3, 0.2, 0.5, -1.1};
+    auto fS = [&](const std::vector<double> &x) {
+      const LrcCondition c = lrc_condition(L, S, 5, ZG, x.data(), 0.0, 10);
+      double v = 0;
+      for (int i = 0; i < 5; i++) v += g[i] * (c.k[c.cl.sn[i]] + c.S[c.cl.sn[i]]);
+      return v;
+    };
+    std::vector<double> G(c0.cl.s, 0.0), F(15, 0.0);
+    for (int i = 0; i < 5; i++) G[c0.cl.sn[i]] += g[i];
+    lrc_condition_forces(L, S, c0, 5, ZG, x0.data(), G, F.data());
+    fmax = 0, err = 0;
+    for (size_t k = 0; k < x0.size(); k++) {
+      const double num = -fd(fS, x0, k, 1e-5);
+      fmax = std::max(fmax, std::abs(num)), err = std::max(err, std::abs(num - F[k]));
+    }
+    INFO("mode " << mode << " conditioning force: max |F| " << fmax << ", max error " << err);
+    CHECK(err < 1e-6 * std::max(1.0, fmax));
+  }
+}
