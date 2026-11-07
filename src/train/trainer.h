@@ -253,7 +253,7 @@ public:
   std::vector<int32_t> lrc_lo_, lrc_hi_;
   std::vector<float> lrc_blend_;
   std::vector<double> lrc_e_, lrc_f_;
-  int64_t lrc_multi = 0, lrc_transition = 0, lrc_seen = 0; // structures with >1 cluster / a nonzero dS / all
+  int64_t lrc_multi = 0, lrc_transition = 0, lrc_seen = 0, lrc_fallback = 0; // >1 cluster / nonzero dS / all / fallback
   void lrc_prepare(const Batch &b, bool forces);
   std::vector<double> sqe_grad;
   double sqe_abs_energy = 0;

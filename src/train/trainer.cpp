@@ -1051,6 +1051,7 @@ void Worker::lrc_prepare(const Batch &b, bool forces) {
     const int32_t *Z = b.atomic_number.data() + a0;
     const runtime::LrcCondition c = runtime::lrc_condition(*lrc, *lrc_sqe, ns, Z, x.data(), double(b.system_charge[k]), maxq);
     lrc_seen++;
+    if (c.cl.fallback) lrc_fallback++;
     if (c.cl.s > 1) {
       lrc_multi++;
       if (c.needs_cond_forces()) lrc_transition++;
@@ -2757,6 +2758,10 @@ void train(const TrainOptions &o) {
           }
           fmt::print("  tail loss per group: {}\n", per);
         }
+        if (w0.lrc && w0.lrc_seen > 0)
+          fmt::print("  lrc: {} structures, {} with > 1 cluster, {} inside a transition (dS != 0; no dE/dS dS/dx in the "
+                     "training forces), {} large-component fallbacks\n", w0.lrc_seen, w0.lrc_multi, w0.lrc_transition,
+                     w0.lrc_fallback);
         // MLIPCPP_LOG_PARAMS=a,b: mean |x| and max |x| of those tensors (GGUF names) at each log line
         if (const char *lp = std::getenv("MLIPCPP_LOG_PARAMS"); lp && *lp) {
           std::string names = lp, out;

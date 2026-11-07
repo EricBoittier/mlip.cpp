@@ -73,6 +73,7 @@ struct LrcClusters {
   std::vector<Weak> weak;
   std::vector<std::pair<int, int>> se; // super-edges (a < b)
   std::vector<double> p;               // super-edge probabilities
+  bool fallback = false;               // a weak component above max_super_edges was taken as one cluster
   bool trivial() const; // one super-node, or no weak links (R binary)
 };
 

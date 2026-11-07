@@ -541,9 +541,16 @@ LrcClusters lrc_clusters(const LrcSpec &L, int n, const double *x) {
   c.R.assign(size_t(c.s) * c.s, 0.0);
   for (int a = 0; a < c.s; a++) c.R[size_t(a) * c.s + a] = 1.0;
   for (const auto &edges : weak_components(c)) {
-    if (int(edges.size()) > L.max_super_edges)
-      throw std::runtime_error("lrc: " + std::to_string(edges.size()) + " super-edges in one weak component (limit " +
-                               std::to_string(L.max_super_edges) + ")");
+    if (int(edges.size()) > L.max_super_edges) {
+      // fallback (rare: many molecules all 5-6 A apart): the weak component counts as one cluster (R = 1 within it,
+      // no gradient). Not smooth where the super-edge count crosses the limit; counted in c.fallback.
+      std::vector<int> nodes;
+      for (int k : edges) nodes.push_back(c.se[k].first), nodes.push_back(c.se[k].second);
+      for (int a : nodes)
+        for (int b : nodes) c.R[size_t(a) * c.s + b] = 1.0;
+      c.fallback = true;
+      continue;
+    }
     enumerate(c, edges, [&](uint64_t, double P, const std::vector<int> &p, const std::vector<int> &nodes,
                             const std::vector<double> &, const std::vector<double> &) {
       for (int a : nodes)
@@ -554,13 +561,14 @@ LrcClusters lrc_clusters(const LrcSpec &L, int n, const double *x) {
   return c;
 }
 
-void lrc_clusters_vjp(const LrcSpec &, const LrcClusters &c, int n, const double *x, const std::vector<double> &W,
+void lrc_clusters_vjp(const LrcSpec &L, const LrcClusters &c, int n, const double *x, const std::vector<double> &W,
                       double *g) {
   (void)n;
   if (c.trivial()) return;
   std::vector<double> dp(c.se.size(), 0.0);
   for (const auto &edges : weak_components(c)) {
     const int m = static_cast<int>(edges.size());
+    if (m > L.max_super_edges) continue; // fallback component: R = 1, no gradient
     enumerate(c, edges, [&](uint64_t st, double, const std::vector<int> &p, const std::vector<int> &nodes,
                             const std::vector<double> &pr, const std::vector<double> &su) {
       double f = 0;
