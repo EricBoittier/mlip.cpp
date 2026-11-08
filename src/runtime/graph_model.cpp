@@ -717,6 +717,7 @@ private:
 
 std::shared_ptr<LrcQSource> make_lrc_graph_charges(const std::string &path, BackendPreference pref, int device) {
   auto m = std::make_unique<GraphModel>();
+  m->set_force_uncached(true); // per-atom outputs
   m->set_backend_preference(pref);
   m->set_device(device);
   if (!m->load_from_gguf(path)) throw std::runtime_error("lrc graph: cannot load the charge pass " + path);
@@ -838,8 +839,9 @@ ModelResult GraphModel::predict_single_impl(
     const char *e = std::getenv("MLIPCPP_NO_GRAPH_CACHE");
     return e && *e && *e != '0';
   }();
+  // per-atom outputs / weights and dE/d(blend) come from the plain graph only
   if (!no_cache && !post_compute_hook && !parameter_gradients && cached_path_supported() &&
-      system.num_atoms() > 0)
+      system.num_atoms() > 0 && !force_uncached_ && atom_w_.empty() && !lrc_want_blend_grad_)
     return predict_cached(system, compute_forces);
   GraphProfile profile;
   if (compute_forces && !forces_mode_) {

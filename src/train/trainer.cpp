@@ -1054,7 +1054,7 @@ void Worker::lrc_prepare(const Batch &b, bool forces) {
   lrc_hi_ = lrc_lo_;
   lrc_blend_.assign(n, 0.0f);
   lrc_e_.assign(S, 0.0), lrc_f_.assign(forces ? 3 * size_t(n) : 0, 0.0);
-  lrc_cond_.assign(b.n_real_systems, {}), lrc_a0_.assign(b.n_real_systems, 0);
+  lrc_cond_.assign(b.n_real_systems, {}), lrc_a0_.assign(b.n_real_systems, 0), lrc_key_.assign(b.n_real_systems, 0);
   const int maxq = model_.conditioning().max_charge;
   int a0 = 0;
   for (int k = 0; k < b.n_real_systems; k++) {
@@ -1063,18 +1063,42 @@ void Worker::lrc_prepare(const Batch &b, bool forces) {
     std::vector<double> x(b.positions.begin() + 3 * size_t(a0), b.positions.begin() + 3 * size_t(a0 + ns));
     const int32_t *Z = b.atomic_number.data() + a0;
     const int spin = b.atom_spin.empty() ? 1 : int(b.atom_spin[a0]);
-    const runtime::LrcCondition c = runtime::lrc_condition(*lrc, *lrc_sqe, ns, Z, x.data(), double(b.system_charge[k]), maxq, spin);
+    // the charge model is frozen and a training structure's geometry fixed: everything here is a function of
+    // (Z, x, Q, spin), cached per structure (the charge pass runs once per structure, not once per visit)
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](const void *p, size_t nb) {
+      const unsigned char *c = static_cast<const unsigned char *>(p);
+      for (size_t q = 0; q < nb; q++) h = (h ^ c[q]) * 1099511628211ull;
+    };
+    mix(Z, sizeof(int32_t) * ns), mix(b.positions.data() + 3 * size_t(a0), sizeof(float) * 3 * ns);
+    const float qs[2] = {float(b.system_charge[k]), float(spin)};
+    mix(qs, sizeof qs);
+    lrc_key_[k] = h;
     lrc_a0_[k] = a0;
     lrc_seen++;
+    auto it = lrc_cache_.find(h);
+    if (it == lrc_cache_.end() || (forces && !it->second.has_f)) {
+      LrcCacheEntry e;
+      e.c = runtime::lrc_condition(*lrc, *lrc_sqe, ns, Z, x.data(), double(b.system_charge[k]), maxq, spin);
+      if (e.c.cl.s > 1) {
+        const runtime::LrcEnergy le = runtime::lrc_energy(*lrc, *lrc_sqe, e.c, ns, Z, x.data(), double(b.system_charge[k]), forces);
+        e.e = le.energy, e.f = le.forces, e.has_f = forces;
+      } else {
+        e.has_f = true; // nothing to add
+      }
+      lrc_cache_misses++;
+      it = lrc_cache_.insert_or_assign(h, std::move(e)).first;
+    }
+    const LrcCacheEntry &e = it->second;
+    const runtime::LrcCondition &c = e.c;
     if (c.cl.fallback) lrc_fallback++;
     if (c.cl.s > 1) {
       lrc_multi++;
       if (c.needs_cond_forces()) lrc_transition++;
       for (int i = 0; i < ns; i++)
         lrc_lo_[a0 + i] = c.row_charge[i], lrc_hi_[a0 + i] = c.row_charge_hi[i], lrc_blend_[a0 + i] = c.blend[i];
-      const runtime::LrcEnergy le = runtime::lrc_energy(*lrc, *lrc_sqe, c, ns, Z, x.data(), double(b.system_charge[k]), forces);
-      lrc_e_[k] = le.energy;
-      if (forces) std::copy(le.forces.begin(), le.forces.end(), lrc_f_.begin() + 3 * size_t(a0));
+      lrc_e_[k] = e.e;
+      if (forces) std::copy(e.f.begin(), e.f.end(), lrc_f_.begin() + 3 * size_t(a0));
       if (lrc_exact) lrc_cond_[k] = c;
     }
     a0 += ns;
@@ -1253,7 +1277,10 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
       if (c.cl.s <= 1 || !c.needs_cond_forces()) continue;
       const int a0 = lrc_a0_[k], ns = b.n_per_system[k];
       std::vector<double> x(b.positions.begin() + 3 * size_t(a0), b.positions.begin() + 3 * size_t(a0 + ns));
-      lrc_rows[k] = runtime::lrc_blend_rows(*lrc, *lrc_sqe, c, ns, b.atomic_number.data() + a0, x.data());
+      LrcCacheEntry &ce = lrc_cache_.at(lrc_key_[k]);
+      if (!ce.has_rows)
+        ce.rows = runtime::lrc_blend_rows(*lrc, *lrc_sqe, c, ns, b.atomic_number.data() + a0, x.data()), ce.has_rows = true;
+      lrc_rows[k] = ce.rows;
       std::vector<double> G(c.cl.s, 0.0);
       for (int i = 0; i < ns; i++) G[c.cl.sn[i]] += gblend[a0 + i];
       double fmax = 0;
@@ -2825,8 +2852,9 @@ void train(const TrainOptions &o) {
           fmt::print("  tail loss per group: {}\n", per);
         }
         if (w0.lrc && w0.lrc_seen > 0)
-          fmt::print("  lrc: {} structures, {} with > 1 cluster, {} with dS != 0 ({}), {} large-component fallbacks\n",
-                     w0.lrc_seen, w0.lrc_multi, w0.lrc_transition,
+          fmt::print("  lrc: {} structures ({} charge-model evaluations, cached), {} with > 1 cluster, {} with dS != 0 ({}), "
+                     "{} large-component fallbacks\n",
+                     w0.lrc_seen, w0.lrc_cache_misses, w0.lrc_multi, w0.lrc_transition,
                      w0.lrc_exact ? fmt::format("exact dE/dS dS/dx in the forces; mean max |F_cond| {:.3g} eV/A over {}",
                                                 w0.lrc_cond_force_sum / std::max<int64_t>(1, w0.lrc_cond_n), w0.lrc_cond_n)
                                   : std::string("no dE/dS dS/dx in the training forces"),

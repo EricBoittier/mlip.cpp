@@ -14,6 +14,7 @@
 #include <memory>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 namespace mlipcpp::train {
@@ -260,6 +261,16 @@ public:
   bool lrc_exact = false;
   std::vector<runtime::LrcCondition> lrc_cond_;
   std::vector<int> lrc_a0_;
+  // per-structure cache (frozen charge model, fixed training geometries): conditioning, energy / forces, blend rows
+  struct LrcCacheEntry {
+    runtime::LrcCondition c;
+    double e = 0;
+    std::vector<double> f, rows;
+    bool has_f = false, has_rows = false;
+  };
+  std::unordered_map<uint64_t, LrcCacheEntry> lrc_cache_;
+  std::vector<uint64_t> lrc_key_;
+  int64_t lrc_cache_misses = 0;
   std::vector<float> lrc_dblend_;
   double lrc_cond_force_sum = 0; // sum over structures of max |F_cond| (eV/A), for the log
   int64_t lrc_cond_n = 0;

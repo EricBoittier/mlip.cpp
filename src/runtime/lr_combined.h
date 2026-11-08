@@ -13,7 +13,8 @@
 //      copy of the start backbone whose energy head is the fitted charge head, pet.plato_lr.lrc_qmodel) gives raw
 //      per-atom charges q_raw_i (R, Q, spin in); Fukui equilibration to the total charge
 //        q0_i = q_raw_i + f_i (Q - sum_j q_raw_j) / sum_j f_j,   f_i = softplus(phi_Z) (pet.plato_lr.lrc_fukui_*)
-//      No SQE flows: the long-range energy is the fixed-charge Coulomb sum of the inter-cluster pairs,
+//      With lrc_qpass_charge = "zero" the charge pass runs at total charge 0 (local chemistry only) and Q enters only
+//      through the equilibration. No SQE flows: the long-range energy is the fixed-charge Coulomb sum of the inter-cluster pairs,
 //        E_lr = sum_{i<j} KE q0_i q0_j T(r_ij) (1 - R_{a_i b_j}) / r_ij,  T the smootherstep 0 -> 1 on [lr_R - lr_t, lr_R]
 //      (pet.plato_lr.sqe_lr_R / _lr_t), forces exact (direct, cluster and charge-pass chain rules).
 //    "fermi2" (default): two-level Fermi reference charges (one chemical potential, gapped levels; no structure-wide uniform shift):
@@ -65,6 +66,8 @@ struct LrcSpec {
   // q0 mode "graph": the charge pass (path, relative to the model's GGUF unless absolute; MLIPCPP_LRC_QMODEL
   // overrides), Fukui parameters per element, the source (set by the model that loads it)
   bool graph = false;
+  bool qpass_neutral = false; // the charge pass sees total charge 0 (pet.plato_lr.lrc_qpass_charge = "zero"); Q enters
+                              // through the Fukui equilibration only
   std::string qmodel;
   std::vector<int32_t> fukui_Z;
   std::vector<double> fukui_phi;

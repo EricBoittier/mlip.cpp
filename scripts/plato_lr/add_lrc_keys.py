@@ -27,6 +27,8 @@ def main():
     ap.add_argument("input"); ap.add_argument("output"); ap.add_argument("--spec", default=None)
     ap.add_argument("--a-on", type=float, default=5.0); ap.add_argument("--a-off", type=float, default=6.0)
     ap.add_argument("--qmodel", default=None); ap.add_argument("--fukui", default=None)
+    ap.add_argument("--qpass-charge", choices=["total", "zero"], default="total",
+                    help="graph: the charge pass sees the total charge, or 0 (Q then enters through the Fukui step only)")
     ap.add_argument("--lr-R", type=float, default=None); ap.add_argument("--lr-t", type=float, default=None)
     ap.add_argument("--mode", choices=["fermi2", "head", "round", "graph"], default="fermi2",
                     help="q0: two-level Fermi (needs --spec), the sqe learned logistic head alone, or soft-rounded")
@@ -68,6 +70,7 @@ def main():
         if not a.qmodel or not a.fukui: raise SystemExit("--mode graph needs --qmodel and --fukui")
         fk = json.load(open(a.fukui))
         new[f"{P}_qmodel"] = enc(f"{P}_qmodel") + struct.pack("<I", 8) + enc(a.qmodel)
+        new[f"{P}_qpass_charge"] = enc(f"{P}_qpass_charge") + struct.pack("<I", 8) + enc(a.qpass_charge)
         for k, v in (("fukui_Z", [float(z) for z in fk["Z"]]), ("fukui_phi", [float(x) for x in fk["phi"]])):
             new[f"{P}_{k}"] = enc(f"{P}_{k}") + struct.pack("<IIQ", 9, 12, len(v)) + struct.pack(f"<{len(v)}d", *v)
     for k, v in (("lr_R", a.lr_R), ("lr_t", a.lr_t)):

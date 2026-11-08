@@ -122,6 +122,11 @@ LrcSpec LrcSpec::from_gguf(const GGUFLoader &G, const SqeSpec &S) {
   }
   if (L.graph) {
     L.qmodel = G.get_string("pet.plato_lr.lrc_qmodel", "");
+    {
+      const std::string qc = G.get_string("pet.plato_lr.lrc_qpass_charge", "total");
+      if (qc != "total" && qc != "zero") throw std::runtime_error("lrc graph: lrc_qpass_charge must be total or zero");
+      L.qpass_neutral = qc == "zero";
+    }
     const auto z = get_f64(G, "pet.plato_lr.lrc_fukui_Z");
     L.fukui_phi = get_f64(G, "pet.plato_lr.lrc_fukui_phi");
     for (double v : z) L.fukui_Z.push_back(static_cast<int32_t>(std::lround(v)));
@@ -162,6 +167,7 @@ void LrcSpec::to_gguf(gguf_context *g) const {
   };
   if (graph) {
     gguf_set_val_str(g, "pet.plato_lr.lrc_qmodel", qmodel.c_str());
+    gguf_set_val_str(g, "pet.plato_lr.lrc_qpass_charge", qpass_neutral ? "zero" : "total");
     std::vector<double> z(fukui_Z.begin(), fukui_Z.end());
     arr("fukui_Z", z), arr("fukui_phi", fukui_phi);
     return;
@@ -476,7 +482,7 @@ LrcQ0 q0_graph(const LrcSpec &L, int n, const int32_t *Z, const double *x, doubl
   LrcQ0 o;
   o.Q = Q, o.spin = spin;
   if (n == 0) return o;
-  o.q0 = L.qsrc->raw(n, Z, x, Q, spin);
+  o.q0 = L.qsrc->raw(n, Z, x, L.qpass_neutral ? 0.0 : Q, spin);
   o.wt.resize(n);
   double sq = 0, sf = 0;
   for (int i = 0; i < n; i++) sq += o.q0[i], o.wt[i] = L.fukui(Z[i]), sf += o.wt[i];
@@ -489,7 +495,7 @@ void vjp_graph(const LrcSpec &L, int n, const int32_t *Z, const double *x, const
   std::vector<double> w(n);
   bool any = false;
   for (int i = 0; i < n; i++) w[i] = c[i] - cb, any |= w[i] != 0;
-  if (any) L.qsrc->raw_vjp(n, Z, x, o.Q, o.spin, w.data(), g);
+  if (any) L.qsrc->raw_vjp(n, Z, x, L.qpass_neutral ? 0.0 : o.Q, o.spin, w.data(), g);
 }
 } // namespace
 
