@@ -466,4 +466,12 @@ AdaptiveCutoff adaptive_cutoff(const runtime::GraphModel &model);
 
 void train(const TrainOptions &opts);
 
+/// Muon's hidden-matrix rule: 2-D, both dims >= 16, not an embedding table (name without "embed").
+/// Every other tensor of a Muon group takes AdamW.
+bool is_muon_matrix(const ggml_tensor *p);
+/// Muon's Newton-Schulz orthogonalisation (the fixed quintic 3.4445, -4.7750, 2.0315; Frobenius
+/// normalisation first; MLIPCPP_NS_POLAR=1: Polar Express) of each matrix of a stack [ne0, ne1, k]:
+/// approximately U V^T of g = U S V^T, singular values in about [0.7, 1.2]. The ggml ops (any backend).
+ggml_tensor *muon_orthogonalize(ggml_context *ctx, ggml_tensor *g, int steps);
+
 } // namespace mlipcpp::train
