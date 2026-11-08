@@ -116,8 +116,19 @@ LrcSpec LrcSpec::from_gguf(const GGUFLoader &G, const SqeSpec &S) {
   scalar("tau", L.tau), scalar("merge_w", L.merge_w);
   {
     const std::string mode = G.get_string("pet.plato_lr.lrc_q0_mode", "fermi2");
-    if (mode != "fermi2" && mode != "round" && mode != "head") throw std::runtime_error("lrc: unknown q0 mode " + mode);
-    L.round = mode == "round", L.head_only = mode == "head";
+    if (mode != "fermi2" && mode != "round" && mode != "head" && mode != "graph")
+      throw std::runtime_error("lrc: unknown q0 mode " + mode);
+    L.round = mode == "round", L.head_only = mode == "head", L.graph = mode == "graph";
+  }
+  if (L.graph) {
+    L.qmodel = G.get_string("pet.plato_lr.lrc_qmodel", "");
+    const auto z = get_f64(G, "pet.plato_lr.lrc_fukui_Z");
+    L.fukui_phi = get_f64(G, "pet.plato_lr.lrc_fukui_phi");
+    for (double v : z) L.fukui_Z.push_back(static_cast<int32_t>(std::lround(v)));
+    if (L.qmodel.empty() || L.fukui_Z.empty() || L.fukui_Z.size() != L.fukui_phi.size())
+      throw std::runtime_error("lrc graph: needs lrc_qmodel and lrc_fukui_Z / _phi of equal length");
+    if (!(L.a_off > L.a_on)) throw std::runtime_error("lrc: bad a_on / a_off");
+    return L;
   }
   const size_t E = S.Z.size();
   if (!(L.a_off > L.a_on)) throw std::runtime_error("lrc: bad a_on / a_off");
@@ -145,11 +156,17 @@ void LrcSpec::to_gguf(gguf_context *g) const {
   auto scalar = [&](const char *k, double v) { gguf_set_val_f64(g, (std::string("pet.plato_lr.lrc_") + k).c_str(), v); };
   scalar("a_on", a_on), scalar("a_off", a_off), scalar("T", T), scalar("D", D), scalar("tau", tau);
   scalar("merge_w", merge_w);
-  gguf_set_val_str(g, "pet.plato_lr.lrc_q0_mode", round ? "round" : head_only ? "head" : "fermi2");
-  if (round || head_only) return;
+  gguf_set_val_str(g, "pet.plato_lr.lrc_q0_mode", graph ? "graph" : round ? "round" : head_only ? "head" : "fermi2");
   auto arr = [&](const char *k, const std::vector<double> &v) {
     gguf_set_arr_data(g, (std::string("pet.plato_lr.lrc_") + k).c_str(), GGUF_TYPE_FLOAT64, v.data(), v.size());
   };
+  if (graph) {
+    gguf_set_val_str(g, "pet.plato_lr.lrc_qmodel", qmodel.c_str());
+    std::vector<double> z(fukui_Z.begin(), fukui_Z.end());
+    arr("fukui_Z", z), arr("fukui_phi", fukui_phi);
+    return;
+  }
+  if (round || head_only) return;
   arr("ip", ip), arr("ea", ea), arr("h", h), arr("l", l), arr("ap", ap), arr("am", am), arr("bp", bp), arr("bm", bm);
 }
 
@@ -443,12 +460,47 @@ void vjp_round(const LrcSpec &L, const SqeSpec &S, int n, const int32_t *Z, cons
 }
 } // namespace
 
-LrcQ0 lrc_q0(const LrcSpec &L, const SqeSpec &S, int n, const int32_t *Z, const double *x, double Q) {
+double LrcSpec::fukui(int z) const {
+  for (size_t k = 0; k < fukui_Z.size(); k++)
+    if (fukui_Z[k] == z) {
+      const double p = fukui_phi[k];
+      return (p > 30 ? p : std::log1p(std::exp(p))) + 1e-6;
+    }
+  throw std::runtime_error("lrc graph: no Fukui parameter for atomic number " + std::to_string(z));
+}
+
+namespace {
+// graph mode: q0 = q_raw + f (Q - sum q_raw) / sum f; wt = f / sum f (f per element: no position dependence)
+LrcQ0 q0_graph(const LrcSpec &L, int n, const int32_t *Z, const double *x, double Q, int spin) {
+  if (!L.qsrc) throw std::runtime_error("lrc graph: the charge pass (lrc_qmodel) is not loaded");
+  LrcQ0 o;
+  o.Q = Q, o.spin = spin;
+  if (n == 0) return o;
+  o.q0 = L.qsrc->raw(n, Z, x, Q, spin);
+  o.wt.resize(n);
+  double sq = 0, sf = 0;
+  for (int i = 0; i < n; i++) sq += o.q0[i], o.wt[i] = L.fukui(Z[i]), sf += o.wt[i];
+  for (int i = 0; i < n; i++) o.wt[i] /= sf, o.q0[i] += o.wt[i] * (Q - sq);
+  return o;
+}
+void vjp_graph(const LrcSpec &L, int n, const int32_t *Z, const double *x, const LrcQ0 &o, const double *c, double *g) {
+  double cb = 0;
+  for (int i = 0; i < n; i++) cb += c[i] * o.wt[i];
+  std::vector<double> w(n);
+  bool any = false;
+  for (int i = 0; i < n; i++) w[i] = c[i] - cb, any |= w[i] != 0;
+  if (any) L.qsrc->raw_vjp(n, Z, x, o.Q, o.spin, w.data(), g);
+}
+} // namespace
+
+LrcQ0 lrc_q0(const LrcSpec &L, const SqeSpec &S, int n, const int32_t *Z, const double *x, double Q, int spin) {
+  if (L.graph) return q0_graph(L, n, Z, x, Q, spin);
   return L.round || L.head_only ? q0_round(L, S, n, Z, x, Q) : q0_fermi2(L, S, n, Z, x, Q);
 }
 void lrc_q0_vjp(const LrcSpec &L, const SqeSpec &S, int n, const int32_t *Z, const double *x, const LrcQ0 &q,
                 const double *c, double *g) {
-  if (L.round || L.head_only) vjp_round(L, S, n, Z, x, q, c, g);
+  if (L.graph) vjp_graph(L, n, Z, x, q, c, g);
+  else if (L.round || L.head_only) vjp_round(L, S, n, Z, x, q, c, g);
   else vjp_fermi2(L, S, n, Z, x, q, c, g);
 }
 
@@ -598,7 +650,7 @@ bool LrcCondition::needs_cond_forces() const {
 }
 
 LrcCondition lrc_condition(const LrcSpec &L, const SqeSpec &S, int n, const int32_t *Z, const double *x, double Q,
-                           int max_charge) {
+                           int max_charge, int spin) {
   LrcCondition c;
   c.cl = lrc_clusters(L, n, x);
   const int s = c.cl.s;
@@ -606,7 +658,7 @@ LrcCondition lrc_condition(const LrcSpec &L, const SqeSpec &S, int n, const int3
   if (s == 1) {
     c.Q0[0] = c.Qloc[0] = Q;
   } else {
-    c.q0 = lrc_q0(L, S, n, Z, x, Q);
+    c.q0 = lrc_q0(L, S, n, Z, x, Q, spin);
     for (int i = 0; i < n; i++) c.Q0[c.cl.sn[i]] += c.q0.q0[i];
     for (int a = 0; a < s; a++)
       for (int b = 0; b < s; b++) c.Qloc[a] += c.cl.R[size_t(a) * s + b] * c.Q0[b];
@@ -647,11 +699,65 @@ void lrc_condition_forces(const LrcSpec &L, const SqeSpec &S, const LrcCondition
   for (size_t k = 0; k < g.size(); k++) F[k] -= g[k];
 }
 
+std::vector<double> lrc_blend_rows(const LrcSpec &L, const SqeSpec &S, const LrcCondition &c, int n, const int32_t *Z,
+                                   const double *x) {
+  const int s = c.cl.s;
+  std::vector<double> rows(size_t(s) * 3 * n, 0.0);
+  if (s == 1) return rows;
+  for (int a = 0; a < s; a++) {
+    if (c.dS[a] == 0) continue;
+    std::vector<double> G(s, 0.0);
+    G[a] = 1.0;
+    double *r = rows.data() + size_t(a) * 3 * n; // lrc_condition_forces subtracts dS_a/dx
+    lrc_condition_forces(L, S, c, n, Z, x, G, r);
+    for (int k = 0; k < 3 * n; k++) r[k] = -r[k];
+  }
+  return rows;
+}
+
+namespace {
+// graph mode: fixed-charge Coulomb of the inter-cluster pairs beyond lr_R - lr_t
+LrcEnergy energy_fixed(const LrcSpec &L, const SqeSpec &S, const LrcCondition &c, int n, const int32_t *Z,
+                       const double *x, bool forces) {
+  constexpr double KE = 14.399645;
+  LrcEnergy out;
+  out.q0 = c.q0.q0, out.q = c.q0.q0;
+  if (forces) out.forces.assign(3 * size_t(n), 0.0);
+  const int s = c.cl.s;
+  const double r0 = S.lr_R - S.lr_t;
+  std::vector<double> g(3 * size_t(n), 0.0), dq(n, 0.0), W(size_t(s) * s, 0.0);
+  const double *q = c.q0.q0.data();
+  for (int i = 0; i < n; i++)
+    for (int j = i + 1; j < n; j++) {
+      const int a = c.cl.sn[i], b = c.cl.sn[j];
+      if (a == b) continue;
+      const double r = dist(x, i, j);
+      if (r <= r0) continue;
+      const double t = (r - r0) / S.lr_t;
+      const double T = sstep(t), dT = dsstep(t) / S.lr_t;
+      const double m = 1.0 - c.cl.R[size_t(a) * s + b];
+      if (m == 0) continue;
+      const double k = KE / r, e = q[i] * q[j] * k;
+      out.energy += e * T * m;
+      if (!forces) continue;
+      add_pair(g.data(), x, i, j, r, q[i] * q[j] * m * (dT * k - T * k / r));
+      dq[i] += q[j] * k * T * m, dq[j] += q[i] * k * T * m;
+      W[size_t(a) * s + b] -= 0.5 * e * T, W[size_t(b) * s + a] -= 0.5 * e * T;
+    }
+  if (!forces) return out;
+  lrc_clusters_vjp(L, c.cl, n, x, W, g.data());
+  lrc_q0_vjp(L, S, n, Z, x, c.q0, dq.data(), g.data());
+  for (size_t k = 0; k < g.size(); k++) out.forces[k] = -g[k];
+  return out;
+}
+} // namespace
+
 LrcEnergy lrc_energy(const LrcSpec &L, const SqeSpec &S, const LrcCondition &c, int n, const int32_t *Z,
                      const double *x, double Q, bool forces) {
   LrcEnergy out;
   if (forces) out.forces.assign(3 * size_t(n), 0.0);
   if (c.cl.s == 1 || n == 0) return out; // one cluster: E*(gamma) - E*(gamma) = 0 exactly
+  if (L.graph) return energy_fixed(L, S, c, n, Z, x, forces);
   SqeClusterMask m{c.cl.sn.data(), c.cl.s, c.cl.R.data()};
   const SqeOutput so = sqe_compute_masked(S, n, Z, x, Q, c.q0.q0.data(), forces, m);
   out.energy = so.energy, out.q = so.q, out.q0 = c.q0.q0;

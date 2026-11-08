@@ -9,6 +9,13 @@
 //      P ~ exp(-sum (n_c - s_c)^2 / 2 tau^2); shift d_c = w_c (<n_c> - s_c) - w_c sum_e d_e / sum_e w_e (sum 0), spread
 //      uniformly over the component: q0_i = s_i + d_c / n_c. One component: q0 = s (sum Q, no rounding).
 //    "head": the learned logistic head s alone (one global shift to Q, as DFT gets only Q).
+//    "graph" (feat/lr-chargehead): a MACE-POLAR-1-style charge head on backbone features. A frozen charge pass (a GGUF
+//      copy of the start backbone whose energy head is the fitted charge head, pet.plato_lr.lrc_qmodel) gives raw
+//      per-atom charges q_raw_i (R, Q, spin in); Fukui equilibration to the total charge
+//        q0_i = q_raw_i + f_i (Q - sum_j q_raw_j) / sum_j f_j,   f_i = softplus(phi_Z) (pet.plato_lr.lrc_fukui_*)
+//      No SQE flows: the long-range energy is the fixed-charge Coulomb sum of the inter-cluster pairs,
+//        E_lr = sum_{i<j} KE q0_i q0_j T(r_ij) (1 - R_{a_i b_j}) / r_ij,  T the smootherstep 0 -> 1 on [lr_R - lr_t, lr_R]
+//      (pet.plato_lr.sqe_lr_R / _lr_t), forces exact (direct, cluster and charge-pass chain rules).
 //    "fermi2" (default): two-level Fermi reference charges (one chemical potential, gapped levels; no structure-wide uniform shift):
 //      q0_i = h_Z sigmoid(t - I_i / T) - l_Z sigmoid(A_i / T - t),   sum_i q0_i = Q  (t = -mu / T, by bisection + Newton)
 //      I_i = IP_Z - D tanh(f+_i),  A_i = EA_Z + D tanh(f-_i),  f+-_i = a+-_Z + sum_Z' b+-_{Z Z'} CN_{i,Z'}
@@ -28,6 +35,8 @@
 #include "sqe.h"
 
 #include <cstdint>
+#include <memory>
+#include <string>
 #include <vector>
 
 struct gguf_context;
@@ -37,6 +46,14 @@ class GGUFLoader;
 
 namespace mlipcpp::runtime {
 
+/// raw per-atom charges of the "graph" q0 mode (the frozen charge pass) and their vector-Jacobian product
+struct LrcQSource {
+  virtual ~LrcQSource() = default;
+  virtual std::vector<double> raw(int n, const int32_t *Z, const double *x, double Q, int spin) = 0;
+  /// g [3n] += d(sum_i w_i q_raw_i)/dx
+  virtual void raw_vjp(int n, const int32_t *Z, const double *x, double Q, int spin, const double *w, double *g) = 0;
+};
+
 struct LrcSpec {
   bool enabled = false;
   double a_on = 5.0, a_off = 6.0; // cluster link window (A)
@@ -45,6 +62,14 @@ struct LrcSpec {
   bool round = false;             // q0 mode "round": soft-rounded component reference (option; imposes integers)
   bool head_only = false;         // q0 mode "head": the learned logistic head alone (sum Q, no rounding)
   double tau = 0.25, merge_w = 2.0; // round: Gaussian width (e) and the merge switch width beyond r_ct (A)
+  // q0 mode "graph": the charge pass (path, relative to the model's GGUF unless absolute; MLIPCPP_LRC_QMODEL
+  // overrides), Fukui parameters per element, the source (set by the model that loads it)
+  bool graph = false;
+  std::string qmodel;
+  std::vector<int32_t> fukui_Z;
+  std::vector<double> fukui_phi;
+  std::shared_ptr<LrcQSource> qsrc;
+  double fukui(int z) const; // softplus(phi_Z)
   // per element in SqeSpec::Z order
   std::vector<double> ip, ea, h, l, ap, am, bp, bm; // bp, bm: E x E (row: the atom's element)
   static LrcSpec from_gguf(const GGUFLoader &L, const SqeSpec &sqe);
@@ -60,6 +85,9 @@ struct LrcQ0 {
   std::vector<int32_t> comp;           // per atom
   std::vector<double> sc, w, nbar, cov; // per component; cov K x K (of the partition distribution)
   std::vector<int> ncomp;              // atoms per component
+  // graph: the structure's charge and spin (the charge pass is evaluated again for the vector-Jacobian products)
+  double Q = 0;
+  int spin = 1;
 };
 
 struct LrcClusters {
@@ -96,7 +124,7 @@ struct LrcEnergy {
 
 int lrc_index(const SqeSpec &sqe, int z); // element index, throws when absent
 
-LrcQ0 lrc_q0(const LrcSpec &L, const SqeSpec &sqe, int n, const int32_t *Z, const double *x, double Q);
+LrcQ0 lrc_q0(const LrcSpec &L, const SqeSpec &sqe, int n, const int32_t *Z, const double *x, double Q, int spin = 1);
 /// dE/dx (added into g, [3n]) of sum_i c_i q0_i(x)
 void lrc_q0_vjp(const LrcSpec &L, const SqeSpec &sqe, int n, const int32_t *Z, const double *x, const LrcQ0 &q,
                 const double *c, double *g);
@@ -108,7 +136,10 @@ void lrc_clusters_vjp(const LrcSpec &L, const LrcClusters &c, int n, const doubl
 
 /// conditioning of one structure (max_charge: rows are clamped into [-max_charge, max_charge])
 LrcCondition lrc_condition(const LrcSpec &L, const SqeSpec &sqe, int n, const int32_t *Z, const double *x, double Q,
-                           int max_charge);
+                           int max_charge, int spin = 1);
+/// the rows dS_a/dx [3n] of every super-node a with dS_a != 0 (zero rows otherwise), s x 3n
+std::vector<double> lrc_blend_rows(const LrcSpec &L, const SqeSpec &sqe, const LrcCondition &c, int n, const int32_t *Z,
+                                   const double *x);
 /// forces (-dE/dx, added into F) of the conditioning's position dependence, G_a = dE/dS_a per super-node
 void lrc_condition_forces(const LrcSpec &L, const SqeSpec &sqe, const LrcCondition &c, int n, const int32_t *Z,
                           const double *x, const std::vector<double> &G, double *F);

@@ -10,6 +10,7 @@
 #include <cmath>
 #include <functional>
 #include <map>
+#include <memory>
 #include <vector>
 
 using namespace mlipcpp::runtime;
@@ -232,4 +233,107 @@ TEST_CASE("lrc: head and soft-rounded q0 modes, forces match central differences
     INFO("mode " << mode << " conditioning force: max |F| " << fmax << ", max error " << err);
     CHECK(err < 1e-6 * std::max(1.0, fmax));
   }
+}
+
+namespace {
+// analytic stand-in for the frozen charge pass: q_raw_i = a_Z + sum_j b_ZZ' exp(-r_ij / 2) + 0.1 Q (position dependent,
+// smooth, like a backbone head); its VJP analytic
+struct ToyQ final : LrcQSource {
+  static double a(int z) { return z == 11 ? 0.8 : z == 17 ? -0.7 : z == 8 ? -0.5 : 0.25; }
+  static double b(int zi, int zj) { return 0.05 * ((zi * 7 + zj * 3) % 5) - 0.1; }
+  std::vector<double> raw(int n, const int32_t *Z, const double *x, double Q, int) override {
+    std::vector<double> q(n);
+    for (int i = 0; i < n; i++) {
+      q[i] = a(Z[i]) + 0.1 * Q;
+      for (int j = 0; j < n; j++)
+        if (j != i) q[i] += b(Z[i], Z[j]) * std::exp(-r(x, i, j) / 2);
+    }
+    return q;
+  }
+  void raw_vjp(int n, const int32_t *Z, const double *x, double, int, const double *w, double *g) override {
+    for (int i = 0; i < n; i++)
+      for (int j = 0; j < n; j++) {
+        if (j == i) continue;
+        const double d = r(x, i, j), dq = -0.5 * w[i] * b(Z[i], Z[j]) * std::exp(-d / 2);
+        for (int k = 0; k < 3; k++) {
+          const double u = (x[3 * i + k] - x[3 * j + k]) / d;
+          g[3 * i + k] += dq * u, g[3 * j + k] -= dq * u;
+        }
+      }
+  }
+  static double r(const double *x, int i, int j) {
+    double s = 0;
+    for (int k = 0; k < 3; k++) s += (x[3 * i + k] - x[3 * j + k]) * (x[3 * i + k] - x[3 * j + k]);
+    return std::sqrt(s);
+  }
+};
+LrcSpec graph_spec() {
+  LrcSpec L;
+  L.enabled = true, L.graph = true;
+  L.fukui_Z = {1, 8, 11, 17}, L.fukui_phi = {0.3, -0.2, 1.1, 0.5};
+  L.qsrc = std::make_shared<ToyQ>();
+  return L;
+}
+} // namespace
+
+TEST_CASE("lrc graph: Fukui equilibration to Q, fixed-charge inter-cluster Coulomb, exact forces", "[lrc]") {
+  SqeSpec S = sqe_spec();
+  S.lr_R = 10.0, S.lr_t = 2.0; // the 8-10 A switch of feat/lr-chargehead
+  const LrcSpec L = graph_spec();
+  // Cl- 5.5 A from the water (a weak link: transition) and 8-10 A from Na+ (inside the long-range switch)
+  const auto x0 = std::vector<double>{0, 0, 0, 3.4, 0.1, 0.2, 4.3, 0.3, 0.1, 3.1, 1.0, -0.2, 9.6, 2.5, 0.4};
+  for (double Q : {0.0, 1.0}) {
+    const LrcQ0 q = lrc_q0(L, S, 5, ZG, x0.data(), Q, 1);
+    double sum = 0;
+    for (double v : q.q0) sum += v;
+    CHECK(sum == Approx(Q).margin(1e-12));
+  }
+  const double Q = 0.0;
+  auto energy = [&](const std::vector<double> &x) {
+    const LrcCondition c = lrc_condition(L, S, 5, ZG, x.data(), Q, 10, 1);
+    return lrc_energy(L, S, c, 5, ZG, x.data(), Q, false).energy;
+  };
+  const LrcCondition c0 = lrc_condition(L, S, 5, ZG, x0.data(), Q, 10, 1);
+  REQUIRE(c0.cl.s == 2);
+  REQUIRE(!c0.cl.trivial());
+  REQUIRE(c0.needs_cond_forces());
+  const LrcEnergy e0 = lrc_energy(L, S, c0, 5, ZG, x0.data(), Q, true);
+  CHECK(std::abs(e0.energy) > 1e-4);
+  double fmax = 0, err = 0;
+  for (size_t k = 0; k < x0.size(); k++) {
+    const double num = -fd(energy, x0, k, 1e-5);
+    fmax = std::max(fmax, std::abs(num)), err = std::max(err, std::abs(num - e0.forces[k]));
+  }
+  INFO("graph long-range force: max |F| " << fmax << ", max error " << err);
+  CHECK(fmax > 1e-4);
+  CHECK(err < 1e-6 * std::max(1.0, fmax));
+  // conditioning forces and the blend rows dS_a/dx
+  const double g[5] = {0.7, -0.3, 0.2, 0.5, -1.1};
+  auto fS = [&](const std::vector<double> &x) {
+    const LrcCondition c = lrc_condition(L, S, 5, ZG, x.data(), Q, 10, 1);
+    double v = 0;
+    for (int i = 0; i < 5; i++) v += g[i] * (c.k[c.cl.sn[i]] + c.S[c.cl.sn[i]]);
+    return v;
+  };
+  std::vector<double> G(c0.cl.s, 0.0), F(15, 0.0);
+  for (int i = 0; i < 5; i++) G[c0.cl.sn[i]] += g[i];
+  lrc_condition_forces(L, S, c0, 5, ZG, x0.data(), G, F.data());
+  const std::vector<double> rows = lrc_blend_rows(L, S, c0, 5, ZG, x0.data());
+  fmax = 0, err = 0;
+  double err_rows = 0;
+  for (size_t k = 0; k < x0.size(); k++) {
+    const double num = -fd(fS, x0, k, 1e-5);
+    double fr = 0;
+    for (int a = 0; a < c0.cl.s; a++) fr -= G[a] * rows[size_t(a) * 15 + k];
+    fmax = std::max(fmax, std::abs(num)), err = std::max(err, std::abs(num - F[k]));
+    err_rows = std::max(err_rows, std::abs(num - fr));
+  }
+  INFO("graph conditioning force: max |F| " << fmax << ", max error " << err << ", via rows " << err_rows);
+  CHECK(fmax > 1e-3);
+  CHECK(err < 1e-6 * std::max(1.0, fmax));
+  CHECK(err_rows < 1e-6 * std::max(1.0, fmax));
+  // nothing inside lr_R - lr_t: Cl- pulled to 7 A of Na+ keeps a zero long-range energy
+  const auto xn = std::vector<double>{0, 0, 0, 3.4, 0.1, 0.2, 4.3, 0.3, 0.1, 3.1, 1.0, -0.2, 7.0, 0.0, 0.0};
+  const LrcCondition cn = lrc_condition(L, S, 5, ZG, xn.data(), Q, 10, 1);
+  if (cn.cl.s > 1) CHECK(lrc_energy(L, S, cn, 5, ZG, xn.data(), Q, false).energy == 0.0);
 }
