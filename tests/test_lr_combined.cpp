@@ -559,3 +559,35 @@ TEST_CASE("lrc cond global: every atom on the structure's charge, no conditionin
     for (double f : F) CHECK(f == 0.0);
   }
 }
+
+TEST_CASE("lrc cond_w: plateaus around integer local charge, conditioning forces still match central differences", "[lrc]") {
+  SqeSpec S = sqe_spec();
+  S.lr_R = 10.0, S.lr_t = 2.0;
+  LrcSpec L = graph_spec();
+  L.cond_w = 0.6;
+  const auto x0 = std::vector<double>{0, 0, 0, 3.4, 0.1, 0.2, 4.3, 0.3, 0.1, 3.1, 1.0, -0.2, 9.6, 2.5, 0.4};
+  const double Q = 0.0;
+  const LrcCondition c0 = lrc_condition(L, S, 5, ZG, x0.data(), Q, 10, 1);
+  for (int a = 0; a < c0.cl.s; a++) {
+    const double u = c0.Qloc[a] - std::floor(c0.Qloc[a]);
+    if (u < 0.2) CHECK(c0.S[a] == 0.0);
+    if (u > 0.8) CHECK(c0.S[a] == 1.0);
+  }
+  const double g[5] = {0.7, -0.3, 0.2, 0.5, -1.1};
+  auto fS = [&](const std::vector<double> &x) {
+    const LrcCondition c = lrc_condition(L, S, 5, ZG, x.data(), Q, 10, 1);
+    double v = 0;
+    for (int i = 0; i < 5; i++) v += g[i] * (c.k[c.cl.sn[i]] + c.S[c.cl.sn[i]]);
+    return v;
+  };
+  std::vector<double> G(c0.cl.s, 0.0), F(15, 0.0);
+  for (int i = 0; i < 5; i++) G[c0.cl.sn[i]] += g[i];
+  lrc_condition_forces(L, S, c0, 5, ZG, x0.data(), G, F.data());
+  double err = 0, fmax = 0;
+  for (size_t k = 0; k < x0.size(); k++) {
+    const double num = -fd(fS, x0, k, 1e-5);
+    fmax = std::max(fmax, std::abs(num)), err = std::max(err, std::abs(num - F[k]));
+  }
+  INFO("cond_w conditioning force: max |F| " << fmax << ", max error " << err);
+  CHECK(err < 1e-6 * std::max(1.0, fmax));
+}

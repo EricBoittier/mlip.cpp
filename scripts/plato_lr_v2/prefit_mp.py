@@ -11,7 +11,9 @@ Both are linear in (theta, tau): one weighted ridge solve (scales 0.05 e A and 0
 ridge strength chosen on a held-out 10 % of the training monomers. Reports the dipole / quadrupole errors with charges
 only and with the fitted moments, on that 10 % and on the set A val monomers (heldout side; never fitted).
 
-    python run.py prefit_mp.py MONOMERS.jsonl CHARGE_PREFIX OUT.json [--rc 4.5 --width 0.6 --centers 1.0,2.0,3.0,4.0]"""
+    python run.py prefit_mp.py MONOMERS.jsonl CHARGE OUT.json [--rc 4.5 --width 0.6 --centers 1.0,2.0,3.0,4.0]
+CHARGE: a stage-1 prefix (CHARGE.pt + CHARGE_fukui.json, PyTorch), or QPASS.json:KEYS.json (mlipcpp-qpass output for a
+monomer xyz and the matching "id:which" keys), e.g. for a GGUF charge pass such as head_q0."""
 import argparse
 import json
 import os
@@ -85,9 +87,15 @@ def main():
     a = ap.parse_args()
     from ase.data import atomic_masses
     centers = np.array([float(c) for c in a.centers.split(",")])
-    model = torch.load(a.charge + ".pt", weights_only=False)["model"].eval()
-    fk = json.load(open(a.charge + "_fukui.json"))
-    phi = np.zeros(128); phi[np.array(fk["Z"])] = fk["phi"]
+    if a.charge.endswith(".json") or ".json:" in a.charge:
+        qj, kj = a.charge.split(":")
+        pre = dict(zip(json.load(open(kj)), [np.array(f["q"]) for f in json.load(open(qj))["frames"]]))
+        model = phi = None
+    else:
+        pre = None
+        model = torch.load(a.charge + ".pt", weights_only=False, map_location="cpu")["model"].eval()
+        fk = json.load(open(a.charge + "_fukui.json"))
+        phi = np.zeros(128); phi[np.array(fk["Z"])] = fk["phi"]
     side = {}
     sp = json.load(open(a.split))
     for p in sp["pairs"]:
@@ -110,7 +118,7 @@ def main():
             at = Atoms(m["sym"], positions=m["R"])
             Z, R = at.numbers, np.array(m["R"], float)
             com = (atomic_masses[Z][:, None] * R).sum(0) / atomic_masses[Z].sum()
-            q = charges(model, phi, Z, R, float(m["charge"]))
+            q = pre[f"{m['id']}:{m['which']}"] if pre is not None else charges(model, phi, Z, R, float(m["charge"]))
             rr = R - com
             mu_q = (q[:, None] * rr).sum(0)
             th_q = sum(q[i] * (1.5 * np.outer(rr[i], rr[i]) - 0.5 * rr[i] @ rr[i] * np.eye(3)) for i in range(len(Z)))

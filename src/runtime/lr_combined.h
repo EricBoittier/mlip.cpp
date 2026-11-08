@@ -100,6 +100,11 @@ struct LrcSpec {
   // local charge Q_loc) or "global" (every atom on the structure's Q, as the plain model: no seam where clusters split
   // inside the backbone cutoff; the charge pass then feeds only the long-range term)
   bool cond_global = false;
+  // blend width of the local-charge conditioning rows (pet.plato_lr.lrc_cond_w, default 1): S = smootherstep((u - 1/2) / w
+  // + 1/2), u the fractional part of Q_loc. w < 1 gives flat plateaus around integers (|u| < (1 - w) / 2 maps to the
+  // integer row exactly), so a small residual charge leaked onto a neutral cluster does not shift its conditioning at
+  // any distance; still C2 in the positions. The long-range charges themselves are not rounded.
+  double cond_w = 1.0;
   bool pol = false;
   std::vector<int32_t> pol_Z;
   std::vector<double> pol_alpha;

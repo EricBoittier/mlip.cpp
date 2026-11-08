@@ -124,6 +124,8 @@ LrcSpec LrcSpec::from_gguf(const GGUFLoader &G, const SqeSpec &S) {
     const std::string cm = G.get_string("pet.plato_lr.lrc_cond", "cluster");
     if (cm != "cluster" && cm != "global") throw std::runtime_error("lrc: lrc_cond must be cluster or global");
     L.cond_global = cm == "global";
+    scalar("cond_w", L.cond_w);
+    if (!(L.cond_w > 0 && L.cond_w <= 1)) throw std::runtime_error("lrc: lrc_cond_w must be in (0, 1]");
   }
   if (L.graph) {
     L.qmodel = G.get_string("pet.plato_lr.lrc_qmodel", "");
@@ -183,6 +185,7 @@ void LrcSpec::to_gguf(gguf_context *g) const {
   scalar("merge_w", merge_w);
   gguf_set_val_str(g, "pet.plato_lr.lrc_q0_mode", graph ? "graph" : round ? "round" : head_only ? "head" : "fermi2");
   gguf_set_val_str(g, "pet.plato_lr.lrc_cond", cond_global ? "global" : "cluster");
+  scalar("cond_w", cond_w);
   auto arr = [&](const char *k, const std::vector<double> &v) {
     gguf_set_arr_data(g, (std::string("pet.plato_lr.lrc_") + k).c_str(), GGUF_TYPE_FLOAT64, v.data(), v.size());
   };
@@ -788,8 +791,8 @@ LrcCondition lrc_condition(const LrcSpec &L, const SqeSpec &S, int n, const int3
     double v = c.Qloc[a];
     const double rv = std::round(v);
     if (std::abs(v - rv) < 1e-9) v = rv; // solver noise on an integer
-    const double k = std::floor(v), u = v - k;
-    c.k[a] = static_cast<int32_t>(k), c.S[a] = sstep(u), c.dS[a] = dsstep(u);
+    const double k = std::floor(v), u = (v - k - 0.5) / L.cond_w + 0.5;
+    c.k[a] = static_cast<int32_t>(k), c.S[a] = sstep(u), c.dS[a] = dsstep(u) / L.cond_w;
   }
   c.row_charge.resize(n), c.row_charge_hi.resize(n), c.blend.resize(n);
   for (int i = 0; i < n; i++) {

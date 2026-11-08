@@ -35,6 +35,7 @@ def main():
     ap.add_argument("--tau", type=float, default=0.25); ap.add_argument("--merge-w", type=float, default=2.0)
     ap.add_argument("--cond", choices=["cluster", "global"], default="cluster",
                     help="backbone conditioning: per smooth cluster (Q_loc) or the structure's Q for every atom")
+    ap.add_argument("--cond-w", type=float, default=1.0, help="blend width of the Q_loc rows (< 1: plateaus at integers)")
     a = ap.parse_args()
     sp = {"T": 0.25, "D": 5.0}
     if a.mode == "fermi2":
@@ -64,7 +65,8 @@ def main():
     enc = lambda s: struct.pack("<Q", len(s.encode())) + s.encode()
     P = "pet.plato_lr.lrc"
     new = {P: enc(P) + struct.pack("<Ii", 5, 1)}
-    for k, v in (("a_on", a.a_on), ("a_off", a.a_off), ("T", sp["T"]), ("D", sp["D"]), ("tau", a.tau), ("merge_w", a.merge_w)):
+    for k, v in (("a_on", a.a_on), ("a_off", a.a_off), ("T", sp["T"]), ("D", sp["D"]), ("tau", a.tau), ("merge_w", a.merge_w),
+                 ("cond_w", a.cond_w)):
         new[f"{P}_{k}"] = enc(f"{P}_{k}") + struct.pack("<Id", 12, float(v))
     new[f"{P}_q0_mode"] = enc(f"{P}_q0_mode") + struct.pack("<I", 8) + enc(a.mode)
     new[f"{P}_cond"] = enc(f"{P}_cond") + struct.pack("<I", 8) + enc(a.cond)

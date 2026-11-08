@@ -270,6 +270,9 @@ if(MLIPCPP_BUILD_TRAINING AND UNIX AND NOT EMSCRIPTEN)
     add_executable(mlipcpp-sqe-check bin/mlipcpp_sqe_check.cpp)
     target_link_libraries(mlipcpp-sqe-check PRIVATE mlipcpp_train)
 
+    add_executable(mlipcpp-qpass bin/mlipcpp_qpass.cpp)
+    target_link_libraries(mlipcpp-qpass PRIVATE mlipcpp_train)
+
     add_executable(mlipcpp-jvp-check bin/mlipcpp_jvp_check.cpp)
     target_link_libraries(mlipcpp-jvp-check PRIVATE mlipcpp_train)
     target_link_options(mlipcpp-jvp-check PRIVATE -rdynamic)
