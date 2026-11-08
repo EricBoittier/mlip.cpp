@@ -33,6 +33,8 @@ def main():
     ap.add_argument("--mode", choices=["fermi2", "head", "round", "graph"], default="fermi2",
                     help="q0: two-level Fermi (needs --spec), the sqe learned logistic head alone, or soft-rounded")
     ap.add_argument("--tau", type=float, default=0.25); ap.add_argument("--merge-w", type=float, default=2.0)
+    ap.add_argument("--cond", choices=["cluster", "global"], default="cluster",
+                    help="backbone conditioning: per smooth cluster (Q_loc) or the structure's Q for every atom")
     a = ap.parse_args()
     sp = {"T": 0.25, "D": 5.0}
     if a.mode == "fermi2":
@@ -65,6 +67,7 @@ def main():
     for k, v in (("a_on", a.a_on), ("a_off", a.a_off), ("T", sp["T"]), ("D", sp["D"]), ("tau", a.tau), ("merge_w", a.merge_w)):
         new[f"{P}_{k}"] = enc(f"{P}_{k}") + struct.pack("<Id", 12, float(v))
     new[f"{P}_q0_mode"] = enc(f"{P}_q0_mode") + struct.pack("<I", 8) + enc(a.mode)
+    new[f"{P}_cond"] = enc(f"{P}_cond") + struct.pack("<I", 8) + enc(a.cond)
     drop = set()
     if a.mode == "graph":
         if not a.qmodel or not a.fukui: raise SystemExit("--mode graph needs --qmodel and --fukui")
@@ -116,7 +119,7 @@ def main():
     head += b"\0" * ((-len(head)) % alignment)
     with open(a.output, "wb") as f:
         f.write(head); f.write(body)
-    print(f"{a.output}: lrc on (q0 {a.mode}, clusters {a.a_on}-{a.a_off} A)")
+    print(f"{a.output}: lrc on (q0 {a.mode}, clusters {a.a_on}-{a.a_off} A, conditioning {a.cond})")
 
 
 if __name__ == "__main__":

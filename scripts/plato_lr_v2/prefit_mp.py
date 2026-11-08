@@ -34,8 +34,13 @@ def charges(model, phi, Z, R, Q):
     s = System(types=torch.tensor(Z, dtype=torch.int32), positions=torch.tensor(R, dtype=torch.float32),
                cell=torch.zeros(3, 3), pbc=torch.zeros(3, dtype=torch.bool))
     s = get_system_with_neighbor_lists(s, model.requested_neighbor_lists())
+    # a water batched alongside (the PyTorch frame attention fails on a batch without any neighbour pair, e.g. a single ion)
+    w = System(types=torch.tensor([8, 1, 1], dtype=torch.int32),
+               positions=torch.tensor([[0, 0, 0], [0.96, 0, 0], [-0.24, 0.93, 0]], dtype=torch.float32),
+               cell=torch.zeros(3, 3), pbc=torch.zeros(3, dtype=torch.bool))
+    w = get_system_with_neighbor_lists(w, model.requested_neighbor_lists())
     with torch.no_grad():
-        raw = model([s], {"energy": ModelOutput(per_atom=True)})["energy"].block().values[:, 0].double().numpy()
+        raw = model([s, w], {"energy": ModelOutput(per_atom=True)})["energy"].block().values[: len(Z), 0].double().numpy()
     f = np.log1p(np.exp(phi[np.asarray(Z)])) + 1e-6
     return raw + f * (Q - raw.sum()) / f.sum()
 

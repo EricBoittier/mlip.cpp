@@ -96,6 +96,10 @@ struct LrcSpec {
   // to each other's dipoles across clusters (no intra-cluster coupling: that is the short-range model's),
   //   (alpha^-1 - T) mu = F0,  E_pol = -1/2 KE mu . F0,  forces Hellmann-Feynman (+ charge-pass VJP, switch, clusters).
   // Thole damping is not needed: every coupled pair is beyond lr_R - lr_t (8 A).
+  // backbone conditioning (pet.plato_lr.lrc_cond): "cluster" (default: every atom conditioned on its smooth cluster's
+  // local charge Q_loc) or "global" (every atom on the structure's Q, as the plain model: no seam where clusters split
+  // inside the backbone cutoff; the charge pass then feeds only the long-range term)
+  bool cond_global = false;
   bool pol = false;
   std::vector<int32_t> pol_Z;
   std::vector<double> pol_alpha;

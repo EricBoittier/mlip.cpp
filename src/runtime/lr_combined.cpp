@@ -120,6 +120,11 @@ LrcSpec LrcSpec::from_gguf(const GGUFLoader &G, const SqeSpec &S) {
       throw std::runtime_error("lrc: unknown q0 mode " + mode);
     L.round = mode == "round", L.head_only = mode == "head", L.graph = mode == "graph";
   }
+  {
+    const std::string cm = G.get_string("pet.plato_lr.lrc_cond", "cluster");
+    if (cm != "cluster" && cm != "global") throw std::runtime_error("lrc: lrc_cond must be cluster or global");
+    L.cond_global = cm == "global";
+  }
   if (L.graph) {
     L.qmodel = G.get_string("pet.plato_lr.lrc_qmodel", "");
     {
@@ -177,6 +182,7 @@ void LrcSpec::to_gguf(gguf_context *g) const {
   scalar("a_on", a_on), scalar("a_off", a_off), scalar("T", T), scalar("D", D), scalar("tau", tau);
   scalar("merge_w", merge_w);
   gguf_set_val_str(g, "pet.plato_lr.lrc_q0_mode", graph ? "graph" : round ? "round" : head_only ? "head" : "fermi2");
+  gguf_set_val_str(g, "pet.plato_lr.lrc_cond", cond_global ? "global" : "cluster");
   auto arr = [&](const char *k, const std::vector<double> &v) {
     gguf_set_arr_data(g, (std::string("pet.plato_lr.lrc_") + k).c_str(), GGUF_TYPE_FLOAT64, v.data(), v.size());
   };
@@ -776,6 +782,7 @@ LrcCondition lrc_condition(const LrcSpec &L, const SqeSpec &S, int n, const int3
     for (int i = 0; i < n; i++) c.Q0[c.cl.sn[i]] += c.q0.q0[i];
     for (int a = 0; a < s; a++)
       for (int b = 0; b < s; b++) c.Qloc[a] += c.cl.R[size_t(a) * s + b] * c.Q0[b];
+    if (L.cond_global) c.Qloc.assign(s, Q); // global conditioning: no position dependence (dS = 0)
   }
   for (int a = 0; a < s; a++) {
     double v = c.Qloc[a];
@@ -797,7 +804,7 @@ LrcCondition lrc_condition(const LrcSpec &L, const SqeSpec &S, int n, const int3
 void lrc_condition_forces(const LrcSpec &L, const SqeSpec &S, const LrcCondition &c, int n, const int32_t *Z,
                           const double *x, const std::vector<double> &G, double *F) {
   const int s = c.cl.s;
-  if (s == 1) return;
+  if (s == 1 || L.cond_global) return;
   std::vector<double> g(3 * size_t(n), 0.0), W(size_t(s) * s, 0.0), cq(n, 0.0);
   std::vector<double> gs(s);
   for (int a = 0; a < s; a++) gs[a] = G[a] * c.dS[a]; // dE/dQloc_a

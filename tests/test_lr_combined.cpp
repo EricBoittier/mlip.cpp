@@ -534,3 +534,28 @@ TEST_CASE("lrc pol: induced dipoles, -1/2 alpha F^2 limit and forces against cen
   INFO("induction " << ep << " eV, -1/2 alpha F^2 " << ref << " eV");
   CHECK(ep == Approx(ref).epsilon(2e-3));
 }
+
+TEST_CASE("lrc cond global: every atom on the structure's charge, no conditioning forces, same long range", "[lrc]") {
+  SqeSpec S = sqe_spec();
+  S.lr_R = 10.0, S.lr_t = 2.0;
+  LrcSpec Lc = graph_spec(), Lg = graph_spec();
+  Lg.cond_global = true;
+  // Cl- 5.5 A from the water (cluster transition) and 8-10 A from Na+: per-cluster conditioning has dS != 0 here
+  const auto x0 = std::vector<double>{0, 0, 0, 3.4, 0.1, 0.2, 4.3, 0.3, 0.1, 3.1, 1.0, -0.2, 9.6, 2.5, 0.4};
+  for (double Q : {0.0, 1.0, -1.0}) {
+    const LrcCondition cc = lrc_condition(Lc, S, 5, ZG, x0.data(), Q, 10, 1);
+    const LrcCondition cg = lrc_condition(Lg, S, 5, ZG, x0.data(), Q, 10, 1);
+    REQUIRE(cg.cl.s == 2);
+    CHECK(!cg.needs_cond_forces());
+    for (int i = 0; i < 5; i++) {
+      CHECK(cg.row_charge[i] == int(Q));
+      CHECK(cg.blend[i] == 0.0f);
+    }
+    const LrcEnergy ec = lrc_energy(Lc, S, cc, 5, ZG, x0.data(), Q, true), eg = lrc_energy(Lg, S, cg, 5, ZG, x0.data(), Q, true);
+    CHECK(eg.energy == Approx(ec.energy).epsilon(1e-12));
+    for (size_t k = 0; k < ec.forces.size(); k++) CHECK(eg.forces[k] == Approx(ec.forces[k]).margin(1e-12));
+    std::vector<double> G(cg.cl.s, 1.0), F(15, 0.0);
+    lrc_condition_forces(Lg, S, cg, 5, ZG, x0.data(), G, F.data());
+    for (double f : F) CHECK(f == 0.0);
+  }
+}
