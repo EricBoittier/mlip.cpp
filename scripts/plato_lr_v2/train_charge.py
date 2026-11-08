@@ -189,7 +189,12 @@ def main():
     spe = len(tr.rows) // a.batch
     total = spe * a.epochs if not a.max_steps else a.max_steps
     warm = max(1, total // 50)
-    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / warm) * 0.5 * (1 + math.cos(math.pi * min(1.0, s / total))))
+    t_start = time.time()
+
+    def lr_factor(s):  # warmup, then cosine over the steps or the wall-time budget, whichever ends first
+        prog = max(s / total, (time.time() - t_start) / (a.hours * 3600))
+        return min(1.0, (s + 1) / warm) * 0.5 * (1 + math.cos(math.pi * min(1.0, prog)))
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_factor)
     log = open(a.out + "_log.jsonl", "a")
     t0, step = time.time(), 0
     vrows = va.rows[:: max(1, len(va.rows) // 1500)]
