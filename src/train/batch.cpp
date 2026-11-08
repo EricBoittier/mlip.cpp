@@ -5,7 +5,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <future>
+#include <string>
+#include <vector>
 #include <limits>
 #include <numbers>
 #include <numeric>
@@ -248,7 +251,24 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
     if (head >= b.n_heads)
       throw std::runtime_error(fmt::format("{}: structure {} has energy head {}, the model {}", split.dir(), s, head, b.n_heads));
     b.system_head[k] = head;
-    b.energy_mask[k] = split.energy_weight(s);
+    // MLIPCPP_HEAD_LOSS_WEIGHTS="w0,w1,...": per-head loss weight (energy and force terms of the structures labelled
+    // for that head; the batch losses are weight-normalised sums, so this sets the heads' relative weight)
+    static const std::vector<float> head_w = [] {
+      std::vector<float> w;
+      if (const char *e = std::getenv("MLIPCPP_HEAD_LOSS_WEIGHTS"); e && *e) {
+        std::string t(e);
+        for (size_t p = 0; p <= t.size();) {
+          size_t q = t.find(',', p); if (q == std::string::npos) q = t.size();
+          w.push_back(std::stof(t.substr(p, q - p))); p = q + 1;
+        }
+        fmt::print("per-head loss weights (MLIPCPP_HEAD_LOSS_WEIGHTS): {}\n", e);
+      }
+      return w;
+    }();
+    const float hw = head < int(head_w.size()) ? head_w[head] : 1.0f;
+    b.energy_mask[k] = split.energy_weight(s) * hw;
+    if (hw != 1.0f)
+      for (int i = 0; i < ns; i++) b.force_mask[offset + i] *= hw;
     if (b.n_heads > 1)
       for (int i = 0; i < ns; i++) b.head_mask[offset + i] = 0.0f, b.head_mask[size_t(head) * n + offset + i] = 1.0f;
     b.energy_target[k] = static_cast<float>(
