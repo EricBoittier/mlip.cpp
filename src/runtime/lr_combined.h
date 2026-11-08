@@ -105,10 +105,16 @@ struct LrcSpec {
   // integer row exactly), so a small residual charge leaked onto a neutral cluster does not shift its conditioning at
   // any distance; still C2 in the positions. The long-range charges themselves are not rounded.
   double cond_w = 1.0;
-  // graph mode: re-equilibrate the long-range charges within each super-node to its plateaued local charge (cond_w
-  // plateaus; pet.plato_lr.lrc_qplateau), so a small fraction left on a separated neutral cluster by the global Fukui
-  // step is removed and the Coulomb charges agree with the conditioning. Model charges only: no labels, no formal charges.
-  bool qplateau = false;
+  // graph mode, soft charge projection of the long-range charges (pet.plato_lr.lrc_qproj, width lrc_qproj_w; R1q):
+  // per link state of the soft clusters, every group G's charge total Q0_G is moved to the plateau value
+  // P(Q0_G) = k + smootherstep((Q0_G - k - 1/2) / w + 1/2) (k = floor Q0_G; |frac| < (1 - w) / 2 maps onto the integer),
+  // shared within G by Fukui weight; the super-node correction s_a is the expectation over the link states, and the
+  // residual -sum_a s_a is put back with weights F_a (1e-3 + E[P'(Q0_G)]) so sum q = Q exactly:
+  //   q'_i = q_i + f_i / F_a (s_a - S g_a / G),  S = sum s, g_a = F_a (1e-3 + E[P']), G = sum g.
+  // Reduces to the separated-cluster projection with no active link and to the merged one with all links. Model charges
+  // only (no labels); the conditioning is unchanged. Validated offline in rdelta/neutralise (project.py).
+  bool qproj = false;
+  double qproj_w = 0.6;
   bool pol = false;
   std::vector<int32_t> pol_Z;
   std::vector<double> pol_alpha;
@@ -191,6 +197,9 @@ void lrc_moments(const LrcSpec &L, int n, const int32_t *Z, const double *x, std
 /// g [3n] += d(sum_i G_i . mu_i + H_i : Theta_i)/dx, G [3n], H [9n]
 void lrc_moments_vjp(const LrcSpec &L, int n, const int32_t *Z, const double *x, const double *G, const double *H,
                      double *g);
+
+/// lrc_qproj: the projected charges of charges q at positions x (diagnostics / parity with rdelta/neutralise)
+std::vector<double> lrc_project_charges(const LrcSpec &L, int n, const int32_t *Z, const double *x, const double *q);
 
 /// inter-cluster long-range energy and forces (zero, exactly, for a one-cluster structure)
 LrcEnergy lrc_energy(const LrcSpec &L, const SqeSpec &sqe, const LrcCondition &c, int n, const int32_t *Z,

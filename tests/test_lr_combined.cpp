@@ -592,32 +592,26 @@ TEST_CASE("lrc cond_w: plateaus around integer local charge, conditioning forces
   CHECK(err < 1e-6 * std::max(1.0, fmax));
 }
 
-TEST_CASE("lrc qplateau: long-range charges re-equilibrated to the plateaued cluster charge, exact forces", "[lrc]") {
+TEST_CASE("lrc qproj: soft charge projection keeps sum q = Q, separated / merged limits, exact forces", "[lrc]") {
   SqeSpec S = sqe_spec();
   S.lr_R = 10.0, S.lr_t = 2.0;
   for (bool mp : {false, true})
-    for (double w : {0.6, 1.0}) {
+    for (double w : {0.2, 0.6, 1.0}) {
       LrcSpec L = mp ? mp_spec(1.0) : graph_spec();
-      L.qplateau = true, L.cond_w = w;
+      L.qproj = true, L.qproj_w = w, L.a_on = 5.0, L.a_off = 6.0;
+      // Cl- in the link window of the water (partly linked) and 8-10 A from Na+
       const auto x0 = std::vector<double>{0, 0, 0, 3.4, 0.1, 0.2, 4.3, 0.3, 0.1, 3.1, 1.0, -0.2, 9.6, 2.5, 0.4};
-      for (double Q : {0.0, 1.0}) {
+      for (double Q : {0.0, 1.0, -1.0}) {
         auto energy = [&](const std::vector<double> &x) {
           const LrcCondition c = lrc_condition(L, S, 5, ZG, x.data(), Q, 10, 1);
           return lrc_energy(L, S, c, 5, ZG, x.data(), Q, false).energy;
         };
         const LrcCondition c0 = lrc_condition(L, S, 5, ZG, x0.data(), Q, 10, 1);
-        REQUIRE(c0.cl.s == 2);
+        REQUIRE(c0.cl.s >= 2);
         const LrcEnergy e0 = lrc_energy(L, S, c0, 5, ZG, x0.data(), Q, true);
-        // every super-node's total moves by P(L_a) - L_a (= P(Q0_a) once split: R binary)
-        for (int a = 0; a < c0.cl.s; a++) {
-          double La = 0, sum = 0;
-          for (int b = 0; b < c0.cl.s; b++) La += c0.cl.R[size_t(a) * c0.cl.s + b] * c0.Q0[b];
-          for (int i = 0; i < 5; i++)
-            if (c0.cl.sn[i] == a) sum += e0.q[i];
-          const double k = std::floor(La), u = (La - k - 0.5) / w + 0.5;
-          const double P = k + (u <= 0 ? 0 : u >= 1 ? 1 : u * u * u * (u * (u * 6 - 15) + 10));
-          CHECK(sum == Approx(c0.Q0[a] + P - La).margin(1e-12));
-        }
+        double sum = 0;
+        for (double v : e0.q) sum += v;
+        CHECK(sum == Approx(Q).margin(1e-12));
         double fmax = 0, err = 0;
         for (size_t k = 0; k < x0.size(); k++) {
           const double num = -fd(energy, x0, k, 1e-5);
@@ -627,4 +621,39 @@ TEST_CASE("lrc qplateau: long-range charges re-equilibrated to the plateaued clu
         CHECK(err < 1e-6 * std::max(1.0, fmax));
       }
     }
+  // separated limit (no active link): every cluster total on its plateau value, the residual spread by Fukui weight;
+  // a cluster whose charge-pass total is within (1 - w) / 2 of an integer ends on that integer when the others are too
+  {
+    LrcSpec L = graph_spec();
+    L.qproj = true, L.qproj_w = 0.6;
+    const int32_t Zp[] = {11, 8, 1, 1};
+    const std::vector<double> x = {0, 0, 0, 30.0, 0, 0, 30.96, 0, 0, 29.76, 0.93, 0};
+    const LrcCondition c = lrc_condition(L, S, 4, Zp, x.data(), 1.0, 10, 1);
+    REQUIRE(c.cl.s == 2);
+    REQUIRE(c.cl.trivial());
+    const LrcEnergy e = lrc_energy(L, S, c, 4, Zp, x.data(), 1.0, false);
+    double qa = e.q[0], qb = e.q[1] + e.q[2] + e.q[3], qa0 = c.q0.q0[0];
+    INFO("charge pass Na " << qa0 << " -> projected " << qa << ", water " << qb);
+    CHECK(qa + qb == Approx(1.0).margin(1e-12));
+    if (std::abs(qa0 - std::round(qa0)) < 0.2) {
+      CHECK(qa == Approx(std::round(qa0)).margin(1e-9));
+      CHECK(qb == Approx(1.0 - std::round(qa0)).margin(1e-9));
+    }
+  }
+  // permutation invariance: reversing the atom order permutes the projected charges
+  {
+    LrcSpec L = graph_spec();
+    L.qproj = true, L.qproj_w = 0.6, L.a_on = 5.0, L.a_off = 6.0;
+    const auto x0 = std::vector<double>{0, 0, 0, 3.4, 0.1, 0.2, 4.3, 0.3, 0.1, 3.1, 1.0, -0.2, 9.6, 2.5, 0.4};
+    std::vector<double> xr(15);
+    int32_t Zr[5];
+    for (int i = 0; i < 5; i++) {
+      Zr[i] = ZG[4 - i];
+      for (int k = 0; k < 3; k++) xr[3 * i + k] = x0[3 * (4 - i) + k];
+    }
+    const LrcCondition ca = lrc_condition(L, S, 5, ZG, x0.data(), 0.0, 10, 1), cb = lrc_condition(L, S, 5, Zr, xr.data(), 0.0, 10, 1);
+    const LrcEnergy ea = lrc_energy(L, S, ca, 5, ZG, x0.data(), 0.0, false), eb = lrc_energy(L, S, cb, 5, Zr, xr.data(), 0.0, false);
+    CHECK(eb.energy == Approx(ea.energy).epsilon(1e-12));
+    for (int i = 0; i < 5; i++) CHECK(eb.q[i] == Approx(ea.q[4 - i]).margin(1e-12));
+  }
 }

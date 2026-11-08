@@ -125,7 +125,12 @@ LrcSpec LrcSpec::from_gguf(const GGUFLoader &G, const SqeSpec &S) {
     if (cm != "cluster" && cm != "global") throw std::runtime_error("lrc: lrc_cond must be cluster or global");
     L.cond_global = cm == "global";
     scalar("cond_w", L.cond_w);
-    L.qplateau = G.get_int32("pet.plato_lr.lrc_qplateau", 0) != 0;
+    if (G.get_int32("pet.plato_lr.lrc_qplateau", 0) != 0)
+      throw std::runtime_error("lrc_qplateau was removed (it lost sum q = Q and double-counted partly linked partners); "
+                               "use lrc_qproj");
+    L.qproj = G.get_int32("pet.plato_lr.lrc_qproj", 0) != 0;
+    scalar("qproj_w", L.qproj_w);
+    if (L.qproj && !(L.qproj_w > 0 && L.qproj_w <= 1)) throw std::runtime_error("lrc: lrc_qproj_w must be in (0, 1]");
     if (!(L.cond_w > 0 && L.cond_w <= 1)) throw std::runtime_error("lrc: lrc_cond_w must be in (0, 1]");
   }
   if (L.graph) {
@@ -187,7 +192,8 @@ void LrcSpec::to_gguf(gguf_context *g) const {
   gguf_set_val_str(g, "pet.plato_lr.lrc_q0_mode", graph ? "graph" : round ? "round" : head_only ? "head" : "fermi2");
   gguf_set_val_str(g, "pet.plato_lr.lrc_cond", cond_global ? "global" : "cluster");
   scalar("cond_w", cond_w);
-  gguf_set_val_i32(g, "pet.plato_lr.lrc_qplateau", qplateau ? 1 : 0);
+  gguf_set_val_i32(g, "pet.plato_lr.lrc_qproj", qproj ? 1 : 0);
+  scalar("qproj_w", qproj_w);
   auto arr = [&](const char *k, const std::vector<double> &v) {
     gguf_set_arr_data(g, (std::string("pet.plato_lr.lrc_") + k).c_str(), GGUF_TYPE_FLOAT64, v.data(), v.size());
   };
@@ -889,6 +895,108 @@ double pol_alpha(const LrcSpec &L, int z) {
   return 0.0;
 }
 
+// smootherstep and its first two derivatives
+inline double sstep2(double x) { return x <= 0 || x >= 1 ? 0.0 : 60.0 * x * (2.0 * x * x - 3.0 * x + 1.0); }
+// plateau value P(L), P'(L), P''(L) of width w
+inline void plateau(double Lq, double w, double &P, double &dP, double &ddP) {
+  const double k = std::floor(Lq), u = (Lq - k - 0.5) / w + 0.5;
+  P = k + sstep(u), dP = dsstep(u) / w, ddP = sstep2(u) / (w * w);
+}
+
+struct LrcProjection {
+  std::vector<double> q, s, dpb, g, F, Q0;
+  double S = 0, G = 0;
+};
+constexpr double kProjEps = 1e-3;
+
+// visit every group of every link state: cb(prob, group nodes, edges of the component, state, pr, su) (fallback and
+// uncovered super-nodes: one state of probability 1, pr / su empty)
+template <class CB> void proj_groups(const LrcSpec &L, const LrcClusters &c, CB &&cb) {
+  std::vector<char> covered(c.s, 0);
+  static const std::vector<double> none;
+  for (const auto &edges : weak_components(c)) {
+    std::vector<int> nodes;
+    for (int k : edges) nodes.push_back(c.se[k].first), nodes.push_back(c.se[k].second);
+    std::sort(nodes.begin(), nodes.end());
+    nodes.erase(std::unique(nodes.begin(), nodes.end()), nodes.end());
+    for (int a : nodes) covered[a] = 1;
+    if (int(edges.size()) > L.max_super_edges) { // fallback: the component is one cluster
+      cb(1.0, nodes, edges, uint64_t(0), none, none, true);
+      continue;
+    }
+    enumerate(c, edges, [&](uint64_t st, double P, const std::vector<int> &p, const std::vector<int> &nd,
+                            const std::vector<double> &pr, const std::vector<double> &su) {
+      std::vector<int> roots;
+      for (int a : nd) roots.push_back(p[a]);
+      std::sort(roots.begin(), roots.end());
+      roots.erase(std::unique(roots.begin(), roots.end()), roots.end());
+      for (int r : roots) {
+        std::vector<int> grp;
+        for (int a : nd)
+          if (p[a] == r) grp.push_back(a);
+        cb(P, grp, edges, st, pr, su, false);
+      }
+    });
+  }
+  for (int a = 0; a < c.s; a++)
+    if (!covered[a]) cb(1.0, std::vector<int>{a}, std::vector<int>{}, uint64_t(0), none, none, true);
+}
+
+LrcProjection lrc_project(const LrcSpec &L, const LrcClusters &c, int n, const int32_t *Z, const double *q) {
+  LrcProjection o;
+  const int s = c.s;
+  o.Q0.assign(s, 0.0), o.F.assign(s, 0.0), o.s.assign(s, 0.0), o.dpb.assign(s, 0.0), o.g.assign(s, 0.0);
+  for (int i = 0; i < n; i++) o.Q0[c.sn[i]] += q[i], o.F[c.sn[i]] += L.fukui(Z[i]);
+  proj_groups(L, c, [&](double pr, const std::vector<int> &grp, const std::vector<int> &, uint64_t,
+                        const std::vector<double> &, const std::vector<double> &, bool) {
+    double QG = 0, FG = 0, P, dP, ddP;
+    for (int a : grp) QG += o.Q0[a], FG += o.F[a];
+    plateau(QG, L.qproj_w, P, dP, ddP);
+    for (int a : grp) o.s[a] += pr * (P - QG) * o.F[a] / FG, o.dpb[a] += pr * dP;
+  });
+  for (int a = 0; a < s; a++) o.g[a] = o.F[a] * (kProjEps + o.dpb[a]), o.S += o.s[a], o.G += o.g[a];
+  o.q.assign(q, q + n);
+  for (int i = 0; i < n; i++) {
+    const int a = c.sn[i];
+    o.q[i] += L.fukui(Z[i]) / o.F[a] * (o.s[a] - o.S * o.g[a] / o.G);
+  }
+  return o;
+}
+
+// dq: dE/dq' on input, dE/dq on output (q the charge-pass charges); g [3n] += the link-probability part
+void lrc_project_vjp(const LrcSpec &L, const LrcClusters &c, const LrcProjection &o, int n, const int32_t *Z,
+                     const double *x, std::vector<double> &dq, double *g) {
+  const int s = c.s;
+  std::vector<double> h(s, 0.0), Ds(s), Dg(s), dQ0(s, 0.0), dp(c.se.size(), 0.0);
+  for (int i = 0; i < n; i++) h[c.sn[i]] += dq[i] * L.fukui(Z[i]) / o.F[c.sn[i]];
+  double Hb = 0;
+  for (int a = 0; a < s; a++) Hb += h[a] * o.g[a];
+  Hb /= o.G;
+  for (int a = 0; a < s; a++) Ds[a] = h[a] - Hb, Dg[a] = -(o.S / o.G) * (h[a] - Hb);
+  proj_groups(L, c, [&](double pr, const std::vector<int> &grp, const std::vector<int> &edges, uint64_t st,
+                        const std::vector<double> &prk, const std::vector<double> &suk, bool single) {
+    double QG = 0, FG = 0, P, dP, ddP, A = 0, B = 0;
+    for (int a : grp) QG += o.Q0[a], FG += o.F[a];
+    plateau(QG, L.qproj_w, P, dP, ddP);
+    for (int a : grp) A += Ds[a] * o.F[a] / FG, B += Dg[a] * o.F[a];
+    for (int a : grp) dQ0[a] += pr * (A * (dP - 1.0) + B * ddP);
+    if (single) return;
+    const double V = A * (P - QG) + B * dP; // this group's term per unit state probability
+    const int m = static_cast<int>(edges.size());
+    for (int k = 0; k < m; k++) dp[edges[k]] += V * prk[k] * suk[k + 1] * (((st >> k) & 1) ? 1.0 : -1.0);
+  });
+  for (int i = 0; i < n; i++) dq[i] += dQ0[c.sn[i]];
+  // p = 1 - prod (1 - A): dp/dA_w = prod over the other links (1 - A)
+  for (size_t w = 0; w < c.weak.size(); w++) {
+    const auto &wk = c.weak[w];
+    if (dp[wk.e] == 0 || wk.dA == 0) continue;
+    double others = 1.0;
+    for (size_t v = 0; v < c.weak.size(); v++)
+      if (v != w && c.weak[v].e == wk.e) others *= 1.0 - c.weak[v].A;
+    add_pair(g, x, wk.i, wk.j, dist(x, wk.i, wk.j), dp[wk.e] * others * wk.dA);
+  }
+}
+
 LrcEnergy energy_fixed(const LrcSpec &L, const SqeSpec &S, const LrcCondition &c, int n, const int32_t *Z,
                        const double *x, bool forces) {
   constexpr double KE = 14.399645;
@@ -899,40 +1007,15 @@ LrcEnergy energy_fixed(const LrcSpec &L, const SqeSpec &S, const LrcCondition &c
   const double r0 = S.lr_R - S.lr_t;
   std::vector<double> g(3 * size_t(n), 0.0), dq(n, 0.0), W(size_t(s) * s, 0.0);
   const double *q = c.q0.q0.data();
-  // lrc_qplateau: the long-range charges re-equilibrated within each super-node a to the plateaued local charge P(L_a),
-  // L_a = sum_b R_ab Q0_b (the conditioning's Q_loc), with the element Fukui weights:
-  //   q'_i = q_i + f_i / F_a (P(L_a) - L_a),  F_a = sum_{j in a} f_j
-  // so a cluster whose charge pass leaves a small fraction (|frac| < (1 - cond_w) / 2) gets exactly the integer, and the
-  // Coulomb charges agree with the conditioning. Smooth in R (P is C2, R_ab smooth). The total is sum_a P(L_a), which
-  // equals Q whenever every cluster sits on a plateau (not for fractional, CT-ambiguous splits).
-  std::vector<double> qp, Lp, dPm1, Fsum;
-  if (L.qplateau) {
-    Lp.assign(s, 0.0), dPm1.assign(s, 0.0), Fsum.assign(s, 0.0);
-    for (int a = 0; a < s; a++)
-      for (int b = 0; b < s; b++) Lp[a] += c.cl.R[size_t(a) * s + b] * c.Q0[b];
-    for (int i = 0; i < n; i++) Fsum[c.cl.sn[i]] += L.fukui(Z[i]);
-    std::vector<double> shift(s);
-    for (int a = 0; a < s; a++) {
-      const double k = std::floor(Lp[a]), u = (Lp[a] - k - 0.5) / L.cond_w + 0.5;
-      shift[a] = k + sstep(u) - Lp[a], dPm1[a] = dsstep(u) / L.cond_w - 1.0;
-    }
-    qp.assign(q, q + n);
-    for (int i = 0; i < n; i++) qp[i] += L.fukui(Z[i]) / Fsum[c.cl.sn[i]] * shift[c.cl.sn[i]];
-    q = qp.data(), out.q = qp;
+  LrcProjection proj;
+  std::vector<double> qp;
+  if (L.qproj) {
+    proj = lrc_project(L, c.cl, n, Z, q);
+    qp = proj.q, q = qp.data(), out.q = qp;
   }
-  // dE/dq' (dq) -> dE/dq of the charge pass, and the reliability part of the re-equilibration into W
+  // dE/dq' (dq) -> dE/dq of the charge pass, and the link-state part of the projection into the position gradient
   auto unplateau = [&]() {
-    if (!L.qplateau) return;
-    std::vector<double> h(s, 0.0);
-    for (int i = 0; i < n; i++) h[c.cl.sn[i]] += dq[i] * L.fukui(Z[i]) / Fsum[c.cl.sn[i]];
-    for (int a = 0; a < s; a++) h[a] *= dPm1[a];
-    std::vector<double> hb(s, 0.0);
-    for (int a = 0; a < s; a++)
-      for (int b = 0; b < s; b++) {
-        hb[b] += h[a] * c.cl.R[size_t(a) * s + b];
-        if (a != b) W[size_t(a) * s + b] += h[a] * c.Q0[b];
-      }
-    for (int i = 0; i < n; i++) dq[i] += hb[c.cl.sn[i]];
+    if (L.qproj) lrc_project_vjp(L, c.cl, proj, n, Z, x, dq, g.data());
   };
   // the switched inter-cluster pairs: (i, j, R, T, dT/dR, m = 1 - R_ab)
   struct P {
@@ -1080,6 +1163,11 @@ LrcEnergy energy_fixed(const LrcSpec &L, const SqeSpec &S, const LrcCondition &c
   return out;
 }
 } // namespace
+
+std::vector<double> lrc_project_charges(const LrcSpec &L, int n, const int32_t *Z, const double *x, const double *q) {
+  const LrcClusters c = lrc_clusters(L, n, x);
+  return lrc_project(L, c, n, Z, q).q;
+}
 
 LrcEnergy lrc_energy(const LrcSpec &L, const SqeSpec &S, const LrcCondition &c, int n, const int32_t *Z,
                      const double *x, double Q, bool forces) {
