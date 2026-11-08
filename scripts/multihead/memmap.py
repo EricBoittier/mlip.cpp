@@ -15,7 +15,9 @@ class SplitWriter:
         os.makedirs(out_dir, exist_ok=True)
         self.dir, self.heads = out_dir, heads
         self.f = {n: open(os.path.join(out_dir, n), "wb") for n in self.FILES if heads or n not in ("head.bin", "energy_weight.bin")}
-        self.extra = {n: open(os.path.join(out_dir, n), "wb") for n in extra}  # name -> raw float32 per structure rows
+        # extra float32 files: "name.bin" written by add(..., name=values) / add_block(..., name=values)
+        self.extra = {n.removesuffix(".bin"): open(os.path.join(out_dir, n if n.endswith(".bin") else n + ".bin"), "wb")
+                      for n in extra}
         self.na = [0]
 
     def add(self, Z, R, F, E, charge=0, spin=1, head=0, energy_weight=1.0, cell=None, **extra):
