@@ -125,6 +125,7 @@ LrcSpec LrcSpec::from_gguf(const GGUFLoader &G, const SqeSpec &S) {
     if (cm != "cluster" && cm != "global") throw std::runtime_error("lrc: lrc_cond must be cluster or global");
     L.cond_global = cm == "global";
     scalar("cond_w", L.cond_w);
+    L.qplateau = G.get_int32("pet.plato_lr.lrc_qplateau", 0) != 0;
     if (!(L.cond_w > 0 && L.cond_w <= 1)) throw std::runtime_error("lrc: lrc_cond_w must be in (0, 1]");
   }
   if (L.graph) {
@@ -186,6 +187,7 @@ void LrcSpec::to_gguf(gguf_context *g) const {
   gguf_set_val_str(g, "pet.plato_lr.lrc_q0_mode", graph ? "graph" : round ? "round" : head_only ? "head" : "fermi2");
   gguf_set_val_str(g, "pet.plato_lr.lrc_cond", cond_global ? "global" : "cluster");
   scalar("cond_w", cond_w);
+  gguf_set_val_i32(g, "pet.plato_lr.lrc_qplateau", qplateau ? 1 : 0);
   auto arr = [&](const char *k, const std::vector<double> &v) {
     gguf_set_arr_data(g, (std::string("pet.plato_lr.lrc_") + k).c_str(), GGUF_TYPE_FLOAT64, v.data(), v.size());
   };
@@ -897,6 +899,41 @@ LrcEnergy energy_fixed(const LrcSpec &L, const SqeSpec &S, const LrcCondition &c
   const double r0 = S.lr_R - S.lr_t;
   std::vector<double> g(3 * size_t(n), 0.0), dq(n, 0.0), W(size_t(s) * s, 0.0);
   const double *q = c.q0.q0.data();
+  // lrc_qplateau: the long-range charges re-equilibrated within each super-node a to the plateaued local charge P(L_a),
+  // L_a = sum_b R_ab Q0_b (the conditioning's Q_loc), with the element Fukui weights:
+  //   q'_i = q_i + f_i / F_a (P(L_a) - L_a),  F_a = sum_{j in a} f_j
+  // so a cluster whose charge pass leaves a small fraction (|frac| < (1 - cond_w) / 2) gets exactly the integer, and the
+  // Coulomb charges agree with the conditioning. Smooth in R (P is C2, R_ab smooth). The total is sum_a P(L_a), which
+  // equals Q whenever every cluster sits on a plateau (not for fractional, CT-ambiguous splits).
+  std::vector<double> qp, Lp, dPm1, Fsum;
+  if (L.qplateau) {
+    Lp.assign(s, 0.0), dPm1.assign(s, 0.0), Fsum.assign(s, 0.0);
+    for (int a = 0; a < s; a++)
+      for (int b = 0; b < s; b++) Lp[a] += c.cl.R[size_t(a) * s + b] * c.Q0[b];
+    for (int i = 0; i < n; i++) Fsum[c.cl.sn[i]] += L.fukui(Z[i]);
+    std::vector<double> shift(s);
+    for (int a = 0; a < s; a++) {
+      const double k = std::floor(Lp[a]), u = (Lp[a] - k - 0.5) / L.cond_w + 0.5;
+      shift[a] = k + sstep(u) - Lp[a], dPm1[a] = dsstep(u) / L.cond_w - 1.0;
+    }
+    qp.assign(q, q + n);
+    for (int i = 0; i < n; i++) qp[i] += L.fukui(Z[i]) / Fsum[c.cl.sn[i]] * shift[c.cl.sn[i]];
+    q = qp.data(), out.q = qp;
+  }
+  // dE/dq' (dq) -> dE/dq of the charge pass, and the reliability part of the re-equilibration into W
+  auto unplateau = [&]() {
+    if (!L.qplateau) return;
+    std::vector<double> h(s, 0.0);
+    for (int i = 0; i < n; i++) h[c.cl.sn[i]] += dq[i] * L.fukui(Z[i]) / Fsum[c.cl.sn[i]];
+    for (int a = 0; a < s; a++) h[a] *= dPm1[a];
+    std::vector<double> hb(s, 0.0);
+    for (int a = 0; a < s; a++)
+      for (int b = 0; b < s; b++) {
+        hb[b] += h[a] * c.cl.R[size_t(a) * s + b];
+        if (a != b) W[size_t(a) * s + b] += h[a] * c.Q0[b];
+      }
+    for (int i = 0; i < n; i++) dq[i] += hb[c.cl.sn[i]];
+  };
   // the switched inter-cluster pairs: (i, j, R, T, dT/dR, m = 1 - R_ab)
   struct P {
     int i, j;
@@ -1012,6 +1049,7 @@ LrcEnergy energy_fixed(const LrcSpec &L, const SqeSpec &S, const LrcCondition &c
     }
     if (!forces) return out;
     if (L.mp) lrc_moments_vjp(L, n, Z, x, Gm.data(), Hm.data(), g.data());
+    unplateau();
     lrc_clusters_vjp(L, c.cl, n, x, W, g.data());
     lrc_q0_vjp(L, S, n, Z, x, c.q0, dq.data(), g.data());
     for (size_t k = 0; k < g.size(); k++) out.forces[k] = -g[k];
@@ -1035,6 +1073,7 @@ LrcEnergy energy_fixed(const LrcSpec &L, const SqeSpec &S, const LrcCondition &c
       W[size_t(a) * s + b] -= 0.5 * e * T, W[size_t(b) * s + a] -= 0.5 * e * T;
     }
   if (!forces) return out;
+  unplateau();
   lrc_clusters_vjp(L, c.cl, n, x, W, g.data());
   lrc_q0_vjp(L, S, n, Z, x, c.q0, dq.data(), g.data());
   for (size_t k = 0; k < g.size(); k++) out.forces[k] = -g[k];

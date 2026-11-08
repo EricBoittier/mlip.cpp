@@ -36,6 +36,7 @@ def main():
     ap.add_argument("--cond", choices=["cluster", "global"], default="cluster",
                     help="backbone conditioning: per smooth cluster (Q_loc) or the structure's Q for every atom")
     ap.add_argument("--cond-w", type=float, default=1.0, help="blend width of the Q_loc rows (< 1: plateaus at integers)")
+    ap.add_argument("--qplateau", action="store_true", help="graph: long-range charges re-equilibrated per cluster to the plateaued local charge")
     a = ap.parse_args()
     sp = {"T": 0.25, "D": 5.0}
     if a.mode == "fermi2":
@@ -70,6 +71,7 @@ def main():
         new[f"{P}_{k}"] = enc(f"{P}_{k}") + struct.pack("<Id", 12, float(v))
     new[f"{P}_q0_mode"] = enc(f"{P}_q0_mode") + struct.pack("<I", 8) + enc(a.mode)
     new[f"{P}_cond"] = enc(f"{P}_cond") + struct.pack("<I", 8) + enc(a.cond)
+    new[f"{P}_qplateau"] = enc(f"{P}_qplateau") + struct.pack("<Ii", 5, 1 if a.qplateau else 0)
     drop = set()
     if a.mode == "graph":
         if not a.qmodel or not a.fukui: raise SystemExit("--mode graph needs --qmodel and --fukui")

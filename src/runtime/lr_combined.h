@@ -105,6 +105,10 @@ struct LrcSpec {
   // integer row exactly), so a small residual charge leaked onto a neutral cluster does not shift its conditioning at
   // any distance; still C2 in the positions. The long-range charges themselves are not rounded.
   double cond_w = 1.0;
+  // graph mode: re-equilibrate the long-range charges within each super-node to its plateaued local charge (cond_w
+  // plateaus; pet.plato_lr.lrc_qplateau), so a small fraction left on a separated neutral cluster by the global Fukui
+  // step is removed and the Coulomb charges agree with the conditioning. Model charges only: no labels, no formal charges.
+  bool qplateau = false;
   bool pol = false;
   std::vector<int32_t> pol_Z;
   std::vector<double> pol_alpha;

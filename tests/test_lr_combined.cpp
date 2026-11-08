@@ -591,3 +591,40 @@ TEST_CASE("lrc cond_w: plateaus around integer local charge, conditioning forces
   INFO("cond_w conditioning force: max |F| " << fmax << ", max error " << err);
   CHECK(err < 1e-6 * std::max(1.0, fmax));
 }
+
+TEST_CASE("lrc qplateau: long-range charges re-equilibrated to the plateaued cluster charge, exact forces", "[lrc]") {
+  SqeSpec S = sqe_spec();
+  S.lr_R = 10.0, S.lr_t = 2.0;
+  for (bool mp : {false, true})
+    for (double w : {0.6, 1.0}) {
+      LrcSpec L = mp ? mp_spec(1.0) : graph_spec();
+      L.qplateau = true, L.cond_w = w;
+      const auto x0 = std::vector<double>{0, 0, 0, 3.4, 0.1, 0.2, 4.3, 0.3, 0.1, 3.1, 1.0, -0.2, 9.6, 2.5, 0.4};
+      for (double Q : {0.0, 1.0}) {
+        auto energy = [&](const std::vector<double> &x) {
+          const LrcCondition c = lrc_condition(L, S, 5, ZG, x.data(), Q, 10, 1);
+          return lrc_energy(L, S, c, 5, ZG, x.data(), Q, false).energy;
+        };
+        const LrcCondition c0 = lrc_condition(L, S, 5, ZG, x0.data(), Q, 10, 1);
+        REQUIRE(c0.cl.s == 2);
+        const LrcEnergy e0 = lrc_energy(L, S, c0, 5, ZG, x0.data(), Q, true);
+        // every super-node's total moves by P(L_a) - L_a (= P(Q0_a) once split: R binary)
+        for (int a = 0; a < c0.cl.s; a++) {
+          double La = 0, sum = 0;
+          for (int b = 0; b < c0.cl.s; b++) La += c0.cl.R[size_t(a) * c0.cl.s + b] * c0.Q0[b];
+          for (int i = 0; i < 5; i++)
+            if (c0.cl.sn[i] == a) sum += e0.q[i];
+          const double k = std::floor(La), u = (La - k - 0.5) / w + 0.5;
+          const double P = k + (u <= 0 ? 0 : u >= 1 ? 1 : u * u * u * (u * (u * 6 - 15) + 10));
+          CHECK(sum == Approx(c0.Q0[a] + P - La).margin(1e-12));
+        }
+        double fmax = 0, err = 0;
+        for (size_t k = 0; k < x0.size(); k++) {
+          const double num = -fd(energy, x0, k, 1e-5);
+          fmax = std::max(fmax, std::abs(num)), err = std::max(err, std::abs(num - e0.forces[k]));
+        }
+        INFO("mp " << mp << " w " << w << " Q " << Q << ": max |F| " << fmax << ", max error " << err);
+        CHECK(err < 1e-6 * std::max(1.0, fmax));
+      }
+    }
+}
