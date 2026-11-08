@@ -20,7 +20,10 @@ On top of that it provides:
   from per-atom energies of a `make_delta_gguf.py` copy of the force model, and the observable is the scaled-bead
   shielding. Three variants are accumulated online: `fep` (exact reweighting), `cumulant` (second-order: no
   exponential weights) and `scaling` (bead contraction only, exact for harmonic modes). The weights assume a
-  Boltzmann-sampled P-bead path integral (PILE, not PIGLET).
+  Boltzmann-sampled P-bead path integral (PILE, not PIGLET). `m_from`/`m_to` set the direction (e.g. 2.0141 → 1.00794
+  expands the D beads of a deuterated run). `est_units: each` substitutes every H on its own; a list such as
+  `1/1.00794/2.0141; 0/2.0141/1.00794` treats the k-th H on each carbon as its own class with its own masses, which
+  gives both steps of CH₂Cl₂ → CHDCl₂ → CD₂Cl₂ from one CHDCl₂ run.
 - `<out>_frames.npz`: reduced per-frame arrays, such as bead-averaged σ per member, σ̃, ln w and H geometry
   descriptors. These are a few kB per frame instead of the bead trajectories.
 
