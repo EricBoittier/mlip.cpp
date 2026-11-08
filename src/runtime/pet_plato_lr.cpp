@@ -90,6 +90,7 @@ PetPlatoLRSpec PetPlatoLRSpec::from_gguf(const GGUFLoader &L) {
   s.frag.scale = L.get_float32("pet.plato_lr.frag_scale", 1.0f);
   s.frag.cond_gate = L.get_int32("pet.plato_lr.frag_cond_gate", 0) != 0;
   s.sqe = SqeSpec::from_gguf(L);
+  s.lrc = LrcSpec::from_gguf(L, s.sqe);
   if (s.les_method != "ewald" && s.les_method != "pme" && s.les_method != "auto")
     throw std::runtime_error("Plato-PET-LR: les_method must be ewald, pme or auto, not " + s.les_method);
   return s;

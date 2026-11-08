@@ -290,6 +290,12 @@ private:
   // fragment-constrained charges (plato_lr_.frag): during a call on an open structure with formal
   // charges, the per-atom conditioning charge (its bonded unit's charge); empty otherwise
   std::vector<int32_t> frag_cond_;
+  // combined model (pet.plato_lr.lrc): the upper rows' charges (input charge_index_unit) and the per-atom blend
+  // (input cond_blend) of the local-charge conditioning; empty: the structure's charge, blend 0
+  std::vector<int32_t> lrc_hi_;
+  std::vector<float> lrc_blend_;
+  ModelResult predict_single_lrc(const AtomicSystem &system, bool compute_forces,
+                                 const std::function<void()> &post_compute_hook, std::vector<float> *parameter_gradients);
   /// the conditioning table rows of every atom (frag_cond_ or the structure's charge)
   /// (unit: the rows of the input charge_index_unit of a frag_cond_gate model)
   std::vector<int32_t> charge_rows(int n_atoms, int charge, int spin_multiplicity, bool unit = false) const;

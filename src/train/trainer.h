@@ -245,6 +245,16 @@ public:
   // split-charge equilibration: the shared spec (updated between steps) and this worker's gradient
   // accumulator (summed over its micro-batches); sqe_energy_sum: sum of the SQE energies seen (eV), for the log
   const runtime::SqeSpec *sqe = nullptr;
+  // combined long-range model (runtime/lr_combined.h; frozen charge model): the spec and its SQE spec; per batch the
+  // conditioning of every real structure, the local-charge rows / blend of every atom and the term's energies / forces
+  const runtime::LrcSpec *lrc = nullptr;
+  const runtime::SqeSpec *lrc_sqe = nullptr;
+  const void *lrc_batch_ = nullptr;
+  std::vector<int32_t> lrc_lo_, lrc_hi_;
+  std::vector<float> lrc_blend_;
+  std::vector<double> lrc_e_, lrc_f_;
+  int64_t lrc_multi = 0, lrc_transition = 0, lrc_seen = 0, lrc_fallback = 0; // >1 cluster / nonzero dS / all / fallback
+  void lrc_prepare(const Batch &b, bool forces);
   std::vector<double> sqe_grad;
   double sqe_abs_energy = 0;
   int64_t sqe_n = 0;

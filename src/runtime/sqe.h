@@ -72,6 +72,16 @@ struct SqeOutput {
   std::vector<double> q0;     // reference charges (given or learned)
   double q0_loss = 0;         // sqe_train_grad with supervision: weight * mean over units of (sum q0 - Q_u)^2
   int cg_iters = 0;
+  std::vector<double> dE_dq0; // dE/dq0_i at fixed geometry (given q0): mu_i (lr_R: the difference of the two minima)
+  std::vector<double> dE_dR;  // sqe_compute_masked: dE/dR_ab (s x s, split evenly over ab and ba)
+};
+
+/// cluster mask of the long-range-only energy: the local functional uses gamma (1 - T(r) (1 - R_{sn_i sn_j})), so only
+/// pairs in different clusters (R < 1) contribute beyond lr_R (runtime/lr_combined.h)
+struct SqeClusterMask {
+  const int32_t *sn = nullptr; // super-node per atom
+  int s = 0;
+  const double *R = nullptr; // s x s
 };
 
 /// one structure. x [3n] A (float or double via the overloads), Z atomic numbers, Q total charge, q0 per-atom reference
@@ -80,6 +90,11 @@ SqeOutput sqe_compute(const SqeSpec &spec, int n, const int32_t *Z, const double
                       bool forces, const double *cell = nullptr);
 SqeOutput sqe_compute(const SqeSpec &spec, int n, const int32_t *Z, const float *x, double Q, const double *q0,
                       bool forces, const double *cell = nullptr);
+
+/// lr_R > 0 required: E*(gamma) - E*(gamma (1 - T (1 - R))) with the given q0 (not learned); Hellmann-Feynman forces at
+/// fixed q0 and R, plus dE_dq0 and dE_dR for the caller's chain rules. Inference / frozen use only.
+SqeOutput sqe_compute_masked(const SqeSpec &spec, int n, const int32_t *Z, const double *x, double Q, const double *q0,
+                             bool forces, const SqeClusterMask &mask);
 
 /// optional supervision of a learned q0 (training only): unit index per atom (0..n_units-1), the units' integer
 /// charges, the loss weight, and `scale` (the loss normalisation, e.g. 1 / structures of the step) on the gradient

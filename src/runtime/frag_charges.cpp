@@ -140,4 +140,16 @@ void install_frag_cond_gate(GraphInterpreter &interp) {
   };
 }
 
+void install_lrc_blend(GraphInterpreter &interp, ggml_tensor *blend) {
+  interp.post_node = [&interp, blend](ggml_context *ctx, const GIRNode &node, ggml_tensor *out) -> ggml_tensor * {
+    if (node.op != "LINEAR") return out;
+    bool proj = false;
+    for (const auto &r : node.inputs) proj |= r == "weight:system_conditioning_project_2_weight";
+    if (!proj) return out;
+    if (ggml_nelements(blend) != out->ne[1]) throw std::runtime_error("lrc blend: atom count != conditioning rows");
+    ggml_tensor *cu = interp.rebuild_substituted(ctx, node.id, "input:charge_index", "input:charge_index_unit");
+    return ggml_add(ctx, out, ggml_mul(ctx, ggml_sub(ctx, cu, out), ggml_reshape_2d(ctx, blend, 1, out->ne[1])));
+  };
+}
+
 } // namespace mlipcpp::runtime

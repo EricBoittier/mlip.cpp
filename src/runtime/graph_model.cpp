@@ -612,6 +612,14 @@ ModelResult GraphModel::predict_with_parameter_gradients(
 std::vector<int32_t> GraphModel::charge_rows(int n_atoms, int charge, int spin_multiplicity, bool unit) const {
   const int32_t ci = conditioning_.rows(charge, spin_multiplicity).first;
   std::vector<int32_t> c(n_atoms, ci);
+  if (plato_lr_.lrc.enabled) { // lower rows (frag_cond_) / upper rows (lrc_hi_) of the local-charge blend
+    const std::vector<int32_t> &src = unit ? lrc_hi_ : frag_cond_;
+    if (!src.empty()) {
+      if (src.size() != static_cast<size_t>(n_atoms)) throw std::logic_error("lrc: atom count");
+      for (int i = 0; i < n_atoms; i++) c[i] = conditioning_.rows(src[i], spin_multiplicity).first;
+    }
+    return c;
+  }
   // gated: charge_index keeps the structure's row, charge_index_unit gets the units' rows
   if (!frag_cond_.empty() && unit == plato_lr_.frag.cond_gate) {
     if (frag_cond_.size() != static_cast<size_t>(n_atoms)) throw std::logic_error("frag_charges: atom count");
@@ -631,6 +639,8 @@ ModelResult GraphModel::predict_single(
     const AtomicSystem &system, bool compute_forces,
     const std::function<void()> &post_compute_hook,
     std::vector<float> *parameter_gradients) {
+  if (plato_lr_.lrc.enabled && system.num_atoms() > 0)
+    return predict_single_lrc(system, compute_forces, post_compute_hook, parameter_gradients);
   const SqeSpec &sq = plato_lr_.sqe;
   if (!sq.enabled || system.num_atoms() == 0)
     return predict_single_frag(system, compute_forces, post_compute_hook, parameter_gradients);
@@ -657,6 +667,58 @@ ModelResult GraphModel::predict_single(
   if (compute_forces && r.forces.size() == s.forces.size())
     for (size_t k = 0; k < s.forces.size(); k++) r.forces[k] = static_cast<float>(double(r.forces[k]) + s.forces[k]);
   r.sqe_charges.assign(s.q.begin(), s.q.end());
+  return r;
+}
+
+// Combined long-range model (runtime/lr_combined.h): every atom conditioned on its smooth cluster's charge (blend of two
+// table rows), plus the inter-cluster SQE long-range energy. A one-cluster structure is the plain model (global charge,
+// no term). Forces: the graph's at fixed conditioning, the long-range term's (Hellmann-Feynman + q0 and cluster chain
+// rules), and the conditioning's position dependence with dE/dS per super-node from central differences of the graph
+// energy in S (h = 0.05; only for structures inside a cluster transition or with a fractional cluster charge).
+ModelResult GraphModel::predict_single_lrc(const AtomicSystem &system, bool compute_forces,
+                                           const std::function<void()> &post_compute_hook,
+                                           std::vector<float> *parameter_gradients) {
+  const LrcSpec &L = plato_lr_.lrc;
+  const SqeSpec &sq = plato_lr_.sqe;
+  bool periodic = false;
+  if (const Cell *c = system.cell()) periodic = c->periodic[0] || c->periodic[1] || c->periodic[2];
+  if (periodic) throw std::runtime_error("lrc: periodic structures are not implemented");
+  const int n = system.num_atoms();
+  std::vector<double> x(system.positions(), system.positions() + 3 * size_t(n));
+  const LrcCondition cond = lrc_condition(L, sq, n, system.atomic_numbers(), x.data(), double(system.charge()),
+                                          conditioning_.max_charge);
+  struct Reset {
+    GraphModel &m;
+    ~Reset() { m.frag_cond_.clear(), m.lrc_hi_.clear(), m.lrc_blend_.clear(); }
+  } reset{*this};
+  if (cond.cl.s > 1) frag_cond_ = cond.row_charge, lrc_hi_ = cond.row_charge_hi, lrc_blend_ = cond.blend;
+  ModelResult r = predict_single_impl(system, compute_forces, post_compute_hook, parameter_gradients);
+  if (cond.cl.s == 1) return r;
+  const LrcEnergy le = lrc_energy(L, sq, cond, n, system.atomic_numbers(), x.data(), double(system.charge()),
+                                  compute_forces);
+  r.energy = static_cast<float>(double(r.energy) + le.energy);
+  r.sqe_charges.assign(le.q.begin(), le.q.end());
+  if (!compute_forces || r.forces.size() != le.forces.size()) return r;
+  std::vector<double> F(le.forces);
+  if (cond.needs_cond_forces()) {
+    const double h = 5e-2; // E is smooth in S; float32 energies: noise ~1e-5 eV / 2h
+    std::vector<double> G(cond.cl.s, 0.0);
+    const std::vector<float> base = cond.blend;
+    for (int a = 0; a < cond.cl.s; a++) {
+      if (cond.dS[a] == 0) continue;
+      double Epm[2];
+      for (int sgn = 0; sgn < 2; sgn++) {
+        lrc_blend_ = base;
+        for (int i = 0; i < n; i++)
+          if (cond.cl.sn[i] == a) lrc_blend_[i] = static_cast<float>(cond.S[a] + (sgn ? -h : h));
+        Epm[sgn] = predict_single_impl(system, false, nullptr, nullptr).energy;
+      }
+      G[a] = (Epm[0] - Epm[1]) / (2 * h);
+    }
+    lrc_blend_ = base;
+    lrc_condition_forces(L, sq, cond, n, system.atomic_numbers(), x.data(), G, F.data());
+  }
+  for (size_t k = 0; k < F.size(); k++) r.forces[k] = static_cast<float>(double(r.forces[k]) + F[k]);
   return r;
 }
 
@@ -959,9 +1021,14 @@ ModelResult GraphModel::predict_single_impl(
 
   // charge / spin conditioning: the table rows of the structure, per atom
   ggml_tensor *charge_index_t = nullptr, *spin_index_t = nullptr, *charge_index_unit_t = nullptr;
-  if (conditioning_.enabled && plato_lr_.frag.cond_gate) {
+  ggml_tensor *cond_blend_t = nullptr;
+  if (conditioning_.enabled && (plato_lr_.frag.cond_gate || plato_lr_.lrc.enabled)) {
     charge_index_unit_t = ggml_new_tensor_1d(input_ctx, GGML_TYPE_I32, n_atoms);
     ggml_set_name(charge_index_unit_t, "charge_index_unit");
+  }
+  if (conditioning_.enabled && plato_lr_.lrc.enabled) {
+    cond_blend_t = ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, n_atoms);
+    ggml_set_name(cond_blend_t, "cond_blend");
   }
   if (conditioning_.enabled) {
     charge_index_t = ggml_new_tensor_1d(input_ctx, GGML_TYPE_I32, n_atoms);
@@ -1156,7 +1223,15 @@ ModelResult GraphModel::predict_single_impl(
       const std::vector<int32_t> cu = charge_rows(n_atoms, system.charge(), system.spin_multiplicity(), true);
       ggml_backend_tensor_set(charge_index_unit_t, cu.data(), 0, cu.size() * sizeof(int32_t));
       interp_.set_input("charge_index_unit", charge_index_unit_t);
-      install_frag_cond_gate(interp_);
+      if (cond_blend_t) {
+        std::vector<float> bl(n_atoms, 0.0f);
+        if (!lrc_blend_.empty()) bl = lrc_blend_;
+        ggml_backend_tensor_set(cond_blend_t, bl.data(), 0, bl.size() * sizeof(float));
+        interp_.set_input("cond_blend", cond_blend_t);
+        install_lrc_blend(interp_, cond_blend_t);
+      } else {
+        install_frag_cond_gate(interp_);
+      }
     }
   }
 
