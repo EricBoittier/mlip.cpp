@@ -91,6 +91,14 @@ struct LrcSpec {
   std::vector<double> mp_theta, mp_tau; // E x E x K (row: the centre atom's element)
   std::vector<int> mp_index;           // atomic number -> index into mp_Z (-1: none), built by from_gguf / mp_build
   void mp_build();
+  // graph mode, induced atomic dipoles (pet.plato_lr.lrc_pol*): additive isotropic polarisabilities per element (A^3,
+  // prefitted to DFT CPHF monomer polarisabilities), responding to the switched field of the OTHER clusters' charges and
+  // to each other's dipoles across clusters (no intra-cluster coupling: that is the short-range model's),
+  //   (alpha^-1 - T) mu = F0,  E_pol = -1/2 KE mu . F0,  forces Hellmann-Feynman (+ charge-pass VJP, switch, clusters).
+  // Thole damping is not needed: every coupled pair is beyond lr_R - lr_t (8 A).
+  bool pol = false;
+  std::vector<int32_t> pol_Z;
+  std::vector<double> pol_alpha;
   static LrcSpec from_gguf(const GGUFLoader &L, const SqeSpec &sqe);
   void to_gguf(gguf_context *g) const;
 };
@@ -139,6 +147,7 @@ struct LrcCondition {
 struct LrcEnergy {
   double energy = 0;
   std::vector<double> forces, q, q0;
+  std::vector<double> mu_ind; // lrc_pol: induced dipoles [3n] (e A)
 };
 
 int lrc_index(const SqeSpec &sqe, int z); // element index, throws when absent

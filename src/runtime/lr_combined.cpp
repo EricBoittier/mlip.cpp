@@ -141,6 +141,13 @@ LrcSpec LrcSpec::from_gguf(const GGUFLoader &G, const SqeSpec &S) {
       L.mp_theta = get_f64(G, "pet.plato_lr.lrc_mp_theta"), L.mp_tau = get_f64(G, "pet.plato_lr.lrc_mp_tau");
       L.mp_build();
     }
+    L.pol = G.get_int32("pet.plato_lr.lrc_pol", 0) != 0;
+    if (L.pol) {
+      for (double v : get_f64(G, "pet.plato_lr.lrc_pol_Z")) L.pol_Z.push_back(static_cast<int32_t>(std::lround(v)));
+      L.pol_alpha = get_f64(G, "pet.plato_lr.lrc_pol_alpha");
+      if (L.pol_Z.empty() || L.pol_Z.size() != L.pol_alpha.size())
+        throw std::runtime_error("lrc pol: needs lrc_pol_Z and lrc_pol_alpha of equal length");
+    }
     return L;
   }
   const size_t E = S.Z.size();
@@ -183,6 +190,11 @@ void LrcSpec::to_gguf(gguf_context *g) const {
       scalar("mp_rc", mp_rc), scalar("mp_width", mp_width);
       std::vector<double> mz(mp_Z.begin(), mp_Z.end());
       arr("mp_centers", mp_centers), arr("mp_Z", mz), arr("mp_theta", mp_theta), arr("mp_tau", mp_tau);
+    }
+    if (pol) {
+      gguf_set_val_i32(g, "pet.plato_lr.lrc_pol", 1);
+      std::vector<double> pz(pol_Z.begin(), pol_Z.end());
+      arr("pol_Z", pz), arr("pol_alpha", pol_alpha);
     }
     return;
   }
@@ -819,6 +831,52 @@ std::vector<double> lrc_blend_rows(const LrcSpec &L, const SqeSpec &S, const Lrc
 
 namespace {
 // graph mode: fixed-charge Coulomb of the inter-cluster pairs beyond lr_R - lr_t
+// one pair's electrostatics (units e, A; times KE outside), r = x_j - x_i:
+//   e = [q_i q_j / R] + (q_j mu_i - q_i mu_j).r / R^3 + mu_i.mu_j / R^3 - 3 (mu_i.r)(mu_j.r) / R^5
+//       + (q_i r.Theta_j.r + q_j r.Theta_i.r) / R^5          (Theta: Buckingham, traceless; mu / Theta may be null)
+// and its derivatives in r, q_i, q_j, mu_i, mu_j, Theta_i, Theta_j
+struct PairK {
+  double e = 0, dr[3] = {0, 0, 0}, dqi = 0, dqj = 0, dmi[3] = {0, 0, 0}, dmj[3] = {0, 0, 0};
+  double dTi[9] = {}, dTj[9] = {};
+};
+PairK pair_kernel(const double *r, double qi, double qj, const double *mi, const double *mj, const double *Ti,
+                  const double *Tj, bool qq) {
+  static const double z3[3] = {0, 0, 0}, z9[9] = {};
+  if (!mi) mi = z3;
+  if (!mj) mj = z3;
+  if (!Ti) Ti = z9;
+  if (!Tj) Tj = z9;
+  PairK k;
+  const double R2 = r[0] * r[0] + r[1] * r[1] + r[2] * r[2], R = std::sqrt(R2);
+  const double R3 = R2 * R, R5 = R3 * R2, R7 = R5 * R2;
+  double mir = 0, mjr = 0, mimj = 0, rTi = 0, rTj = 0, Tir[3] = {0, 0, 0}, Tjr[3] = {0, 0, 0};
+  for (int a = 0; a < 3; a++) {
+    mir += mi[a] * r[a], mjr += mj[a] * r[a], mimj += mi[a] * mj[a];
+    for (int b = 0; b < 3; b++) Tir[a] += Ti[3 * a + b] * r[b], Tjr[a] += Tj[3 * a + b] * r[b];
+  }
+  for (int a = 0; a < 3; a++) rTi += r[a] * Tir[a], rTj += r[a] * Tjr[a];
+  const double qf = qq ? 1.0 : 0.0, pr = qj * mir - qi * mjr, Mr = qi * rTj + qj * rTi;
+  k.e = qf * qi * qj / R + pr / R3 + mimj / R3 - 3 * mir * mjr / R5 + Mr / R5;
+  for (int a = 0; a < 3; a++) {
+    const double p = qj * mi[a] - qi * mj[a];
+    k.dr[a] = -qf * qi * qj * r[a] / R3 + p / R3 - 3 * pr * r[a] / R5 - 3 * mimj * r[a] / R5 -
+              3 * (mjr * mi[a] + mir * mj[a]) / R5 + 15 * mir * mjr * r[a] / R7 + 2 * (qi * Tjr[a] + qj * Tir[a]) / R5 -
+              5 * Mr * r[a] / R7;
+    k.dmi[a] = qj * r[a] / R3 + mj[a] / R3 - 3 * mjr * r[a] / R5;
+    k.dmj[a] = -qi * r[a] / R3 + mi[a] / R3 - 3 * mir * r[a] / R5;
+    for (int b = 0; b < 3; b++) k.dTi[3 * a + b] = qj * r[a] * r[b] / R5, k.dTj[3 * a + b] = qi * r[a] * r[b] / R5;
+  }
+  k.dqi = qf * qj / R - mjr / R3 + rTj / R5, k.dqj = qf * qi / R + mir / R3 + rTi / R5;
+  return k;
+}
+
+// atomic polarisability (A^3) of atomic number z (0 outside pol_Z)
+double pol_alpha(const LrcSpec &L, int z) {
+  for (size_t k = 0; k < L.pol_Z.size(); k++)
+    if (L.pol_Z[k] == z) return L.pol_alpha[k];
+  return 0.0;
+}
+
 LrcEnergy energy_fixed(const LrcSpec &L, const SqeSpec &S, const LrcCondition &c, int n, const int32_t *Z,
                        const double *x, bool forces) {
   constexpr double KE = 14.399645;
@@ -829,55 +887,121 @@ LrcEnergy energy_fixed(const LrcSpec &L, const SqeSpec &S, const LrcCondition &c
   const double r0 = S.lr_R - S.lr_t;
   std::vector<double> g(3 * size_t(n), 0.0), dq(n, 0.0), W(size_t(s) * s, 0.0);
   const double *q = c.q0.q0.data();
-  if (L.mp) { // charges + atomic dipoles and quadrupoles, same pairs, switch and (1 - R)
+  // the switched inter-cluster pairs: (i, j, R, T, dT/dR, m = 1 - R_ab)
+  struct P {
+    int i, j;
+    double R, T, dT, m;
+  };
+  std::vector<P> pairs;
+  for (int i = 0; i < n; i++)
+    for (int j = i + 1; j < n; j++) {
+      const int a = c.cl.sn[i], b = c.cl.sn[j];
+      if (a == b) continue;
+      const double R = dist(x, i, j);
+      if (R <= r0) continue;
+      const double m = 1.0 - c.cl.R[size_t(a) * s + b];
+      if (m == 0) continue;
+      const double t = (R - r0) / S.lr_t;
+      pairs.push_back({i, j, R, sstep(t), dsstep(t) / S.lr_t, m});
+    }
+  if (L.mp || L.pol) {
     std::vector<double> mu, th, Gm(3 * size_t(n), 0.0), Hm(9 * size_t(n), 0.0);
-    lrc_moments(L, n, Z, x, mu, th);
-    for (int i = 0; i < n; i++)
-      for (int j = i + 1; j < n; j++) {
-        const int a = c.cl.sn[i], b = c.cl.sn[j];
-        if (a == b) continue;
-        const double R = dist(x, i, j);
-        if (R <= r0) continue;
-        const double m = 1.0 - c.cl.R[size_t(a) * s + b];
-        if (m == 0) continue;
-        const double t = (R - r0) / S.lr_t, T = sstep(t), dT = dsstep(t) / S.lr_t;
-        double r[3];
-        for (int k = 0; k < 3; k++) r[k] = x[3 * j + k] - x[3 * i + k];
-        const double *mi = &mu[3 * size_t(i)], *mj = &mu[3 * size_t(j)];
-        const double *Ti = &th[9 * size_t(i)], *Tj = &th[9 * size_t(j)];
-        const double R2 = R * R, R3 = R2 * R, R5 = R3 * R2, R7 = R5 * R2;
-        double mir = 0, mjr = 0, mimj = 0, rTi = 0, rTj = 0, Tir[3] = {0, 0, 0}, Tjr[3] = {0, 0, 0};
-        for (int k = 0; k < 3; k++) {
-          mir += mi[k] * r[k], mjr += mj[k] * r[k], mimj += mi[k] * mj[k];
-          for (int l = 0; l < 3; l++) Tir[k] += Ti[3 * k + l] * r[l], Tjr[k] += Tj[3 * k + l] * r[l];
+    if (L.mp) lrc_moments(L, n, Z, x, mu, th);
+    // add one kernel's energy (weight scale) and gradients (fixed mu / Theta for the induced part: Hellmann-Feynman)
+    auto accumulate = [&](const P &p, const PairK &k, double scale, bool moment_grads, bool energy) {
+      const double w = KE * p.T * p.m * scale;
+      if (energy) out.energy += w * k.e;
+      if (!forces) return;
+      for (int a = 0; a < 3; a++) {
+        const double v = w * k.dr[a] + KE * scale * p.m * p.dT * k.e * (x[3 * p.j + a] - x[3 * p.i + a]) / p.R;
+        g[3 * p.j + a] += v, g[3 * p.i + a] -= v;
+        if (moment_grads) {
+          Gm[3 * size_t(p.i) + a] += w * k.dmi[a], Gm[3 * size_t(p.j) + a] += w * k.dmj[a];
+          for (int b = 0; b < 3; b++)
+            Hm[9 * size_t(p.i) + 3 * a + b] += w * k.dTi[3 * a + b], Hm[9 * size_t(p.j) + 3 * a + b] += w * k.dTj[3 * a + b];
         }
-        for (int k = 0; k < 3; k++) rTi += r[k] * Tir[k], rTj += r[k] * Tjr[k];
-        const double pr = q[j] * mir - q[i] * mjr;
-        const double e = q[i] * q[j] / R + pr / R3 + mimj / R3 - 3 * mir * mjr / R5 + (q[i] * rTj + q[j] * rTi) / R5;
-        const double w = KE * T * m;
-        out.energy += w * e;
-        if (!forces) continue;
-        // de/dr (r = x_j - x_i)
-        const double Mr = q[i] * rTj + q[j] * rTi;
-        for (int k = 0; k < 3; k++) {
-          const double p = q[j] * mi[k] - q[i] * mj[k];
-          const double de = -q[i] * q[j] * r[k] / R3 + p / R3 - 3 * pr * r[k] / R5 - 3 * mimj * r[k] / R5 -
-                            3 * (mjr * mi[k] + mir * mj[k]) / R5 + 15 * mir * mjr * r[k] / R7 +
-                            2 * (q[i] * Tjr[k] + q[j] * Tir[k]) / R5 - 5 * Mr * r[k] / R7;
-          const double v = w * de + KE * m * dT * e * r[k] / R;
-          g[3 * j + k] += v, g[3 * i + k] -= v;
-          Gm[3 * size_t(i) + k] += w * (q[j] * r[k] / R3 + mj[k] / R3 - 3 * mjr * r[k] / R5);
-          Gm[3 * size_t(j) + k] += w * (-q[i] * r[k] / R3 + mi[k] / R3 - 3 * mir * r[k] / R5);
-          for (int l = 0; l < 3; l++) {
-            Hm[9 * size_t(i) + 3 * k + l] += w * q[j] * r[k] * r[l] / R5;
-            Hm[9 * size_t(j) + 3 * k + l] += w * q[i] * r[k] * r[l] / R5;
+      }
+      dq[p.i] += w * k.dqi, dq[p.j] += w * k.dqj;
+      const int a = c.cl.sn[p.i], b = c.cl.sn[p.j];
+      W[size_t(a) * s + b] -= 0.5 * KE * scale * k.e * p.T, W[size_t(b) * s + a] -= 0.5 * KE * scale * k.e * p.T;
+    };
+    for (const P &p : pairs) {
+      double r[3];
+      for (int a = 0; a < 3; a++) r[a] = x[3 * p.j + a] - x[3 * p.i + a];
+      const double *mi = L.mp ? &mu[3 * size_t(p.i)] : nullptr, *mj = L.mp ? &mu[3 * size_t(p.j)] : nullptr;
+      const double *Ti = L.mp ? &th[9 * size_t(p.i)] : nullptr, *Tj = L.mp ? &th[9 * size_t(p.j)] : nullptr;
+      accumulate(p, pair_kernel(r, q[p.i], q[p.j], mi, mj, Ti, Tj, true), 1.0, L.mp, true);
+    }
+    if (L.pol) {
+      // induced atomic dipoles (inter-cluster only, additive isotropic alpha): (alpha^-1 - T) mu = F0, F0_i the switched
+      // field of the other clusters' charges; E = -1/2 KE mu . F0 (Hellmann-Feynman forces: the gradient at fixed mu of
+      // KE sum_pairs w [charge-dipole + dipole-dipole], the same kernel without q q)
+      std::vector<int> id(n, -1), at;
+      for (const P &p : pairs)
+        for (int k : {p.i, p.j})
+          if (id[k] < 0 && pol_alpha(L, Z[k]) > 0) id[k] = static_cast<int>(at.size()), at.push_back(k);
+      const int m3 = 3 * static_cast<int>(at.size());
+      if (m3 > 0) {
+        std::vector<double> A(size_t(m3) * m3, 0.0), F0(m3, 0.0);
+        for (size_t k = 0; k < at.size(); k++)
+          for (int a = 0; a < 3; a++) A[(3 * k + a) * m3 + 3 * k + a] = 1.0 / pol_alpha(L, Z[at[k]]);
+        for (const P &p : pairs) {
+          const double w = p.T * p.m;
+          double d[3];
+          for (int a = 0; a < 3; a++) d[a] = x[3 * p.i + a] - x[3 * p.j + a]; // x_i - x_j
+          const double R3 = p.R * p.R * p.R, R5 = R3 * p.R * p.R;
+          const int ki = id[p.i], kj = id[p.j];
+          for (int a = 0; a < 3; a++) {
+            if (ki >= 0) F0[3 * ki + a] += w * q[p.j] * d[a] / R3;
+            if (kj >= 0) F0[3 * kj + a] -= w * q[p.i] * d[a] / R3;
+          }
+          if (ki >= 0 && kj >= 0)
+            for (int a = 0; a < 3; a++)
+              for (int b = 0; b < 3; b++) {
+                const double t = w * (3 * d[a] * d[b] / R5 - (a == b ? 1.0 / R3 : 0.0));
+                A[(3 * ki + a) * m3 + 3 * kj + b] -= t, A[(3 * kj + b) * m3 + 3 * ki + a] -= t;
+              }
+        }
+        // dense Cholesky (A is symmetric positive definite for the far-field couplings used here)
+        std::vector<double> Lc(A), y(F0);
+        for (int j = 0; j < m3; j++) {
+          double d = Lc[size_t(j) * m3 + j];
+          for (int k = 0; k < j; k++) d -= Lc[size_t(j) * m3 + k] * Lc[size_t(j) * m3 + k];
+          if (!(d > 0)) throw std::runtime_error("lrc pol: polarisation matrix not positive definite (polarisation catastrophe)");
+          Lc[size_t(j) * m3 + j] = std::sqrt(d);
+          for (int i = j + 1; i < m3; i++) {
+            double v = Lc[size_t(i) * m3 + j];
+            for (int k = 0; k < j; k++) v -= Lc[size_t(i) * m3 + k] * Lc[size_t(j) * m3 + k];
+            Lc[size_t(i) * m3 + j] = v / Lc[size_t(j) * m3 + j];
           }
         }
-        dq[i] += w * (q[j] / R - mjr / R3 + rTj / R5), dq[j] += w * (q[i] / R + mir / R3 + rTi / R5);
-        W[size_t(a) * s + b] -= 0.5 * KE * e * T, W[size_t(b) * s + a] -= 0.5 * KE * e * T;
+        for (int i = 0; i < m3; i++) {
+          for (int k = 0; k < i; k++) y[i] -= Lc[size_t(i) * m3 + k] * y[k];
+          y[i] /= Lc[size_t(i) * m3 + i];
+        }
+        for (int i = m3 - 1; i >= 0; i--) {
+          for (int k = i + 1; k < m3; k++) y[i] -= Lc[size_t(k) * m3 + i] * y[k];
+          y[i] /= Lc[size_t(i) * m3 + i];
+        }
+        double eind = 0;
+        for (int k = 0; k < m3; k++) eind += y[k] * F0[k];
+        out.energy += -0.5 * KE * eind;
+        out.mu_ind.assign(3 * size_t(n), 0.0);
+        for (size_t k = 0; k < at.size(); k++)
+          for (int a = 0; a < 3; a++) out.mu_ind[3 * size_t(at[k]) + a] = y[3 * k + a];
+        if (forces)
+          for (const P &p : pairs) {
+            double r[3];
+            for (int a = 0; a < 3; a++) r[a] = x[3 * p.j + a] - x[3 * p.i + a];
+            const double *mi = id[p.i] >= 0 ? &y[3 * size_t(id[p.i])] : nullptr;
+            const double *mj = id[p.j] >= 0 ? &y[3 * size_t(id[p.j])] : nullptr;
+            if (!mi && !mj) continue;
+            accumulate(p, pair_kernel(r, q[p.i], q[p.j], mi, mj, nullptr, nullptr, false), 1.0, false, false);
+          }
       }
+    }
     if (!forces) return out;
-    lrc_moments_vjp(L, n, Z, x, Gm.data(), Hm.data(), g.data());
+    if (L.mp) lrc_moments_vjp(L, n, Z, x, Gm.data(), Hm.data(), g.data());
     lrc_clusters_vjp(L, c.cl, n, x, W, g.data());
     lrc_q0_vjp(L, S, n, Z, x, c.q0, dq.data(), g.data());
     for (size_t k = 0; k < g.size(); k++) out.forces[k] = -g[k];

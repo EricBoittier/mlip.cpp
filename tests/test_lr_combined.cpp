@@ -490,3 +490,47 @@ TEST_CASE("lrc mp: point multipoles equal octahedral satellites far apart", "[lr
   CHECK(std::abs(e_mp) > 1e-4);
   CHECK(e_sat == Approx(e_mp).epsilon(2e-3));
 }
+
+TEST_CASE("lrc pol: induced dipoles, -1/2 alpha F^2 limit and forces against central differences", "[lrc]") {
+  SqeSpec S = sqe_spec();
+  S.lr_R = 10.0, S.lr_t = 2.0;
+  for (bool with_mp : {false, true}) {
+    LrcSpec L = with_mp ? mp_spec(1.0) : graph_spec();
+    L.pol = true, L.pol_Z = {1, 8, 11, 17}, L.pol_alpha = {0.4, 0.8, 0.2, 2.5};
+    const auto x0 = std::vector<double>{0, 0, 0, 3.4, 0.1, 0.2, 4.3, 0.3, 0.1, 3.1, 1.0, -0.2, 9.6, 2.5, 0.4};
+    for (double Q : {0.0, 1.0}) {
+      auto energy = [&](const std::vector<double> &x) {
+        const LrcCondition c = lrc_condition(L, S, 5, ZG, x.data(), Q, 10, 1);
+        return lrc_energy(L, S, c, 5, ZG, x.data(), Q, false).energy;
+      };
+      const LrcCondition c0 = lrc_condition(L, S, 5, ZG, x0.data(), Q, 10, 1);
+      REQUIRE(c0.cl.s == 2);
+      const LrcEnergy e0 = lrc_energy(L, S, c0, 5, ZG, x0.data(), Q, true);
+      LrcSpec Ln = L;
+      Ln.pol = false;
+      const double enp = lrc_energy(Ln, S, c0, 5, ZG, x0.data(), Q, false).energy;
+      CHECK(e0.energy - enp < -1e-6); // induction lowers the energy
+      double fmax = 0, err = 0;
+      for (size_t k = 0; k < x0.size(); k++) {
+        const double num = -fd(energy, x0, k, 1e-5);
+        fmax = std::max(fmax, std::abs(num)), err = std::max(err, std::abs(num - e0.forces[k]));
+      }
+      INFO("mp " << with_mp << " Q " << Q << " pol long-range force: max |F| " << fmax << ", max error " << err);
+      CHECK(err < 1e-6 * std::max(1.0, fmax));
+    }
+  }
+  // isolated Cl (alpha 2.5) 20 A from a Na (alpha 0.2): -1/2 KE (alpha_Cl q_Na^2 + alpha_Na q_Cl^2) / R^4 to the mutual term
+  LrcSpec L = graph_spec();
+  L.pol = true, L.pol_Z = {11, 17}, L.pol_alpha = {0.2, 2.5};
+  const int32_t Zp[] = {11, 17};
+  const std::vector<double> x = {0, 0, 0, 20.0, 0, 0};
+  const LrcCondition c = lrc_condition(L, S, 2, Zp, x.data(), 0.0, 10, 1);
+  REQUIRE(c.cl.s == 2);
+  LrcSpec Ln = L;
+  Ln.pol = false;
+  const double ep = lrc_energy(L, S, c, 2, Zp, x.data(), 0.0, false).energy - lrc_energy(Ln, S, c, 2, Zp, x.data(), 0.0, false).energy;
+  const double qa = c.q0.q0[0], qb = c.q0.q0[1];
+  const double ref = -0.5 * KE * (2.5 * qa * qa + 0.2 * qb * qb) / std::pow(20.0, 4);
+  INFO("induction " << ep << " eV, -1/2 alpha F^2 " << ref << " eV");
+  CHECK(ep == Approx(ref).epsilon(2e-3));
+}
