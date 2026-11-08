@@ -909,8 +909,10 @@ void Worker::upload_inputs(StepGraph &g, const Batch &b, const std::vector<float
     g.plato->upload(b.positions.data());
     if (g.dx) {
       if (plato_dx_.size() != size_t(3) * b.n_atoms) throw std::logic_error("upload_inputs: position tangent");
-      ggml_backend_tensor_set(g.dx, plato_dx_.data(), 0, ggml_nbytes(g.dx));
-      ggml_backend_tensor_set(g.jvp_scale, &plato_jvp_scale_, 0, sizeof(float));
+      // (a model whose long-range ops do not read the absolute positions, e.g. frames-only Plato-LR: the tangent input
+      // is unused by the graph and not allocated)
+      if (g.dx->buffer) ggml_backend_tensor_set(g.dx, plato_dx_.data(), 0, ggml_nbytes(g.dx));
+      if (g.jvp_scale->buffer) ggml_backend_tensor_set(g.jvp_scale, &plato_jvp_scale_, 0, sizeof(float));
     }
   }
   for (size_t i = 0; i < g.inputs.size(); i++)

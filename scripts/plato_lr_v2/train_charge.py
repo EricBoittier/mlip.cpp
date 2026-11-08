@@ -22,6 +22,8 @@ import time
 import numpy as np
 import torch
 
+torch.multiprocessing.set_sharing_strategy("file_system")  # many small tensors per batch: fd passing runs out
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from make_scratch import build  # noqa: E402
 
@@ -64,26 +66,70 @@ def haar(rng):
 
 
 def batch(sp, rows, rng, dev, nl_opts, rotate):
-    from metatomic.torch import System
-    from metatrain.utils.neighbor_lists import get_system_with_neighbor_lists
-    systems, qd, Q, ci, sid = [], [], [], [], []
+    """one batch as plain arrays (picklable): per structure Z, positions (rotated) and the full neighbour list of each
+    requested option (vesin, open boundaries); the metatomic Systems are assembled in the main process (to_dev)"""
+    from vesin import NeighborList
+    st, qd, Q, ci, sid = [], [], [], [], []
     off = 0
     for k, s in enumerate(rows):
         i0, i1 = sp.na[s], sp.na[s + 1]
         x = sp.x[i0:i1].astype(np.float64)
         if rotate:
             x = x @ haar(rng).T
-        sysm = System(types=torch.tensor(sp.a[i0:i1], dtype=torch.int32), positions=torch.tensor(x, dtype=torch.float32),
-                      cell=torch.zeros(3, 3), pbc=torch.zeros(3, dtype=torch.bool))
-        systems.append(get_system_with_neighbor_lists(sysm, nl_opts).to(dev))
+        x = x.astype(np.float32)
+        nls = []
+        for cut, full in nl_opts:  # (cutoff, full_list) per requested option
+            i, j, S, D = NeighborList(cutoff=cut, full_list=full).compute(
+                points=x.astype(np.float64), box=np.zeros((3, 3)), periodic=False, quantities="ijSD")
+            nls.append((i.astype(np.int32), j.astype(np.int32), S.astype(np.int32), D.astype(np.float32)))
+        st.append((sp.a[i0:i1].copy(), x, nls))
         qd.append(sp.q[i0:i1])
         Q.append(float(sp.Q[s]))
         c = sp.clusters(s)
         ci.append(c + off)
         off += int(c.max()) + 1
         sid.append(np.full(i1 - i0, k))
-    t = lambda v, dt=torch.float32: torch.tensor(np.concatenate(v), dtype=dt, device=dev)
-    return systems, t(qd), torch.tensor(Q, device=dev), t(ci, torch.long), t(sid, torch.long), off
+    t = lambda v, dt=torch.float32: torch.tensor(np.concatenate(v), dtype=dt)
+    return st, t(qd), torch.tensor(Q), t(ci, torch.long), t(sid, torch.long), off
+
+
+def make_system(Z, x, nls, nl_opts, dev):
+    from metatensor.torch import Labels, TensorBlock
+    from metatomic.torch import System
+    s = System(types=torch.tensor(Z, dtype=torch.int32, device=dev), positions=torch.tensor(x, device=dev),
+               cell=torch.zeros(3, 3, device=dev), pbc=torch.zeros(3, dtype=torch.bool, device=dev))
+    for o, (i, j, S, D) in zip(nl_opts, nls):
+        samples = Labels(["first_atom", "second_atom", "cell_shift_a", "cell_shift_b", "cell_shift_c"],
+                         torch.tensor(np.concatenate([i[:, None], j[:, None], S], 1), dtype=torch.int32, device=dev))
+        blk = TensorBlock(values=torch.tensor(D, device=dev).reshape(-1, 3, 1), samples=samples,
+                          components=[Labels.range("xyz", 3).to(dev)], properties=Labels.range("distance", 1).to(dev))
+        s.add_neighbor_list(o, blk)
+    return s
+
+
+def to_dev(b, dev, nl_opts):
+    st, qd, Q, ci, sid, off = b
+    return [make_system(Z, x, n, nl_opts, dev) for Z, x, n in st], qd.to(dev), Q.to(dev), ci.to(dev), sid.to(dev), off
+
+
+class Batches(torch.utils.data.Dataset):
+    """batches built in DataLoader worker processes (neighbour lists and clusters on the CPU)"""
+    def __init__(self, sp, chunks, nl_opts, rotate, seed):
+        self.sp, self.chunks, self.nl, self.rot, self.seed = sp, chunks, nl_opts, rotate, seed
+
+    def __len__(self):
+        return len(self.chunks)
+
+    def __getitem__(self, k):
+        rng = np.random.default_rng((self.seed, k))
+        return batch(self.sp, self.chunks[k], rng, "cpu", self.nl, self.rot)
+
+
+def loader(sp, chunks, nl_opts, rotate, seed, workers):
+    spec = [(float(o.cutoff), bool(o.full_list)) for o in nl_opts]
+    return torch.utils.data.DataLoader(Batches(sp, chunks, spec, rotate, seed), batch_size=None, shuffle=False,
+                                       num_workers=workers, prefetch_factor=4 if workers else None,
+                                       persistent_workers=False)
 
 
 def forward(model, phi, systems, Q, sid, dev):
@@ -122,6 +168,8 @@ def main():
     ap.add_argument("--hours", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=13)
     ap.add_argument("--max-steps", type=int, default=0)
+    ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--subset", type=int, default=0, help="train on this many random training rows (0: all)")
     ap.add_argument("--d-pet", type=int, default=128)
     ap.add_argument("--gnn", type=int, default=2)
     ap.add_argument("--att", type=int, default=2)
@@ -134,6 +182,8 @@ def main():
     phi = torch.nn.Parameter(torch.zeros(84, device=dev))
     tr, va = Split(a.train, f"{a.excl}/train.npy"), Split(a.val, f"{a.excl}/val.npy")
     nl_opts = model.requested_neighbor_lists()
+    if a.subset:
+        tr.rows = np.sort(np.random.default_rng(a.seed).choice(tr.rows, a.subset, replace=False))
     params = [p for p in model.parameters() if p.requires_grad] + [phi]
     opt = torch.optim.AdamW(params, lr=a.lr, weight_decay=0.0)
     spe = len(tr.rows) // a.batch
@@ -148,8 +198,8 @@ def main():
         model.eval()
         ea, n, ec, nc = 0.0, 0, [], 0
         with torch.no_grad():
-            for k in range(0, len(vrows), a.batch):
-                sy, qd, Q, ci, sid, nclu = batch(va, vrows[k:k + a.batch], rng, dev, nl_opts, False)
+            for b in loader(va, [vrows[k:k + a.batch] for k in range(0, len(vrows), a.batch)], nl_opts, False, 0, a.workers):
+                sy, qd, Q, ci, sid, nclu = to_dev(b, dev, nl_opts)
                 q = forward(model, phi, sy, Q, sid, dev)
                 ea += (q - qd).abs().sum().item(); n += len(q)
                 _, _, c = losses(q, qd, ci, nclu, sid, len(sy), dev)
@@ -160,8 +210,9 @@ def main():
     done = False
     for ep in range(a.epochs):
         perm = rng.permutation(tr.rows)
-        for k in range(spe):
-            sy, qd, Q, ci, sid, nclu = batch(tr, perm[k * a.batch:(k + 1) * a.batch], rng, dev, nl_opts, True)
+        chunks = [perm[k * a.batch:(k + 1) * a.batch] for k in range(spe)]
+        for b in loader(tr, chunks, nl_opts, True, a.seed * 1000 + ep, a.workers):
+            sy, qd, Q, ci, sid, nclu = to_dev(b, dev, nl_opts)
             q = forward(model, phi, sy, Q, sid, dev)
             la, lc, _ = losses(q, qd, ci, nclu, sid, len(sy), dev)
             L = la + a.wc * lc
