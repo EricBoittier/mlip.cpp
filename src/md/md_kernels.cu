@@ -926,6 +926,22 @@ __global__ void shift_kernel(int n, const double *wrapped, const double *x, int6
   for (int c = 0; c < 3; c++) shift[3 * i + c] = wrapped[3 * i + c] - x[i * xs0 + c * xs1];
 }
 
+// s.x = x_ref + the minimum image of (raw - x_ref): the caller's positions continued from those the list was
+// built from, whatever wrap the caller (or the last build) applied
+__global__ void unwrap_to_ref_kernel(int n, double *x, const double *raw, const double *x_ref, Cell cell, Inverse inverse) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const double *inv = inverse.m;
+  double u[3], f[3];
+  for (int c = 0; c < 3; c++) u[c] = raw[3 * i + c] - x_ref[3 * i + c];
+  for (int d = 0; d < 3; d++) {
+    f[d] = u[0] * inv[d] + u[1] * inv[3 + d] + u[2] * inv[6 + d];
+    if (cell.pbc[d]) f[d] -= rint(f[d]);
+  }
+  for (int c = 0; c < 3; c++)
+    x[3 * i + c] = x_ref[3 * i + c] + f[0] * cell.m[c] + f[1] * cell.m[3 + c] + f[2] * cell.m[6 + c];
+}
+
 constexpr int TOTALS_BLOCK = 256;
 __global__ void totals_kernel(int n, const float *e, const int32_t *types, const double *type_energy, int n_types,
                               double scale,
@@ -970,6 +986,15 @@ void load_positions(State &s, const double *x, int64_t xs0, int64_t xs1, const d
 
 void store_shift(State &s, const double *x, int64_t xs0, int64_t xs1, double *shift) {
   LAUNCH(shift_kernel, s.n, s.n, s.x, x, xs0, xs1, shift);
+}
+
+void unwrap_to_ref(State &s, const double *raw) {
+  const bool any_pbc = s.pbc[0] || s.pbc[1] || s.pbc[2];
+  if (!any_pbc) {
+    check(cudaMemcpyAsync(s.x, raw, sizeof(double) * 3 * s.n, cudaMemcpyDeviceToDevice, stream_of(s)), "x");
+    return;
+  }
+  LAUNCH(unwrap_to_ref_kernel, s.n, s.n, s.x, raw, s.x_ref, make_cell(s), make_inverse(s));
 }
 
 void totals(State &s, const float *e, const int32_t *types, const double *type_energy, int n_types,

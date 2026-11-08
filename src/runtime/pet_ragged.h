@@ -24,6 +24,9 @@ struct PetRaggedSpec {
   int64_t d_pet = 0, d_node = 0;
   float rms_eps = 1e-8f, ln_eps = 1e-5f;
   float cutoff_width = 1.0f; // of the bump function
+  // charge / spin conditioning (metatrain's SystemConditioningEmbedding, GGUF pet.system_conditioning):
+  // project(cat(charge_emb, spin_emb)) added to the node features after every GNN layer
+  bool conditioning = false;
 };
 
 struct PetRaggedInputs {
@@ -34,6 +37,8 @@ struct PetRaggedInputs {
   ggml_tensor *reverse = nullptr;          // I32 [e_cap], row of the reverse edge
   ggml_tensor *offsets = nullptr;          // I32 [n + 1]
   ggml_tensor *centers = nullptr;          // I32 [e_cap], atom of each row
+  ggml_tensor *charge_index = nullptr;     // I32 [1] (conditioning): charge + max_charge of the structure
+  ggml_tensor *spin_index = nullptr;       // I32 [1] (conditioning): 2S+1 - 1
 };
 
 struct PetRaggedOutputs {

@@ -105,6 +105,9 @@ void load_positions(State &s, const double *x, int64_t xs0, int64_t xs1, const d
                     const int32_t *types, const int32_t *type_species, int n_types, int32_t *bad);
 /// shift[i] = s.x[i] - x(i): what build_list's wrap added to each atom
 void store_shift(State &s, const double *x, int64_t xs0, int64_t xs1, double *shift);
+// s.x = s.x_ref + minimum image of (raw - s.x_ref): the caller's positions ([n, 3] device array) continued from
+// those of the list's build, however the caller wrapped them (no jump of a cell vector at a face crossing)
+void unwrap_to_ref(State &s, const double *raw);
 /// scalars[2] = max |x - x_ref|^2 (float bits), on the device only
 void displacement(State &s);
 /// Totals in one block: out[0] = energy_scale sum e + sum type_energy[types],

@@ -140,6 +140,11 @@ bool pet_ragged_spec(const std::map<std::string, ggml_tensor *> &w, int64_t d_pe
   spec.heads = heads, spec.d_pet = d_pet;
   spec.d_node = w.at("node_embedders_0_weight")->ne[0];
   spec.cutoff_width = cutoff_width;
+  spec.conditioning = has("system_conditioning_charge_embedding_weight");
+  if (spec.conditioning)
+    for (const char *name : {"system_conditioning_spin_multiplicity_embedding_weight", "system_conditioning_project_0_weight",
+                             "system_conditioning_project_2_weight"})
+      if (!has(name)) return why = std::string("no ") + name, false;
   return true;
 }
 
@@ -167,6 +172,16 @@ PetRaggedOutputs build_pet_ragged(ggml_context *ctx, const PetRaggedSpec &spec,
 
   ggml_tensor *node = ggml_get_rows(ctx, b.weight("node_embedders_0_weight"), in.species);              // [d_node, n]
   ggml_tensor *messages = ggml_get_rows(ctx, b.weight("neighbor_embedder_weight"), in.neighbor_species); // [d_pet, E]
+
+  // charge / spin conditioning: one [d_node, 1] vector per structure (the same inputs at every layer),
+  // broadcast over the atoms; it does not depend on the positions
+  ggml_tensor *cond = nullptr;
+  if (spec.conditioning) {
+    if (!in.charge_index || !in.spin_index) throw std::runtime_error("PET (ragged): conditioning needs charge / spin inputs");
+    ggml_tensor *c = ggml_get_rows(ctx, b.weight("system_conditioning_charge_embedding_weight"), in.charge_index);
+    ggml_tensor *s = ggml_get_rows(ctx, b.weight("system_conditioning_spin_multiplicity_embedding_weight"), in.spin_index);
+    cond = b.mlp2(ggml_concat(ctx, c, s, 0), "system_conditioning_project_0", "system_conditioning_project_2", false);
+  }
 
   for (int l = 0; l < spec.layers; l++) {
     const std::string g = "gnn_layers_" + std::to_string(l) + "_", t = g + "trans_layers_0_";
@@ -239,6 +254,7 @@ PetRaggedOutputs build_pet_ragged(ggml_context *ctx, const PetRaggedSpec &spec,
     ggml_tensor *normed = b.add_rms_norm(node, b.linear(b.columns(o, 0, n), t + "center_expansion"), node,
                                          t + "norm_center_features", spec.rms_eps);
     node = ggml_add(ctx, node, b.gated_mlp(normed, t + "center_mlp"));
+    if (cond) node = ggml_add(ctx, node, cond); // metatrain: output_node_embeddings + cond_embedding
     // the node update first, as without out.order: the backward then meets the attention output's
     // edge rows before its node rows (the zero-padded gradient is the edges', the in-place ACC the nodes')
     if (residual_order) out.order.push_back(node);
