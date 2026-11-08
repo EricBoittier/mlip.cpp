@@ -19,6 +19,8 @@ struct ModelResult {
   std::vector<float> latent_charges;
   // split-charge equilibration (pet.plato_lr.sqe): the SQE charges per atom (e); empty otherwise
   std::vector<float> sqe_charges;
+  // graph models: the per-atom model outputs (scaled to eV, without the composition energies)
+  std::vector<float> atomic_energies;
 
   bool has_forces = false;
   bool has_stress = false;
