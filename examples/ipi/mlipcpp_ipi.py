@@ -22,7 +22,8 @@ Parameters (all optional except template/model):
   extras_members  also return every member's sigma in extras (json key sigma_iso_members) [false]
   temperature     K, needed by the estimator [298]
   out             prefix of the plugin's own outputs: <out>_frames.npz (reduced per-frame data), <out>_online.json
-                  (running estimates + errors), <out>_flagged.xyz (high-disagreement configurations) [shield]
+                  (running estimates + errors), <out>_flagged.xyz (high-disagreement configurations); rewritten every
+                  5 sampled frames, since i-PI may exit without running atexit handlers [shield]
   store_frames    keep the reduced per-frame arrays (tiny compared to trajectories) [true]
   skip_steps      discard the first steps from the online statistics [0]
   target_se       stop the run (write ./EXIT, i-PI soft exit) once the standard error of the stop quantity < this (ppm) [off]
@@ -39,6 +40,12 @@ Parameters (all optional except template/model):
   est_molecules   all | comma list of molecule indices to which the estimator applies (e.g. the protio molecules
                   of a mixed box) [all]
   m_from, m_to    masses (amu) of the substituted isotope in the simulation and in the target [1.00794, 2.01410] (i-PI's H and D)
+  est_units       molecule: all H of a molecule substituted together (default) | each: every H atom on its own
+                  (m_from -> m_to; e.g. CH2Cl2 -> CHDCl2) | "k:mfrom:mto; k:mfrom:mto ...": only the k-th hydrogen-type
+                  atom (atom order) bonded to each heavy atom of the estimator molecules, with its own masses, one
+                  class per entry ("/" may replace ":"; e.g. a CHDCl2 box: "1/1.00794/2.0141; 0/2.0141/1.00794"
+                  contracts the H and expands the D)
+                  [molecule]. In atom modes the stored sigma_t/lnw rows are units (est_sel, est_class, est_atom map them).
 """
 import ctypes
 import glob as _glob
@@ -248,7 +255,8 @@ class ShieldingEngine:
     def __init__(self, capi, numbers, template_positions, cell0, shield_models, species=(6,), beads_mode="all",
                  temperature=298.0, out="shield", store_frames=True, skip_steps=0, target_se=None, stop_on="dsigma",
                  min_steps=0, uq_top=0.01, uq_radius=6.0, acf_lags=0, estimator=None, delta_model=None,
-                 est_dmin=9.0, est_molecules="all", m_from=1.00794, m_to=2.01410, extras_members=False, seed=0):
+                 est_dmin=9.0, est_molecules="all", m_from=1.00794, m_to=2.01410, extras_members=False, seed=0,
+                 est_units="molecule"):
         self.capi = capi
         self.z = np.ascontiguousarray(numbers, dtype=np.int32)
         self.n = len(self.z)
@@ -278,10 +286,30 @@ class ShieldingEngine:
                 hm = [m for m in hm if m in keep]
             self.est_mols = np.array(hm, int)
             self.dmin = float(est_dmin)
+            self.units = str(est_units).strip().lower()
+            if self.units == "molecule":
+                self.est_sel, self.est_class, self.nclass = np.arange(len(self.sel)), np.zeros(len(self.sel), int), 1
+            else:  # atom units: (H atom, alpha, class)
+                spec = ([(None, float(m_from), float(m_to))] if self.units == "each" else
+                        [tuple(float(v) if i else int(v) for i, v in enumerate(e.split(":")))
+                         for e in self.units.replace(",", ";").replace("/", ":").split(";") if e.strip()])
+                # units per bonded heavy atom (robust to template molecules that the bond graph merges)
+                ua, ual, ucl = [], [], []
+                selpos = {int(a): j for j, a in enumerate(self.sel)}
+                for c0 in sorted(set(self.hpar.tolist())):
+                    if self.mol[c0] not in set(self.est_mols.tolist()):
+                        continue
+                    hs = sorted(int(h) for h, c in zip(self.hidx, self.hpar) if c == c0)
+                    for c, (k, mf, mt) in enumerate(spec):
+                        for a in (hs if k is None else [hs[k]]):
+                            ua.append(a); ual.append(np.sqrt(mf / mt)); ucl.append(c)
+                self.est_atom, self.est_alpha, self.est_class = np.array(ua), np.array(ual), np.array(ucl)
+                self.est_sel = np.array([selpos.get(int(self.hpar[np.where(self.hidx == a)[0][0]]), -1) for a in ua])
+                self.nclass = len(spec)
         # online statistics
         ns = len(self.sel)
         self.fp_sigma = FPBlocking(1)  # mean shielding of the selected atoms (committee mean)
-        self.jk = BlockJackknife(4 * self.M + 4) if self.est else None
+        self.jk = [BlockJackknife(4 * self.M + 4) for _ in range(self.nclass)] if self.est else None
         self.acf = OnlineACF(ns, int(acf_lags)) if int(acf_lags) > 0 else None
         self.frames, self.spreads = [], []
         self.nflag, self.stopped, self.t0, self.nsampled = 0, False, time.time(), 0
@@ -414,7 +442,10 @@ class ShieldingEngine:
             self.extras_list.append(json.dumps(e))
         if self.est and step >= self.skip:  # the estimator only where it enters the statistics
             t1 = time.perf_counter()
-            rec.update(self._estimator(X, h, cell, sig if len(Xs) == P else self._sigma(X, cell)))
+            if self.units == "molecule":
+                rec.update(self._estimator(X, h, cell, sig if len(Xs) == P else self._sigma(X, cell)))
+            else:
+                rec.update(self._estimator_atoms(X, h, cell))
             self.timing["estimator_s"] += time.perf_counter() - t1
         geo = self._geometry(X, h)
         rec.update(rCH_cent=geo[0].astype(np.float32), rCH_bead=geo[1].astype(np.float32),
@@ -424,7 +455,7 @@ class ShieldingEngine:
         if self.store and step >= self.skip:
             self.frames.append(rec)
         self.nsampled += 1
-        if self.nsampled % 25 == 0:
+        if self.nsampled % 5 == 0:  # i-PI does not reliably run atexit handlers: keep the files current
             self.flush()
 
     def _estimator(self, X, h, cell, sig):
@@ -466,6 +497,43 @@ class ShieldingEngine:
                 lnw[js] = lnw_mol[m]
         return {"sigma_t": sigt, "lnw": lnw.astype(np.float64), "ngroups": len(groups)}
 
+    def _estimator_atoms(self, X, h, cell):
+        """Scaled-coordinate FEP per hydrogen-type atom (unit u: atom a_u, scale alpha_u = sqrt(m_from/m_to)). Units
+        scaled together are >= dmin apart; each atom's energy change goes to the nearest scaled unit (H centroids)."""
+        P = len(X)
+        inv = np.linalg.inv(h)
+        cen = X.mean(0)
+        e0 = self._eatoms(X, cell)
+        nu = len(self.est_atom)
+        uc = cen[self.est_atom]
+        groups, gc = [], []
+        for u in self.rng.permutation(nu):
+            for g, cg in zip(groups, gc):
+                d = np.asarray(cg) - uc[u]
+                d -= np.round(d @ inv) @ h
+                if (np.linalg.norm(d, axis=1) >= self.dmin).all():
+                    g.append(u); cg.append(uc[u]); break
+            else:
+                groups.append([u]); gc.append([uc[u]])
+        sigt = np.full((nu, self.M), np.nan, np.float32)
+        lnw = np.full(nu, np.nan)
+        for g in groups:
+            g = np.array(g)
+            a, al = self.est_atom[g], self.est_alpha[g]
+            Xt = X.copy()
+            Xt[:, a] = cen[a] + al[None, :, None] * (X[:, a] - cen[a])
+            et = self._eatoms(Xt, cell)
+            st = self._sigma(Xt, cell).mean(0)
+            dv = cen[:, None, :] - uc[g][None]
+            dv -= np.round(dv @ inv) @ h
+            owner = np.argmin(np.linalg.norm(dv, axis=-1), axis=1)
+            dE = (et - e0).sum(0)
+            for k, u in enumerate(g):
+                lnw[u] = -self.beta / P * dE[owner == k].sum()
+                if self.est_sel[u] >= 0:
+                    sigt[u] = st[:, self.sel[self.est_sel[u]]]
+        return {"sigma_t": sigt, "lnw": lnw, "ngroups": len(groups)}
+
     def _online(self, rec, X, h):
         if rec["step"] < self.skip:
             return
@@ -476,15 +544,16 @@ class ShieldingEngine:
         if self.acf is not None:
             self.acf.add(s.mean(1))
         if self.est:
-            ok = np.isfinite(rec["lnw"])
-            # shift log-weights by a fixed reference (first frame's median) to keep sums finite
-            if not hasattr(self, "lnw_ref"):
-                self.lnw_ref = float(np.median(rec["lnw"][ok]))
-            lw = rec["lnw"][ok]
-            w = np.exp(lw - self.lnw_ref)
-            st, s0 = rec["sigma_t"][ok].astype(float), s[ok]
-            self.jk.add(np.concatenate([(w[:, None] * st).sum(0), [w.sum(), (w * w).sum(), ok.sum(), lw.sum()],
-                                        s0.sum(0), st.sum(0), (lw[:, None] * st).sum(0)]))
+            if not hasattr(self, "lnw_ref"):  # fixed reference per class (first frame's median) keeps sums finite
+                self.lnw_ref = [float(np.nanmedian(np.where(self.est_class == c, rec["lnw"], np.nan)))
+                                for c in range(self.nclass)]
+            for c in range(self.nclass):
+                ok = np.isfinite(rec["lnw"]) & (self.est_class == c) & (self.est_sel >= 0)
+                lw = rec["lnw"][ok]
+                w = np.exp(lw - self.lnw_ref[c])
+                st, s0 = rec["sigma_t"][ok].astype(float), s[self.est_sel[ok]]
+                self.jk[c].add(np.concatenate([(w[:, None] * st).sum(0), [w.sum(), (w * w).sum(), ok.sum(), lw.sum()],
+                                               s0.sum(0), st.sum(0), (lw[:, None] * st).sum(0)]))
         self._flag(rec, X, h, spread)
         self._maybe_stop(rec["step"])
 
@@ -536,13 +605,15 @@ class ShieldingEngine:
              "sigma_se_ppm": float(self.fp_sigma.se()[0]) if self.fp_sigma.n[0] else None,
              "sigma_se_levels": self.fp_sigma.se_levels()[:, 0].tolist() if self.fp_sigma.n[0] else [],
              "flagged": self.nflag, "wall_s": time.time() - self.t0, **self.timing, "stopped": self.stopped}
-        if self.est and self.jk.blocks:
-            s.update(dsigma_blocks=len(self.jk.blocks), dsigma_block_len=self.jk.blen,
-                     kish_ess_fraction=float(self.jk.estimate(lambda t: self.dsigma(t, "ess"))[0][0]))
-            for v in ("fep", "cumulant", "scaling"):
-                est, se, k = self.jk.estimate(lambda t: self.dsigma(t, v))
-                s[v] = dict(dsigma_ppm=float(est[-1]), dsigma_se_ppm=float(se[-1]), ddelta_ppm=-float(est[-1]),
-                            dsigma_members_ppm=est[:-1].tolist(), committee_std_ppm=float(np.std(est[:-1])))
+        if self.est and self.jk[0].blocks:
+            for c, jk in enumerate(self.jk):
+                d = s if c == 0 else s.setdefault(f"class_{c}", {})  # class 0 keeps the single-class layout
+                d.update(dsigma_blocks=len(jk.blocks), dsigma_block_len=jk.blen,
+                         kish_ess_fraction=float(jk.estimate(lambda t: self.dsigma(t, "ess"))[0][0]))
+                for v in ("fep", "cumulant", "scaling"):
+                    est, se, k = jk.estimate(lambda t: self.dsigma(t, v))
+                    d[v] = dict(dsigma_ppm=float(est[-1]), dsigma_se_ppm=float(se[-1]), ddelta_ppm=-float(est[-1]),
+                                dsigma_members_ppm=est[:-1].tolist(), committee_std_ppm=float(np.std(est[:-1])))
         if self.acf is not None:
             s["acf"] = self.acf.result().tolist()
         return s
@@ -551,7 +622,7 @@ class ShieldingEngine:
         if self.target is None or self.stopped or step < self.skip + self.min_steps:
             return
         if self.stop_on in ("dsigma", "fep", "cumulant", "scaling") and self.est:
-            _, se, k = self.jk.estimate(lambda t: self.dsigma(t, "fep" if self.stop_on == "dsigma" else self.stop_on))
+            _, se, k = self.jk[0].estimate(lambda t: self.dsigma(t, "fep" if self.stop_on == "dsigma" else self.stop_on))
             se = se[-1] if k >= 16 else np.nan
         else:
             se = self.fp_sigma.se()[0]
@@ -565,8 +636,13 @@ class ShieldingEngine:
             json.dump(self.summary(), f, indent=1)
         if self.store and self.frames:
             keys = list(self.frames[0])
+            extra = {}
+            if self.est:
+                extra = dict(est_sel=self.est_sel, est_class=self.est_class, est_units=self.units)
+                if self.units != "molecule":
+                    extra.update(est_atom=self.est_atom, est_alpha=self.est_alpha)
             np.savez(self.out + "_frames.npz", **{k: np.array([r[k] for r in self.frames]) for k in keys},
-                     sel=self.sel, mol=self.mol, hidx=self.hidx, hpar=self.hpar, z=self.z)
+                     sel=self.sel, mol=self.mol, hidx=self.hidx, hpar=self.hpar, z=self.z, **extra)
 
 
 # ------------------------------------------------------------------------------------------------- i-PI driver
@@ -575,7 +651,8 @@ class MLIPCppDriver(Dummy_driver):
                  shield_models=None, shield_stride=1, shield_beads="all", shield_species="6", extras_members=False,
                  temperature=298, out="shield", store_frames=True, skip_steps=0, target_se=None, stop_on="dsigma",
                  min_steps=0, uq_top=0.01, uq_radius=6.0, acf_lags=0, estimator=None, delta_model=None,
-                 est_dmin=9.0, est_molecules="all", m_from=1.00794, m_to=2.01410, seed=0, *args, **kwargs):
+                 est_dmin=9.0, est_molecules="all", m_from=1.00794, m_to=2.01410, seed=0, est_units="molecule",
+                 *args, **kwargs):
         self.template, self.model_path = str(template), str(model)
         self.lib_path = lib or os.environ.get("MLIPCPP_C_LIB")
         if not self.lib_path:
@@ -590,7 +667,7 @@ class MLIPCppDriver(Dummy_driver):
                        min_steps=int(min_steps), uq_top=float(uq_top), uq_radius=float(uq_radius),
                        acf_lags=int(acf_lags), estimator=estimator, delta_model=delta_model,
                        dmin=float(est_dmin), est_molecules=est_molecules, m_from=float(m_from), m_to=float(m_to),
-                       seed=int(seed))
+                       seed=int(seed), est_units=est_units)
         super().__init__(*args, **kwargs)
 
     def check_parameters(self):
@@ -614,7 +691,8 @@ class MLIPCppDriver(Dummy_driver):
                 self.capi, self.numbers, at.positions, at.cell[:], _paths(o["shield_models"]), o["species"],
                 o["beads"], o["temperature"], o["out"], o["store"], o["skip"], o["target"], o["stop_on"],
                 o["min_steps"], o["uq_top"], o["uq_radius"], o["acf_lags"], o["estimator"], o["delta_model"],
-                o["dmin"], o["est_molecules"], o["m_from"], o["m_to"], o["extras_members"], o["seed"])
+                o["dmin"], o["est_molecules"], o["m_from"], o["m_to"], o["extras_members"], o["seed"],
+                o["est_units"])
 
     def compute_structure(self, cell, pos):
         x = np.ascontiguousarray(unit_to_user("length", "angstrom", pos).reshape(-1, 3), dtype=np.float32)
