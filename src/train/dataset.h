@@ -55,6 +55,13 @@ public:
   int charge(int64_t s) const { return charge_.empty() ? 0 : charge_[s]; }
   int spin_multiplicity(int64_t s) const { return spin_.empty() ? 1 : spin_[s]; }
   bool has_conditioning_data() const { return !charge_.empty() || !spin_.empty(); }
+  /// energy head (level of theory) of structure s: head.bin (float32 [ns]; absent: 0, the model's own head)
+  int head(int64_t s) const { return head_.empty() ? 0 : head_[s]; }
+  bool has_heads() const { return !head_.empty(); }
+  int n_heads() const; // 1 + the largest head index (1 without head.bin)
+  /// weight of structure s's energy label: energy_weight.bin (float32 [ns], 0 = forces only; absent: 1)
+  float energy_weight(int64_t s) const { return ew_.size() ? ew_[s] : 1.0f; }
+  bool has_energy_weights() const { return ew_.size() > 0; }
   /// DFT partial charges per atom, <target>_charge.bin (float32 [N]; e.g. mulliken, lowdin,
   /// nbo), for mlipcpp-train --charge-corr-weight; false if the file is absent
   bool load_partial_charges(const std::string &target);
@@ -101,6 +108,8 @@ private:
   Mapped<float> x_, c_, energy_, force_;
   Mapped<int32_t> a_;
   std::vector<int32_t> charge_, spin_;
+  std::vector<int32_t> head_;
+  Mapped<float> ew_;
   Mapped<float> pq_;
   bool sqe_q0_labels_ = false, sqe_neutral_ = false;
   Mapped<int32_t> frag_;

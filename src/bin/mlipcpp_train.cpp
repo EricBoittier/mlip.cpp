@@ -52,6 +52,9 @@ int main(int argc, char **argv) {
                "fragq.bin, frag_ok.bin), W x mean over units of (sum q0 - Q_u)^2 per structure; training only;\n"
                "--frag-cond-gate: keep the structure-charge conditioning c and add g (c_unit - c), g the zero-initialised\n"
                "per-channel tensor plato_frag_cond_gate (scripts/plato_lr/add_frag_keys.py --cond-gate);\n"
+               "--data-chunks PATTERN: epoch k trains on the split fmt::format(PATTERN, k) (e.g. DIR/chunk{{:05d}}), loaded\n"
+               "    while the previous epoch trains; DIR/train sets the steps per epoch. Energy heads: head.bin / energy_weight.bin\n"
+               "    in a split (float32 per structure) pick the head and weight the energy label (multi-head GGUF, --model-baselines);\n"
                "--tail-data DIR --tail-weight W [--tail-floor-mev 2.585 --tail-delta 1] (conservative): the physics-\n"
                "  normalised tail loss on pulled-apart scans (train/tail_loss.h; DIR a split + tail_pairs.tsv), one scan per\n"
                "  step, classes in turn: W x mean_p Huber((dE_model - dE_DFT) / max(|dE_ref|, floor)), no absolute energies;\n"
@@ -88,6 +91,7 @@ int main(int argc, char **argv) {
     const std::string a = argv[i];
     auto val = [&]() -> std::string { return i + 1 < argc ? argv[++i] : (usage(), ""); };
     if (a == "--data") o.data_dir = val();
+    else if (a == "--data-chunks") o.data_chunks = val();
     else if (a == "--init") o.init_gguf = val();
     else if (a == "-o" || a == "--output") o.output = val();
     else if (a == "--cache-dir") o.cache_dir = val();

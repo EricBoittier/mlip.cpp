@@ -120,6 +120,14 @@ void write_gguf(const std::string &src, const std::string &dst, Worker &w,
   for (auto [Z, s] : sc.force_scale) fk.push_back(Z), fv.push_back(static_cast<float>(s));
   gguf_set_arr_data(g, "pet.composition_keys", GGUF_TYPE_INT32, ck.data(), ck.size());
   gguf_set_arr_data(g, "pet.composition_values", GGUF_TYPE_FLOAT32, cv.data(), cv.size());
+  for (size_t h = 1; h < sc.head_composition.size(); h++) { // energy heads h >= 1
+    std::vector<int32_t> hk;
+    std::vector<float> hv;
+    for (auto [Z, c] : sc.head_composition[h]) hk.push_back(Z), hv.push_back(static_cast<float>(c));
+    const std::string key = fmt::format("pet.head{}.composition_", h);
+    gguf_set_arr_data(g, (key + "keys").c_str(), GGUF_TYPE_INT32, hk.data(), hk.size());
+    gguf_set_arr_data(g, (key + "values").c_str(), GGUF_TYPE_FLOAT32, hv.data(), hv.size());
+  }
   gguf_set_arr_data(g, "pet.nc_force_scale_keys", GGUF_TYPE_INT32, fk.data(), fk.size());
   gguf_set_arr_data(g, "pet.nc_force_scale_values", GGUF_TYPE_FLOAT32, fv.data(), fv.size());
   const std::string tmp = dst + ".tmp";
@@ -310,6 +318,11 @@ StepStats &StepStats::operator+=(const StepStats &o) {
   ae_energy_per_atom += o.ae_energy_per_atom, ae_force += o.ae_force;
   sum_e += o.sum_e, sum2_e += o.sum2_e, sum_f += o.sum_f, sum2_f += o.sum2_f;
   n_systems += o.n_systems, n_force_components += o.n_force_components;
+  n_energy_masked += o.n_energy_masked;
+  for (int h = 0; h < kHeads; h++) {
+    h_ne[h] += o.h_ne[h], h_nf[h] += o.h_nf[h];
+    h_ae_e[h] += o.h_ae_e[h], h_se_e[h] += o.h_se_e[h], h_ae_f[h] += o.h_ae_f[h], h_se_f[h] += o.h_se_f[h];
+  }
   return *this;
 }
 
@@ -432,6 +445,10 @@ void fill_constants(const std::vector<std::pair<ggml_tensor *, float>> &cs) {
 /// composition (eV/atom) and force components (eV/A) of the real structures.
 void add_target_sums(const Batch &b, double energy_scale, StepStats &st) {
   for (int k = 0; k < b.n_real_systems; k++) {
+    if (!b.energy_mask.empty() && b.energy_mask[k] == 0.0f) {
+      st.n_energy_masked++;
+      continue;
+    }
     const double y = double(b.energy_target[k]) * energy_scale;
     st.sum_e += y, st.sum2_e += y * y;
   }
@@ -631,6 +648,11 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
       runtime::install_frag_cond_gate(interp);
     }
   }
+  if (const runtime::EnergyHeads &heads = model_.energy_heads(); heads.enabled()) {
+    // one-hot head of each atom's structure: the per-atom energy is sum_h mask_h e_h (runtime/energy_heads.h)
+    g->head_mask = input(ctx, GGML_TYPE_F32, {n, heads.n}, "head_mask");
+    runtime::install_head_select(interp, heads, g->head_mask);
+  }
   if (model_.plato_lr().enabled) {
     plato_create(*g, ctx, n, mode == FORCES);
     g->plato->set_padding_mask(padding_mask);
@@ -703,6 +725,10 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
                                          : ggml_mul(ctx, force_target, force_mask);
     // metatrain's average_by_num_atoms: per-structure Σ_i e_i / N
     ggml_tensor *d_energy = ggml_sub(ctx, ggml_mul_mat(ctx, atom_weight, energy), energy_target);
+    if (energy_mask) { // structures without an energy label: forces only
+      g->emask = input(ctx, GGML_TYPE_F32, {S, 1}, "energy_mask");
+      d_energy = ggml_mul(ctx, d_energy, g->emask);
+    }
     ggml_tensor *d_force = ggml_mul(ctx, ggml_sub(ctx, force, force_target), force_mask);
     // squared error, or Huber 0.5 c^2 + delta (|d| - |c|), c = clamp(d, -delta, delta)
     auto component = [&](ggml_tensor *d, double delta) {
@@ -846,6 +872,16 @@ void Worker::upload_inputs(StepGraph &g, const Batch &b, const std::vector<float
                            span(b.force_mask), span(b.force_scale), {norms, sizeof norms}});
   if (dv) src.insert(src.end(), {span(*dv), span(*dc)});
   if (src.size() != g.inputs.size()) throw std::logic_error("upload_inputs: input count");
+  if (g.head_mask && g.head_mask->buffer) {
+    if (b.head_mask.size() != size_t(ggml_nelements(g.head_mask)))
+      throw std::logic_error("upload_inputs: head mask size (data heads vs model heads)");
+    ggml_backend_tensor_set(g.head_mask, b.head_mask.data(), 0, ggml_nbytes(g.head_mask));
+  }
+  if (g.emask && g.emask->buffer) {
+    std::vector<float> e(ggml_nelements(g.emask), 0.0f);
+    std::copy_n(b.energy_mask.begin(), std::min(e.size(), b.energy_mask.size()), e.begin());
+    ggml_backend_tensor_set(g.emask, e.data(), 0, ggml_nbytes(g.emask));
+  }
   if (g.ecot) {
     std::vector<float> c(ggml_nelements(g.ecot), 0.0f);
     std::copy_n(ecot_.begin(), std::min(c.size(), ecot_.size()), c.begin());
@@ -1178,9 +1214,14 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
     for (int a = 0; a < n; a++) d_e[k] += double(b.atom_weight[static_cast<size_t>(k) * n + a]) * out[ow * a];
     d_e[k] -= b.energy_target[k];
     if (sqe && k < b.n_real_systems) d_e[k] += sqe_e[k] / (energy_scale * b.n_per_system[k]);
+    if (energy_mask) d_e[k] *= k < int(b.energy_mask.size()) ? b.energy_mask[k] : 0.0f;
     st.loss_energy += w.energy * e_norm * loss.value(d_e[k], loss.delta_e);
     st.se_energy_per_atom += d_e[k] * d_e[k] * energy_scale * energy_scale;
     if (k < b.n_real_systems) st.ae_energy_per_atom += std::abs(d_e[k]) * energy_scale;
+    if (k < b.n_real_systems && (b.energy_mask.empty() || b.energy_mask[k] != 0.0f)) {
+      const int h = std::min<int>(b.system_head.empty() ? 0 : b.system_head[k], StepStats::kHeads - 1);
+      st.h_ne[h]++, st.h_ae_e[h] += std::abs(d_e[k]) * energy_scale, st.h_se_e[h] += std::pow(d_e[k] * energy_scale, 2);
+    }
   }
   add_target_sums(b, energy_scale, st);
   std::vector<float> per_atom(n, 0.0f);
@@ -1198,6 +1239,10 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
       st.se_force_nc += std::pow(rnc * b.force_scale[a], 2);
       e2 += std::pow(r * energy_scale, 2);
       st.ae_force += std::abs(r) * energy_scale;
+      if (sys < b.n_real_systems) {
+        const int h = std::min<int>(b.system_head.empty() ? 0 : b.system_head[sys], StepStats::kHeads - 1);
+        st.h_nf[h]++, st.h_ae_f[h] += std::abs(r) * energy_scale, st.h_se_f[h] += std::pow(r * energy_scale, 2);
+      }
       u[3 * a + c] = w.force * f_norm * loss.slope(r, loss.delta_f);
     }
     st.se_force += e2;
@@ -2151,6 +2196,24 @@ void train(const TrainOptions &o) {
   Worker &w0 = *workers[0];
   const float cutoff = w0.model().cutoff();
   const auto &species = w0.model().species_to_index();
+  // energy heads (levels of theory): the data's head.bin indices must exist in the model
+  {
+    const runtime::EnergyHeads &heads = w0.model().energy_heads();
+    if (const char *e = std::getenv("MLIPCPP_ENERGY_HEAD"); e && *e)
+      throw std::runtime_error("unset MLIPCPP_ENERGY_HEAD for training (it swaps the heads' tensors at load)");
+    for (const MemmapSplit *sp : {&train_split, &val_split, &test_split})
+      if (sp->n_heads() > heads.n)
+        throw std::runtime_error(fmt::format("{}: head.bin uses {} energy heads, the model has {}", sp->dir(), sp->n_heads(), heads.n));
+    bool ew = train_split.has_energy_weights() || val_split.has_energy_weights() || test_split.has_energy_weights();
+    for (auto &w : workers) w->energy_mask = heads.enabled() || ew;
+    if (heads.enabled()) {
+      std::string names;
+      for (int h = 0; h < heads.n; h++) names += fmt::format("{}{}={}", h ? ", " : "", h, h < int(heads.names.size()) ? heads.names[h] : "?");
+      fmt::print("energy heads: {} ({}), {} readout tensors per head; data with head.bin: train {}, val {}, test {}{}\n",
+                 heads.n, names, heads.weights.size(), train_split.has_heads(), val_split.has_heads(), test_split.has_heads(),
+                 ew ? "; energy_weight.bin present" : "");
+    }
+  }
   fmt::print("model: {} parameters in {} tensors, cutoff {} A, {} worker(s) on {}\n",
              w0.n_params(), w0.params().size(), cutoff, workers.size(),
              ggml_backend_name(w0.model().backend()));
@@ -2251,6 +2314,11 @@ void train(const TrainOptions &o) {
     for (auto [Z, c] : w0.model().composition_energies()) scaling.composition[Z] = c;
     for (auto [Z, f] : w0.model().nc_force_scales()) scaling.force_scale[Z] = f;
     scaling.energy_scale = w0.model().energy_scale();
+    if (const runtime::EnergyHeads &heads = w0.model().energy_heads(); heads.enabled()) {
+      scaling.head_composition.resize(heads.n);
+      for (int h = 0; h < heads.n; h++)
+        for (auto [Z, c] : heads.composition[h]) scaling.head_composition[h][Z] = c;
+    }
   } else {
     scaling = TargetScaling::fit(train_split);
   }
@@ -2269,7 +2337,8 @@ void train(const TrainOptions &o) {
     c.taper = o.conservative && adaptive.enabled(); // the radii's share of -dE/dx
     return c;
   };
-  const NeighborCache nl_train = eval_only ? NeighborCache{} : nl(train_split),
+  NeighborCache nl_train = eval_only ? NeighborCache{} : nl(train_split);
+  const NeighborCache
                       nl_val = nl(val_split), nl_test = nl(test_split);
   fmt::print("neighbour lists ready ({:.1f} s)\n", seconds_since(t0));
   // structures used: all, or those within --max-neighbors and --max-attention
@@ -2295,8 +2364,8 @@ void train(const TrainOptions &o) {
                  o.max_attention, s.size() - n_excluded - static_cast<int64_t>(ids.size()), s.size(), name);
     return ids;
   };
-  const std::vector<int64_t> ids_train = eval_only ? std::vector<int64_t>{} : kept("train", train_split, nl_train),
-                             ids_val = kept("val", val_split, nl_val), ids_test = kept("test", test_split, nl_test);
+  std::vector<int64_t> ids_train = eval_only ? std::vector<int64_t>{} : kept("train", train_split, nl_train);
+  const std::vector<int64_t> ids_val = kept("val", val_split, nl_val), ids_test = kept("test", test_split, nl_test);
 
   const int W = static_cast<int>(workers.size()), B = o.batch_size;
   const Tiling tiling{o.tile_nb_ratio, o.tile_atom_ratio, B};
@@ -2402,16 +2471,17 @@ void train(const TrainOptions &o) {
     return total;
   };
   auto rmse = [](const StepStats &s) {
-    return std::pair{1e3 * std::sqrt(s.se_energy_per_atom / s.n_systems),
+    return std::pair{1e3 * std::sqrt(s.se_energy_per_atom / std::max<int64_t>(1, s.n_systems - s.n_energy_masked)),
                      1e3 * std::sqrt(s.se_force / s.n_force_components)};
   };
   // MAE (conservative mode) and R^2 in % (energies per atom after the composition, force components pooled)
   auto mae = [](const StepStats &s) {
-    return std::pair{1e3 * s.ae_energy_per_atom / s.n_systems, 1e3 * s.ae_force / s.n_force_components};
+    return std::pair{1e3 * s.ae_energy_per_atom / std::max<int64_t>(1, s.n_systems - s.n_energy_masked),
+                     1e3 * s.ae_force / s.n_force_components};
   };
   auto r2 = [](const StepStats &s) {
     auto one = [](double sse, double sum, double sum2, int64_t n) { return 100 * (1 - sse / (sum2 - sum * sum / n)); };
-    return std::pair{one(s.se_energy_per_atom, s.sum_e, s.sum2_e, s.n_systems),
+    return std::pair{one(s.se_energy_per_atom, s.sum_e, s.sum2_e, s.n_systems - s.n_energy_masked),
                      one(s.se_force, s.sum_f, s.sum2_f, s.n_force_components)};
   };
   std::unique_ptr<std::FILE, int (*)(std::FILE *)> jsonl(nullptr, std::fclose);
@@ -2541,6 +2611,22 @@ void train(const TrainOptions &o) {
                o.log_errors_epochs);
   }
 
+  // --data-chunks: one chunk (a MemmapSplit and its neighbour lists, no disk cache) per epoch
+  struct Chunk {
+    std::unique_ptr<MemmapSplit> split;
+    NeighborCache nl;
+  };
+  auto load_chunk = [&](const std::string &dir) {
+    Chunk c{std::make_unique<MemmapSplit>(dir), {}};
+    if (c.split->n_heads() > w0.model().energy_heads().n)
+      throw std::runtime_error(dir + ": head.bin uses more energy heads than the model has");
+    c.nl = NeighborCache::load_or_build(*c.split, cutoff, "", o.n_threads, adaptive);
+    c.nl.taper = o.conservative && adaptive.enabled();
+    return c;
+  };
+  std::future<Chunk> chunk_next;
+  std::string chunk_next_dir;
+  if (!o.data_chunks.empty() && !o.exclude.empty()) throw std::runtime_error("--data-chunks cannot be combined with --exclude");
   int64_t global_step = state.step;
   if (jsonl && o.resume.empty()) log_line(-1, evaluate(val_split, nl_val, ids_val), ",\"init\":true"); // the initial model (epoch -1: before any training)
   std::vector<double> sqe_m, sqe_v; // host Adam state of the SQE parameters (not in the resume state)
@@ -2550,6 +2636,28 @@ void train(const TrainOptions &o) {
   for (int epoch = static_cast<int>(state.epoch); epoch < o.epochs && global_step != o.max_steps; epoch++) {
     const bool logging = log_file && epoch < o.log_errors_epochs;
     collect_errors(logging);
+    if (!o.data_chunks.empty()) { // streamed data: this epoch's chunk (prefetched), then start loading the next
+      const auto tc = clock_type::now();
+      const std::string dir = fmt::format(fmt::runtime(o.data_chunks), epoch);
+      if (chunk_next.valid() && chunk_next_dir == dir) {
+        Chunk c = chunk_next.get();
+        train_split = std::move(*c.split), nl_train = std::move(c.nl);
+      } else if (std::filesystem::weakly_canonical(train_split.dir()) != std::filesystem::weakly_canonical(dir)) {
+        if (chunk_next.valid()) chunk_next.get();
+        Chunk c = load_chunk(dir);
+        train_split = std::move(*c.split), nl_train = std::move(c.nl);
+      }
+      ids_train = kept("train", train_split, nl_train);
+      if (static_cast<int64_t>(ids_train.size()) < steps_per_epoch * W * B)
+        throw std::runtime_error(fmt::format("{}: {} usable structures, an epoch needs {}", dir, ids_train.size(),
+                                             steps_per_epoch * W * B));
+      fmt::print("epoch {}: chunk {} ({} structures, waited {:.1f} s)\n", epoch, dir, train_split.size(), seconds_since(tc));
+      if (epoch + 1 < o.epochs) {
+        chunk_next_dir = fmt::format(fmt::runtime(o.data_chunks), epoch + 1);
+        chunk_next = std::async(std::launch::async, load_chunk, chunk_next_dir);
+      }
+      std::fflush(stdout);
+    }
     std::vector<int64_t> perm = ids_train;
     std::shuffle(perm.begin(), perm.end(), std::mt19937_64(o.seed + epoch));
 
@@ -2747,6 +2855,24 @@ void train(const TrainOptions &o) {
                "F {:.2f} meV/A{} | val ({:.1f} s) RMSE E {:.2f} meV/atom, F {:.2f} meV/A{}, R2 E {:.4f}% F {:.4f}%\n",
                epoch, t_train, ep.n_systems / t_train, ep.loss / done, tre, trf, nc_rmse(ep),
                t_val, ve, vf, nc_rmse(val), re, rf);
+    std::string heads_json;
+    if (const runtime::EnergyHeads &heads = w0.model().energy_heads(); heads.enabled()) {
+      auto one = [&](const char *what, const StepStats &s) {
+        std::string json = "[";
+        for (int h = 0; h < std::min(heads.n, int(StepStats::kHeads)); h++) {
+          const double ne = std::max<int64_t>(1, s.h_ne[h]), nf = std::max<int64_t>(1, s.h_nf[h]);
+          const double em = 1e3 * s.h_ae_e[h] / ne, er = 1e3 * std::sqrt(s.h_se_e[h] / ne),
+                       fm = 1e3 * s.h_ae_f[h] / nf, fr = 1e3 * std::sqrt(s.h_se_f[h] / nf);
+          fmt::print("epoch {} {} head {} ({}): {} structures, E MAE {:.3f} RMSE {:.3f} meV/atom; {} force components, "
+                     "F MAE {:.2f} RMSE {:.2f} meV/A\n", epoch, what, h, h < int(heads.names.size()) ? heads.names[h] : "",
+                     s.h_ne[h], em, er, s.h_nf[h], fm, fr);
+          json += fmt::format("{}{{\"head\":{},\"n_e\":{},\"e_mae\":{},\"e_rmse\":{},\"n_f\":{},\"f_mae\":{},\"f_rmse\":{}}}",
+                              h ? "," : "", h, s.h_ne[h], em, er, s.h_nf[h], fm, fr);
+        }
+        return json + "]";
+      };
+      heads_json = ",\"train_heads\":" + one("train", ep) + ",\"val_heads\":" + one("val", val);
+    }
     if (o.charge_corr_weight > 0)
       fmt::print("epoch {} charge correlation ({}): mean r train {:.4f} ({} structures, {} skipped), val {:.4f} ({} structures)\n",
                  epoch, o.charge_corr_target, ep.sum_charge_r / std::max<int64_t>(1, ep.n_charge_r), ep.n_charge_r,
@@ -2769,7 +2895,8 @@ void train(const TrainOptions &o) {
                          ep.loss / done, tre, trf, t_train, t_val, best) +
                  (grouped ? ",\"lr_groups\":" + grouped->lr_json(std::max<int64_t>(0, global_step - 1), steps_per_epoch, total_steps)
                           : std::string()) +
-                 (tail_on ? fmt::format(",\"train_tail_loss\":{}", tail_ep_l / std::max<int64_t>(1, tail_ep_n)) : std::string()));
+                 (tail_on ? fmt::format(",\"train_tail_loss\":{}", tail_ep_l / std::max<int64_t>(1, tail_ep_n)) : std::string()) +
+                 heads_json);
     tail_ep_l = 0, tail_ep_n = 0;
     if (o.save_every <= 0)
       write_gguf(o.init_gguf, fmt::format("{}.epoch{}", o.output, epoch), w0, params, scaling);

@@ -1,6 +1,8 @@
 #include "train/batch.h"
 #include "core/padding.h"
 
+#include <fmt/format.h>
+
 #include <algorithm>
 #include <cmath>
 #include <future>
@@ -12,16 +14,20 @@
 
 namespace mlipcpp::train {
 
-double TargetScaling::comp(const int32_t *Z, int n) const {
+double TargetScaling::comp(const int32_t *Z, int n, int head) const {
+  if (head < 0 || head >= n_heads()) throw std::runtime_error("energy head " + std::to_string(head) + " not in the model");
+  const std::map<int, double> &c = head == 0 || head_composition.empty() ? composition : head_composition[head];
   double e = 0.0;
   for (int i = 0; i < n; i++) {
-    auto it = composition.find(Z[i]);
-    if (it != composition.end()) e += it->second;
+    auto it = c.find(Z[i]);
+    if (it != c.end()) e += it->second;
   }
   return e;
 }
 
 TargetScaling TargetScaling::fit(const MemmapSplit &train) {
+  if (train.n_heads() > 1)
+    throw std::runtime_error("multi-head data (head.bin): the composition per head comes from the model (--model-baselines)");
   // composition: least squares E ≈ Σ_Z count_Z c_Z, normal equations in
   // float64 with metatrain's 1e-14 relative ridge, solved by Cholesky
   std::map<int, int> col;
@@ -158,6 +164,13 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
   b.force_target.assign(n * 3, 0.0f);
   b.force_scale.assign(n, 0.0f);
   b.force_mask.assign(n, 0.0f);
+  b.n_heads = scaling.n_heads();
+  b.energy_mask.assign(b.n_systems, 0.0f);
+  b.system_head.assign(b.n_real_systems, 0);
+  if (b.n_heads > 1) {
+    b.head_mask.assign(size_t(b.n_heads) * n, 0.0f);
+    for (int a = 0; a < n; a++) b.head_mask[a] = 1.0f; // padding atoms (overwritten for real ones)
+  }
   b.n_per_system.assign(b.n_systems, 0);
   b.species.assign(n, 0);
   b.atom_charge.assign(n, 0);
@@ -231,8 +244,15 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
         }
       }
     }
+    const int head = split.head(s);
+    if (head >= b.n_heads)
+      throw std::runtime_error(fmt::format("{}: structure {} has energy head {}, the model {}", split.dir(), s, head, b.n_heads));
+    b.system_head[k] = head;
+    b.energy_mask[k] = split.energy_weight(s);
+    if (b.n_heads > 1)
+      for (int i = 0; i < ns; i++) b.head_mask[offset + i] = 0.0f, b.head_mask[size_t(head) * n + offset + i] = 1.0f;
     b.energy_target[k] = static_cast<float>(
-        (split.energy(s) - scaling.comp(Z, ns)) / (scaling.energy_scale * ns));
+        (split.energy(s) - scaling.comp(Z, ns, head)) / (scaling.energy_scale * ns));
     if (split.sqe_q0_labels() && split.has_frag_charges() && split.frag_ok(s)) {
       const std::vector<double> q = runtime::frag_atom_charges(ns, split.frag_units(s), split.frag_unit_charge(s));
       std::copy(q.begin(), q.end(), b.sqe_q0.begin() + offset);
@@ -250,7 +270,7 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
       std::vector<double> FF(3 * size_t(ns));
       const double Ef = runtime::frag_coulomb(split.frag_spec(), ns, split.positions(s), q.data(), FF.data());
       if (Ef != 0) {
-        b.energy_target[k] = static_cast<float>((double(split.energy(s)) - scaling.comp(Z, ns) - Ef) / (scaling.energy_scale * ns));
+        b.energy_target[k] = static_cast<float>((double(split.energy(s)) - scaling.comp(Z, ns, head) - Ef) / (scaling.energy_scale * ns));
         for (int i = 0; i < ns; i++) {
           const float f[3] = {float(FF[3 * i]), float(FF[3 * i + 1]), float(FF[3 * i + 2])};
           float fr[3];

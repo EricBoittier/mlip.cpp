@@ -4,6 +4,7 @@
 #include "core/conditioning.h"
 #include "core/coulomb.h"
 #include "graph_interpreter.h"
+#include "energy_heads.h"
 #include "pet_ragged.h"
 #include "pet_plato_lr.h"
 #include "mlipcpp/model.h"
@@ -139,6 +140,13 @@ public:
 
   const std::map<int, int> &species_to_index() const { return species_to_index_; }
   const std::map<int, float> &composition_energies() const { return composition_energies_; }
+  /// Energy heads (one per level of theory; runtime/energy_heads.h). A multi-head GGUF predicts with head 0
+  /// unless MLIPCPP_ENERGY_HEAD (a head name or index) is set when it is loaded, or select_energy_head is called
+  /// before the first prediction.
+  const EnergyHeads &energy_heads() const { return heads_; }
+  int energy_head() const { return energy_head_; }
+  /// Predict with head h: its readout tensors take the place of head 0's, and its composition baseline.
+  void select_energy_head(int h);
   const std::map<int, float> &nc_force_scales() const { return nc_force_scales_; }
   float energy_scale() const { return energy_scale_; }
   float cutoff_width() const { return cutoff_width_; }
@@ -218,6 +226,8 @@ private:
 
   // Composition energies (atomic reference energies)
   std::map<int, float> composition_energies_;
+  EnergyHeads heads_;
+  int energy_head_ = 0;
 
   // Per-species scale of the non-conservative force head
   std::map<int, float> nc_force_scales_;

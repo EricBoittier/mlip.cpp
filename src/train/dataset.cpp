@@ -108,6 +108,22 @@ MemmapSplit::MemmapSplit(const std::string &dir) : dir_(dir) {
   };
   optional("charge", charge_);
   optional("spin_multiplicity", spin_);
+  // multi-head (level-of-theory) training: head.bin (float32 [ns], integer head index of each structure's
+  // level of theory) and energy_weight.bin (float32 [ns], 0 = no energy label: forces only), both optional
+  optional("head", head_);
+  for (int32_t h : head_)
+    if (h < 0) throw std::runtime_error(dir + "/head.bin: negative head index");
+  const std::string ew = dir + "/energy_weight.bin";
+  if (std::filesystem::exists(ew)) {
+    ew_ = Mapped<float>(ew);
+    if (ew_.size() != ns) throw std::runtime_error(ew + ": size does not match ns.npy");
+  }
+}
+
+int MemmapSplit::n_heads() const {
+  int h = 0;
+  for (int32_t v : head_) h = std::max(h, v);
+  return head_.empty() ? 1 : h + 1;
 }
 
 bool MemmapSplit::load_partial_charges(const std::string &target) {

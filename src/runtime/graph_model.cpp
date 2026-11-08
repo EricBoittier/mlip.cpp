@@ -544,7 +544,41 @@ bool GraphModel::load_from_gguf(const std::string &path) {
     }
   }
 
+  // energy heads (one per level of theory): head 0 is the graph's readout, head h >= 1 the "head<h>." copies
+  heads_ = EnergyHeads{};
+  heads_.n = loader.get_int32("pet.energy_heads", 1);
+  if (heads_.n < 1) heads_.n = 1;
+  heads_.composition.assign(heads_.n, composition_energies_);
+  if (heads_.enabled()) {
+    heads_.names = json::parse(loader.get_string("pet.energy_head_names", "[]")).get<std::vector<std::string>>();
+    const std::string p1 = EnergyHeads::prefix(1);
+    for (const auto &name : weight_names_)
+      if (name.rfind(p1, 0) == 0) heads_.weights.push_back(name.substr(p1.size()));
+    if (heads_.weights.empty()) {
+      ggml_free(temp_ctx);
+      throw std::runtime_error("pet.energy_heads > 1 but no head1.* tensors");
+    }
+    for (int h = 1; h < heads_.n; h++) {
+      const std::string key = "pet.head" + std::to_string(h) + ".composition_";
+      auto hk = loader.get_array_int32(key + "keys");
+      auto hv = loader.get_array_float32(key + "values");
+      if (hk.size() != hv.size()) {
+        ggml_free(temp_ctx);
+        throw std::runtime_error(key + "keys / values mismatch");
+      }
+      heads_.composition[h].clear();
+      for (size_t i = 0; i < hk.size(); i++) heads_.composition[h][hk[i]] = hv[i];
+      for (const auto &w : heads_.weights)
+        if (!ggml_get_tensor(ctx_weights_, (EnergyHeads::prefix(h) + w).c_str())) {
+          ggml_free(temp_ctx);
+          throw std::runtime_error("energy head " + std::to_string(h) + ": no tensor " + EnergyHeads::prefix(h) + w);
+        }
+    }
+  }
+  energy_head_ = 0;
+
   ggml_free(temp_ctx);
+  if (const char *e = std::getenv("MLIPCPP_ENERGY_HEAD"); e && *e) select_energy_head(heads_.index(e));
 
   // Use primary backend (may be GPU) for compute; owned by BackendProvider.
   compute_backend_ = backend_provider_->primary();
@@ -566,6 +600,18 @@ std::vector<std::pair<std::string, ggml_tensor *>> GraphModel::weights() const {
 
 void GraphModel::load_graph_file(const std::string &path) {
   interp_.load_graph_file(path);
+}
+
+void GraphModel::select_energy_head(int h) {
+  if (h < 0 || h >= heads_.n) throw std::runtime_error("select_energy_head: no head " + std::to_string(h));
+  for (const auto &w : heads_.weights) {
+    const std::string name = h == 0 ? w : EnergyHeads::prefix(h) + w;
+    ggml_tensor *t = ggml_get_tensor(ctx_weights_, name.c_str());
+    if (!t) throw std::runtime_error("select_energy_head: no tensor " + name);
+    interp_.set_weight(w, t);
+  }
+  composition_energies_ = heads_.composition[h];
+  energy_head_ = h;
 }
 
 void GraphModel::set_weight(const std::string &name, ggml_tensor *tensor) {
