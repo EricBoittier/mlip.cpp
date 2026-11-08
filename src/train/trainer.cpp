@@ -2362,8 +2362,10 @@ void train(const TrainOptions &o) {
       }
       if (L.graph)
         fmt::print("lrc: q0 mode graph (frozen backbone charge head {} + element Fukui equilibration), fixed-charge "
-                   "inter-cluster Coulomb, switch {} -> {} A\n", L.qmodel, g_sqe.lr_R - g_sqe.lr_t, g_sqe.lr_R);
-      fmt::print("lrc: combined model, frozen charge model: two-level Fermi q0 (T {} eV, D {} eV), clusters a_on {} A, "
+                   "inter-cluster Coulomb, switch {} -> {} A, clusters a_on {} A, a_off {} A, local-charge conditioning\n",
+                   L.qmodel, g_sqe.lr_R - g_sqe.lr_t, g_sqe.lr_R, L.a_on, L.a_off);
+      else
+        fmt::print("lrc: combined model, frozen charge model: two-level Fermi q0 (T {} eV, D {} eV), clusters a_on {} A, "
                  "a_off {} A, inter-cluster SQE long range lr_R {} A (switch {} A), local-charge conditioning\n",
                  L.T, L.D, L.a_on, L.a_off, g_sqe.lr_R, g_sqe.lr_t);
       g_sqe.enabled = false; // the keys stay in the copied GGUF metadata

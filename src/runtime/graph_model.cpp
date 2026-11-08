@@ -765,8 +765,10 @@ ModelResult GraphModel::predict_single_lrc(const AtomicSystem &system, bool comp
   r.sqe_charges.assign(le.q.begin(), le.q.end());
   if (!compute_forces || r.forces.size() != le.forces.size()) return r;
   std::vector<double> F(le.forces);
-  if (cond.needs_cond_forces() && !fd_ds) {
-    if (blend_grad.size() != static_cast<size_t>(n)) throw std::runtime_error("lrc: no dE/dS from the graph");
+  // a structure without any edge runs no backward pass (forces off in the graph), so it has no graph dE/dS: central
+  // differences in S then (its energy still depends on the conditioning)
+  const bool exact_ds = !fd_ds && blend_grad.size() == static_cast<size_t>(n);
+  if (cond.needs_cond_forces() && exact_ds) {
     std::vector<double> G(cond.cl.s, 0.0);
     for (int i = 0; i < n; i++) G[cond.cl.sn[i]] += blend_grad[i];
     lrc_condition_forces(L, sq, cond, n, system.atomic_numbers(), x.data(), G, F.data());
