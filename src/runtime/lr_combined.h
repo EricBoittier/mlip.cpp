@@ -75,6 +75,22 @@ struct LrcSpec {
   double fukui(int z) const; // softplus(phi_Z)
   // per element in SqeSpec::Z order
   std::vector<double> ip, ea, h, l, ap, am, bp, bm; // bp, bm: E x E (row: the atom's element)
+  // graph mode, atomic multipoles (pet.plato_lr.lrc_mp*, feat/plato-lr-v2): a prefitted (frozen) atomic dipole and
+  // traceless (Buckingham) quadrupole per atom, linear in element-pair x radial channels of the neighbours within mp_rc,
+  //   mu_i    = sum_j sum_k theta[Z_i, Z_j, k] g_k(r_ij) u_ij,                       u_ij = (x_j - x_i) / r_ij
+  //   Theta_i = sum_j sum_k tau[Z_i, Z_j, k]   g_k(r_ij) (3/2 u_ij u_ij^T - 1/2 I),
+  //   g_k(r) = exp(-(r - c_k)^2 / 2 w^2) * (1 + cos(pi r / mp_rc)) / 2   (r < mp_rc)
+  // (equivariant by construction; elements outside mp_Z carry none). They add the charge-dipole, dipole-dipole and
+  // charge-quadrupole terms to the inter-cluster pairs of the fixed-charge Coulomb sum (same switch and (1 - R)).
+  // These are the octahedral distributed charges' moments (kernel-lr lane) as point multipoles: the six satellites at
+  // +-a e_k reproduce (q, mu, Theta) exactly and differ only above the quadrupole, O((a / r)^2) <= 0.2 % at 8 A.
+  bool mp = false;
+  double mp_rc = 4.5, mp_width = 0.5;
+  std::vector<double> mp_centers;      // K radial centres
+  std::vector<int32_t> mp_Z;           // E elements
+  std::vector<double> mp_theta, mp_tau; // E x E x K (row: the centre atom's element)
+  std::vector<int> mp_index;           // atomic number -> index into mp_Z (-1: none), built by from_gguf / mp_build
+  void mp_build();
   static LrcSpec from_gguf(const GGUFLoader &L, const SqeSpec &sqe);
   void to_gguf(gguf_context *g) const;
 };
@@ -146,6 +162,13 @@ std::vector<double> lrc_blend_rows(const LrcSpec &L, const SqeSpec &sqe, const L
 /// forces (-dE/dx, added into F) of the conditioning's position dependence, G_a = dE/dS_a per super-node
 void lrc_condition_forces(const LrcSpec &L, const SqeSpec &sqe, const LrcCondition &c, int n, const int32_t *Z,
                           const double *x, const std::vector<double> &G, double *F);
+
+/// graph mode with lrc_mp: the atomic dipoles mu [3n] and quadrupoles Theta [9n] (row-major 3 x 3) of every atom
+void lrc_moments(const LrcSpec &L, int n, const int32_t *Z, const double *x, std::vector<double> &mu,
+                 std::vector<double> &theta);
+/// g [3n] += d(sum_i G_i . mu_i + H_i : Theta_i)/dx, G [3n], H [9n]
+void lrc_moments_vjp(const LrcSpec &L, int n, const int32_t *Z, const double *x, const double *G, const double *H,
+                     double *g);
 
 /// inter-cluster long-range energy and forces (zero, exactly, for a one-cluster structure)
 LrcEnergy lrc_energy(const LrcSpec &L, const SqeSpec &sqe, const LrcCondition &c, int n, const int32_t *Z,
