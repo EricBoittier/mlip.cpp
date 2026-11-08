@@ -52,6 +52,10 @@ int main(int argc, char **argv) {
                "fragq.bin, frag_ok.bin), W x mean over units of (sum q0 - Q_u)^2 per structure; training only;\n"
                "--frag-cond-gate: keep the structure-charge conditioning c and add g (c_unit - c), g the zero-initialised\n"
                "per-channel tensor plato_frag_cond_gate (scripts/plato_lr/add_frag_keys.py --cond-gate);\n"
+               "--tail-data DIR --tail-weight W [--tail-floor-mev 2.585 --tail-delta 1] (conservative): the physics-\n"
+               "  normalised tail loss on pulled-apart scans (train/tail_loss.h; DIR a split + tail_pairs.tsv), one scan per\n"
+               "  step, classes in turn: W x mean_p Huber((dE_model - dE_DFT) / max(|dE_ref|, floor)), no absolute energies;\n"
+               "--checkpoint-steps N: also OUT.step%06d.gguf every N steps;\n"
                "--lr-schedule: per-group learning rates (src/train/lr_schedule.h), replaces --lr, --warmup-fraction,\n"
                "--schedule, --decay-after, --min-lr and --optimizer; groups matched on metatrain state-dict names;\n"
                "--dump-lr-schedule N prints the groups' lr of the first N steps as JSON and stops (with\n"
@@ -131,6 +135,11 @@ int main(int argc, char **argv) {
     else if (a == "--frag-charge-weight") o.frag_charge_weight = std::stod(val());
     else if (a == "--frag-charges") o.frag_charges = true;
     else if (a == "--frag-cond-gate") o.frag_cond_gate = true;
+    else if (a == "--tail-data") o.tail_data = val();
+    else if (a == "--tail-weight") o.tail_weight = std::stod(val());
+    else if (a == "--tail-floor-mev") o.tail_floor_mev = std::stod(val());
+    else if (a == "--tail-delta") o.tail_delta = std::stod(val());
+    else if (a == "--checkpoint-steps") o.checkpoint_steps = std::stoll(val());
     else if (a == "--sqe") o.sqe = true;
     else if (a == "--sqe-q0-weight") o.sqe_q0_weight = std::stod(val());
     else if (a == "--allreduce") o.allreduce = std::stoi(val()) != 0;

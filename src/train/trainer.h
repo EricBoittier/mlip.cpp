@@ -3,6 +3,7 @@
 #include "runtime/graph_model.h"
 #include "train/batch.h"
 #include "runtime/sqe.h"
+#include "train/tail_loss.h"
 
 #include <ggml-alloc.h>
 
@@ -96,6 +97,14 @@ struct TrainOptions {
   // plato_frag_cond_gate (scripts/plato_lr/add_frag_keys.py --cond-gate)
   bool frag_cond_gate = false;
   double energy_weight = 1.0, force_weight = 1.0, nc_force_weight = 1.0;
+  // physics-normalised tail loss (train/tail_loss.h): --tail-data DIR holds a MemmapSplit of pulled-apart scans plus
+  // tail_pairs.tsv; every step adds one scan (classes in turn, so each class contributes equally) with the loss
+  // tail_weight * mean_p Huber_{tail_delta}((ΔE_model - ΔE_DFT) / max(|ΔE_ref|, tail_floor)); no absolute energies
+  // and no forces of the scans enter. Conservative training only. tail_weight 0: off
+  std::string tail_data;
+  double tail_weight = 0.0, tail_floor_mev = 2.585, tail_delta = 1.0;
+  // checkpoint_steps > 0: also <output>.step%06d.gguf every that many steps (for per-checkpoint monitors)
+  int64_t checkpoint_steps = 0;
   // fine-tuning: keep the composition and scales stored in --init instead of
   // fitting them on the training set
   bool model_baselines = false;
@@ -242,6 +251,13 @@ public:
   double sqe_q0_weight = 0, sqe_q0_loss = 0; // learned q0: supervision weight; summed loss for the log
   int64_t sqe_q0_n = 0;
   double frag_charge_weight = 0.0;
+  /// tail loss: BACKWARD graphs get the input tail_cotangent c [S] and the term sum_k c_k d_energy_k
+  bool tail_cotangent = false;
+  /// One tail group: a forward pass for the model energies, the tail loss and dL/dE on the host, then a backward
+  /// pass of sum_k (mult dL/dE_k) E_k (energy and force loss norms 0) accumulated into the gradients.
+  /// pairs: local indices into the batch; returns the loss, the normalised residuals in `r` (optional).
+  double run_tail(const Batch &b, double energy_scale, const std::vector<TailPair> &pairs, const TailLoss &tl,
+                  double mult, std::vector<double> *r = nullptr);
 
   /// Profiling: compute node by node (synchronised) and accumulate, per op
   /// ("fwd:OP" / "bwd:OP"; conservative mode "F.fwd:OP" / "F.bwd:OP" for the
@@ -308,6 +324,7 @@ private:
     ggml_tensor *qref = nullptr, *qok = nullptr, *qw = nullptr, *charge_r = nullptr, *charge_loss = nullptr;
     // fragment-sum charge loss: inputs (column one-hot [n, F], targets [F], weight x norm), error per column [F]
     ggml_tensor *fonehot = nullptr, *ftarget = nullptr, *fw = nullptr, *frag_d = nullptr;
+    ggml_tensor *ecot = nullptr; // tail loss: dL/d(d_energy) per structure [S, 1]
     ~StepGraph();
   };
   /// graph kinds: the loss (FORWARD / BACKWARD to the weights); conservative
@@ -337,6 +354,8 @@ private:
   ggml_tensor *frag_charge_graph(StepGraph &g, ggml_context *ctx, int S, bool loss); // error per column (+ the loss term)
   void frag_charge_stats(StepGraph &g, const Batch &b, StepStats &st);
   float plato_jvp_scale_ = 1.0f;
+  bool zero_norms_ = false;           // run_tail: energy and force loss norms 0
+  std::vector<float> ecot_;           // run_tail: the cotangent of this batch
   void plato_create(StepGraph &g, ggml_context *ctx, int n, bool grad);
 
   runtime::GraphModel model_;
@@ -446,5 +465,13 @@ std::string cache_path(const std::string &cache_dir, const MemmapSplit &split, f
 AdaptiveCutoff adaptive_cutoff(const runtime::GraphModel &model);
 
 void train(const TrainOptions &opts);
+
+/// Muon's hidden-matrix rule: 2-D, both dims >= 16, not an embedding table (name without "embed").
+/// Every other tensor of a Muon group takes AdamW.
+bool is_muon_matrix(const ggml_tensor *p);
+/// Muon's Newton-Schulz orthogonalisation (the fixed quintic 3.4445, -4.7750, 2.0315; Frobenius
+/// normalisation first; MLIPCPP_NS_POLAR=1: Polar Express) of each matrix of a stack [ne0, ne1, k]:
+/// approximately U V^T of g = U S V^T, singular values in about [0.7, 1.2]. The ggml ops (any backend).
+ggml_tensor *muon_orthogonalize(ggml_context *ctx, ggml_tensor *g, int steps);
 
 } // namespace mlipcpp::train
