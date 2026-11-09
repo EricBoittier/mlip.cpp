@@ -1077,6 +1077,10 @@ void Worker::lrc_prepare(const Batch &b, bool forces) {
     mix(qs, sizeof qs);
     lrc_key_[k] = h;
     lrc_a0_[k] = a0;
+    // bounded: with rotation augmentation every visit has new coordinates, so the cache never hits across epochs and
+    // grew without bound (lyra R1q: 94 GB host RSS after 7 epochs, OOM). Entries are only needed within this step, so
+    // drop them all once the map is large (only between structures of the batch whose keys are not yet used).
+    if (k == 0 && lrc_cache_.size() > 4096) lrc_cache_.clear();
     lrc_seen++;
     auto it = lrc_cache_.find(h);
     if (it == lrc_cache_.end() || (forces && !it->second.has_f)) {
