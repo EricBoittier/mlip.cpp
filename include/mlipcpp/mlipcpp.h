@@ -382,6 +382,35 @@ mlipcpp_error_t mlipcpp_predict_ptr_with_options(mlipcpp_model_t model, int32_t 
                                                   const mlipcpp_predict_options_t *options,
                                                   mlipcpp_result_t *result);
 
+/**
+ * @brief Predict several independent systems in one call (e.g. the beads of a
+ *        path integral), returning per-system energies, forces and stress
+ * @param model Model handle
+ * @param n_systems Number of systems (>= 1)
+ * @param n_atoms Atoms per system [n_systems]
+ * @param positions Positions of all systems, concatenated [sum(n_atoms) * 3]
+ * @param atomic_numbers Atomic numbers, concatenated [sum(n_atoms)]
+ * @param cells Lattice matrices (rows), one per system [n_systems * 9], or NULL
+ * @param pbc Periodicity flags [n_systems * 3], or NULL (all periodic if cells)
+ * @param options Prediction options (NULL for defaults), the same for every system
+ * @param energies Output [n_systems] (eV)
+ * @param forces Output [sum(n_atoms) * 3] (eV/A), or NULL
+ * @param stress Output [n_systems * 6] Voigt (eV/A^3), or NULL; filled when
+ *        options->compute_stress and the system is periodic, else zeros
+ * @return MLIPCPP_OK on success, error code on failure
+ *
+ * Graph models of the cached path pack the systems into one disconnected graph
+ * (one neighbour list per system, one compute); other models evaluate them in
+ * turn. Each system's result equals that of mlipcpp_predict_with_options.
+ * Does not touch the result handle of the single-system calls.
+ */
+mlipcpp_error_t mlipcpp_predict_batch(mlipcpp_model_t model, int32_t n_systems,
+                                      const int32_t *n_atoms, const float *positions,
+                                      const int32_t *atomic_numbers, const float *cells,
+                                      const bool *pbc,
+                                      const mlipcpp_predict_options_t *options,
+                                      float *energies, float *forces, float *stress);
+
 /* ============================================================================
  * Result Access
  * ============================================================================
