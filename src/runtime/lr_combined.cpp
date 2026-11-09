@@ -116,8 +116,52 @@ LrcSpec LrcSpec::from_gguf(const GGUFLoader &G, const SqeSpec &S) {
   scalar("tau", L.tau), scalar("merge_w", L.merge_w);
   {
     const std::string mode = G.get_string("pet.plato_lr.lrc_q0_mode", "fermi2");
-    if (mode != "fermi2" && mode != "round" && mode != "head") throw std::runtime_error("lrc: unknown q0 mode " + mode);
-    L.round = mode == "round", L.head_only = mode == "head";
+    if (mode != "fermi2" && mode != "round" && mode != "head" && mode != "graph")
+      throw std::runtime_error("lrc: unknown q0 mode " + mode);
+    L.round = mode == "round", L.head_only = mode == "head", L.graph = mode == "graph";
+  }
+  {
+    const std::string cm = G.get_string("pet.plato_lr.lrc_cond", "cluster");
+    if (cm != "cluster" && cm != "global") throw std::runtime_error("lrc: lrc_cond must be cluster or global");
+    L.cond_global = cm == "global";
+    scalar("cond_w", L.cond_w);
+    if (G.get_int32("pet.plato_lr.lrc_qplateau", 0) != 0)
+      throw std::runtime_error("lrc_qplateau was removed (it lost sum q = Q and double-counted partly linked partners); "
+                               "use lrc_qproj");
+    L.qproj = G.get_int32("pet.plato_lr.lrc_qproj", 0) != 0;
+    scalar("qproj_w", L.qproj_w);
+    if (L.qproj && !(L.qproj_w > 0 && L.qproj_w <= 1)) throw std::runtime_error("lrc: lrc_qproj_w must be in (0, 1]");
+    if (!(L.cond_w > 0 && L.cond_w <= 1)) throw std::runtime_error("lrc: lrc_cond_w must be in (0, 1]");
+  }
+  if (L.graph) {
+    L.qmodel = G.get_string("pet.plato_lr.lrc_qmodel", "");
+    {
+      const std::string qc = G.get_string("pet.plato_lr.lrc_qpass_charge", "total");
+      if (qc != "total" && qc != "zero") throw std::runtime_error("lrc graph: lrc_qpass_charge must be total or zero");
+      L.qpass_neutral = qc == "zero";
+    }
+    const auto z = get_f64(G, "pet.plato_lr.lrc_fukui_Z");
+    L.fukui_phi = get_f64(G, "pet.plato_lr.lrc_fukui_phi");
+    for (double v : z) L.fukui_Z.push_back(static_cast<int32_t>(std::lround(v)));
+    if (L.qmodel.empty() || L.fukui_Z.empty() || L.fukui_Z.size() != L.fukui_phi.size())
+      throw std::runtime_error("lrc graph: needs lrc_qmodel and lrc_fukui_Z / _phi of equal length");
+    if (!(L.a_off > L.a_on)) throw std::runtime_error("lrc: bad a_on / a_off");
+    L.mp = G.get_int32("pet.plato_lr.lrc_mp", 0) != 0;
+    if (L.mp) {
+      scalar("mp_rc", L.mp_rc), scalar("mp_width", L.mp_width);
+      L.mp_centers = get_f64(G, "pet.plato_lr.lrc_mp_centers");
+      for (double v : get_f64(G, "pet.plato_lr.lrc_mp_Z")) L.mp_Z.push_back(static_cast<int32_t>(std::lround(v)));
+      L.mp_theta = get_f64(G, "pet.plato_lr.lrc_mp_theta"), L.mp_tau = get_f64(G, "pet.plato_lr.lrc_mp_tau");
+      L.mp_build();
+    }
+    L.pol = G.get_int32("pet.plato_lr.lrc_pol", 0) != 0;
+    if (L.pol) {
+      for (double v : get_f64(G, "pet.plato_lr.lrc_pol_Z")) L.pol_Z.push_back(static_cast<int32_t>(std::lround(v)));
+      L.pol_alpha = get_f64(G, "pet.plato_lr.lrc_pol_alpha");
+      if (L.pol_Z.empty() || L.pol_Z.size() != L.pol_alpha.size())
+        throw std::runtime_error("lrc pol: needs lrc_pol_Z and lrc_pol_alpha of equal length");
+    }
+    return L;
   }
   const size_t E = S.Z.size();
   if (!(L.a_off > L.a_on)) throw std::runtime_error("lrc: bad a_on / a_off");
@@ -145,11 +189,33 @@ void LrcSpec::to_gguf(gguf_context *g) const {
   auto scalar = [&](const char *k, double v) { gguf_set_val_f64(g, (std::string("pet.plato_lr.lrc_") + k).c_str(), v); };
   scalar("a_on", a_on), scalar("a_off", a_off), scalar("T", T), scalar("D", D), scalar("tau", tau);
   scalar("merge_w", merge_w);
-  gguf_set_val_str(g, "pet.plato_lr.lrc_q0_mode", round ? "round" : head_only ? "head" : "fermi2");
-  if (round || head_only) return;
+  gguf_set_val_str(g, "pet.plato_lr.lrc_q0_mode", graph ? "graph" : round ? "round" : head_only ? "head" : "fermi2");
+  gguf_set_val_str(g, "pet.plato_lr.lrc_cond", cond_global ? "global" : "cluster");
+  scalar("cond_w", cond_w);
+  gguf_set_val_i32(g, "pet.plato_lr.lrc_qproj", qproj ? 1 : 0);
+  scalar("qproj_w", qproj_w);
   auto arr = [&](const char *k, const std::vector<double> &v) {
     gguf_set_arr_data(g, (std::string("pet.plato_lr.lrc_") + k).c_str(), GGUF_TYPE_FLOAT64, v.data(), v.size());
   };
+  if (graph) {
+    gguf_set_val_str(g, "pet.plato_lr.lrc_qmodel", qmodel.c_str());
+    gguf_set_val_str(g, "pet.plato_lr.lrc_qpass_charge", qpass_neutral ? "zero" : "total");
+    std::vector<double> z(fukui_Z.begin(), fukui_Z.end());
+    arr("fukui_Z", z), arr("fukui_phi", fukui_phi);
+    if (mp) {
+      gguf_set_val_i32(g, "pet.plato_lr.lrc_mp", 1);
+      scalar("mp_rc", mp_rc), scalar("mp_width", mp_width);
+      std::vector<double> mz(mp_Z.begin(), mp_Z.end());
+      arr("mp_centers", mp_centers), arr("mp_Z", mz), arr("mp_theta", mp_theta), arr("mp_tau", mp_tau);
+    }
+    if (pol) {
+      gguf_set_val_i32(g, "pet.plato_lr.lrc_pol", 1);
+      std::vector<double> pz(pol_Z.begin(), pol_Z.end());
+      arr("pol_Z", pz), arr("pol_alpha", pol_alpha);
+    }
+    return;
+  }
+  if (round || head_only) return;
   arr("ip", ip), arr("ea", ea), arr("h", h), arr("l", l), arr("ap", ap), arr("am", am), arr("bp", bp), arr("bm", bm);
 }
 
@@ -443,12 +509,129 @@ void vjp_round(const LrcSpec &L, const SqeSpec &S, int n, const int32_t *Z, cons
 }
 } // namespace
 
-LrcQ0 lrc_q0(const LrcSpec &L, const SqeSpec &S, int n, const int32_t *Z, const double *x, double Q) {
+double LrcSpec::fukui(int z) const {
+  for (size_t k = 0; k < fukui_Z.size(); k++)
+    if (fukui_Z[k] == z) {
+      const double p = fukui_phi[k];
+      return (p > 30 ? p : std::log1p(std::exp(p))) + 1e-6;
+    }
+  throw std::runtime_error("lrc graph: no Fukui parameter for atomic number " + std::to_string(z));
+}
+
+// ---- atomic multipoles (graph mode, lrc_mp) ---------------------------------------------------------------------------
+void LrcSpec::mp_build() {
+  const size_t E = mp_Z.size(), K = mp_centers.size();
+  if (!mp) return;
+  if (E == 0 || K == 0 || mp_theta.size() != E * E * K || mp_tau.size() != E * E * K || !(mp_rc > 0) || !(mp_width > 0))
+    throw std::runtime_error("lrc mp: needs mp_Z, mp_centers and E x E x K mp_theta / mp_tau, mp_rc, mp_width > 0");
+  mp_index.assign(128, -1);
+  for (size_t e = 0; e < E; e++)
+    if (mp_Z[e] >= 0 && mp_Z[e] < 128) mp_index[mp_Z[e]] = static_cast<int>(e);
+}
+
+namespace {
+// coefficient c(r) = sum_k p[k] g_k(r) and dc/dr for one element pair (p: K values)
+inline void mp_radial(const LrcSpec &L, const double *p, double r, double &c, double &dc) {
+  c = dc = 0;
+  if (r >= L.mp_rc) return;
+  const double fc = 0.5 * (1 + std::cos(M_PI * r / L.mp_rc)), dfc = -0.5 * M_PI / L.mp_rc * std::sin(M_PI * r / L.mp_rc);
+  const double w2 = L.mp_width * L.mp_width;
+  for (size_t k = 0; k < L.mp_centers.size(); k++) {
+    const double d = r - L.mp_centers[k], e = std::exp(-0.5 * d * d / w2);
+    c += p[k] * e * fc, dc += p[k] * e * (dfc - fc * d / w2);
+  }
+}
+// neighbour pairs (i, j) within mp_rc with the element-pair parameter offsets; visit(i, j, r, u[3], off)
+template <class F> void mp_pairs(const LrcSpec &L, int n, const int32_t *Z, const double *x, F &&visit) {
+  const size_t E = L.mp_Z.size(), K = L.mp_centers.size();
+  for (int i = 0; i < n; i++) {
+    const int ei = Z[i] >= 0 && Z[i] < 128 ? L.mp_index[Z[i]] : -1;
+    if (ei < 0) continue;
+    for (int j = 0; j < n; j++) {
+      if (j == i) continue;
+      const int ej = Z[j] >= 0 && Z[j] < 128 ? L.mp_index[Z[j]] : -1;
+      if (ej < 0) continue;
+      const double r = dist(x, i, j);
+      if (r >= L.mp_rc || r == 0) continue;
+      double u[3];
+      for (int k = 0; k < 3; k++) u[k] = (x[3 * j + k] - x[3 * i + k]) / r;
+      visit(i, j, r, u, (size_t(ei) * E + size_t(ej)) * K);
+    }
+  }
+}
+} // namespace
+
+void lrc_moments(const LrcSpec &L, int n, const int32_t *Z, const double *x, std::vector<double> &mu,
+                 std::vector<double> &theta) {
+  mu.assign(3 * size_t(n), 0.0), theta.assign(9 * size_t(n), 0.0);
+  if (!L.mp) return;
+  mp_pairs(L, n, Z, x, [&](int i, int, double r, const double *u, size_t off) {
+    double c, dc, t, dt;
+    mp_radial(L, L.mp_theta.data() + off, r, c, dc);
+    mp_radial(L, L.mp_tau.data() + off, r, t, dt);
+    for (int a = 0; a < 3; a++) {
+      mu[3 * size_t(i) + a] += c * u[a];
+      for (int b = 0; b < 3; b++) theta[9 * size_t(i) + 3 * a + b] += t * (1.5 * u[a] * u[b] - (a == b ? 0.5 : 0.0));
+    }
+  });
+}
+
+void lrc_moments_vjp(const LrcSpec &L, int n, const int32_t *Z, const double *x, const double *G, const double *H,
+                     double *g) {
+  if (!L.mp) return;
+  mp_pairs(L, n, Z, x, [&](int i, int j, double r, const double *u, size_t off) {
+    double c, dc, t, dt;
+    mp_radial(L, L.mp_theta.data() + off, r, c, dc);
+    mp_radial(L, L.mp_tau.data() + off, r, t, dt);
+    const double *Gi = G + 3 * size_t(i), *Hi = H + 9 * size_t(i);
+    double Gu = 0, Hu[3] = {0, 0, 0}, uHu = 0, tr = Hi[0] + Hi[4] + Hi[8];
+    for (int a = 0; a < 3; a++) {
+      Gu += Gi[a] * u[a];
+      for (int b = 0; b < 3; b++) Hu[a] += 0.5 * (Hi[3 * a + b] + Hi[3 * b + a]) * u[b];
+    }
+    for (int a = 0; a < 3; a++) uHu += u[a] * Hu[a];
+    // s = x_j - x_i: d(c(r) G.u)/ds = c' (G.u) u + c / r (G - (G.u) u);
+    // d(t(r) (3/2 u.Hu - 1/2 tr H))/ds = t' (3/2 uHu - 1/2 tr H) u + 3 t / r (Hu - (uHu) u)
+    for (int a = 0; a < 3; a++) {
+      const double d = dc * Gu * u[a] + c / r * (Gi[a] - Gu * u[a]) + dt * (1.5 * uHu - 0.5 * tr) * u[a] +
+                       3.0 * t / r * (Hu[a] - uHu * u[a]);
+      g[3 * size_t(j) + a] += d, g[3 * size_t(i) + a] -= d;
+    }
+  });
+}
+
+namespace {
+// graph mode: q0 = q_raw + f (Q - sum q_raw) / sum f; wt = f / sum f (f per element: no position dependence)
+LrcQ0 q0_graph(const LrcSpec &L, int n, const int32_t *Z, const double *x, double Q, int spin) {
+  if (!L.qsrc) throw std::runtime_error("lrc graph: the charge pass (lrc_qmodel) is not loaded");
+  LrcQ0 o;
+  o.Q = Q, o.spin = spin;
+  if (n == 0) return o;
+  o.q0 = L.qsrc->raw(n, Z, x, L.qpass_neutral ? 0.0 : Q, spin);
+  o.wt.resize(n);
+  double sq = 0, sf = 0;
+  for (int i = 0; i < n; i++) sq += o.q0[i], o.wt[i] = L.fukui(Z[i]), sf += o.wt[i];
+  for (int i = 0; i < n; i++) o.wt[i] /= sf, o.q0[i] += o.wt[i] * (Q - sq);
+  return o;
+}
+void vjp_graph(const LrcSpec &L, int n, const int32_t *Z, const double *x, const LrcQ0 &o, const double *c, double *g) {
+  double cb = 0;
+  for (int i = 0; i < n; i++) cb += c[i] * o.wt[i];
+  std::vector<double> w(n);
+  bool any = false;
+  for (int i = 0; i < n; i++) w[i] = c[i] - cb, any |= w[i] != 0;
+  if (any) L.qsrc->raw_vjp(n, Z, x, L.qpass_neutral ? 0.0 : o.Q, o.spin, w.data(), g);
+}
+} // namespace
+
+LrcQ0 lrc_q0(const LrcSpec &L, const SqeSpec &S, int n, const int32_t *Z, const double *x, double Q, int spin) {
+  if (L.graph) return q0_graph(L, n, Z, x, Q, spin);
   return L.round || L.head_only ? q0_round(L, S, n, Z, x, Q) : q0_fermi2(L, S, n, Z, x, Q);
 }
 void lrc_q0_vjp(const LrcSpec &L, const SqeSpec &S, int n, const int32_t *Z, const double *x, const LrcQ0 &q,
                 const double *c, double *g) {
-  if (L.round || L.head_only) vjp_round(L, S, n, Z, x, q, c, g);
+  if (L.graph) vjp_graph(L, n, Z, x, q, c, g);
+  else if (L.round || L.head_only) vjp_round(L, S, n, Z, x, q, c, g);
   else vjp_fermi2(L, S, n, Z, x, q, c, g);
 }
 
@@ -598,7 +781,7 @@ bool LrcCondition::needs_cond_forces() const {
 }
 
 LrcCondition lrc_condition(const LrcSpec &L, const SqeSpec &S, int n, const int32_t *Z, const double *x, double Q,
-                           int max_charge) {
+                           int max_charge, int spin) {
   LrcCondition c;
   c.cl = lrc_clusters(L, n, x);
   const int s = c.cl.s;
@@ -606,17 +789,18 @@ LrcCondition lrc_condition(const LrcSpec &L, const SqeSpec &S, int n, const int3
   if (s == 1) {
     c.Q0[0] = c.Qloc[0] = Q;
   } else {
-    c.q0 = lrc_q0(L, S, n, Z, x, Q);
+    c.q0 = lrc_q0(L, S, n, Z, x, Q, spin);
     for (int i = 0; i < n; i++) c.Q0[c.cl.sn[i]] += c.q0.q0[i];
     for (int a = 0; a < s; a++)
       for (int b = 0; b < s; b++) c.Qloc[a] += c.cl.R[size_t(a) * s + b] * c.Q0[b];
+    if (L.cond_global) c.Qloc.assign(s, Q); // global conditioning: no position dependence (dS = 0)
   }
   for (int a = 0; a < s; a++) {
     double v = c.Qloc[a];
     const double rv = std::round(v);
     if (std::abs(v - rv) < 1e-9) v = rv; // solver noise on an integer
-    const double k = std::floor(v), u = v - k;
-    c.k[a] = static_cast<int32_t>(k), c.S[a] = sstep(u), c.dS[a] = dsstep(u);
+    const double k = std::floor(v), u = (v - k - 0.5) / L.cond_w + 0.5;
+    c.k[a] = static_cast<int32_t>(k), c.S[a] = sstep(u), c.dS[a] = dsstep(u) / L.cond_w;
   }
   c.row_charge.resize(n), c.row_charge_hi.resize(n), c.blend.resize(n);
   for (int i = 0; i < n; i++) {
@@ -631,7 +815,7 @@ LrcCondition lrc_condition(const LrcSpec &L, const SqeSpec &S, int n, const int3
 void lrc_condition_forces(const LrcSpec &L, const SqeSpec &S, const LrcCondition &c, int n, const int32_t *Z,
                           const double *x, const std::vector<double> &G, double *F) {
   const int s = c.cl.s;
-  if (s == 1) return;
+  if (s == 1 || L.cond_global) return;
   std::vector<double> g(3 * size_t(n), 0.0), W(size_t(s) * s, 0.0), cq(n, 0.0);
   std::vector<double> gs(s);
   for (int a = 0; a < s; a++) gs[a] = G[a] * c.dS[a]; // dE/dQloc_a
@@ -647,11 +831,350 @@ void lrc_condition_forces(const LrcSpec &L, const SqeSpec &S, const LrcCondition
   for (size_t k = 0; k < g.size(); k++) F[k] -= g[k];
 }
 
+std::vector<double> lrc_blend_rows(const LrcSpec &L, const SqeSpec &S, const LrcCondition &c, int n, const int32_t *Z,
+                                   const double *x) {
+  const int s = c.cl.s;
+  std::vector<double> rows(size_t(s) * 3 * n, 0.0);
+  if (s == 1) return rows;
+  for (int a = 0; a < s; a++) {
+    if (c.dS[a] == 0) continue;
+    std::vector<double> G(s, 0.0);
+    G[a] = 1.0;
+    double *r = rows.data() + size_t(a) * 3 * n; // lrc_condition_forces subtracts dS_a/dx
+    lrc_condition_forces(L, S, c, n, Z, x, G, r);
+    for (int k = 0; k < 3 * n; k++) r[k] = -r[k];
+  }
+  return rows;
+}
+
+namespace {
+// graph mode: fixed-charge Coulomb of the inter-cluster pairs beyond lr_R - lr_t
+// one pair's electrostatics (units e, A; times KE outside), r = x_j - x_i:
+//   e = [q_i q_j / R] + (q_j mu_i - q_i mu_j).r / R^3 + mu_i.mu_j / R^3 - 3 (mu_i.r)(mu_j.r) / R^5
+//       + (q_i r.Theta_j.r + q_j r.Theta_i.r) / R^5          (Theta: Buckingham, traceless; mu / Theta may be null)
+// and its derivatives in r, q_i, q_j, mu_i, mu_j, Theta_i, Theta_j
+struct PairK {
+  double e = 0, dr[3] = {0, 0, 0}, dqi = 0, dqj = 0, dmi[3] = {0, 0, 0}, dmj[3] = {0, 0, 0};
+  double dTi[9] = {}, dTj[9] = {};
+};
+PairK pair_kernel(const double *r, double qi, double qj, const double *mi, const double *mj, const double *Ti,
+                  const double *Tj, bool qq) {
+  static const double z3[3] = {0, 0, 0}, z9[9] = {};
+  if (!mi) mi = z3;
+  if (!mj) mj = z3;
+  if (!Ti) Ti = z9;
+  if (!Tj) Tj = z9;
+  PairK k;
+  const double R2 = r[0] * r[0] + r[1] * r[1] + r[2] * r[2], R = std::sqrt(R2);
+  const double R3 = R2 * R, R5 = R3 * R2, R7 = R5 * R2;
+  double mir = 0, mjr = 0, mimj = 0, rTi = 0, rTj = 0, Tir[3] = {0, 0, 0}, Tjr[3] = {0, 0, 0};
+  for (int a = 0; a < 3; a++) {
+    mir += mi[a] * r[a], mjr += mj[a] * r[a], mimj += mi[a] * mj[a];
+    for (int b = 0; b < 3; b++) Tir[a] += Ti[3 * a + b] * r[b], Tjr[a] += Tj[3 * a + b] * r[b];
+  }
+  for (int a = 0; a < 3; a++) rTi += r[a] * Tir[a], rTj += r[a] * Tjr[a];
+  const double qf = qq ? 1.0 : 0.0, pr = qj * mir - qi * mjr, Mr = qi * rTj + qj * rTi;
+  k.e = qf * qi * qj / R + pr / R3 + mimj / R3 - 3 * mir * mjr / R5 + Mr / R5;
+  for (int a = 0; a < 3; a++) {
+    const double p = qj * mi[a] - qi * mj[a];
+    k.dr[a] = -qf * qi * qj * r[a] / R3 + p / R3 - 3 * pr * r[a] / R5 - 3 * mimj * r[a] / R5 -
+              3 * (mjr * mi[a] + mir * mj[a]) / R5 + 15 * mir * mjr * r[a] / R7 + 2 * (qi * Tjr[a] + qj * Tir[a]) / R5 -
+              5 * Mr * r[a] / R7;
+    k.dmi[a] = qj * r[a] / R3 + mj[a] / R3 - 3 * mjr * r[a] / R5;
+    k.dmj[a] = -qi * r[a] / R3 + mi[a] / R3 - 3 * mir * r[a] / R5;
+    for (int b = 0; b < 3; b++) k.dTi[3 * a + b] = qj * r[a] * r[b] / R5, k.dTj[3 * a + b] = qi * r[a] * r[b] / R5;
+  }
+  k.dqi = qf * qj / R - mjr / R3 + rTj / R5, k.dqj = qf * qi / R + mir / R3 + rTi / R5;
+  return k;
+}
+
+// atomic polarisability (A^3) of atomic number z (0 outside pol_Z)
+double pol_alpha(const LrcSpec &L, int z) {
+  for (size_t k = 0; k < L.pol_Z.size(); k++)
+    if (L.pol_Z[k] == z) return L.pol_alpha[k];
+  return 0.0;
+}
+
+// smootherstep and its first two derivatives
+inline double sstep2(double x) { return x <= 0 || x >= 1 ? 0.0 : 60.0 * x * (2.0 * x * x - 3.0 * x + 1.0); }
+// plateau value P(L), P'(L), P''(L) of width w
+inline void plateau(double Lq, double w, double &P, double &dP, double &ddP) {
+  const double k = std::floor(Lq), u = (Lq - k - 0.5) / w + 0.5;
+  P = k + sstep(u), dP = dsstep(u) / w, ddP = sstep2(u) / (w * w);
+}
+
+struct LrcProjection {
+  std::vector<double> q, s, dpb, g, F, Q0;
+  double S = 0, G = 0;
+};
+constexpr double kProjEps = 1e-3;
+
+// visit every group of every link state: cb(prob, group nodes, edges of the component, state, pr, su) (fallback and
+// uncovered super-nodes: one state of probability 1, pr / su empty)
+template <class CB> void proj_groups(const LrcSpec &L, const LrcClusters &c, CB &&cb) {
+  std::vector<char> covered(c.s, 0);
+  static const std::vector<double> none;
+  for (const auto &edges : weak_components(c)) {
+    std::vector<int> nodes;
+    for (int k : edges) nodes.push_back(c.se[k].first), nodes.push_back(c.se[k].second);
+    std::sort(nodes.begin(), nodes.end());
+    nodes.erase(std::unique(nodes.begin(), nodes.end()), nodes.end());
+    for (int a : nodes) covered[a] = 1;
+    if (int(edges.size()) > L.max_super_edges) { // fallback: the component is one cluster
+      cb(1.0, nodes, edges, uint64_t(0), none, none, true);
+      continue;
+    }
+    enumerate(c, edges, [&](uint64_t st, double P, const std::vector<int> &p, const std::vector<int> &nd,
+                            const std::vector<double> &pr, const std::vector<double> &su) {
+      std::vector<int> roots;
+      for (int a : nd) roots.push_back(p[a]);
+      std::sort(roots.begin(), roots.end());
+      roots.erase(std::unique(roots.begin(), roots.end()), roots.end());
+      for (int r : roots) {
+        std::vector<int> grp;
+        for (int a : nd)
+          if (p[a] == r) grp.push_back(a);
+        cb(P, grp, edges, st, pr, su, false);
+      }
+    });
+  }
+  for (int a = 0; a < c.s; a++)
+    if (!covered[a]) cb(1.0, std::vector<int>{a}, std::vector<int>{}, uint64_t(0), none, none, true);
+}
+
+LrcProjection lrc_project(const LrcSpec &L, const LrcClusters &c, int n, const int32_t *Z, const double *q) {
+  LrcProjection o;
+  const int s = c.s;
+  o.Q0.assign(s, 0.0), o.F.assign(s, 0.0), o.s.assign(s, 0.0), o.dpb.assign(s, 0.0), o.g.assign(s, 0.0);
+  for (int i = 0; i < n; i++) o.Q0[c.sn[i]] += q[i], o.F[c.sn[i]] += L.fukui(Z[i]);
+  proj_groups(L, c, [&](double pr, const std::vector<int> &grp, const std::vector<int> &, uint64_t,
+                        const std::vector<double> &, const std::vector<double> &, bool) {
+    double QG = 0, FG = 0, P, dP, ddP;
+    for (int a : grp) QG += o.Q0[a], FG += o.F[a];
+    plateau(QG, L.qproj_w, P, dP, ddP);
+    for (int a : grp) o.s[a] += pr * (P - QG) * o.F[a] / FG, o.dpb[a] += pr * dP;
+  });
+  for (int a = 0; a < s; a++) o.g[a] = o.F[a] * (kProjEps + o.dpb[a]), o.S += o.s[a], o.G += o.g[a];
+  o.q.assign(q, q + n);
+  for (int i = 0; i < n; i++) {
+    const int a = c.sn[i];
+    o.q[i] += L.fukui(Z[i]) / o.F[a] * (o.s[a] - o.S * o.g[a] / o.G);
+  }
+  return o;
+}
+
+// dq: dE/dq' on input, dE/dq on output (q the charge-pass charges); g [3n] += the link-probability part
+void lrc_project_vjp(const LrcSpec &L, const LrcClusters &c, const LrcProjection &o, int n, const int32_t *Z,
+                     const double *x, std::vector<double> &dq, double *g) {
+  const int s = c.s;
+  std::vector<double> h(s, 0.0), Ds(s), Dg(s), dQ0(s, 0.0), dp(c.se.size(), 0.0);
+  for (int i = 0; i < n; i++) h[c.sn[i]] += dq[i] * L.fukui(Z[i]) / o.F[c.sn[i]];
+  double Hb = 0;
+  for (int a = 0; a < s; a++) Hb += h[a] * o.g[a];
+  Hb /= o.G;
+  for (int a = 0; a < s; a++) Ds[a] = h[a] - Hb, Dg[a] = -(o.S / o.G) * (h[a] - Hb);
+  proj_groups(L, c, [&](double pr, const std::vector<int> &grp, const std::vector<int> &edges, uint64_t st,
+                        const std::vector<double> &prk, const std::vector<double> &suk, bool single) {
+    double QG = 0, FG = 0, P, dP, ddP, A = 0, B = 0;
+    for (int a : grp) QG += o.Q0[a], FG += o.F[a];
+    plateau(QG, L.qproj_w, P, dP, ddP);
+    for (int a : grp) A += Ds[a] * o.F[a] / FG, B += Dg[a] * o.F[a];
+    for (int a : grp) dQ0[a] += pr * (A * (dP - 1.0) + B * ddP);
+    if (single) return;
+    const double V = A * (P - QG) + B * dP; // this group's term per unit state probability
+    const int m = static_cast<int>(edges.size());
+    for (int k = 0; k < m; k++) dp[edges[k]] += V * prk[k] * suk[k + 1] * (((st >> k) & 1) ? 1.0 : -1.0);
+  });
+  for (int i = 0; i < n; i++) dq[i] += dQ0[c.sn[i]];
+  // p = 1 - prod (1 - A): dp/dA_w = prod over the other links (1 - A)
+  for (size_t w = 0; w < c.weak.size(); w++) {
+    const auto &wk = c.weak[w];
+    if (dp[wk.e] == 0 || wk.dA == 0) continue;
+    double others = 1.0;
+    for (size_t v = 0; v < c.weak.size(); v++)
+      if (v != w && c.weak[v].e == wk.e) others *= 1.0 - c.weak[v].A;
+    add_pair(g, x, wk.i, wk.j, dist(x, wk.i, wk.j), dp[wk.e] * others * wk.dA);
+  }
+}
+
+LrcEnergy energy_fixed(const LrcSpec &L, const SqeSpec &S, const LrcCondition &c, int n, const int32_t *Z,
+                       const double *x, bool forces) {
+  constexpr double KE = 14.399645;
+  LrcEnergy out;
+  out.q0 = c.q0.q0, out.q = c.q0.q0;
+  if (forces) out.forces.assign(3 * size_t(n), 0.0);
+  const int s = c.cl.s;
+  const double r0 = S.lr_R - S.lr_t;
+  std::vector<double> g(3 * size_t(n), 0.0), dq(n, 0.0), W(size_t(s) * s, 0.0);
+  const double *q = c.q0.q0.data();
+  LrcProjection proj;
+  std::vector<double> qp;
+  if (L.qproj) {
+    proj = lrc_project(L, c.cl, n, Z, q);
+    qp = proj.q, q = qp.data(), out.q = qp;
+  }
+  // dE/dq' (dq) -> dE/dq of the charge pass, and the link-state part of the projection into the position gradient
+  auto unplateau = [&]() {
+    if (L.qproj) lrc_project_vjp(L, c.cl, proj, n, Z, x, dq, g.data());
+  };
+  // the switched inter-cluster pairs: (i, j, R, T, dT/dR, m = 1 - R_ab)
+  struct P {
+    int i, j;
+    double R, T, dT, m;
+  };
+  std::vector<P> pairs;
+  for (int i = 0; i < n; i++)
+    for (int j = i + 1; j < n; j++) {
+      const int a = c.cl.sn[i], b = c.cl.sn[j];
+      if (a == b) continue;
+      const double R = dist(x, i, j);
+      if (R <= r0) continue;
+      const double m = 1.0 - c.cl.R[size_t(a) * s + b];
+      if (m == 0) continue;
+      const double t = (R - r0) / S.lr_t;
+      pairs.push_back({i, j, R, sstep(t), dsstep(t) / S.lr_t, m});
+    }
+  if (L.mp || L.pol) {
+    std::vector<double> mu, th, Gm(3 * size_t(n), 0.0), Hm(9 * size_t(n), 0.0);
+    if (L.mp) lrc_moments(L, n, Z, x, mu, th);
+    // add one kernel's energy (weight scale) and gradients (fixed mu / Theta for the induced part: Hellmann-Feynman)
+    auto accumulate = [&](const P &p, const PairK &k, double scale, bool moment_grads, bool energy) {
+      const double w = KE * p.T * p.m * scale;
+      if (energy) out.energy += w * k.e;
+      if (!forces) return;
+      for (int a = 0; a < 3; a++) {
+        const double v = w * k.dr[a] + KE * scale * p.m * p.dT * k.e * (x[3 * p.j + a] - x[3 * p.i + a]) / p.R;
+        g[3 * p.j + a] += v, g[3 * p.i + a] -= v;
+        if (moment_grads) {
+          Gm[3 * size_t(p.i) + a] += w * k.dmi[a], Gm[3 * size_t(p.j) + a] += w * k.dmj[a];
+          for (int b = 0; b < 3; b++)
+            Hm[9 * size_t(p.i) + 3 * a + b] += w * k.dTi[3 * a + b], Hm[9 * size_t(p.j) + 3 * a + b] += w * k.dTj[3 * a + b];
+        }
+      }
+      dq[p.i] += w * k.dqi, dq[p.j] += w * k.dqj;
+      const int a = c.cl.sn[p.i], b = c.cl.sn[p.j];
+      W[size_t(a) * s + b] -= 0.5 * KE * scale * k.e * p.T, W[size_t(b) * s + a] -= 0.5 * KE * scale * k.e * p.T;
+    };
+    for (const P &p : pairs) {
+      double r[3];
+      for (int a = 0; a < 3; a++) r[a] = x[3 * p.j + a] - x[3 * p.i + a];
+      const double *mi = L.mp ? &mu[3 * size_t(p.i)] : nullptr, *mj = L.mp ? &mu[3 * size_t(p.j)] : nullptr;
+      const double *Ti = L.mp ? &th[9 * size_t(p.i)] : nullptr, *Tj = L.mp ? &th[9 * size_t(p.j)] : nullptr;
+      accumulate(p, pair_kernel(r, q[p.i], q[p.j], mi, mj, Ti, Tj, true), 1.0, L.mp, true);
+    }
+    if (L.pol) {
+      // induced atomic dipoles (inter-cluster only, additive isotropic alpha): (alpha^-1 - T) mu = F0, F0_i the switched
+      // field of the other clusters' charges; E = -1/2 KE mu . F0 (Hellmann-Feynman forces: the gradient at fixed mu of
+      // KE sum_pairs w [charge-dipole + dipole-dipole], the same kernel without q q)
+      std::vector<int> id(n, -1), at;
+      for (const P &p : pairs)
+        for (int k : {p.i, p.j})
+          if (id[k] < 0 && pol_alpha(L, Z[k]) > 0) id[k] = static_cast<int>(at.size()), at.push_back(k);
+      const int m3 = 3 * static_cast<int>(at.size());
+      if (m3 > 0) {
+        std::vector<double> A(size_t(m3) * m3, 0.0), F0(m3, 0.0);
+        for (size_t k = 0; k < at.size(); k++)
+          for (int a = 0; a < 3; a++) A[(3 * k + a) * m3 + 3 * k + a] = 1.0 / pol_alpha(L, Z[at[k]]);
+        for (const P &p : pairs) {
+          const double w = p.T * p.m;
+          double d[3];
+          for (int a = 0; a < 3; a++) d[a] = x[3 * p.i + a] - x[3 * p.j + a]; // x_i - x_j
+          const double R3 = p.R * p.R * p.R, R5 = R3 * p.R * p.R;
+          const int ki = id[p.i], kj = id[p.j];
+          for (int a = 0; a < 3; a++) {
+            if (ki >= 0) F0[3 * ki + a] += w * q[p.j] * d[a] / R3;
+            if (kj >= 0) F0[3 * kj + a] -= w * q[p.i] * d[a] / R3;
+          }
+          if (ki >= 0 && kj >= 0)
+            for (int a = 0; a < 3; a++)
+              for (int b = 0; b < 3; b++) {
+                const double t = w * (3 * d[a] * d[b] / R5 - (a == b ? 1.0 / R3 : 0.0));
+                A[(3 * ki + a) * m3 + 3 * kj + b] -= t, A[(3 * kj + b) * m3 + 3 * ki + a] -= t;
+              }
+        }
+        // dense Cholesky (A is symmetric positive definite for the far-field couplings used here)
+        std::vector<double> Lc(A), y(F0);
+        for (int j = 0; j < m3; j++) {
+          double d = Lc[size_t(j) * m3 + j];
+          for (int k = 0; k < j; k++) d -= Lc[size_t(j) * m3 + k] * Lc[size_t(j) * m3 + k];
+          if (!(d > 0)) throw std::runtime_error("lrc pol: polarisation matrix not positive definite (polarisation catastrophe)");
+          Lc[size_t(j) * m3 + j] = std::sqrt(d);
+          for (int i = j + 1; i < m3; i++) {
+            double v = Lc[size_t(i) * m3 + j];
+            for (int k = 0; k < j; k++) v -= Lc[size_t(i) * m3 + k] * Lc[size_t(j) * m3 + k];
+            Lc[size_t(i) * m3 + j] = v / Lc[size_t(j) * m3 + j];
+          }
+        }
+        for (int i = 0; i < m3; i++) {
+          for (int k = 0; k < i; k++) y[i] -= Lc[size_t(i) * m3 + k] * y[k];
+          y[i] /= Lc[size_t(i) * m3 + i];
+        }
+        for (int i = m3 - 1; i >= 0; i--) {
+          for (int k = i + 1; k < m3; k++) y[i] -= Lc[size_t(k) * m3 + i] * y[k];
+          y[i] /= Lc[size_t(i) * m3 + i];
+        }
+        double eind = 0;
+        for (int k = 0; k < m3; k++) eind += y[k] * F0[k];
+        out.energy += -0.5 * KE * eind;
+        out.mu_ind.assign(3 * size_t(n), 0.0);
+        for (size_t k = 0; k < at.size(); k++)
+          for (int a = 0; a < 3; a++) out.mu_ind[3 * size_t(at[k]) + a] = y[3 * k + a];
+        if (forces)
+          for (const P &p : pairs) {
+            double r[3];
+            for (int a = 0; a < 3; a++) r[a] = x[3 * p.j + a] - x[3 * p.i + a];
+            const double *mi = id[p.i] >= 0 ? &y[3 * size_t(id[p.i])] : nullptr;
+            const double *mj = id[p.j] >= 0 ? &y[3 * size_t(id[p.j])] : nullptr;
+            if (!mi && !mj) continue;
+            accumulate(p, pair_kernel(r, q[p.i], q[p.j], mi, mj, nullptr, nullptr, false), 1.0, false, false);
+          }
+      }
+    }
+    if (!forces) return out;
+    if (L.mp) lrc_moments_vjp(L, n, Z, x, Gm.data(), Hm.data(), g.data());
+    unplateau();
+    lrc_clusters_vjp(L, c.cl, n, x, W, g.data());
+    lrc_q0_vjp(L, S, n, Z, x, c.q0, dq.data(), g.data());
+    for (size_t k = 0; k < g.size(); k++) out.forces[k] = -g[k];
+    return out;
+  }
+  for (int i = 0; i < n; i++)
+    for (int j = i + 1; j < n; j++) {
+      const int a = c.cl.sn[i], b = c.cl.sn[j];
+      if (a == b) continue;
+      const double r = dist(x, i, j);
+      if (r <= r0) continue;
+      const double t = (r - r0) / S.lr_t;
+      const double T = sstep(t), dT = dsstep(t) / S.lr_t;
+      const double m = 1.0 - c.cl.R[size_t(a) * s + b];
+      if (m == 0) continue;
+      const double k = KE / r, e = q[i] * q[j] * k;
+      out.energy += e * T * m;
+      if (!forces) continue;
+      add_pair(g.data(), x, i, j, r, q[i] * q[j] * m * (dT * k - T * k / r));
+      dq[i] += q[j] * k * T * m, dq[j] += q[i] * k * T * m;
+      W[size_t(a) * s + b] -= 0.5 * e * T, W[size_t(b) * s + a] -= 0.5 * e * T;
+    }
+  if (!forces) return out;
+  unplateau();
+  lrc_clusters_vjp(L, c.cl, n, x, W, g.data());
+  lrc_q0_vjp(L, S, n, Z, x, c.q0, dq.data(), g.data());
+  for (size_t k = 0; k < g.size(); k++) out.forces[k] = -g[k];
+  return out;
+}
+} // namespace
+
+std::vector<double> lrc_project_charges(const LrcSpec &L, int n, const int32_t *Z, const double *x, const double *q) {
+  const LrcClusters c = lrc_clusters(L, n, x);
+  return lrc_project(L, c, n, Z, q).q;
+}
+
 LrcEnergy lrc_energy(const LrcSpec &L, const SqeSpec &S, const LrcCondition &c, int n, const int32_t *Z,
                      const double *x, double Q, bool forces) {
   LrcEnergy out;
   if (forces) out.forces.assign(3 * size_t(n), 0.0);
   if (c.cl.s == 1 || n == 0) return out; // one cluster: E*(gamma) - E*(gamma) = 0 exactly
+  if (L.graph) return energy_fixed(L, S, c, n, Z, x, forces);
   SqeClusterMask m{c.cl.sn.data(), c.cl.s, c.cl.R.data()};
   const SqeOutput so = sqe_compute_masked(S, n, Z, x, Q, c.q0.q0.data(), forces, m);
   out.energy = so.energy, out.q = so.q, out.q0 = c.q0.q0;

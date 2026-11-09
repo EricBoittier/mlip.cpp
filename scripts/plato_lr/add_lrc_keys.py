@@ -7,6 +7,13 @@ Tensors unchanged: the charge model is float64 metadata (host side, frozen in tr
 
 Q0FIT.json: {"spec": {"T", "D", "Z", "IP", "EA", "h", "l", "ap", "am", "bp", "bm"}} (fit_q0.py / lrc_ref.FermiQ0.spec);
 the element order must be the GGUF's pet.plato_lr.sqe_Z.
+
+    python add_lrc_keys.py IN_SQE.gguf OUT.gguf --mode graph --qmodel CHARGE.gguf --fukui FUKUI.json [--lr-R 10 --lr-t 2]
+
+--mode graph (feat/lr-chargehead): q0 from a frozen charge pass (CHARGE.gguf, a plain model whose per-atom outputs are
+the raw charges; path stored as given, relative paths resolve next to OUT.gguf) and Fukui equilibration
+(FUKUI.json: {"Z": [...], "phi": [...]}, f = softplus(phi)); the long-range energy is the fixed-charge inter-cluster
+Coulomb sum. --lr-R / --lr-t replace the sqe long-range switch (pet.plato_lr.sqe_lr_R / _lr_t).
 """
 import argparse
 import json
@@ -19,9 +26,18 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("input"); ap.add_argument("output"); ap.add_argument("--spec", default=None)
     ap.add_argument("--a-on", type=float, default=5.0); ap.add_argument("--a-off", type=float, default=6.0)
-    ap.add_argument("--mode", choices=["fermi2", "head", "round"], default="fermi2",
+    ap.add_argument("--qmodel", default=None); ap.add_argument("--fukui", default=None)
+    ap.add_argument("--qpass-charge", choices=["total", "zero"], default="total",
+                    help="graph: the charge pass sees the total charge, or 0 (Q then enters through the Fukui step only)")
+    ap.add_argument("--lr-R", type=float, default=None); ap.add_argument("--lr-t", type=float, default=None)
+    ap.add_argument("--mode", choices=["fermi2", "head", "round", "graph"], default="fermi2",
                     help="q0: two-level Fermi (needs --spec), the sqe learned logistic head alone, or soft-rounded")
     ap.add_argument("--tau", type=float, default=0.25); ap.add_argument("--merge-w", type=float, default=2.0)
+    ap.add_argument("--cond", choices=["cluster", "global"], default="cluster",
+                    help="backbone conditioning: per smooth cluster (Q_loc) or the structure's Q for every atom")
+    ap.add_argument("--cond-w", type=float, default=1.0, help="blend width of the Q_loc rows (< 1: plateaus at integers)")
+    ap.add_argument("--qproj", type=float, default=0.0,
+                    help="graph: soft charge projection of the long-range charges with this width w (0: off; R1q 0.6)")
     a = ap.parse_args()
     sp = {"T": 0.25, "D": 5.0}
     if a.mode == "fermi2":
@@ -51,9 +67,25 @@ def main():
     enc = lambda s: struct.pack("<Q", len(s.encode())) + s.encode()
     P = "pet.plato_lr.lrc"
     new = {P: enc(P) + struct.pack("<Ii", 5, 1)}
-    for k, v in (("a_on", a.a_on), ("a_off", a.a_off), ("T", sp["T"]), ("D", sp["D"]), ("tau", a.tau), ("merge_w", a.merge_w)):
+    for k, v in (("a_on", a.a_on), ("a_off", a.a_off), ("T", sp["T"]), ("D", sp["D"]), ("tau", a.tau), ("merge_w", a.merge_w),
+                 ("cond_w", a.cond_w)):
         new[f"{P}_{k}"] = enc(f"{P}_{k}") + struct.pack("<Id", 12, float(v))
     new[f"{P}_q0_mode"] = enc(f"{P}_q0_mode") + struct.pack("<I", 8) + enc(a.mode)
+    new[f"{P}_cond"] = enc(f"{P}_cond") + struct.pack("<I", 8) + enc(a.cond)
+    new[f"{P}_qproj"] = enc(f"{P}_qproj") + struct.pack("<Ii", 5, 1 if a.qproj > 0 else 0)
+    new[f"{P}_qproj_w"] = enc(f"{P}_qproj_w") + struct.pack("<Id", 12, float(a.qproj if a.qproj > 0 else 0.6))
+    drop = set()
+    if a.mode == "graph":
+        if not a.qmodel or not a.fukui: raise SystemExit("--mode graph needs --qmodel and --fukui")
+        fk = json.load(open(a.fukui))
+        new[f"{P}_qmodel"] = enc(f"{P}_qmodel") + struct.pack("<I", 8) + enc(a.qmodel)
+        new[f"{P}_qpass_charge"] = enc(f"{P}_qpass_charge") + struct.pack("<I", 8) + enc(a.qpass_charge)
+        for k, v in (("fukui_Z", [float(z) for z in fk["Z"]]), ("fukui_phi", [float(x) for x in fk["phi"]])):
+            new[f"{P}_{k}"] = enc(f"{P}_{k}") + struct.pack("<IIQ", 9, 12, len(v)) + struct.pack(f"<{len(v)}d", *v)
+    for k, v in (("lr_R", a.lr_R), ("lr_t", a.lr_t)):
+        if v is not None:
+            key = f"pet.plato_lr.sqe_{k}"; drop.add(key)
+            new[key] = enc(key) + struct.pack("<Id", 12, float(v))
     magic, version = take("I"), take("I")
     assert magic == 0x46554747 and version == 3, (hex(magic), version)
     nt, nkv = take("Q"), take("Q")
@@ -63,7 +95,7 @@ def main():
         v = value(t)
         if k in ("general.alignment", "pet.plato_lr.sqe", "pet.plato_lr.sqe_Z", "pet.plato_lr.sqe_q0", "pet.plato_lr.sqe_lr_R"):
             meta[k] = v
-        if not k.startswith(P):
+        if not k.startswith(P) and k not in drop:
             kept.append(data[k0:pos])
     alignment = int(meta.get("general.alignment", 32))
     if not meta.get("pet.plato_lr.sqe"):
@@ -72,7 +104,7 @@ def main():
         raise SystemExit(f"{a.input}: needs sqe_q0 uniform and sqe_lr_R > 0")
     Z = [int(z) for z in meta["pet.plato_lr.sqe_Z"]]
     if a.mode != "fermi2":
-        Z, sp["Z"] = [], []  # the head lives in the sqe_q0_* tables
+        Z, sp["Z"] = [], []  # the head lives in the sqe_q0_* tables (graph: in the charge pass)
     zi = {int(z): i for i, z in enumerate(sp["Z"])}
     E0 = len(sp["Z"])
     for k in (("ip", "ea", "h", "l", "ap", "am") if a.mode == "fermi2" else ()):
@@ -93,7 +125,7 @@ def main():
     head += b"\0" * ((-len(head)) % alignment)
     with open(a.output, "wb") as f:
         f.write(head); f.write(body)
-    print(f"{a.output}: lrc on (q0 {a.mode}, clusters {a.a_on}-{a.a_off} A)")
+    print(f"{a.output}: lrc on (q0 {a.mode}, clusters {a.a_on}-{a.a_off} A, conditioning {a.cond})")
 
 
 if __name__ == "__main__":

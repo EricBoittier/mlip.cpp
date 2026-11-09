@@ -394,6 +394,15 @@ bool GraphModel::load_from_gguf(const std::string &path) {
   num_heads_ = loader.get_int32("pet.num_heads", 0);
   conditioning_.enabled = loader.get_int32("pet.system_conditioning", 0) != 0;
   plato_lr_ = PetPlatoLRSpec::from_gguf(loader);
+  if (plato_lr_.lrc.enabled && plato_lr_.lrc.graph) { // the frozen charge pass of the lrc q0 mode "graph"
+    std::string qp = plato_lr_.lrc.qmodel;
+    if (const char *e = std::getenv("MLIPCPP_LRC_QMODEL"); e && *e) qp = e;
+    if (!qp.empty() && qp[0] != '/') {
+      const auto slash = path.find_last_of('/');
+      if (slash != std::string::npos) qp = path.substr(0, slash + 1) + qp;
+    }
+    plato_lr_.lrc.qsrc = make_lrc_graph_charges(qp, backend_preference_, device_);
+  }
   if (plato_lr_.enabled && !forces_mode_)
     throw std::runtime_error("Plato-PET-LR GGUFs are forces-mode exports");
   conditioning_.max_charge = loader.get_int32("pet.max_charge", 10);
@@ -670,6 +679,52 @@ ModelResult GraphModel::predict_single(
   return r;
 }
 
+namespace {
+// lrc q0 mode "graph": a plain GraphModel whose per-atom outputs are the raw charges (e)
+class LrcGraphCharges final : public LrcQSource {
+public:
+  explicit LrcGraphCharges(std::unique_ptr<GraphModel> m) : m_(std::move(m)) {}
+  std::vector<double> raw(int n, const int32_t *Z, const double *x, double Q, int spin) override {
+    const AtomicSystem sys = system(n, Z, x, Q, spin);
+    m_->set_atom_energy_weights({});
+    const ModelResult r = m_->predict(sys, false);
+    return std::vector<double>(r.atomic_energies.begin(), r.atomic_energies.end());
+  }
+  void raw_vjp(int n, const int32_t *Z, const double *x, double Q, int spin, const double *w, double *g) override {
+    const AtomicSystem sys = system(n, Z, x, Q, spin);
+    std::vector<float> wf(w, w + n);
+    m_->set_atom_energy_weights(wf);
+    struct Reset {
+      GraphModel &m;
+      ~Reset() { m.set_atom_energy_weights({}); }
+    } reset{*m_};
+    const ModelResult r = m_->predict(sys, true);
+    if (r.forces.size() != 3 * size_t(n)) throw std::runtime_error("lrc graph: charge pass returned no gradient");
+    for (size_t k = 0; k < r.forces.size(); k++) g[k] -= double(r.forces[k]);
+  }
+
+private:
+  static AtomicSystem system(int n, const int32_t *Z, const double *x, double Q, int spin) {
+    std::vector<float> xf(x, x + 3 * size_t(n));
+    AtomicSystem sys(n, xf.data(), Z, nullptr);
+    sys.set_charge(static_cast<int>(std::lround(Q)));
+    sys.set_spin_multiplicity(spin);
+    return sys;
+  }
+  std::unique_ptr<GraphModel> m_;
+};
+} // namespace
+
+std::shared_ptr<LrcQSource> make_lrc_graph_charges(const std::string &path, BackendPreference pref, int device) {
+  auto m = std::make_unique<GraphModel>();
+  m->set_force_uncached(true); // per-atom outputs
+  m->set_backend_preference(pref);
+  m->set_device(device);
+  if (!m->load_from_gguf(path)) throw std::runtime_error("lrc graph: cannot load the charge pass " + path);
+  if (m->plato_lr().lrc.enabled) throw std::runtime_error("lrc graph: the charge pass must be a plain model");
+  return std::make_shared<LrcGraphCharges>(std::move(m));
+}
+
 // Combined long-range model (runtime/lr_combined.h): every atom conditioned on its smooth cluster's charge (blend of two
 // table rows), plus the inter-cluster SQE long-range energy. A one-cluster structure is the plain model (global charge,
 // no term). Forces: the graph's at fixed conditioning, the long-range term's (Hellmann-Feynman + q0 and cluster chain
@@ -686,13 +741,23 @@ ModelResult GraphModel::predict_single_lrc(const AtomicSystem &system, bool comp
   const int n = system.num_atoms();
   std::vector<double> x(system.positions(), system.positions() + 3 * size_t(n));
   const LrcCondition cond = lrc_condition(L, sq, n, system.atomic_numbers(), x.data(), double(system.charge()),
-                                          conditioning_.max_charge);
+                                          conditioning_.max_charge, system.spin_multiplicity());
   struct Reset {
     GraphModel &m;
     ~Reset() { m.frag_cond_.clear(), m.lrc_hi_.clear(), m.lrc_blend_.clear(); }
   } reset{*this};
   if (cond.cl.s > 1) frag_cond_ = cond.row_charge, lrc_hi_ = cond.row_charge_hi, lrc_blend_ = cond.blend;
+  // exact dE/dS (graph gradient w.r.t. the blend input) for structures in a transition / with a fractional cluster
+  // charge; MLIPCPP_LRC_FD_DS=1: the earlier central differences in S (h = 0.05), for checks
+  static const bool fd_ds = [] { const char *e = std::getenv("MLIPCPP_LRC_FD_DS"); return e && *e == '1'; }();
+  lrc_want_blend_grad_ = compute_forces && cond.cl.s > 1 && cond.needs_cond_forces() && !fd_ds;
+  struct WantReset {
+    bool &f;
+    ~WantReset() { f = false; }
+  } want_reset{lrc_want_blend_grad_};
   ModelResult r = predict_single_impl(system, compute_forces, post_compute_hook, parameter_gradients);
+  lrc_want_blend_grad_ = false;
+  const std::vector<double> blend_grad = lrc_blend_grad_;
   if (cond.cl.s == 1) return r;
   const LrcEnergy le = lrc_energy(L, sq, cond, n, system.atomic_numbers(), x.data(), double(system.charge()),
                                   compute_forces);
@@ -700,7 +765,14 @@ ModelResult GraphModel::predict_single_lrc(const AtomicSystem &system, bool comp
   r.sqe_charges.assign(le.q.begin(), le.q.end());
   if (!compute_forces || r.forces.size() != le.forces.size()) return r;
   std::vector<double> F(le.forces);
-  if (cond.needs_cond_forces()) {
+  // a structure without any edge runs no backward pass (forces off in the graph), so it has no graph dE/dS: central
+  // differences in S then (its energy still depends on the conditioning)
+  const bool exact_ds = !fd_ds && blend_grad.size() == static_cast<size_t>(n);
+  if (cond.needs_cond_forces() && exact_ds) {
+    std::vector<double> G(cond.cl.s, 0.0);
+    for (int i = 0; i < n; i++) G[cond.cl.sn[i]] += blend_grad[i];
+    lrc_condition_forces(L, sq, cond, n, system.atomic_numbers(), x.data(), G, F.data());
+  } else if (cond.needs_cond_forces()) {
     const double h = 5e-2; // E is smooth in S; float32 energies: noise ~1e-5 eV / 2h
     std::vector<double> G(cond.cl.s, 0.0);
     const std::vector<float> base = cond.blend;
@@ -769,8 +841,9 @@ ModelResult GraphModel::predict_single_impl(
     const char *e = std::getenv("MLIPCPP_NO_GRAPH_CACHE");
     return e && *e && *e != '0';
   }();
+  // per-atom outputs / weights and dE/d(blend) come from the plain graph only
   if (!no_cache && !post_compute_hook && !parameter_gradients && cached_path_supported() &&
-      system.num_atoms() > 0)
+      system.num_atoms() > 0 && !force_uncached_ && atom_w_.empty() && !lrc_want_blend_grad_)
     return predict_cached(system, compute_forces);
   GraphProfile profile;
   if (compute_forces && !forces_mode_) {
@@ -1029,6 +1102,13 @@ ModelResult GraphModel::predict_single_impl(
   if (conditioning_.enabled && plato_lr_.lrc.enabled) {
     cond_blend_t = ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, n_atoms);
     ggml_set_name(cond_blend_t, "cond_blend");
+    if (compute_forces && lrc_want_blend_grad_) ggml_set_param(cond_blend_t); // dE/dS (exact conditioning forces)
+  }
+  ggml_tensor *atom_w_t = nullptr;
+  if (compute_forces && !atom_w_.empty()) {
+    if (atom_w_.size() != static_cast<size_t>(n_atoms)) throw std::logic_error("atom energy weights: atom count");
+    atom_w_t = ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, n_atoms);
+    ggml_set_name(atom_w_t, "atom_energy_weights");
   }
   if (conditioning_.enabled) {
     charge_index_t = ggml_new_tensor_1d(input_ctx, GGML_TYPE_I32, n_atoms);
@@ -1211,6 +1291,7 @@ ModelResult GraphModel::predict_single_impl(
     interp_.set_input("coulomb_matrix", coulomb_t);
   }
 
+  if (atom_w_t) ggml_backend_tensor_set(atom_w_t, atom_w_.data(), 0, atom_w_.size() * sizeof(float));
   if (conditioning_.enabled) {
     const auto [ci, si] = conditioning_.rows(system.charge(), system.spin_multiplicity());
     (void)ci;
@@ -1323,7 +1404,9 @@ ModelResult GraphModel::predict_single_impl(
 
   if (compute_forces) {
     // Build forward + backward graph
-    ggml_tensor *total_energy = ggml_sum(compute_ctx, output);
+    ggml_tensor *total_energy = atom_w_t ? ggml_sum(compute_ctx, ggml_mul(compute_ctx, output,
+                                                                          ggml_reshape(compute_ctx, atom_w_t, output)))
+                                         : ggml_sum(compute_ctx, output);
     // Seed the backbone with the native solver's charge adjoint in a second
     // backward evaluation. Potentials are independent inputs to the readout.
     if (lr_charge_adjoint)
@@ -1361,6 +1444,8 @@ ModelResult GraphModel::predict_single_impl(
       for (ggml_tensor *p : {plato->positions, plato->strain})
         if (ggml_tensor *g = p ? ggml_graph_get_grad(cgraph, p) : nullptr)
           for (; g; g = g->view_src) ggml_set_output(g);
+    if (cond_blend_t && (cond_blend_t->flags & GGML_TENSOR_FLAG_PARAM))
+      if (ggml_tensor *g = ggml_graph_get_grad(cgraph, cond_blend_t)) ggml_set_output(g);
   } else {
     cgraph = ggml_new_graph(compute_ctx);
     ggml_build_forward_expand(cgraph, output);
@@ -1462,6 +1547,18 @@ ModelResult GraphModel::predict_single_impl(
   std::vector<float> atomic_energies(n_atoms);
   ggml_backend_tensor_get(output, atomic_energies.data(), 0,
                           n_atoms * sizeof(float));
+
+  result.atomic_energies.resize(n_atoms);
+  for (int i = 0; i < n_atoms; i++) result.atomic_energies[i] = atomic_energies[i] * energy_scale_;
+  lrc_blend_grad_.clear();
+  if (compute_forces && cond_blend_t && (cond_blend_t->flags & GGML_TENSOR_FLAG_PARAM)) {
+    lrc_blend_grad_.assign(n_atoms, 0.0);
+    if (ggml_tensor *g = ggml_graph_get_grad(cgraph, cond_blend_t)) {
+      std::vector<float> gb(n_atoms);
+      ggml_backend_tensor_get(g, gb.data(), 0, n_atoms * sizeof(float));
+      for (int i = 0; i < n_atoms; i++) lrc_blend_grad_[i] = double(gb[i]) * energy_scale_;
+    }
+  }
 
   // Sum and scale
   float model_energy = 0.0f;

@@ -42,6 +42,10 @@ struct CachedGraph;
  *   ModelResult result = model.predict(system);
  *   ModelResult result_f = model.predict(system, true); // with forces
  */
+class GraphModel;
+/// the frozen charge pass of the lrc q0 mode "graph" (runtime/lr_combined.h), a plain GraphModel on the same backend
+std::shared_ptr<LrcQSource> make_lrc_graph_charges(const std::string &path, BackendPreference pref, int device);
+
 class GraphModel : public Model {
 public:
   GraphModel();
@@ -126,6 +130,13 @@ public:
 
   GraphInterpreter &interpreter() { return interp_; }
   ggml_backend_t backend() const { return compute_backend_; }
+
+  /// per-atom weights w of the differentiated sum (forces = -d(sum_i w_i e_i)/dx); empty: all 1
+  void set_atom_energy_weights(std::vector<float> w) { atom_w_ = std::move(w); }
+  /// always the plain (uncached) graph: ModelResult::atomic_energies is filled only there
+  void set_force_uncached(bool on) { force_uncached_ = on; }
+  int device() const { return device_; }
+  BackendPreference backend_preference() const { return backend_preference_; }
 
   /// Weight tensors by GGUF name, in GGUF order (all F32, on the backend).
   std::vector<std::pair<std::string, ggml_tensor *>> weights() const;
@@ -294,6 +305,13 @@ private:
   // (input cond_blend) of the local-charge conditioning; empty: the structure's charge, blend 0
   std::vector<int32_t> lrc_hi_;
   std::vector<float> lrc_blend_;
+  // combined model: dE/d(blend) per atom of the last predict_single_impl with forces (scaled to eV), when asked
+  bool lrc_want_blend_grad_ = false;
+  std::vector<double> lrc_blend_grad_;
+  // per-atom weights w of the differentiated energy sum_i w_i e_i (forces then -d/dx of it; the energy stays the plain
+  // sum); empty: all 1. Used by the lrc charge pass (LrcGraphCharges), whose per-atom outputs are charges.
+  std::vector<float> atom_w_;
+  bool force_uncached_ = false;
   ModelResult predict_single_lrc(const AtomicSystem &system, bool compute_forces,
                                  const std::function<void()> &post_compute_hook, std::vector<float> *parameter_gradients);
   /// the conditioning table rows of every atom (frag_cond_ or the structure's charge)

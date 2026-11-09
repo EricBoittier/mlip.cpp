@@ -14,6 +14,7 @@
 #include <memory>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 namespace mlipcpp::train {
@@ -254,6 +255,25 @@ public:
   std::vector<float> lrc_blend_;
   std::vector<double> lrc_e_, lrc_f_;
   int64_t lrc_multi = 0, lrc_transition = 0, lrc_seen = 0, lrc_fallback = 0; // >1 cluster / nonzero dS / all / fallback
+  // exact conditioning forces in training (q0 mode "graph", or MLIPCPP_LRC_EXACT=1): FORCES returns dE/d(blend),
+  // F gets -sum_a G_a dS_a/dx, MIXED seeds the blend with the tangent (dS/dx . u) per super-node. Per batch: the
+  // conditioning of every real structure (atom offset) and the rows dS_a/dx of the transition ones
+  bool lrc_exact = false;
+  std::vector<runtime::LrcCondition> lrc_cond_;
+  std::vector<int> lrc_a0_;
+  // per-structure cache (frozen charge model, fixed training geometries): conditioning, energy / forces, blend rows
+  struct LrcCacheEntry {
+    runtime::LrcCondition c;
+    double e = 0;
+    std::vector<double> f, rows;
+    bool has_f = false, has_rows = false;
+  };
+  std::unordered_map<uint64_t, LrcCacheEntry> lrc_cache_;
+  std::vector<uint64_t> lrc_key_;
+  int64_t lrc_cache_misses = 0;
+  std::vector<float> lrc_dblend_;
+  double lrc_cond_force_sum = 0; // sum over structures of max |F_cond| (eV/A), for the log
+  int64_t lrc_cond_n = 0;
   void lrc_prepare(const Batch &b, bool forces);
   std::vector<double> sqe_grad;
   double sqe_abs_energy = 0;
@@ -335,6 +355,8 @@ private:
     // fragment-sum charge loss: inputs (column one-hot [n, F], targets [F], weight x norm), error per column [F]
     ggml_tensor *fonehot = nullptr, *ftarget = nullptr, *fw = nullptr, *frag_d = nullptr;
     ggml_tensor *ecot = nullptr; // tail loss: dL/d(d_energy) per structure [S, 1]
+    // lrc exact conditioning forces: the blend input, FORCES its gradient, MIXED its tangent
+    ggml_tensor *blend = nullptr, *grad_blend = nullptr, *dblend = nullptr;
     ~StepGraph();
   };
   /// graph kinds: the loss (FORWARD / BACKWARD to the weights); conservative
