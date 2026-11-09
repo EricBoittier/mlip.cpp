@@ -462,6 +462,76 @@ mlipcpp_error_t mlipcpp_result_has_stress(mlipcpp_result_t result,
  */
 void mlipcpp_result_free(mlipcpp_result_t result);
 
+/* ============================================================================
+ * Device arrays (an MD engine whose arrays live on the GPU)
+ * ============================================================================
+ */
+
+/**
+ * @brief One MD step on arrays in GPU memory (LAMMPS's KOKKOS package)
+ *
+ * Positions and types are read, and forces added, where the engine keeps
+ * them, on the engine's CUDA stream; nothing crosses to the host but the
+ * totals. mlip.cpp keeps its own Verlet neighbour list (cutoff + skin) on the
+ * device between calls and rebuilds it when the engine says its atoms may
+ * have been reordered or remapped (rebuild_neighbors), when the cell changes,
+ * or when it finds that an atom moved more than half the skin (that step is
+ * then computed again). An engine that rebuilds its own list on the same
+ * criterion with the same skin (LAMMPS: neighbor->ago == 0, neighbor->skin)
+ * thus never pays for a second computation.
+ *
+ * Element (i, c) of positions is positions[i * position_strides[0] +
+ * c * position_strides[1]], likewise for forces (strides {0, 0}: {3, 1}).
+ * Types index type_atomic_numbers (host memory, n_types + 1 entries, 0 for a
+ * type without an element; an atom of such a type is an error).
+ */
+typedef struct {
+  int32_t n_atoms;
+  const double *positions;          /**< device, Angstrom */
+  int64_t position_strides[2];      /**< in doubles: atom, component */
+  const int32_t *types;             /**< device [n_atoms], in [0, n_types] */
+  int32_t n_types;
+  const int32_t *type_atomic_numbers; /**< host [n_types + 1] */
+  const double *cell;               /**< host [9], lattice vectors as rows, or NULL (no periodicity) */
+  bool pbc[3];                      /**< periodic directions (with a cell) */
+  double *forces;                   /**< device, eV/Angstrom, added into */
+  int64_t force_strides[2];         /**< in doubles: atom, component */
+  void *stream;                     /**< cudaStream_t the step is ordered on (NULL: the legacy default stream) */
+  bool rebuild_neighbors;           /**< the atoms may have been reordered or remapped since the last call */
+  double skin;                      /**< Verlet skin of mlip.cpp's list, Angstrom (< 0: MLIPCPP_NL_SKIN, or 0.5) */
+  bool compute_virial;
+} mlipcpp_device_system_t;
+
+/**
+ * @brief Totals of mlipcpp_compute_device
+ *
+ * virial = -sum over the model's edges of v (x) dE/dv, symmetrised, in eV,
+ * Voigt order xx yy zz yz xz xy: -V sigma for a periodic cell (sigma the
+ * stress of mlipcpp_result_get_stress), sum_i x_i (x) F_i without one.
+ */
+typedef struct {
+  double energy;    /**< eV */
+  double virial[6]; /**< eV, zero unless compute_virial */
+  int32_t neighbor_list_rebuilt; /**< 1 when this call built mlip.cpp's list */
+  int32_t attempts; /**< 1, or more when the step had to be computed again */
+} mlipcpp_device_result_t;
+
+/** @brief Defaults: strides {3, 1}, no cell, skin -1, stream NULL, everything else 0 */
+mlipcpp_error_t mlipcpp_device_system_default(mlipcpp_device_system_t *system);
+
+/** @brief Whether the loaded model can run mlipcpp_compute_device (a CUDA build, a forces-mode graph model on CUDA) */
+bool mlipcpp_model_supports_device(mlipcpp_model_t model);
+
+/**
+ * @brief Energy, forces (added into system->forces) and optionally the virial of one step on device arrays
+ *
+ * Synchronous: returns when the step's work is done (and the forces added),
+ * having waited for the work queued on system->stream before it. The
+ * host-array API above is unaffected.
+ */
+mlipcpp_error_t mlipcpp_compute_device(mlipcpp_model_t model, const mlipcpp_device_system_t *system,
+                                       mlipcpp_device_result_t *result);
+
 #ifdef __cplusplus
 }
 #endif

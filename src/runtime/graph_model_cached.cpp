@@ -26,6 +26,7 @@
 #ifdef MLIPCPP_HAVE_CUDA_INPUTS
 #include "md/md_kernels.h"
 #include <cuda_runtime.h>
+#include <ggml-backend-impl.h> // ggml_backend_event::context: the cudaEvent_t of a CUDA backend's event
 #endif
 
 #include <algorithm>
@@ -98,6 +99,20 @@ struct DeviceInputs {
   double list_cell[9] = {0};
   int list_pbc[3] = {0, 0, 0};
 
+  // predict_device_step
+  double *shift = nullptr;             // [n, 3]: what build_list's wrap added to the caller's positions
+  int32_t *flags = nullptr;            // [4]: graph overflow, bad type, step good
+  double *out = nullptr, *out_host = nullptr; // [16] the totals (out_host pinned)
+  int32_t *type_species = nullptr;     // [n_types + 1]
+  double *type_energy = nullptr;       // [n_types + 1] composition energy
+  std::vector<int32_t> type_z;         // what type_species was made from
+  int type_cap = 0;
+  double list_skin = -1;
+  bool have_sizes = false;             // last_total / last_max_kept from an earlier call
+  int64_t last_total = 0;
+  int last_max_kept = 0;
+  ggml_backend_event_t ev_in = nullptr, ev_out = nullptr;
+
   void atoms(int n) {
     st.n = n;
     if (size_t(n) > n_cap) {
@@ -106,6 +121,7 @@ struct DeviceInputs {
       dalloc(st.count, n_cap), dalloc(st.nkept, n_cap), dalloc(st.r, n_cap), dalloc(st.root, n_cap);
       dalloc(st.dn_root, n_cap), dalloc(st.clamped, n_cap), dalloc(st.dEdr, n_cap);
       dalloc(st.f_cons, 3 * n_cap), dalloc(virial, 6 * n_cap), dalloc(st.offsets, n_cap + 1);
+      dalloc(shift, 3 * n_cap);
     }
     if (!st.scalars) dalloc(st.scalars, 3);
     candidates(st.K ? st.K : 64);
@@ -120,6 +136,11 @@ struct DeviceInputs {
   }
   ~DeviceInputs() {
     md::gpu::free_cells(st);
+    for (void *p : {(void *)shift, (void *)flags, (void *)out, (void *)type_species, (void *)type_energy})
+      if (p) cudaFree(p);
+    if (out_host) cudaFreeHost(out_host);
+    if (ev_in) ggml_backend_event_free(ev_in);
+    if (ev_out) ggml_backend_event_free(ev_out);
     for (void *p : {(void *)st.x, (void *)st.x_ref, (void *)st.species, (void *)st.count, (void *)st.nkept,
                     (void *)st.r, (void *)st.root, (void *)st.dn_root, (void *)st.clamped, (void *)st.dEdr,
                     (void *)st.f_cons, (void *)virial, (void *)st.offsets, (void *)st.scalars, (void *)st.cand_j, (void *)st.cand_rev,
@@ -127,6 +148,35 @@ struct DeviceInputs {
       if (p) cudaFree(p);
   }
 };
+
+// st's cell, periodicity and the periodic images within `reach` (as md::Engine::set_system); no cell: none
+void set_device_cell(md::gpu::State &st, const double *cell, const int *pbc, double reach) {
+  std::fill(std::begin(st.cell), std::end(st.cell), 0.0);
+  std::fill(std::begin(st.pbc), std::end(st.pbc), 0);
+  std::fill(std::begin(st.images), std::end(st.images), 0);
+  if (!cell) return;
+  for (int a = 0; a < 3; a++) {
+    for (int b = 0; b < 3; b++) st.cell[3 * a + b] = cell[3 * a + b];
+    st.pbc[a] = pbc[a];
+  }
+  const double *m = st.cell;
+  auto cross = [&](int a, int b, double out[3]) {
+    out[0] = m[3 * a + 1] * m[3 * b + 2] - m[3 * a + 2] * m[3 * b + 1];
+    out[1] = m[3 * a + 2] * m[3 * b] - m[3 * a] * m[3 * b + 2];
+    out[2] = m[3 * a] * m[3 * b + 1] - m[3 * a + 1] * m[3 * b];
+  };
+  double c12[3];
+  cross(1, 2, c12);
+  const double volume = std::abs(m[0] * c12[0] + m[1] * c12[1] + m[2] * c12[2]);
+  for (int a = 0; a < 3; a++) {
+    if (!st.pbc[a]) continue;
+    double w[3];
+    cross((a + 1) % 3, (a + 2) % 3, w);
+    const double height = volume / std::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+    st.images[a] = static_cast<int>(std::ceil(reach / height));
+    if (st.images[a] > 127) throw std::runtime_error("GraphModel: cell too thin for the cutoff");
+  }
+}
 
 md::gpu::Graph device_graph(const CachedGraph &g) {
   auto ptr = [](ggml_tensor *t) { return t ? t->data : nullptr; };
@@ -782,6 +832,8 @@ ModelResult GraphModel::predict_cached_device(const AtomicSystem &system, bool c
   if (!device_inputs_) device_inputs_ = new DeviceInputs();
   auto &d = *static_cast<DeviceInputs *>(device_inputs_);
   md::gpu::State &st = d.st;
+  st.stream = nullptr; // the legacy stream (predict_device_step sets the caller's)
+  d.have_sizes = false, d.list_skin = -1; // predict_device_step: its list and wrap shifts are not this one's
   d.atoms(n);
   // a Verlet skin: successive calls on the same atoms (MD steps) reuse the
   // candidate list until an atom has moved half of it (MLIPCPP_NL_SKIN, Angstrom; 0: rebuild every call)
@@ -792,32 +844,17 @@ ModelResult GraphModel::predict_cached_device(const AtomicSystem &system, bool c
   const md::gpu::Cutoff cut{cutoff_, skin, adaptive ? num_neighbors_adaptive_ : 0.0, cutoff_width_adaptive_};
 
   // cell and periodic images within the cutoff (as md::Engine::set_system)
-  std::fill(std::begin(st.cell), std::end(st.cell), 0.0);
-  std::fill(std::begin(st.pbc), std::end(st.pbc), 0);
-  std::fill(std::begin(st.images), std::end(st.images), 0);
   const Cell *cell = system.cell();
   if (cell) {
+    double m[9];
+    int pbc[3];
     for (int a = 0; a < 3; a++) {
-      for (int b = 0; b < 3; b++) st.cell[3 * a + b] = cell->matrix[a][b];
-      st.pbc[a] = cell->periodic[a];
+      for (int b = 0; b < 3; b++) m[3 * a + b] = cell->matrix[a][b];
+      pbc[a] = cell->periodic[a];
     }
-    const double *m = st.cell;
-    auto cross = [&](int a, int b, double out[3]) {
-      out[0] = m[3 * a + 1] * m[3 * b + 2] - m[3 * a + 2] * m[3 * b + 1];
-      out[1] = m[3 * a + 2] * m[3 * b] - m[3 * a] * m[3 * b + 2];
-      out[2] = m[3 * a] * m[3 * b + 1] - m[3 * a + 1] * m[3 * b];
-    };
-    double c12[3];
-    cross(1, 2, c12);
-    const double volume = std::abs(m[0] * c12[0] + m[1] * c12[1] + m[2] * c12[2]);
-    for (int a = 0; a < 3; a++) {
-      if (!st.pbc[a]) continue;
-      double w[3];
-      cross((a + 1) % 3, (a + 2) % 3, w);
-      const double height = volume / std::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
-      st.images[a] = static_cast<int>(std::ceil((cutoff_ + skin) / height));
-      if (st.images[a] > 127) throw std::runtime_error("GraphModel: cell too thin for the cutoff");
-    }
+    set_device_cell(st, m, pbc, cutoff_ + skin);
+  } else {
+    set_device_cell(st, nullptr, nullptr, cutoff_ + skin);
   }
   std::vector<double> x(system.positions(), system.positions() + 3 * size_t(n));
   upload(st.x, x.data(), x.size());
@@ -912,6 +949,201 @@ ModelResult GraphModel::predict_cached_device(const AtomicSystem &system, bool c
   }
   profile.mark("readback");
   return result;
+}
+#endif
+
+bool GraphModel::device_step_supported() const {
+#ifdef MLIPCPP_HAVE_CUDA_INPUTS
+  return cached_path_supported() && !nc_forces_ && compute_backend_ &&
+         std::string_view(ggml_backend_name(compute_backend_)).rfind("CUDA", 0) == 0;
+#else
+  return false;
+#endif
+}
+
+#ifndef MLIPCPP_HAVE_CUDA_INPUTS
+GraphModel::DeviceTotals GraphModel::predict_device_step(const DeviceStep &) {
+  throw std::runtime_error("GraphModel: device arrays need a CUDA build of mlip.cpp");
+}
+#else
+// predict_cached_device for an engine whose arrays are on the GPU: the same
+// kernels, on the caller's stream, without a download before the graph runs.
+// Instead of reading back the kept-edge count (and the largest per atom) to
+// size the graph, the graph is sized from the previous call's counts (with
+// fit_ragged_graph's spare rows) and a guard kernel checks on the device that
+// they fit; the list is not checked against the displacements before the step
+// but along with the totals after it. The one download, the totals, says
+// whether the step held; if not (graph too small, list stale) it is computed
+// again before anything is added into the caller's forces (added by a kernel
+// that reads the same verdict on the device).
+GraphModel::DeviceTotals GraphModel::predict_device_step(const DeviceStep &in) {
+  static const bool full_fp32 = [] { // as predict(): TF32 only with MLIPCPP_TF32
+    if (std::getenv("MLIPCPP_TF32")) return false;
+    setenv("GGML_CUDA_NO_TF32", "1", 0);
+    return true;
+  }();
+  (void)full_fp32;
+  if (!device_step_supported())
+    throw std::runtime_error("GraphModel: device arrays need a forces-mode model of the cached path on CUDA");
+  const int n = in.n_atoms;
+  if (n <= 0 || !in.positions || !in.types || !in.forces || !in.type_atomic_numbers || in.n_types < 0)
+    throw std::runtime_error("GraphModel: device step without atoms, positions, types, forces or type table");
+  const bool adaptive = num_neighbors_adaptive_ > 0.0f;
+  cuda_check(cudaSetDevice(device_), "set device");
+  if (!device_inputs_) device_inputs_ = new DeviceInputs();
+  auto &d = *static_cast<DeviceInputs *>(device_inputs_);
+  md::gpu::State &st = d.st;
+  cudaStream_t stream = static_cast<cudaStream_t>(in.stream);
+  st.stream = in.stream;
+  if (st.n != n) d.list_built = false, d.have_sizes = false;
+  d.atoms(n);
+  if (!d.flags) {
+    dalloc(d.flags, 4), dalloc(d.out, 16);
+    cuda_check(cudaMallocHost(&d.out_host, 16 * sizeof(double)), "pinned totals");
+  }
+
+  // atom type -> model species and composition energy, when the table changes
+  const std::vector<int32_t> type_z(in.type_atomic_numbers, in.type_atomic_numbers + in.n_types + 1);
+  if (type_z != d.type_z) {
+    std::vector<int32_t> species(type_z.size(), -1);
+    std::vector<double> e0(type_z.size(), 0.0);
+    for (size_t t = 0; t < type_z.size(); t++) {
+      if (auto it = species_to_index_.find(type_z[t]); it != species_to_index_.end()) species[t] = it->second;
+      if (auto c = composition_energies_.find(type_z[t]); c != composition_energies_.end()) e0[t] = c->second;
+    }
+    if (int(type_z.size()) > d.type_cap) {
+      d.type_cap = int(type_z.size());
+      dalloc(d.type_species, d.type_cap), dalloc(d.type_energy, d.type_cap);
+    }
+    cuda_check(cudaMemcpyAsync(d.type_species, species.data(), species.size() * sizeof(int32_t),
+                               cudaMemcpyHostToDevice, stream), "type species");
+    cuda_check(cudaMemcpyAsync(d.type_energy, e0.data(), e0.size() * sizeof(double), cudaMemcpyHostToDevice, stream),
+               "type energies");
+    cuda_check(cudaStreamSynchronize(stream), "type table"); // the host vectors go out of scope
+    d.type_z = type_z;
+  }
+
+  static const double env_skin = [] {
+    const char *e = std::getenv("MLIPCPP_NL_SKIN");
+    return e && *e ? std::max(0.0, std::atof(e)) : 0.5;
+  }();
+  const double skin = in.skin >= 0 ? in.skin : env_skin;
+  const md::gpu::Cutoff cut{cutoff_, skin, adaptive ? num_neighbors_adaptive_ : 0.0, cutoff_width_adaptive_};
+  const bool periodic = in.cell && (in.pbc[0] || in.pbc[1] || in.pbc[2]);
+  const int pbc[3] = {in.pbc[0], in.pbc[1], in.pbc[2]};
+  set_device_cell(st, periodic ? in.cell : nullptr, pbc, cutoff_ + skin);
+  const int64_t *xs = in.position_strides, *fs = in.force_strides;
+  const bool ragged = use_ragged();
+
+  DeviceTotals result;
+  bool stale = false;
+  for (int attempt = 1;; attempt++) {
+    if (attempt > 4) throw std::runtime_error("GraphModel: device step did not settle (graph or list)");
+    result.attempts = attempt;
+    cuda_check(cudaMemsetAsync(d.flags, 0, 4 * sizeof(int32_t), stream), "flags");
+    const bool same = d.list_built && skin == d.list_skin && !stale &&
+                      std::equal(std::begin(st.cell), std::end(st.cell), std::begin(d.list_cell)) &&
+                      std::equal(std::begin(st.pbc), std::end(st.pbc), std::begin(d.list_pbc));
+    if (!same || (in.rebuild && attempt == 1)) {
+      // the caller's positions as they are, wrapped by build_list; the wrap kept for the next calls
+      md::gpu::load_positions(st, in.positions, xs[0], xs[1], nullptr, in.types, d.type_species, in.n_types,
+                              d.flags + 1);
+      for (;;) {
+        md::gpu::reset_scalars(st);
+        md::gpu::build_list(st, cut);
+        int32_t overflow = 0;
+        cuda_check(cudaMemcpyAsync(&overflow, st.scalars, sizeof overflow, cudaMemcpyDeviceToHost, stream), "overflow");
+        cuda_check(cudaStreamSynchronize(stream), "overflow");
+        if (overflow == 0) break;
+        d.candidates(overflow + overflow / 4 + 8);
+      }
+      md::gpu::store_shift(st, in.positions, xs[0], xs[1], d.shift);
+      d.list_built = true, d.list_skin = skin, stale = false, result.rebuilt = true;
+      d.list_species.clear(); // predict_cached_device: not its list
+      std::copy(std::begin(st.cell), std::end(st.cell), std::begin(d.list_cell));
+      std::copy(std::begin(st.pbc), std::end(st.pbc), std::begin(d.list_pbc));
+    } else {
+      md::gpu::load_positions(st, in.positions, xs[0], xs[1], d.shift, in.types, d.type_species, in.n_types,
+                              d.flags + 1);
+      md::gpu::displacement(st);
+    }
+
+    md::gpu::Graph gg;
+    const int32_t *total = nullptr;
+    if (ragged) {
+      md::gpu::count_kept(st, cut);
+      if (!d.have_sizes) { // first call: the counts, to size the graph
+        int32_t t = 0, m = 0;
+        cuda_check(cudaMemcpyAsync(&t, st.offsets + n, sizeof t, cudaMemcpyDeviceToHost, stream), "total");
+        cuda_check(cudaMemcpyAsync(&m, st.scalars + 1, sizeof m, cudaMemcpyDeviceToHost, stream), "max kept");
+        cuda_check(cudaStreamSynchronize(stream), "sizes");
+        d.last_total = t, d.last_max_kept = m, d.have_sizes = true;
+      }
+      fit_ragged_graph(n, d.last_total, d.last_max_kept);
+      gg = device_graph(*cached_);
+      md::gpu::pack_ragged_guarded(st, cut, gg, cached_->max_len, d.flags);
+      total = st.offsets + n;
+    } else {
+      if (!cached_ || cached_->n_atoms != n || cached_->ragged)
+        build_cached_graph(n, cached_ && !cached_->ragged ? cached_->M : 16, false, true);
+      if (d.have_sizes) fit_cached_graph(n, std::max(d.last_max_kept, 1)); // always with the backward pass
+      st.M = cached_->M;
+      gg = device_graph(*cached_);
+      md::gpu::prepare_inputs(st, cut, gg);
+      md::gpu::slots_guard(st, d.flags);
+    }
+
+    CachedGraph &g = *cached_;
+    if (g.direct < 0) { // every node on the compute backend: no scheduler, no host round trip
+      g.direct = 1;
+      for (int i = 0; i < ggml_graph_n_nodes(g.graph) && g.direct; i++) {
+        const ggml_tensor *t = ggml_graph_node(g.graph, i);
+        g.direct = ggml_backend_supports_op(compute_backend_, t);
+        for (int k = 0; k < GGML_MAX_SRC && g.direct; k++) // and its operands in memory the backend reads
+          if (const ggml_tensor *src = t->src[k]; src && src->buffer)
+            g.direct = ggml_backend_supports_buft(compute_backend_, ggml_backend_buffer_get_type(src->buffer));
+      }
+      if (g.direct && !d.ev_in) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(compute_backend_);
+        d.ev_in = dev ? ggml_backend_event_new(dev) : nullptr;
+        d.ev_out = dev ? ggml_backend_event_new(dev) : nullptr;
+      }
+      if (!d.ev_in || !d.ev_out) g.direct = 0;
+      if (std::getenv("MLIPCPP_PROFILE_GRAPH"))
+        std::fprintf(stderr, "mlipcpp: device step, graph of %d nodes %s\n", ggml_graph_n_nodes(g.graph),
+                     g.direct ? "on the backend's stream, after the caller's" : "through the scheduler (synchronous)");
+    }
+    if (g.direct) {
+      cuda_check(cudaEventRecord(static_cast<cudaEvent_t>(d.ev_in->context), stream), "event");
+      ggml_backend_event_wait(compute_backend_, d.ev_in);
+      if (ggml_backend_graph_compute_async(compute_backend_, g.graph) != GGML_STATUS_SUCCESS)
+        throw std::runtime_error("Graph computation failed");
+      ggml_backend_event_record(d.ev_out, compute_backend_);
+      cuda_check(cudaStreamWaitEvent(stream, static_cast<cudaEvent_t>(d.ev_out->context), 0), "event wait");
+    } else {
+      cuda_check(cudaStreamSynchronize(stream), "inputs");
+      if (backend_provider_->compute(g.graph) != GGML_STATUS_SUCCESS) throw std::runtime_error("Graph computation failed");
+    }
+
+    md::gpu::conservative_forces(st, cut, gg, energy_scale_, d.flags);
+    if (in.virial) md::gpu::virial(st, cut, gg, d.virial, d.flags);
+    md::gpu::totals(st, gg.energy, in.types, d.type_energy, in.n_types, energy_scale_, in.virial ? d.virial : nullptr,
+                    total, 0.25 * skin * skin, d.flags, d.out);
+    md::gpu::add_forces(st, in.forces, fs[0], fs[1], d.flags + 2);
+    cuda_check(cudaMemcpyAsync(d.out_host, d.out, 12 * sizeof(double), cudaMemcpyDeviceToHost, stream), "totals");
+    cuda_check(cudaStreamSynchronize(stream), "totals");
+
+    const double *o = d.out_host;
+    if (o[11] != 0) throw std::runtime_error("GraphModel: an atom type has no element of the model");
+    if (ragged) d.last_total = int64_t(o[8]);
+    d.last_max_kept = int(o[9]);
+    const bool over = o[7] != 0, moved = o[10] > 0.25 * skin * skin;
+    if (moved) stale = true; // an atom moved more than half the skin since the list was built
+    if (over || moved) continue;
+    result.energy = o[0];
+    for (int c = 0; c < 6; c++) result.virial[c] = o[1 + c];
+    return result;
+  }
 }
 #endif
 
