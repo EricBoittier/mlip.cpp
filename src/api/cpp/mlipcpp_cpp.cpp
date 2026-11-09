@@ -15,6 +15,7 @@
 #include <ggml-backend.h>
 #include <ggml.h>
 
+#include <algorithm>
 #include <cstring>
 #include <mutex>
 
@@ -102,11 +103,18 @@ void suppress_logging() {
 struct Predictor::Impl {
   std::unique_ptr<Model> model; // Internal Model from model.h
   std::string model_type_str;
+  std::vector<int32_t> atomic_types;
+  bool nc_forces = false;
 
   Impl(const std::string &path, const ModelOptions &options) {
     // Load metadata to determine model type
     GGUFLoader loader(path);
     std::string arch = loader.get_string("general.architecture", "");
+    auto species_map = loader.get_array_int32("pet.species_map");
+    for (size_t i = 0; i + 1 < species_map.size(); i += 2) {
+      atomic_types.push_back(species_map[i]);
+    }
+    std::sort(atomic_types.begin(), atomic_types.end());
 
     if (arch == "pet") {
       auto pet_model = std::make_unique<pet::PETModel>(pet::PETHypers{});
@@ -148,6 +156,7 @@ struct Predictor::Impl {
       }
 
       model_type_str = "PET-Graph";
+      nc_forces = graph_model->nc_forces();
       model = std::move(graph_model);
     } else {
       throw std::runtime_error("Unsupported model architecture: " + arch);
@@ -284,6 +293,21 @@ struct Predictor::Impl {
         result.stress = compute_fd_stress(system);
       }
       return result;
+    } else if (options.use_nc_forces) {
+      if (!nc_forces) {
+        throw std::runtime_error("this model has no non-conservative force head");
+      }
+      // the force head is part of the forward pass: no backward needed
+      auto internal_result = model->predict(system, false);
+      Result result;
+      result.energy = internal_result.energy;
+      if (options.compute_forces) {
+        result.forces = std::move(internal_result.nc_forces);
+      }
+      if (options.compute_stress && options.fd_stress) {
+        result.stress = compute_fd_stress(system);
+      }
+      return result;
     } else {
       // Fallback for non-PET models
       auto result = predict_impl(system, options.compute_forces || options.compute_stress);
@@ -312,6 +336,12 @@ Predictor &Predictor::operator=(Predictor &&other) noexcept = default;
 float Predictor::cutoff() const { return impl_->model->cutoff(); }
 
 std::string_view Predictor::model_type() const { return impl_->model_type_str; }
+
+const std::vector<int32_t> &Predictor::atomic_types() const {
+  return impl_->atomic_types;
+}
+
+bool Predictor::has_nc_forces() const { return impl_->nc_forces; }
 
 Result Predictor::predict(std::span<const float> positions,
                           std::span<const int32_t> atomic_numbers,

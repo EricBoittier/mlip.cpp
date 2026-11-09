@@ -30,6 +30,13 @@ set_target_properties(c_api_test PROPERTIES LINKER_LANGUAGE C)
 add_executable(cpp_api_test cpp_api_test.cpp)
 target_link_libraries(cpp_api_test PRIVATE mlipcpp)
 
+# metatomic plugin driver, through the metatomic C API only
+if(MLIPCPP_BUILD_METATOMIC)
+    add_executable(metatomic_plugin metatomic_plugin.c)
+    target_link_libraries(metatomic_plugin PRIVATE metatomic m)
+    add_dependencies(metatomic_plugin mlipcpp-metatomic)
+endif()
+
 # Fortran API test (only when Fortran bindings are enabled)
 if(MLIPCPP_BUILD_FORTRAN)
     add_executable(fortran_api_test fortran_api_test.f90)
@@ -51,6 +58,12 @@ if(MLIPCPP_BUILD_TESTS)
 
     add_test(NAME cpp_api_test COMMAND cpp_api_test "${MLIPCPP_TEST_MODEL}")
     set_tests_properties(cpp_api_test PROPERTIES SKIP_RETURN_CODE 77)
+
+    if(MLIPCPP_BUILD_METATOMIC)
+        add_test(NAME metatomic_plugin
+            COMMAND metatomic_plugin $<TARGET_FILE:mlipcpp-metatomic> "${MLIPCPP_TEST_MODEL}")
+        set_tests_properties(metatomic_plugin PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
 
     if(MLIPCPP_BUILD_FORTRAN)
         add_test(NAME fortran_api_test

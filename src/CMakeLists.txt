@@ -98,6 +98,31 @@ set_target_properties(mlipcpp PROPERTIES
 )
 
 # =============================================================================
+# metatomic plugin (optional)
+# =============================================================================
+if(MLIPCPP_BUILD_METATOMIC)
+    add_library(mlipcpp-metatomic SHARED api/metatomic/mlipcpp_metatomic.cpp)
+    target_link_libraries(mlipcpp-metatomic PRIVATE mlipcpp ggml metatomic)
+    target_include_directories(mlipcpp-metatomic PRIVATE ${ggml_SOURCE_DIR}/include)
+    # only export the plugin entry point, keep our ggml copy private
+    set_target_properties(mlipcpp-metatomic PROPERTIES
+        PREFIX ""
+        SUFFIX ".so"
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON
+    )
+    if(UNIX AND NOT APPLE)
+        target_link_options(mlipcpp-metatomic PRIVATE -Wl,--exclude-libs,ALL)
+    endif()
+
+    include(GNUInstallDirs)
+    install(TARGETS mlipcpp-metatomic
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
+endif()
+
+# =============================================================================
 # Fortran bindings (optional)
 # =============================================================================
 if(MLIPCPP_BUILD_FORTRAN)

@@ -1163,7 +1163,7 @@ ModelResult GraphModel::predict_single(
   P3MResult mesh_result;
   std::vector<float> charge_values;
   if (charge_graph) {
-    if (ggml_backend_graph_compute(compute_backend_, charge_graph) !=
+    if (backend_provider_->compute(charge_graph) !=
         GGML_STATUS_SUCCESS)
       throw std::runtime_error("PET-LR charge graph failed");
     profile.mark("charge_forward");
@@ -1183,7 +1183,7 @@ ModelResult GraphModel::predict_single(
     ggml_graph_reset(cgraph);
   }
 
-  ggml_status status = ggml_backend_graph_compute(compute_backend_, cgraph);
+  ggml_status status = backend_provider_->compute(cgraph);
   if (status != GGML_STATUS_SUCCESS) {
     throw std::runtime_error("Graph computation failed");
   }
@@ -1200,7 +1200,7 @@ ModelResult GraphModel::predict_single(
                             ggml_nbytes(lr_charge_adjoint));
     profile.mark("p3m_backward");
     ggml_graph_reset(cgraph);
-    if (ggml_backend_graph_compute(compute_backend_, cgraph) !=
+    if (backend_provider_->compute(cgraph) !=
         GGML_STATUS_SUCCESS)
       throw std::runtime_error("PET-LR charge backward graph failed");
   }
