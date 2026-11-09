@@ -714,6 +714,26 @@ mlipcpp_error_t mlipcpp_result_get_stress(mlipcpp_result_t result,
   }
 }
 
+mlipcpp_error_t mlipcpp_result_get_atomic_values(mlipcpp_result_t result,
+                                                 float *values) {
+  if (!result) {
+    set_error("Invalid result handle");
+    return MLIPCPP_ERROR_INVALID_HANDLE;
+  }
+  if (!values) {
+    set_error("NULL values pointer");
+    return MLIPCPP_ERROR_NULL_POINTER;
+  }
+  const auto &v = result->result->atomic_values;
+  if (v.empty() || static_cast<int32_t>(v.size()) != result->n_atoms) {
+    set_error("Per-atom values not available for this model");
+    return MLIPCPP_ERROR_UNSUPPORTED;
+  }
+  std::memcpy(values, v.data(), v.size() * sizeof(float));
+  clear_error();
+  return MLIPCPP_OK;
+}
+
 mlipcpp_error_t mlipcpp_result_n_atoms(mlipcpp_result_t result,
                                        int32_t *n_atoms) {
   if (!result) {

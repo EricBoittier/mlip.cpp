@@ -374,6 +374,8 @@ ggml_tensor *GraphInterpreter::build_node(ggml_context *ctx,
     return build_unary(ctx, node, GGML_UNARY_OP_RELU);
   } else if (node.op == "UNARY_GELU") {
     return build_unary(ctx, node, GGML_UNARY_OP_GELU);
+  } else if (node.op == "UNARY_GELU_ERF") {
+    return build_unary(ctx, node, GGML_UNARY_OP_GELU_ERF);
   } else if (node.op == "UNARY_TANH") {
     return build_unary(ctx, node, GGML_UNARY_OP_TANH);
   } else if (node.op == "UNARY_EXP") {
