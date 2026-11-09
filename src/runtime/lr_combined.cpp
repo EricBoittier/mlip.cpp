@@ -6,11 +6,14 @@
 #include <gguf.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <complex>
 #include <functional>
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 
 namespace mlipcpp::runtime {
 
@@ -29,12 +32,154 @@ double dist(const double *x, int i, int j) {
   for (int k = 0; k < 3; k++) d2 += (x[3 * i + k] - x[3 * j + k]) * (x[3 * i + k] - x[3 * j + k]);
   return std::sqrt(d2);
 }
-void add_pair(double *g, const double *x, int i, int j, double r, double dEdr) {
+// g += dE/dx of a pair term E(r_ij); vir (3 x 3, may be null) += its strain derivative d (dE/dd), d = x_j - x_i
+void add_pair(double *g, const double *x, int i, int j, double r, double dEdr, double *vir = nullptr) {
+  double d[3];
   for (int k = 0; k < 3; k++) {
-    const double f = dEdr * (x[3 * i + k] - x[3 * j + k]) / r;
-    g[3 * i + k] += f, g[3 * j + k] -= f;
+    d[k] = x[3 * j + k] - x[3 * i + k];
+    const double f = dEdr * d[k] / r;
+    g[3 * i + k] -= f, g[3 * j + k] += f;
   }
+  if (vir)
+    for (int a = 0; a < 3; a++)
+      for (int b = 0; b < 3; b++) vir[3 * a + b] += dEdr * d[a] * d[b] / r;
 }
+
+// ---- periodic geometry ------------------------------------------------------------------------------------------------
+// cell rows a_k; fractional f = x inv (x = f h); perp[k]: spacing of the lattice planes normal to a_k
+struct Cell3 {
+  double h[3][3], inv[3][3], V, perp[3];
+};
+Cell3 cell3(const double *cell) {
+  Cell3 C;
+  for (int a = 0; a < 3; a++)
+    for (int b = 0; b < 3; b++) C.h[a][b] = cell[3 * a + b];
+  const auto &h = C.h;
+  const double det = h[0][0] * (h[1][1] * h[2][2] - h[1][2] * h[2][1]) - h[0][1] * (h[1][0] * h[2][2] - h[1][2] * h[2][0]) +
+                     h[0][2] * (h[1][0] * h[2][1] - h[1][1] * h[2][0]);
+  if (!(std::abs(det) > 1e-9) || !std::isfinite(det)) throw std::runtime_error("lrc: singular periodic cell");
+  for (int a = 0; a < 3; a++)
+    for (int b = 0; b < 3; b++)
+      C.inv[a][b] = (h[(b + 1) % 3][(a + 1) % 3] * h[(b + 2) % 3][(a + 2) % 3] -
+                     h[(b + 1) % 3][(a + 2) % 3] * h[(b + 2) % 3][(a + 1) % 3]) / det;
+  C.V = std::abs(det);
+  for (int k = 0; k < 3; k++) {
+    const double *u = h[(k + 1) % 3], *v = h[(k + 2) % 3];
+    const double c0 = u[1] * v[2] - u[2] * v[1], c1 = u[2] * v[0] - u[0] * v[2], c2 = u[0] * v[1] - u[1] * v[0];
+    C.perp[k] = C.V / std::sqrt(c0 * c0 + c1 * c1 + c2 * c2);
+  }
+  return C;
+}
+
+using I3 = std::array<long long, 3>;
+inline bool nonzero(const I3 &v) { return v[0] || v[1] || v[2]; }
+
+// every periodic pair closer than rc, once: visit(i, j, s, d, r) with d = x_j + s h - x_i, i < j, or i == j with s
+// lexicographically positive (an atom and its own image); bins in fractional space, any cell shape and any rc
+template <class F> void periodic_pairs(int n, const double *x, const Cell3 &C, double rc, F &&visit) {
+  int nb[3], m[3];
+  for (int k = 0; k < 3; k++) {
+    nb[k] = std::clamp(static_cast<int>(C.perp[k] / rc), 1, 64);
+    m[k] = static_cast<int>(std::ceil(rc * nb[k] / C.perp[k]));
+  }
+  std::vector<std::array<int, 3>> bin(n);
+  std::vector<I3> w(n);
+  std::vector<std::vector<int>> cells(size_t(nb[0]) * nb[1] * nb[2]);
+  for (int i = 0; i < n; i++) {
+    for (int k = 0; k < 3; k++) {
+      double f = 0;
+      for (int a = 0; a < 3; a++) f += x[3 * i + a] * C.inv[a][k];
+      const double fl = std::floor(f);
+      w[i][k] = static_cast<long long>(fl);
+      bin[i][k] = std::min(static_cast<int>((f - fl) * nb[k]), nb[k] - 1);
+    }
+    cells[(size_t(bin[i][0]) * nb[1] + bin[i][1]) * nb[2] + bin[i][2]].push_back(i);
+  }
+  auto fdiv = [](int a, int b) { return a >= 0 ? a / b : -((-a + b - 1) / b); };
+  const double rc2 = rc * rc;
+  for (int i = 0; i < n; i++)
+    for (int o0 = -m[0]; o0 <= m[0]; o0++)
+      for (int o1 = -m[1]; o1 <= m[1]; o1++)
+        for (int o2 = -m[2]; o2 <= m[2]; o2++) {
+          const int o[3] = {o0, o1, o2};
+          int tb[3], sh[3];
+          for (int k = 0; k < 3; k++) {
+            const int t = bin[i][k] + o[k];
+            sh[k] = fdiv(t, nb[k]), tb[k] = t - sh[k] * nb[k];
+          }
+          for (int j : cells[(size_t(tb[0]) * nb[1] + tb[1]) * nb[2] + tb[2]]) {
+            if (j < i) continue;
+            I3 s;
+            for (int k = 0; k < 3; k++) s[k] = sh[k] + w[i][k] - w[j][k];
+            if (j == i && !(s[0] > 0 || (s[0] == 0 && (s[1] > 0 || (s[1] == 0 && s[2] > 0))))) continue;
+            double d[3], r2 = 0;
+            for (int a = 0; a < 3; a++) {
+              d[a] = x[3 * j + a] - x[3 * i + a] + s[0] * C.h[0][a] + s[1] * C.h[1][a] + s[2] * C.h[2][a];
+              r2 += d[a] * d[a];
+            }
+            if (r2 < rc2 && r2 > 0) visit(i, j, s, d, std::sqrt(r2));
+          }
+        }
+}
+
+// integer lattice spanned by the wrap vectors of a cluster (net cell translations of its cycles), rows in echelon form
+struct Wraps {
+  long long b[3][3] = {};
+  void add(I3 v) {
+    for (int c = 0; c < 3; c++) {
+      if (v[c] == 0) continue;
+      if (b[c][c] == 0) {
+        for (int k = 0; k < 3; k++) b[c][k] = v[c] < 0 ? -v[k] : v[k];
+        return;
+      }
+      while (v[c] != 0) { // Euclid on the pivot column (unimodular row operations)
+        const long long t = b[c][c] / v[c];
+        for (int k = 0; k < 3; k++) b[c][k] -= t * v[k], std::swap(b[c][k], v[k]);
+      }
+      if (b[c][c] < 0)
+        for (long long &e : b[c]) e = -e;
+    }
+  }
+  void add(const Wraps &o) {
+    for (const auto &r : o.b) add(I3{r[0], r[1], r[2]});
+  }
+  bool none() const { return !b[0][0] && !b[1][1] && !b[2][2]; }
+  bool full() const { return b[0][0] == 1 && b[1][1] == 1 && b[2][2] == 1; } // every image is the same cluster
+};
+
+// union-find with cell offsets: phi(i) = the image of i in its root's frame; a link (i, 0) ~ (j, s) says
+// phi(j) - phi(i) = s, and a link that closes a cycle with another offset is a wrap of the cluster
+struct OffsetUF {
+  std::vector<int> p;
+  std::vector<I3> o; // phi(i) - phi(p[i])
+  explicit OffsetUF(int n) : p(n), o(n, I3{0, 0, 0}) { std::iota(p.begin(), p.end(), 0); }
+  std::pair<int, I3> find(int i) {
+    std::vector<int> path;
+    int r = i;
+    while (p[r] != r) path.push_back(r), r = p[r];
+    I3 up{0, 0, 0};
+    for (size_t k = path.size(); k-- > 0;) {
+      const int v = path[k];
+      for (int d = 0; d < 3; d++) up[d] += o[v][d];
+      o[v] = up, p[v] = r;
+    }
+    return {r, path.empty() ? I3{0, 0, 0} : o[i]};
+  }
+  // join the clusters of i and j through the link (i, 0) ~ (j, s); returns the wrap vector it closes (zero if none)
+  I3 unite(int i, int j, const I3 &s, std::vector<Wraps> *wr = nullptr) {
+    const auto [ri, fi] = find(i);
+    const auto [rj, fj] = find(j);
+    I3 w;
+    for (int d = 0; d < 3; d++) w[d] = fi[d] + s[d] - fj[d];
+    if (ri == rj) {
+      if (wr && nonzero(w)) (*wr)[ri].add(w);
+      return w;
+    }
+    p[rj] = ri, o[rj] = w;
+    if (wr) (*wr)[ri].add((*wr)[rj]);
+    return I3{0, 0, 0};
+  }
+};
 
 // D3 counting function cnt(r) of sqe.cpp (sigmoid times the cn switch) and its derivative
 void cn_count(const SqeSpec &S, double R, double r, double &w, double &dw) {
@@ -602,35 +747,41 @@ void lrc_moments_vjp(const LrcSpec &L, int n, const int32_t *Z, const double *x,
 
 namespace {
 // graph mode: q0 = q_raw + f (Q - sum q_raw) / sum f; wt = f / sum f (f per element: no position dependence)
-LrcQ0 q0_graph(const LrcSpec &L, int n, const int32_t *Z, const double *x, double Q, int spin) {
+LrcQ0 q0_graph(const LrcSpec &L, int n, const int32_t *Z, const double *x, double Q, int spin, const double *cell) {
   if (!L.qsrc) throw std::runtime_error("lrc graph: the charge pass (lrc_qmodel) is not loaded");
   LrcQ0 o;
   o.Q = Q, o.spin = spin;
+  if (cell) o.cell.assign(cell, cell + 9);
   if (n == 0) return o;
-  o.q0 = L.qsrc->raw(n, Z, x, L.qpass_neutral ? 0.0 : Q, spin);
+  o.q0 = L.qsrc->raw(n, Z, x, L.qpass_neutral ? 0.0 : Q, spin, cell);
   o.wt.resize(n);
   double sq = 0, sf = 0;
   for (int i = 0; i < n; i++) sq += o.q0[i], o.wt[i] = L.fukui(Z[i]), sf += o.wt[i];
   for (int i = 0; i < n; i++) o.wt[i] /= sf, o.q0[i] += o.wt[i] * (Q - sq);
   return o;
 }
-void vjp_graph(const LrcSpec &L, int n, const int32_t *Z, const double *x, const LrcQ0 &o, const double *c, double *g) {
+void vjp_graph(const LrcSpec &L, int n, const int32_t *Z, const double *x, const LrcQ0 &o, const double *c, double *g,
+               double *vir) {
   double cb = 0;
   for (int i = 0; i < n; i++) cb += c[i] * o.wt[i];
   std::vector<double> w(n);
   bool any = false;
   for (int i = 0; i < n; i++) w[i] = c[i] - cb, any |= w[i] != 0;
-  if (any) L.qsrc->raw_vjp(n, Z, x, L.qpass_neutral ? 0.0 : o.Q, o.spin, w.data(), g);
+  if (any)
+    L.qsrc->raw_vjp(n, Z, x, L.qpass_neutral ? 0.0 : o.Q, o.spin, o.cell.empty() ? nullptr : o.cell.data(), w.data(), g,
+                    vir);
 }
 } // namespace
 
-LrcQ0 lrc_q0(const LrcSpec &L, const SqeSpec &S, int n, const int32_t *Z, const double *x, double Q, int spin) {
-  if (L.graph) return q0_graph(L, n, Z, x, Q, spin);
+LrcQ0 lrc_q0(const LrcSpec &L, const SqeSpec &S, int n, const int32_t *Z, const double *x, double Q, int spin,
+             const double *cell) {
+  if (L.graph) return q0_graph(L, n, Z, x, Q, spin, cell);
+  if (cell) throw std::runtime_error("lrc: periodic reference charges need the graph q0 mode");
   return L.round || L.head_only ? q0_round(L, S, n, Z, x, Q) : q0_fermi2(L, S, n, Z, x, Q);
 }
 void lrc_q0_vjp(const LrcSpec &L, const SqeSpec &S, int n, const int32_t *Z, const double *x, const LrcQ0 &q,
-                const double *c, double *g) {
-  if (L.graph) vjp_graph(L, n, Z, x, q, c, g);
+                const double *c, double *g, double *vir) {
+  if (L.graph) vjp_graph(L, n, Z, x, q, c, g, vir);
   else if (L.round || L.head_only) vjp_round(L, S, n, Z, x, q, c, g);
   else vjp_fermi2(L, S, n, Z, x, q, c, g);
 }
@@ -683,30 +834,11 @@ template <class F> void enumerate(const LrcClusters &c, const std::vector<int> &
 }
 } // namespace
 
-LrcClusters lrc_clusters(const LrcSpec &L, int n, const double *x) {
-  LrcClusters c;
-  std::vector<int> par(n);
-  std::iota(par.begin(), par.end(), 0);
-  std::vector<std::pair<int, int>> weak;
-  for (int i = 0; i < n; i++)
-    for (int j = i + 1; j < n; j++) {
-      const double r = dist(x, i, j);
-      if (r <= L.a_on) {
-        const int a = uf_find(par, i), b = uf_find(par, j);
-        if (a != b) par[std::max(a, b)] = std::min(a, b);
-      } else if (r < L.a_off) {
-        weak.push_back({i, j});
-      }
-    }
-  c.sn.resize(n);
-  std::vector<int> lab(n, -1);
-  c.s = 0;
-  for (int i = 0; i < n; i++) { // numbered by first atom
-    const int r = uf_find(par, i);
-    if (lab[r] < 0) lab[r] = c.s++;
-    c.sn[i] = lab[r];
-  }
-  std::vector<int> seidx; // map (a, b) -> index
+namespace {
+// super-edges, link probabilities and reliabilities from the super-nodes (c.s, c.sn) and the weak atom pairs, whose
+// distances are those of the cluster-frame positions c.xh
+void finish_clusters(const LrcSpec &L, LrcClusters &c, const std::vector<std::pair<int, int>> &weak) {
+  const double *x = c.xh.data();
   for (auto [i, j] : weak) {
     int a = c.sn[i], b = c.sn[j];
     if (a == b) continue;
@@ -741,13 +873,109 @@ LrcClusters lrc_clusters(const LrcSpec &L, int n, const double *x) {
           if (a != b && p[a] == p[b]) c.R[size_t(a) * c.s + b] += P;
     });
   }
+}
+
+// periodic: links through the images; super-nodes are the strong components of the tiling, either one bulk cluster
+// (connected to all its images) or all finite, and then each weak component is unwrapped into c.xh
+LrcClusters clusters_periodic(const LrcSpec &L, int n, const double *x, const double *cell) {
+  LrcClusters c;
+  c.cell.assign(cell, cell + 9);
+  const Cell3 C = cell3(cell);
+  OffsetUF u(n);
+  std::vector<Wraps> wr(n);
+  struct Link {
+    int i, j;
+    I3 s;
+  };
+  std::vector<Link> weak;
+  periodic_pairs(n, x, C, L.a_off, [&](int i, int j, const I3 &s, const double *, double r) {
+    if (r <= L.a_on) u.unite(i, j, s, &wr);
+    else weak.push_back({i, j, s});
+  });
+  std::vector<int> root(n);
+  std::vector<I3> phi(n);
+  for (int i = 0; i < n; i++) std::tie(root[i], phi[i]) = u.find(i);
+  c.sn.resize(n);
+  std::vector<int> lab(n, -1);
+  c.s = 0;
+  for (int i = 0; i < n; i++) { // numbered by first atom
+    if (lab[root[i]] < 0) lab[root[i]] = c.s++;
+    c.sn[i] = lab[root[i]];
+  }
+  if (c.s == 1 && wr[root[0]].full()) { // bulk: one cluster through every image
+    c.bulk = true, c.xh.assign(x, x + 3 * size_t(n)), c.R.assign(1, 1.0);
+    return c;
+  }
+  for (int i = 0; i < n; i++)
+    if (!wr[root[i]].none())
+      throw std::runtime_error(
+          "lrc: a cluster wraps the periodic cell without being one bulk cluster (a slab, a wire, interpenetrating "
+          "networks, or a network beside separate molecules); only bulk cells, where every atom has a neighbour within "
+          "a_on = " + std::to_string(L.a_on) + " A through the images, and fully separated clusters are supported");
+  // weak links between super-nodes, with the cell offset between the two clusters' frames
+  OffsetUF v(c.s);
+  std::vector<std::pair<int, int>> wk;
+  const char *wrap = "lrc: clusters within a_off of their own periodic images, directly or through a chain of weak "
+                     "links, are not supported (use a larger cell)";
+  for (const Link &l : weak) {
+    const int a = c.sn[l.i], b = c.sn[l.j];
+    I3 d;
+    for (int k = 0; k < 3; k++) d[k] = l.s[k] - phi[l.j][k] + phi[l.i][k];
+    if (a == b) {
+      if (nonzero(d)) throw std::runtime_error(wrap);
+      continue;
+    }
+    if (nonzero(v.unite(a, b, d))) throw std::runtime_error(wrap);
+    wk.push_back({l.i, l.j});
+  }
+  c.xh.resize(3 * size_t(n));
+  for (int i = 0; i < n; i++) {
+    const I3 psi = v.find(c.sn[i]).second;
+    for (int a = 0; a < 3; a++) {
+      double t = x[3 * i + a];
+      for (int k = 0; k < 3; k++) t += double(phi[i][k] + psi[k]) * C.h[k][a];
+      c.xh[3 * i + a] = t;
+    }
+  }
+  finish_clusters(L, c, wk);
+  return c;
+}
+} // namespace
+
+LrcClusters lrc_clusters(const LrcSpec &L, int n, const double *x, const double *cell) {
+  if (cell) return clusters_periodic(L, n, x, cell);
+  LrcClusters c;
+  c.xh.assign(x, x + 3 * size_t(n));
+  std::vector<int> par(n);
+  std::iota(par.begin(), par.end(), 0);
+  std::vector<std::pair<int, int>> weak;
+  for (int i = 0; i < n; i++)
+    for (int j = i + 1; j < n; j++) {
+      const double r = dist(x, i, j);
+      if (r <= L.a_on) {
+        const int a = uf_find(par, i), b = uf_find(par, j);
+        if (a != b) par[std::max(a, b)] = std::min(a, b);
+      } else if (r < L.a_off) {
+        weak.push_back({i, j});
+      }
+    }
+  c.sn.resize(n);
+  std::vector<int> lab(n, -1);
+  c.s = 0;
+  for (int i = 0; i < n; i++) { // numbered by first atom
+    const int r = uf_find(par, i);
+    if (lab[r] < 0) lab[r] = c.s++;
+    c.sn[i] = lab[r];
+  }
+  finish_clusters(L, c, weak);
   return c;
 }
 
 void lrc_clusters_vjp(const LrcSpec &L, const LrcClusters &c, int n, const double *x, const std::vector<double> &W,
-                      double *g) {
+                      double *g, double *vir) {
   (void)n;
   if (c.trivial()) return;
+  if (!c.xh.empty()) x = c.xh.data(); // the links are differences of the cluster-frame positions
   std::vector<double> dp(c.se.size(), 0.0);
   for (const auto &edges : weak_components(c)) {
     const int m = static_cast<int>(edges.size());
@@ -769,7 +997,7 @@ void lrc_clusters_vjp(const LrcSpec &L, const LrcClusters &c, int n, const doubl
     double others = 1.0;
     for (size_t v = 0; v < c.weak.size(); v++)
       if (v != w && c.weak[v].e == wk.e) others *= 1.0 - c.weak[v].A;
-    add_pair(g, x, wk.i, wk.j, dist(x, wk.i, wk.j), dp[wk.e] * others * wk.dA);
+    add_pair(g, x, wk.i, wk.j, dist(x, wk.i, wk.j), dp[wk.e] * others * wk.dA, vir);
   }
 }
 
@@ -781,15 +1009,18 @@ bool LrcCondition::needs_cond_forces() const {
 }
 
 LrcCondition lrc_condition(const LrcSpec &L, const SqeSpec &S, int n, const int32_t *Z, const double *x, double Q,
-                           int max_charge, int spin) {
+                           int max_charge, int spin, const double *cell) {
   LrcCondition c;
-  c.cl = lrc_clusters(L, n, x);
+  c.cl = lrc_clusters(L, n, x, cell);
   const int s = c.cl.s;
   c.Q0.assign(s, 0.0), c.Qloc.assign(s, 0.0), c.S.assign(s, 0.0), c.dS.assign(s, 0.0), c.k.assign(s, 0);
-  if (s == 1) {
+  if (c.cl.images() && (!L.graph || L.mp || L.pol))
+    throw std::runtime_error("lrc: separated clusters in a periodic cell need the graph q0 mode without lrc_mp / "
+                             "lrc_pol (bulk cells work in every mode)");
+  if (s == 1 && !c.cl.images()) { // one open cluster or a bulk cell: the structure's charge, no long range
     c.Q0[0] = c.Qloc[0] = Q;
-  } else {
-    c.q0 = lrc_q0(L, S, n, Z, x, Q, spin);
+  } else { // (a single periodic cluster still meets its images: the charges are needed)
+    c.q0 = lrc_q0(L, S, n, Z, x, Q, spin, cell);
     for (int i = 0; i < n; i++) c.Q0[c.cl.sn[i]] += c.q0.q0[i];
     for (int a = 0; a < s; a++)
       for (int b = 0; b < s; b++) c.Qloc[a] += c.cl.R[size_t(a) * s + b] * c.Q0[b];
@@ -813,21 +1044,21 @@ LrcCondition lrc_condition(const LrcSpec &L, const SqeSpec &S, int n, const int3
 }
 
 void lrc_condition_forces(const LrcSpec &L, const SqeSpec &S, const LrcCondition &c, int n, const int32_t *Z,
-                          const double *x, const std::vector<double> &G, double *F) {
+                          const double *x, const std::vector<double> &G, double *F, double *vir) {
   const int s = c.cl.s;
-  if (s == 1 || L.cond_global) return;
+  if (s == 1 || L.cond_global) return; // (one periodic cluster: Q_loc = Q, no position dependence either)
   std::vector<double> g(3 * size_t(n), 0.0), W(size_t(s) * s, 0.0), cq(n, 0.0);
   std::vector<double> gs(s);
   for (int a = 0; a < s; a++) gs[a] = G[a] * c.dS[a]; // dE/dQloc_a
   for (int a = 0; a < s; a++)
     for (int b = 0; b < s; b++)
       if (a != b) W[size_t(a) * s + b] = gs[a] * c.Q0[b];
-  lrc_clusters_vjp(L, c.cl, n, x, W, g.data());
+  lrc_clusters_vjp(L, c.cl, n, x, W, g.data(), vir);
   for (int i = 0; i < n; i++) {
     const int b = c.cl.sn[i];
     for (int a = 0; a < s; a++) cq[i] += gs[a] * c.cl.R[size_t(a) * s + b];
   }
-  lrc_q0_vjp(L, S, n, Z, x, c.q0, cq.data(), g.data());
+  lrc_q0_vjp(L, S, n, Z, x, c.q0, cq.data(), g.data(), vir);
   for (size_t k = 0; k < g.size(); k++) F[k] -= g[k];
 }
 
@@ -965,8 +1196,9 @@ LrcProjection lrc_project(const LrcSpec &L, const LrcClusters &c, int n, const i
 
 // dq: dE/dq' on input, dE/dq on output (q the charge-pass charges); g [3n] += the link-probability part
 void lrc_project_vjp(const LrcSpec &L, const LrcClusters &c, const LrcProjection &o, int n, const int32_t *Z,
-                     const double *x, std::vector<double> &dq, double *g) {
+                     const double *x, std::vector<double> &dq, double *g, double *vir = nullptr) {
   const int s = c.s;
+  if (!c.xh.empty()) x = c.xh.data();
   std::vector<double> h(s, 0.0), Ds(s), Dg(s), dQ0(s, 0.0), dp(c.se.size(), 0.0);
   for (int i = 0; i < n; i++) h[c.sn[i]] += dq[i] * L.fukui(Z[i]) / o.F[c.sn[i]];
   double Hb = 0;
@@ -993,8 +1225,138 @@ void lrc_project_vjp(const LrcSpec &L, const LrcClusters &c, const LrcProjection
     double others = 1.0;
     for (size_t v = 0; v < c.weak.size(); v++)
       if (v != w && c.weak[v].e == wk.e) others *= 1.0 - c.weak[v].A;
-    add_pair(g, x, wk.i, wk.j, dist(x, wk.i, wk.j), dp[wk.e] * others * wk.dA);
+    add_pair(g, x, wk.i, wk.j, dist(x, wk.i, wk.j), dp[wk.e] * others * wk.dA, vir);
   }
+}
+
+// periodic, separated clusters: the fixed-charge inter-cluster Coulomb of the tiling,
+//   E = KE [ Ewald(q) - sum_{pairs r < lr_R} q_i q_j (1 - T) / r - sum_{i < j, R_ab > 0} q_i q_j T R_ab / r^_ij ]
+// (every image pair counted once; r^ the distance in the unwrapped weak component, the only image of j linked to i).
+// Ewald: point charges, tin-foil boundary, neutralising background for a charged cell; real-space cutoff balancing the
+// real and reciprocal sums (at least lr_R) with erfc(alpha rc) = erfc(5) ~ 1e-12.
+LrcEnergy energy_images(const LrcSpec &L, const SqeSpec &S, const LrcCondition &c, int n, const int32_t *Z,
+                        const double *x, bool forces) {
+  constexpr double KE = 14.399645, acc = 5.0;
+  LrcEnergy out;
+  out.q0 = c.q0.q0, out.q = c.q0.q0;
+  const int s = c.cl.s;
+  const Cell3 C = cell3(c.cl.cell.data());
+  const double r0 = S.lr_R - S.lr_t;
+  std::vector<double> g(3 * size_t(n), 0.0), dq(n, 0.0), W(size_t(s) * s, 0.0), vir(9, 0.0);
+  std::vector<double> q = c.q0.q0;
+  LrcProjection proj;
+  if (L.qproj) proj = lrc_project(L, c.cl, n, Z, q.data()), q = proj.q, out.q = q;
+  double E = 0, Qt = 0;
+  for (double v : q) Qt += v;
+  // one pair's energy q_i q_j u(r), j's image at d = x_j' - x_i, du = du/dr
+  auto pair = [&](int i, int j, const double *d, double r, double u, double du) {
+    E += q[i] * q[j] * u;
+    dq[i] += q[j] * u, dq[j] += q[i] * u;
+    if (!forces) return;
+    const double f = q[i] * q[j] * du / r;
+    for (int a = 0; a < 3; a++) {
+      g[3 * j + a] += f * d[a], g[3 * i + a] -= f * d[a];
+      for (int b = 0; b < 3; b++) vir[3 * a + b] += f * d[a] * d[b];
+    }
+  };
+  auto sw = [&](double r, double &T, double &dT) {
+    const double t = (r - r0) / S.lr_t;
+    T = sstep(t), dT = dsstep(t) / S.lr_t;
+  };
+  const double rc = std::max(S.lr_R, acc * std::cbrt(C.V) / (std::sqrt(M_PI) * std::pow(double(n), 1.0 / 6.0)));
+  const double al = acc / rc, kmax = 2 * acc * al;
+  // real space: erfc(alpha r) / r, less the part of the bare 1 / r that the switch keeps out (1 - T inside lr_R)
+  periodic_pairs(n, x, C, std::max(rc, S.lr_R), [&](int i, int j, const I3 &, const double *d, double r) {
+    double u = 0, du = 0;
+    if (r < rc) {
+      const double e = std::erfc(al * r) / r;
+      u += e, du -= (e + 2 * al / std::sqrt(M_PI) * std::exp(-al * al * r * r)) / r;
+    }
+    if (r < S.lr_R) {
+      double T, dT;
+      sw(r, T, dT);
+      u -= (1 - T) / r, du += dT / r + (1 - T) / (r * r);
+    }
+    pair(i, j, d, r, u, du);
+  });
+  // self and background (- pi Q^2 / 2 V alpha^2: proportional to 1 / V)
+  const double self = al / std::sqrt(M_PI), bg = M_PI / (2 * C.V * al * al);
+  for (int i = 0; i < n; i++) E -= self * q[i] * q[i], dq[i] -= 2 * self * q[i] + 2 * bg * Qt;
+  E -= bg * Qt * Qt;
+  for (int a = 0; a < 3; a++) vir[4 * a] += bg * Qt * Qt;
+  // reciprocal space over the half space of k (k and -k together): (4 pi / V) exp(-k^2 / 4 alpha^2) / k^2 |S(k)|^2
+  int M[3];
+  for (int k = 0; k < 3; k++)
+    M[k] = static_cast<int>(kmax * std::sqrt(C.h[k][0] * C.h[k][0] + C.h[k][1] * C.h[k][1] + C.h[k][2] * C.h[k][2]) /
+                            (2 * M_PI));
+  if (double(2 * M[0] + 1) * (2 * M[1] + 1) * (2 * M[2] + 1) * n > 4e9)
+    throw std::runtime_error("lrc: periodic long range too large for the direct Ewald sum (cell / atom count)");
+  std::vector<std::complex<double>> ph[3]; // e^{i 2 pi m f_jk}, m in [-M_k, M_k]
+  for (int k = 0; k < 3; k++) {
+    const int w = 2 * M[k] + 1;
+    ph[k].resize(size_t(n) * w);
+    for (int j = 0; j < n; j++) {
+      double f = 0;
+      for (int a = 0; a < 3; a++) f += x[3 * j + a] * C.inv[a][k];
+      for (int m = -M[k]; m <= M[k]; m++) ph[k][size_t(j) * w + m + M[k]] = std::polar(1.0, 2 * M_PI * m * f);
+    }
+  }
+  std::vector<std::complex<double>> e(n);
+  for (int m0 = 0; m0 <= M[0]; m0++)
+    for (int m1 = -M[1]; m1 <= M[1]; m1++)
+      for (int m2 = -M[2]; m2 <= M[2]; m2++) {
+        if (m0 == 0 && (m1 < 0 || (m1 == 0 && m2 <= 0))) continue;
+        double k[3], k2 = 0;
+        for (int a = 0; a < 3; a++) {
+          k[a] = 2 * M_PI * (m0 * C.inv[a][0] + m1 * C.inv[a][1] + m2 * C.inv[a][2]);
+          k2 += k[a] * k[a];
+        }
+        if (k2 > kmax * kmax) continue;
+        std::complex<double> Sk = 0;
+        for (int j = 0; j < n; j++) {
+          e[j] = ph[0][size_t(j) * (2 * M[0] + 1) + m0 + M[0]] * ph[1][size_t(j) * (2 * M[1] + 1) + m1 + M[1]] *
+                 ph[2][size_t(j) * (2 * M[2] + 1) + m2 + M[2]];
+          Sk += q[j] * e[j];
+        }
+        const double A = 4 * M_PI / C.V * std::exp(-k2 / (4 * al * al)) / k2, S2 = std::norm(Sk);
+        E += A * S2;
+        for (int j = 0; j < n; j++) {
+          const std::complex<double> z = std::conj(Sk) * e[j];
+          dq[j] += 2 * A * z.real();
+          if (forces)
+            for (int a = 0; a < 3; a++) g[3 * j + a] -= 2 * A * q[j] * z.imag() * k[a];
+        }
+        if (forces)
+          for (int a = 0; a < 3; a++)
+            for (int b = 0; b < 3; b++)
+              vir[3 * a + b] += A * S2 * ((a == b ? -1.0 : 0.0) + 2 * k[a] * k[b] * (1 / (4 * al * al) + 1 / k2));
+      }
+  // the linked pairs: each cluster with itself (R = 1) and with the clusters of its weak component
+  const double *xh = c.cl.xh.data();
+  for (int i = 0; i < n; i++)
+    for (int j = i + 1; j < n; j++) {
+      const int a = c.cl.sn[i], b = c.cl.sn[j];
+      const double R = a == b ? 1.0 : c.cl.R[size_t(a) * s + b];
+      if (R == 0) continue;
+      const double d[3] = {xh[3 * j] - xh[3 * i], xh[3 * j + 1] - xh[3 * i + 1], xh[3 * j + 2] - xh[3 * i + 2]};
+      const double r = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+      if (r <= r0) continue;
+      double T, dT;
+      sw(r, T, dT);
+      pair(i, j, d, r, -T * R / r, -R * (dT / r - T / (r * r)));
+      if (a != b) W[size_t(a) * s + b] -= 0.5 * q[i] * q[j] * T / r, W[size_t(b) * s + a] -= 0.5 * q[i] * q[j] * T / r;
+    }
+  out.energy = KE * E;
+  if (!forces) return out;
+  for (std::vector<double> *v : {&g, &dq, &W, &vir})
+    for (double &t : *v) t *= KE;
+  if (L.qproj) lrc_project_vjp(L, c.cl, proj, n, Z, x, dq, g.data(), vir.data());
+  lrc_clusters_vjp(L, c.cl, n, x, W, g.data(), vir.data());
+  lrc_q0_vjp(L, S, n, Z, x, c.q0, dq.data(), g.data(), vir.data());
+  out.forces.resize(g.size());
+  for (size_t k = 0; k < g.size(); k++) out.forces[k] = -g[k];
+  out.virial = vir;
+  return out;
 }
 
 LrcEnergy energy_fixed(const LrcSpec &L, const SqeSpec &S, const LrcCondition &c, int n, const int32_t *Z,
@@ -1164,8 +1526,9 @@ LrcEnergy energy_fixed(const LrcSpec &L, const SqeSpec &S, const LrcCondition &c
 }
 } // namespace
 
-std::vector<double> lrc_project_charges(const LrcSpec &L, int n, const int32_t *Z, const double *x, const double *q) {
-  const LrcClusters c = lrc_clusters(L, n, x);
+std::vector<double> lrc_project_charges(const LrcSpec &L, int n, const int32_t *Z, const double *x, const double *q,
+                                        const double *cell) {
+  const LrcClusters c = lrc_clusters(L, n, x, cell);
   return lrc_project(L, c, n, Z, q).q;
 }
 
@@ -1173,7 +1536,12 @@ LrcEnergy lrc_energy(const LrcSpec &L, const SqeSpec &S, const LrcCondition &c, 
                      const double *x, double Q, bool forces) {
   LrcEnergy out;
   if (forces) out.forces.assign(3 * size_t(n), 0.0);
-  if (c.cl.s == 1 || n == 0) return out; // one cluster: E*(gamma) - E*(gamma) = 0 exactly
+  if (n == 0 || (c.cl.s == 1 && !c.cl.images())) return out; // one cluster / bulk: E*(gamma) - E*(gamma) = 0 exactly
+  if (c.cl.images()) {
+    if (!L.graph || L.mp || L.pol)
+      throw std::runtime_error("lrc: separated clusters in a periodic cell need the graph q0 mode without lrc_mp / lrc_pol");
+    return energy_images(L, S, c, n, Z, x, forces);
+  }
   if (L.graph) return energy_fixed(L, S, c, n, Z, x, forces);
   SqeClusterMask m{c.cl.sn.data(), c.cl.s, c.cl.R.data()};
   const SqeOutput so = sqe_compute_masked(S, n, Z, x, Q, c.q0.q0.data(), forces, m);

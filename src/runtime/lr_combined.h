@@ -31,7 +31,18 @@
 //    charge for a structure that is one cluster: the plain model). Long-range energy on the SQE charges (q0 the
 //    reference): E*(gamma) - E*(gamma (1 - T(r) (1 - R))), T the sqe lr switch: inter-cluster pairs only, Hellmann-
 //    Feynman forces plus the q0 and R chain rules.
-// Open structures only.
+//
+// Periodic cells (all three directions; "graph" q0 mode without lrc_mp / lrc_pol, i.e. R1 / R1q): the clusters are
+// those of the infinite tiling, links found through the periodic images.
+//  - bulk: one cluster connected to every one of its images (a liquid or a solid; every atom has a neighbour within
+//    a_on). There is no inter-cluster pair, so no long range, and the conditioning is the structure's charge: the
+//    plain model. The charge pass is not run.
+//  - separated: every cluster finite in the tiling (molecules in vacuum). Each one meets the other clusters and its
+//    own images, so the inter-cluster sum runs over the images: E_lr = Ewald(q) minus the pairs inside lr_R weighted
+//    1 - T and the pairs of linked clusters weighted T R (the reliability is that of the unwrapped weak component),
+//    neutralising background for a charged cell. The open-structure value is its large-cell limit.
+//  - anything else (a slab, a wire, a network next to separate molecules, weak links that wrap the cell) throws.
+// Forces and the virial (dE/d strain, for the stress) are exact in both cases.
 
 #include "sqe.h"
 
@@ -47,12 +58,15 @@ class GGUFLoader;
 
 namespace mlipcpp::runtime {
 
-/// raw per-atom charges of the "graph" q0 mode (the frozen charge pass) and their vector-Jacobian product
+/// raw per-atom charges of the "graph" q0 mode (the frozen charge pass) and their vector-Jacobian product;
+/// cell: the lattice vectors as rows (9, A), null for an open structure
 struct LrcQSource {
   virtual ~LrcQSource() = default;
-  virtual std::vector<double> raw(int n, const int32_t *Z, const double *x, double Q, int spin) = 0;
-  /// g [3n] += d(sum_i w_i q_raw_i)/dx
-  virtual void raw_vjp(int n, const int32_t *Z, const double *x, double Q, int spin, const double *w, double *g) = 0;
+  virtual std::vector<double> raw(int n, const int32_t *Z, const double *x, double Q, int spin, const double *cell) = 0;
+  /// g [3n] += d(sum_i w_i q_raw_i)/dx; vir (3 x 3, periodic only, may be null) += its derivative in the homogeneous
+  /// strain (positions and cell deformed together)
+  virtual void raw_vjp(int n, const int32_t *Z, const double *x, double Q, int spin, const double *cell, const double *w,
+                       double *g, double *vir) = 0;
 };
 
 struct LrcSpec {
@@ -131,9 +145,10 @@ struct LrcQ0 {
   std::vector<int32_t> comp;           // per atom
   std::vector<double> sc, w, nbar, cov; // per component; cov K x K (of the partition distribution)
   std::vector<int> ncomp;              // atoms per component
-  // graph: the structure's charge and spin (the charge pass is evaluated again for the vector-Jacobian products)
+  // graph: the structure's charge, spin and cell (the charge pass is evaluated again for the vector-Jacobian products)
   double Q = 0;
   int spin = 1;
+  std::vector<double> cell; // 9 when periodic
 };
 
 struct LrcClusters {
@@ -148,6 +163,12 @@ struct LrcClusters {
   std::vector<std::pair<int, int>> se; // super-edges (a < b)
   std::vector<double> p;               // super-edge probabilities
   bool fallback = false;               // a weak component above max_super_edges was taken as one cluster
+  // periodic: the cell (rows), whether it is one bulk cluster, and the cluster-frame positions: x with every weak
+  // component unwrapped across the cell, so that its links are plain differences of xh (xh = x when open)
+  std::vector<double> cell, xh;
+  bool bulk = false;
+  bool periodic() const { return !cell.empty(); }
+  bool images() const { return periodic() && !bulk; } // the long range runs over the periodic images
   bool trivial() const; // one super-node, or no weak links (R binary)
 };
 
@@ -167,29 +188,33 @@ struct LrcEnergy {
   double energy = 0;
   std::vector<double> forces, q, q0;
   std::vector<double> mu_ind; // lrc_pol: induced dipoles [3n] (e A)
+  std::vector<double> virial; // periodic with forces: dE/d strain (3 x 3, eV); stress = virial / volume
 };
 
 int lrc_index(const SqeSpec &sqe, int z); // element index, throws when absent
 
-LrcQ0 lrc_q0(const LrcSpec &L, const SqeSpec &sqe, int n, const int32_t *Z, const double *x, double Q, int spin = 1);
-/// dE/dx (added into g, [3n]) of sum_i c_i q0_i(x)
+/// cell (here and below): the lattice vectors as rows (9, A), all three directions periodic; null for open structures
+LrcQ0 lrc_q0(const LrcSpec &L, const SqeSpec &sqe, int n, const int32_t *Z, const double *x, double Q, int spin = 1,
+             const double *cell = nullptr);
+/// dE/dx (added into g, [3n]) of sum_i c_i q0_i(x); vir (periodic, may be null) += its strain derivative
 void lrc_q0_vjp(const LrcSpec &L, const SqeSpec &sqe, int n, const int32_t *Z, const double *x, const LrcQ0 &q,
-                const double *c, double *g);
+                const double *c, double *g, double *vir = nullptr);
 
-LrcClusters lrc_clusters(const LrcSpec &L, int n, const double *x);
+LrcClusters lrc_clusters(const LrcSpec &L, int n, const double *x, const double *cell = nullptr);
 /// dE/dx (added into g) of sum_{a != b} W_ab R_ab(x); W s x s
 void lrc_clusters_vjp(const LrcSpec &L, const LrcClusters &c, int n, const double *x, const std::vector<double> &W,
-                      double *g);
+                      double *g, double *vir = nullptr);
 
 /// conditioning of one structure (max_charge: rows are clamped into [-max_charge, max_charge])
 LrcCondition lrc_condition(const LrcSpec &L, const SqeSpec &sqe, int n, const int32_t *Z, const double *x, double Q,
-                           int max_charge, int spin = 1);
+                           int max_charge, int spin = 1, const double *cell = nullptr);
 /// the rows dS_a/dx [3n] of every super-node a with dS_a != 0 (zero rows otherwise), s x 3n
 std::vector<double> lrc_blend_rows(const LrcSpec &L, const SqeSpec &sqe, const LrcCondition &c, int n, const int32_t *Z,
                                    const double *x);
-/// forces (-dE/dx, added into F) of the conditioning's position dependence, G_a = dE/dS_a per super-node
+/// forces (-dE/dx, added into F) of the conditioning's position dependence, G_a = dE/dS_a per super-node; vir
+/// (periodic, may be null) += dE/d strain
 void lrc_condition_forces(const LrcSpec &L, const SqeSpec &sqe, const LrcCondition &c, int n, const int32_t *Z,
-                          const double *x, const std::vector<double> &G, double *F);
+                          const double *x, const std::vector<double> &G, double *F, double *vir = nullptr);
 
 /// graph mode with lrc_mp: the atomic dipoles mu [3n] and quadrupoles Theta [9n] (row-major 3 x 3) of every atom
 void lrc_moments(const LrcSpec &L, int n, const int32_t *Z, const double *x, std::vector<double> &mu,
@@ -199,9 +224,11 @@ void lrc_moments_vjp(const LrcSpec &L, int n, const int32_t *Z, const double *x,
                      double *g);
 
 /// lrc_qproj: the projected charges of charges q at positions x (diagnostics / parity with rdelta/neutralise)
-std::vector<double> lrc_project_charges(const LrcSpec &L, int n, const int32_t *Z, const double *x, const double *q);
+std::vector<double> lrc_project_charges(const LrcSpec &L, int n, const int32_t *Z, const double *x, const double *q,
+                                        const double *cell = nullptr);
 
-/// inter-cluster long-range energy and forces (zero, exactly, for a one-cluster structure)
+/// inter-cluster long-range energy and forces (zero, exactly, for a one-cluster open structure and a bulk cell); the
+/// cell is the conditioning's (c.cl.cell)
 LrcEnergy lrc_energy(const LrcSpec &L, const SqeSpec &sqe, const LrcCondition &c, int n, const int32_t *Z,
                      const double *x, double Q, bool forces);
 
