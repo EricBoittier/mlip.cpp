@@ -434,3 +434,48 @@ TEST_CASE("lrc combo readout: forces of the real graph match central differences
     CHECK(err < 1e-3 * std::max(1.0, fmax));
   }
 }
+
+// An element absent from lrc_fukui_Z (a rare gas) used to throw "no combo parameters"; it now takes the defaults that
+// set_combo_keys.py gives an element without fit data (theta 0, eta softplus^-1(5), kappa softplus^-1(1e-3), sf_score 0,
+// sf_scale softplus^-1(1)) and phi = 0. Every arm: identical to the same element listed with those values, sum q = Q,
+// forces against central differences. Ar (Z 18) in place of the Cl- of kX8.
+TEST_CASE("lrc combo: an element without parameters takes the set_combo_keys defaults in every arm", "[lrc][combo]") {
+  const SqeSpec S = sqe_spec();
+  const int32_t Zr[] = {11, 8, 1, 1, 18};
+  for (const auto &a : kArms) {
+    const LrcSpec L = combo_spec(a);
+    LrcSpec Ll = combo_spec(a);
+    const size_t E = Ll.fukui_Z.size();
+    Ll.fukui_Z.push_back(18), Ll.fukui_phi.push_back(0.0);
+    Ll.thr_theta.push_back(0.0), Ll.sf_score.push_back(0.0), Ll.sf_scale.push_back(std::log(std::expm1(1.0)));
+    Ll.qeq_eta.push_back(std::log(std::expm1(5.0)));
+    std::vector<double> kap((E + 1) * (E + 1), std::log(std::expm1(1e-3)));
+    for (size_t i = 0; i < E; i++)
+      for (size_t j = 0; j < E; j++) kap[i * (E + 1) + j] = L.flow_kappa[i * E + j];
+    Ll.flow_kappa = kap;
+    Ll.fukui_check(), Ll.combo_check();
+    for (auto [Q, spin] : std::vector<std::pair<double, int>>{{0, 1}, {1, 2}, {-1, 2}}) {
+      INFO(a.name << " Q " << Q);
+      const LrcQ0 o = lrc_q0(L, S, 5, Zr, kX8.data(), Q, spin), ol = lrc_q0(Ll, S, 5, Zr, kX8.data(), Q, spin);
+      double sum = 0;
+      for (int i = 0; i < 5; i++) {
+        sum += o.q0[i];
+        CHECK(o.q0[i] == Approx(ol.q0[i]).margin(1e-14));
+      }
+      CHECK(sum == Approx(Q).margin(1e-12));
+      const LrcCondition c0 = lrc_condition(L, S, 5, Zr, kX8.data(), Q, 10, spin);
+      REQUIRE(c0.cl.s == 2);
+      const LrcEnergy e0 = lrc_energy(L, S, c0, 5, Zr, kX8.data(), Q, true);
+      CHECK(std::isfinite(e0.energy));
+      auto energy = [&](const std::vector<double> &x) {
+        return lrc_energy(L, S, lrc_condition(L, S, 5, Zr, x.data(), Q, 10, spin), 5, Zr, x.data(), Q, false).energy;
+      };
+      double fmax = 0, err = 0;
+      for (size_t k = 0; k < 15; k++) {
+        const double num = -fd(energy, kX8, k, 1e-5);
+        fmax = std::max(fmax, std::abs(num)), err = std::max(err, std::abs(num - e0.forces[k]));
+      }
+      CHECK(err < 1e-8 * std::max(1.0, fmax));
+    }
+  }
+}
