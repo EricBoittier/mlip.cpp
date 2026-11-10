@@ -20,6 +20,7 @@
 #include <numeric>
 #include <cmath>
 #include <cstring>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <tuple>
@@ -696,14 +697,15 @@ namespace {
 class LrcGraphCharges final : public LrcQSource {
 public:
   explicit LrcGraphCharges(std::unique_ptr<GraphModel> m) : m_(std::move(m)) {}
-  std::vector<double> raw(int n, const int32_t *Z, const double *x, double Q, int spin) override {
-    const AtomicSystem sys = system(n, Z, x, Q, spin);
+  std::vector<double> raw(int n, const int32_t *Z, const double *x, double Q, int spin, const double *cell) override {
+    const AtomicSystem sys = system(n, Z, x, Q, spin, cell);
     m_->set_atom_energy_weights({});
     const ModelResult r = m_->predict(sys, false);
     return std::vector<double>(r.atomic_energies.begin(), r.atomic_energies.end());
   }
-  void raw_vjp(int n, const int32_t *Z, const double *x, double Q, int spin, const double *w, double *g) override {
-    const AtomicSystem sys = system(n, Z, x, Q, spin);
+  void raw_vjp(int n, const int32_t *Z, const double *x, double Q, int spin, const double *cell, const double *w,
+               double *g, double *vir) override {
+    const AtomicSystem sys = system(n, Z, x, Q, spin, cell);
     std::vector<float> wf(w, w + n);
     m_->set_atom_energy_weights(wf);
     struct Reset {
@@ -713,12 +715,29 @@ public:
     const ModelResult r = m_->predict(sys, true);
     if (r.forces.size() != 3 * size_t(n)) throw std::runtime_error("lrc graph: charge pass returned no gradient");
     for (size_t k = 0; k < r.forces.size(); k++) g[k] -= double(r.forces[k]);
+    if (!vir || !cell) return;
+    if (r.stress.size() != 6) throw std::runtime_error("lrc graph: charge pass returned no stress");
+    // stress (Voigt xx yy zz yz xz xy) = (1 / V) dE/d strain
+    const double V = std::abs(cell[0] * (cell[4] * cell[8] - cell[5] * cell[7]) -
+                              cell[1] * (cell[3] * cell[8] - cell[5] * cell[6]) +
+                              cell[2] * (cell[3] * cell[7] - cell[4] * cell[6]));
+    constexpr int va[6] = {0, 1, 2, 1, 0, 0}, vb[6] = {0, 1, 2, 2, 2, 1};
+    for (int k = 0; k < 6; k++) {
+      vir[3 * va[k] + vb[k]] += V * r.stress[k];
+      if (va[k] != vb[k]) vir[3 * vb[k] + va[k]] += V * r.stress[k];
+    }
   }
 
 private:
-  static AtomicSystem system(int n, const int32_t *Z, const double *x, double Q, int spin) {
+  static AtomicSystem system(int n, const int32_t *Z, const double *x, double Q, int spin, const double *cell) {
     std::vector<float> xf(x, x + 3 * size_t(n));
-    AtomicSystem sys(n, xf.data(), Z, nullptr);
+    std::optional<Cell> c;
+    if (cell) {
+      float h[3][3];
+      for (int a = 0; a < 9; a++) h[a / 3][a % 3] = static_cast<float>(cell[a]);
+      c.emplace(h, true, true, true);
+    }
+    AtomicSystem sys(n, xf.data(), Z, c ? &*c : nullptr);
     sys.set_charge(static_cast<int>(std::lround(Q)));
     sys.set_spin_multiplicity(spin);
     return sys;
@@ -748,13 +767,18 @@ ModelResult GraphModel::predict_single_lrc(const AtomicSystem &system, bool comp
                                            std::vector<float> *parameter_gradients) {
   const LrcSpec &L = plato_lr_.lrc;
   const SqeSpec &sq = plato_lr_.sqe;
-  bool periodic = false;
-  if (const Cell *c = system.cell()) periodic = c->periodic[0] || c->periodic[1] || c->periodic[2];
-  if (periodic) throw std::runtime_error("lrc: periodic structures are not implemented");
+  std::vector<double> cell; // lattice rows, fully periodic cells only (lr_combined.h: bulk or separated clusters)
+  if (const Cell *c = system.cell()) {
+    const int np = c->periodic[0] + c->periodic[1] + c->periodic[2];
+    if (np != 0 && np != 3) throw std::runtime_error("lrc: periodic in all three directions or none");
+    if (np == 3)
+      for (int a = 0; a < 9; a++) cell.push_back(double(c->matrix[a / 3][a % 3]));
+  }
   const int n = system.num_atoms();
   std::vector<double> x(system.positions(), system.positions() + 3 * size_t(n));
   const LrcCondition cond = lrc_condition(L, sq, n, system.atomic_numbers(), x.data(), double(system.charge()),
-                                          conditioning_.max_charge, system.spin_multiplicity());
+                                          conditioning_.max_charge, system.spin_multiplicity(),
+                                          cell.empty() ? nullptr : cell.data());
   struct Reset {
     GraphModel &m;
     ~Reset() { m.frag_cond_.clear(), m.lrc_hi_.clear(), m.lrc_blend_.clear(); }
@@ -771,20 +795,22 @@ ModelResult GraphModel::predict_single_lrc(const AtomicSystem &system, bool comp
   ModelResult r = predict_single_impl(system, compute_forces, post_compute_hook, parameter_gradients);
   lrc_want_blend_grad_ = false;
   const std::vector<double> blend_grad = lrc_blend_grad_;
-  if (cond.cl.s == 1) return r;
+  // one open cluster or a bulk cell: the plain model (lrc_intra: the long range still acts inside)
+  if (cond.cl.s == 1 && !cond.cl.images() && !L.intra) return r;
   const LrcEnergy le = lrc_energy(L, sq, cond, n, system.atomic_numbers(), x.data(), double(system.charge()),
                                   compute_forces);
   r.energy = static_cast<float>(double(r.energy) + le.energy);
   r.sqe_charges.assign(le.q.begin(), le.q.end());
   if (!compute_forces || r.forces.size() != le.forces.size()) return r;
-  std::vector<double> F(le.forces);
+  std::vector<double> F(le.forces), vir(le.virial);
+  vir.resize(9, 0.0);
   // dE/dS from the graph, also for a structure without any edge (a backward pass for the blend alone there); the
   // central differences in S (h = 0.05) only on request: their truncation error was ~3 eV/A on bare ions (E04)
   if (cond.needs_cond_forces() && !fd_ds) {
     if (blend_grad.size() != static_cast<size_t>(n)) throw std::runtime_error("lrc: no dE/dS from the graph");
     std::vector<double> G(cond.cl.s, 0.0);
     for (int i = 0; i < n; i++) G[cond.cl.sn[i]] += blend_grad[i];
-    lrc_condition_forces(L, sq, cond, n, system.atomic_numbers(), x.data(), G, F.data());
+    lrc_condition_forces(L, sq, cond, n, system.atomic_numbers(), x.data(), G, F.data(), vir.data());
   } else if (cond.needs_cond_forces()) {
     const double h = 5e-2; // E is smooth in S; float32 energies: noise ~1e-5 eV / 2h
     std::vector<double> G(cond.cl.s, 0.0);
@@ -801,9 +827,17 @@ ModelResult GraphModel::predict_single_lrc(const AtomicSystem &system, bool comp
       G[a] = (Epm[0] - Epm[1]) / (2 * h);
     }
     lrc_blend_ = base;
-    lrc_condition_forces(L, sq, cond, n, system.atomic_numbers(), x.data(), G, F.data());
+    lrc_condition_forces(L, sq, cond, n, system.atomic_numbers(), x.data(), G, F.data(), vir.data());
   }
   for (size_t k = 0; k < F.size(); k++) r.forces[k] = static_cast<float>(double(r.forces[k]) + F[k]);
+  if (!cell.empty() && r.stress.size() == 6) { // the long-range and conditioning virial (Voigt, / V)
+    const double *h = cell.data();
+    const double V = std::abs(h[0] * (h[4] * h[8] - h[5] * h[7]) - h[1] * (h[3] * h[8] - h[5] * h[6]) +
+                              h[2] * (h[3] * h[7] - h[4] * h[6]));
+    constexpr int va[6] = {0, 1, 2, 1, 0, 0}, vb[6] = {0, 1, 2, 2, 2, 1};
+    for (int k = 0; k < 6; k++)
+      r.stress[k] = static_cast<float>(double(r.stress[k]) + 0.5 * (vir[3 * va[k] + vb[k]] + vir[3 * vb[k] + va[k]]) / V);
+  }
   return r;
 }
 
