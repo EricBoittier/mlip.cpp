@@ -30,6 +30,12 @@ int main(int argc, char **argv) {
                "          [--lr-schedule FILE.json] [--dump-lr-schedule N [--dump-steps-per-epoch S]]\n"
                "          [--charge-corr-weight W] [--charge-corr-target mulliken|lowdin|nbo] [--charge-corr-min R] [--frag-charge-weight W] [--frag-charges [--frag-cond-gate]] [--sqe [--sqe-q0-weight W]]\n"
                "          [--loss mse|huber] [--huber-delta-e D] [--huber-delta-f D]\n"
+               "          [--force-scale-global] [--energy-sw FILE.f32] [--lr-energy-grad exact|legacy]\n"
+               "--force-scale-global: one force-loss scale (RMS of all training force components) for every species;\n"
+               "--energy-sw FILE: per-structure energy-loss weights w (raw float32, one per training-split row), training\n"
+               "steps only, as a residual scale sqrt(w) (MSE: w d^2);\n"
+               "--lr-energy-grad exact (default) | legacy: the host-side energies (lrc / SQE) in the energy-loss gradient of\n"
+               "the conservative step (legacy: backbone residual only, as before; the reported loss always includes them);\n"
                "--loss huber: torch.nn.HuberLoss per component (metatrain's huber; 0.5 d^2 below delta, then linear), deltas in\n"
                "the loss's units: energy per atom over the energy scale (default 0.01), forces over their scale (0.02);\n"
                "--charge-corr-weight W (Plato-PET-LR with LES; default 0: off): an auxiliary loss on the latent charges,\n"
@@ -126,6 +132,9 @@ int main(int argc, char **argv) {
     else if (a == "--force-weight") o.force_weight = std::stod(val());
     else if (a == "--nc-force-weight") o.nc_force_weight = std::stod(val());
     else if (a == "--model-baselines") o.model_baselines = true;
+    else if (a == "--force-scale-global") o.force_scale_global = true;
+    else if (a == "--energy-sw") o.energy_sw = val();
+    else if (a == "--lr-energy-grad") o.lr_energy_grad = val();
     else if (a == "--charge-corr-weight") o.charge_corr_weight = std::stod(val());
     else if (a == "--loss") o.loss = val();
     else if (a == "--huber-delta-e") o.huber_delta_e = std::stod(val());

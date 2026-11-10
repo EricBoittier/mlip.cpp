@@ -65,6 +65,11 @@ struct TrainOptions {
   int log_errors_epochs = 1;
   // drop structures: DIR/{train,val,test}.npy hold split indices ("" = none)
   std::string exclude;
+  // loss normalisation options (feat/plato-lr-v2-lossnorm): one force scale for all species instead of per-species
+  // RMS; per-structure energy-loss weights (raw float32 per training-split row); host energies in the gradient
+  bool force_scale_global = false;
+  std::string energy_sw;
+  std::string lr_energy_grad = "exact";
   // conservative forces -dE/dx (Worker::Conservative): the force loss is on
   // them, the direct head keeps a term of its own; loss weights of the
   // energy, the conservative and the direct forces
@@ -221,6 +226,15 @@ public:
     bool on = false;
     double energy = 1.0, force = 1.0, nc_force = 1.0;
   } conservative;
+  /// Host-side energies (combined long range lrc, SQE) in the energy-loss gradient of the conservative step:
+  /// true (exact): the MIXED graph's energy residual includes them (targets shifted by E_host / (s_E N));
+  /// false (legacy, before feat/plato-lr-v2-lossnorm): the graph residual is the backbone's alone, while the
+  /// host loss / metrics include them (energy-gradient bias on structures with a nonzero host energy).
+  bool host_energy_in_grad = true;
+  /// per-structure energy-loss weights of the training split (indexed by split row; empty: all 1), applied to
+  /// backward (training) steps only as a residual scale sqrt(w) on atom_weight / energy_target (MSE: w d^2)
+  const std::vector<float> *energy_sw = nullptr;
+  std::vector<float> aw_override_, et_override_; // per-step overrides of Batch::atom_weight / energy_target
   /// auxiliary loss on the LES latent charges (Plato-PET-LR): weight * mean over the structures with
   /// partial charges of max(0, r_min - r_s), r_s the Pearson correlation of the first latent charge
   /// channel with the DFT partial charges (Batch::ref_charge); weight 0: off

@@ -862,9 +862,11 @@ void Worker::upload_inputs(StepGraph &g, const Batch &b, const std::vector<float
       src.insert(src.end(), {span(cond_rows_[2]), span(lrc_blend_)});
     }
   }
-  if (g.inputs.size() > src.size())
-    src.insert(src.end(), {span(b.atom_weight), span(b.energy_target), span(b.force_target),
-                           span(b.force_mask), span(b.force_scale), {norms, sizeof norms}});
+  if (g.inputs.size() > src.size()) {
+    const bool ov = dv && !et_override_.empty(); // MIXED step of run_conservative: shifted / weighted energy residual
+    src.insert(src.end(), {ov ? span(aw_override_) : span(b.atom_weight), ov ? span(et_override_) : span(b.energy_target),
+                           span(b.force_target), span(b.force_mask), span(b.force_scale), {norms, sizeof norms}});
+  }
   if (dv) src.insert(src.end(), {span(*dv), span(*dc)});
   if (dv && g.dblend) {
     if (lrc_dblend_.size() != size_t(b.n_atoms)) throw std::logic_error("upload_inputs: blend tangent");
@@ -1308,7 +1310,8 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
     d_e[k] -= b.energy_target[k];
     if (sqe && k < b.n_real_systems) d_e[k] += sqe_e[k] / (energy_scale * b.n_per_system[k]);
     if (lrc && k < b.n_real_systems) d_e[k] += lrc_e_[k] / (energy_scale * b.n_per_system[k]);
-    st.loss_energy += w.energy * e_norm * loss.value(d_e[k], loss.delta_e);
+    const double swk = backward && energy_sw && k < b.n_real_systems ? double((*energy_sw)[b.ids[k]]) : 1.0;
+    st.loss_energy += w.energy * e_norm * loss.value(std::sqrt(swk) * d_e[k], loss.delta_e);
     st.se_energy_per_atom += d_e[k] * d_e[k] * energy_scale * energy_scale;
     if (k < b.n_real_systems) st.ae_energy_per_atom += std::abs(d_e[k]) * energy_scale;
   }
@@ -1352,7 +1355,8 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
       const double *q0;
       sqe_inputs(k, x, q0);
       const int a0 = sys_off[k], ns = b.n_per_system[k];
-      const double dLdE = w.energy * e_norm * loss.slope(d_e[k], loss.delta_e) / (energy_scale * ns);
+      const double swk = energy_sw ? double((*energy_sw)[b.ids[k]]) : 1.0;
+      const double dLdE = w.energy * e_norm * std::sqrt(swk) * loss.slope(std::sqrt(swk) * d_e[k], loss.delta_e) / (energy_scale * ns);
       std::vector<double> dLdF(u.begin() + 3 * size_t(a0), u.begin() + 3 * size_t(a0 + ns));
       for (double &v : dLdF) v /= energy_scale;
       // learned q0: optional supervision by the unit labels (training only)
@@ -1424,10 +1428,27 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
       }
     }
   }
+  // the MIXED graph's energy residual: host energies (lrc / SQE) in the target (exact), per-structure weights
+  aw_override_.clear(), et_override_.clear();
+  const bool shift = host_energy_in_grad && (lrc || sqe), weigh = energy_sw != nullptr;
+  if (shift || weigh) {
+    aw_override_ = b.atom_weight, et_override_ = b.energy_target;
+    for (int k = 0; k < b.n_real_systems; k++) {
+      if (shift)
+        et_override_[k] -= static_cast<float>(((sqe ? sqe_e[k] : 0.0) + (lrc ? lrc_e_[k] : 0.0)) /
+                                              (energy_scale * b.n_per_system[k]));
+      if (weigh) {
+        const float r = std::sqrt((*energy_sw)[b.ids[k]]);
+        et_override_[k] *= r;
+        for (int a = 0; a < n; a++) aw_override_[static_cast<size_t>(k) * n + a] *= r;
+      }
+    }
+  }
   t_cpu = seconds_since(t_host);
   StepGraph &gm = graph(n, m, S, MIXED, once);
   t0 = clock_type::now();
   upload_inputs(gm, b, &dv, &dc);
+  aw_override_.clear(), et_override_.clear();
   t_upload += seconds_since(t0);
   compute(gm);
   return st;
@@ -2413,6 +2434,43 @@ void train(const TrainOptions &o) {
   fmt::print("targets ({}): composition for {} species, energy scale {:.6g} eV/atom ({:.1f} s)\n",
              eval_only || o.model_baselines ? "from the model" : "fitted", scaling.composition.size(),
              scaling.energy_scale, seconds_since(t0));
+  if (o.force_scale_global && !eval_only) {
+    // one force scale for every species: the uncentred RMS of all training force components (per-species: TargetScaling::fit)
+    double f2 = 0;
+    int64_t cnt = 0;
+    for (int64_t s = 0; s < train_split.size(); s++) {
+      const float *F = train_split.forces(s);
+      for (int i = 0; i < 3 * train_split.n_atoms(s); i++) f2 += double(F[i]) * F[i], cnt++;
+    }
+    const double g = std::sqrt(f2 / std::max<int64_t>(cnt, 1));
+    for (auto &[Z, f] : scaling.force_scale) f = g;
+    fmt::print("--force-scale-global: every species' force scale {:.6g} eV/A ({} components)\n", g, cnt);
+  }
+  static std::vector<float> energy_sw; // per training row; lives as long as the workers use it
+  if (!o.energy_sw.empty() && !eval_only) {
+    if (!o.conservative) throw std::runtime_error("--energy-sw: conservative training only");
+    std::FILE *f = std::fopen(o.energy_sw.c_str(), "rb");
+    if (!f) throw std::runtime_error("--energy-sw: cannot open " + o.energy_sw);
+    energy_sw.assign(train_split.size(), 0.0f);
+    const size_t got = std::fread(energy_sw.data(), sizeof(float), energy_sw.size() + 1, f);
+    std::fclose(f);
+    if (got != energy_sw.size())
+      throw std::runtime_error(fmt::format("--energy-sw: {} holds {} float32, the training split has {} rows", o.energy_sw,
+                                           got, energy_sw.size()));
+    double lo = 1e300, hi = 0, mean = 0;
+    for (float v : energy_sw) {
+      if (!(v >= 0) || !std::isfinite(v)) throw std::runtime_error("--energy-sw: weights must be finite and >= 0");
+      lo = std::min<double>(lo, v), hi = std::max<double>(hi, v), mean += v;
+    }
+    fmt::print("--energy-sw {}: per-structure energy-loss weights, min {:.4g} mean {:.4g} max {:.4g} (training steps only)\n",
+               o.energy_sw, lo, mean / energy_sw.size(), hi);
+    for (auto &w : workers) w->energy_sw = &energy_sw;
+  }
+  for (auto &w : workers) w->host_energy_in_grad = o.lr_energy_grad != "legacy";
+  if (o.lr_energy_grad != "exact" && o.lr_energy_grad != "legacy")
+    throw std::runtime_error("--lr-energy-grad exact|legacy, not " + o.lr_energy_grad);
+  fmt::print("host energies (lrc / SQE) in the energy-loss gradient: {}\n",
+             o.lr_energy_grad == "legacy" ? "no (legacy)" : "yes (exact)");
 
   t0 = clock_type::now();
   const AdaptiveCutoff adaptive = adaptive_cutoff(w0.model());
