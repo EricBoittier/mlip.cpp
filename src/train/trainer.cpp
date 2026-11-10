@@ -1451,6 +1451,15 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
   aw_override_.clear(), et_override_.clear();
   t_upload += seconds_since(t0);
   compute(gm);
+  if (static const bool dbg = std::getenv("MLIPCPP_DEBUG_EGRAD") != nullptr; dbg && gm.stats) {
+    // diagnostic: the MIXED graph's energy-loss term (the one differentiated) vs the host energy loss (reported)
+    float gs[4];
+    ggml_backend_tensor_get(gm.stats, gs, 0, sizeof gs);
+    double lrc_abs = 0;
+    for (int k = 0; k < b.n_real_systems && lrc; k++) lrc_abs += std::abs(lrc_e_[k]);
+    fmt::print("EGRAD graph_loss_e {:.6e} host_loss_e {:.6e} rel_diff {:.3e} sum|E_lrc| {:.4f} eV\n", gs[1], st.loss_energy,
+               (gs[1] - st.loss_energy) / std::max(1e-30, std::abs(st.loss_energy)), lrc_abs);
+  }
   return st;
 }
 
