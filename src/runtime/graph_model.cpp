@@ -717,10 +717,10 @@ public:
     for (size_t k = 0; k < r.forces.size(); k++) g[k] -= double(r.forces[k]);
     if (!vir || !cell) return;
     if (r.stress.size() != 6) throw std::runtime_error("lrc graph: charge pass returned no stress");
-    // stress (Voigt xx yy zz yz xz xy) = (1 / V) dE/d strain
-    const double V = std::abs(cell[0] * (cell[4] * cell[8] - cell[5] * cell[7]) -
-                              cell[1] * (cell[3] * cell[8] - cell[5] * cell[6]) +
-                              cell[2] * (cell[3] * cell[7] - cell[4] * cell[6]));
+    // stress (Voigt xx yy zz yz xz xy) = (1 / V) dE/d strain (V of the cell the pass saw: a slab's filled open row)
+    const std::array<double, 9> hf = filled(cell);
+    const double V = std::abs(hf[0] * (hf[4] * hf[8] - hf[5] * hf[7]) - hf[1] * (hf[3] * hf[8] - hf[5] * hf[6]) +
+                              hf[2] * (hf[3] * hf[7] - hf[4] * hf[6]));
     constexpr int va[6] = {0, 1, 2, 1, 0, 0}, vb[6] = {0, 1, 2, 2, 2, 1};
     for (int k = 0; k < 6; k++) {
       vir[3 * va[k] + vb[k]] += V * r.stress[k];
@@ -729,13 +729,30 @@ public:
   }
 
 private:
+  // a slab's zero (open) row replaced by a 1000 A normal (non-periodic there, as mlipcpp-train's data loader does)
+  static std::array<double, 9> filled(const double *cell) {
+    std::array<double, 9> h;
+    std::copy(cell, cell + 9, h.begin());
+    for (int k = 0; k < 3; k++) {
+      if (h[3 * k] != 0 || h[3 * k + 1] != 0 || h[3 * k + 2] != 0) continue;
+      const double *u = &h[3 * ((k + 1) % 3)], *v = &h[3 * ((k + 2) % 3)];
+      const double w[3] = {u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]};
+      const double nw = std::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+      if (!(nw > 0)) throw std::runtime_error("lrc graph: a cell with more than one open direction");
+      for (int a = 0; a < 3; a++) h[3 * k + a] = 1000.0 * w[a] / nw;
+    }
+    return h;
+  }
   static AtomicSystem system(int n, const int32_t *Z, const double *x, double Q, int spin, const double *cell) {
     std::vector<float> xf(x, x + 3 * size_t(n));
     std::optional<Cell> c;
     if (cell) {
+      bool pbc[3];
+      for (int k = 0; k < 3; k++) pbc[k] = cell[3 * k] != 0 || cell[3 * k + 1] != 0 || cell[3 * k + 2] != 0;
+      const std::array<double, 9> hf = filled(cell);
       float h[3][3];
-      for (int a = 0; a < 9; a++) h[a / 3][a % 3] = static_cast<float>(cell[a]);
-      c.emplace(h, true, true, true);
+      for (int a = 0; a < 9; a++) h[a / 3][a % 3] = static_cast<float>(hf[a]);
+      c.emplace(h, pbc[0], pbc[1], pbc[2]);
     }
     AtomicSystem sys(n, xf.data(), Z, c ? &*c : nullptr);
     sys.set_charge(static_cast<int>(std::lround(Q)));
@@ -767,12 +784,17 @@ ModelResult GraphModel::predict_single_lrc(const AtomicSystem &system, bool comp
                                            std::vector<float> *parameter_gradients) {
   const LrcSpec &L = plato_lr_.lrc;
   const SqeSpec &sq = plato_lr_.sqe;
-  std::vector<double> cell; // lattice rows, fully periodic cells only (lr_combined.h: bulk or separated clusters)
+  // lattice rows (lr_combined.h): fully periodic cells, or slabs (lrc_slab) with the open direction's row zero; hv the
+  // cell as given (its volume normalises the long-range stress like the backbone's)
+  std::vector<double> cell, hv;
   if (const Cell *c = system.cell()) {
     const int np = c->periodic[0] + c->periodic[1] + c->periodic[2];
-    if (np != 0 && np != 3) throw std::runtime_error("lrc: periodic in all three directions or none");
-    if (np == 3)
-      for (int a = 0; a < 9; a++) cell.push_back(double(c->matrix[a / 3][a % 3]));
+    if (np == 2 && L.slab == LrcSpec::Slab::None)
+      throw std::runtime_error("lrc: periodic in all three directions or none (slabs need pet.plato_lr.lrc_slab)");
+    if (np != 0 && np != 3 && np != 2) throw std::runtime_error("lrc: periodic in all three directions, two (a slab) or none");
+    if (np >= 2)
+      for (int a = 0; a < 9; a++)
+        hv.push_back(double(c->matrix[a / 3][a % 3])), cell.push_back(c->periodic[a / 3] ? hv.back() : 0.0);
   }
   const int n = system.num_atoms();
   std::vector<double> x(system.positions(), system.positions() + 3 * size_t(n));
@@ -831,7 +853,7 @@ ModelResult GraphModel::predict_single_lrc(const AtomicSystem &system, bool comp
   }
   for (size_t k = 0; k < F.size(); k++) r.forces[k] = static_cast<float>(double(r.forces[k]) + F[k]);
   if (!cell.empty() && r.stress.size() == 6) { // the long-range and conditioning virial (Voigt, / V)
-    const double *h = cell.data();
+    const double *h = hv.data();
     const double V = std::abs(h[0] * (h[4] * h[8] - h[5] * h[7]) - h[1] * (h[3] * h[8] - h[5] * h[6]) +
                               h[2] * (h[3] * h[7] - h[4] * h[6]));
     constexpr int va[6] = {0, 1, 2, 1, 0, 0}, vb[6] = {0, 1, 2, 2, 2, 1};
