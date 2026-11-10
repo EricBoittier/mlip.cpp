@@ -61,6 +61,12 @@ int main(int argc, char **argv) {
                "--tail-data DIR --tail-weight W [--tail-floor-mev 2.585 --tail-delta 1] (conservative): the physics-\n"
                "  normalised tail loss on pulled-apart scans (train/tail_loss.h; DIR a split + tail_pairs.tsv), one scan per\n"
                "  step, classes in turn: W x mean_p Huber((dE_model - dE_DFT) / max(|dE_ref|, floor)), no absolute energies;\n"
+               "--pair-data DIR [--pair-weight W] [--pair-scale 1] [--pair-delta 1] [--pair-rows-weight V] [--pair-every 1]\n"
+               "  [--pair-val DIR] (conservative): same-geometry charge / spin-state groups (vertical IP / EA, spin gaps; DIR a\n"
+               "  split + pairs.tsv in the tail_pairs.tsv format), one group co-batched every N steps, classes in turn:\n"
+               "  W x mean_p Huber_delta((dE_model - dE_DFT) / scale eV), plus (V > 0) the members' ordinary energy + force\n"
+               "  loss at V x an ordinary row; --pair-val: the held-out groups' dE errors (eV) after each epoch;\n"
+               "  --pair-grad-check N: FD check of the pair loss's parameter gradient on N groups, then stop;\n"
                "--checkpoint-steps N: also OUT.step%06d.gguf every N steps;\n"
                "--lr-schedule: per-group learning rates (src/train/lr_schedule.h), replaces --lr, --warmup-fraction,\n"
                "--schedule, --decay-after, --min-lr and --optimizer; groups matched on metatrain state-dict names;\n"
@@ -148,6 +154,14 @@ int main(int argc, char **argv) {
     else if (a == "--tail-weight") o.tail_weight = std::stod(val());
     else if (a == "--tail-floor-mev") o.tail_floor_mev = std::stod(val());
     else if (a == "--tail-delta") o.tail_delta = std::stod(val());
+    else if (a == "--pair-data") o.pair_data = val();
+    else if (a == "--pair-val") o.pair_val = val();
+    else if (a == "--pair-weight") o.pair_weight = std::stod(val());
+    else if (a == "--pair-scale") o.pair_scale = std::stod(val());
+    else if (a == "--pair-delta") o.pair_delta = std::stod(val());
+    else if (a == "--pair-rows-weight") o.pair_rows_weight = std::stod(val());
+    else if (a == "--pair-every") o.pair_every = std::stoi(val());
+    else if (a == "--pair-grad-check") o.pair_grad_check = std::stoi(val());
     else if (a == "--checkpoint-steps") o.checkpoint_steps = std::stoll(val());
     else if (a == "--sqe") o.sqe = true;
     else if (a == "--sqe-q0-weight") o.sqe_q0_weight = std::stod(val());
