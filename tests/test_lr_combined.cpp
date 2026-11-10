@@ -2,10 +2,14 @@
 // on a neutral partner, the local charge's smoothness through the cluster link window, forces of the long-range term and
 // of the conditioning against central differences, the reduction to the structure's charge for one cluster, and a zero
 // long-range energy when no inter-cluster pair reaches lr_R - lr_t.
+#include "runtime/graph_model.h"
 #include "runtime/lr_combined.h"
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
+
+#include <cstdlib>
+#include <filesystem>
 
 #include <array>
 #include <cmath>
@@ -949,4 +953,71 @@ TEST_CASE("lrc fukui: dump for the torch parity check (MLIPCPP_FUKUI_PARITY=out.
   }
   std::fprintf(f, "]}\n");
   std::fclose(f);
+}
+// E04: bare ions beyond the backbone cutoff (no graph edge) still move their conditioning through the cluster link.
+// Host side (double): dS_a/dx of two bare ions inside the 8/10 A link window against central differences.
+TEST_CASE("lrc edge-free: bare-ion conditioning dS/dx matches central differences", "[lrc]") {
+  const SqeSpec S = sqe_spec();
+  LrcSpec L = lrc_spec();
+  L.a_on = 8.0, L.a_off = 10.0; // the R1 window
+  const int32_t Z[2] = {3, 11};  // Li+ ... Na+, Q = +2
+  const double u[3] = {0.92031, 0.34051, -0.19327}; // unit vector
+  const double Q = 2.0;
+  for (double d : {8.5, 9.185, 9.217, 9.6}) {
+    const std::vector<double> x0{0, 0, 0, d * u[0], d * u[1], d * u[2]};
+    const LrcCondition c0 = lrc_condition(L, S, 2, Z, x0.data(), Q, 10);
+    REQUIRE(c0.cl.s == 2);
+    REQUIRE(c0.needs_cond_forces());
+    const std::vector<double> rows = lrc_blend_rows(L, S, c0, 2, Z, x0.data());
+    double fmax = 0, err = 0;
+    for (int a = 0; a < 2; a++) {
+      auto Sa = [&](const std::vector<double> &x) {
+        const LrcCondition c = lrc_condition(L, S, 2, Z, x.data(), Q, 10);
+        return c.k[a] + c.S[a];
+      };
+      for (size_t k = 0; k < 6; k++) {
+        const double num = fd(Sa, x0, k, 1e-5);
+        fmax = std::max(fmax, std::abs(num)), err = std::max(err, std::abs(num - rows[size_t(a) * 6 + k]));
+      }
+    }
+    INFO("d " << d << ": max |dS/dx| " << fmax << " /A, max error " << err);
+    CHECK(fmax > 1e-2);
+    CHECK(err < 1e-8);
+  }
+}
+
+// Graph side: the whole model's force on bare Li+ ... Na+ (no edge: before the fix dE/dS came from central differences
+// in S with h = 0.05, ~3 eV/A off). The network is fp32, so the tolerance is fp32-limited (0.05 eV/A at |F| ~ 13-25
+// eV/A, the level the molecular E04 centres pass at), not the 1e-8 of the double host-side checks.
+// MLIPCPP_TEST_LRC_GGUF: a cluster-conditioned combined model (R1 type); its charge pass from the GGUF's directory or
+// MLIPCPP_LRC_QMODEL.
+TEST_CASE("lrc edge-free: bare-ion forces of a conditioned model match central differences", "[lrc][gguf]") {
+  const char *path = std::getenv("MLIPCPP_TEST_LRC_GGUF");
+  if (!path || !*path || !std::filesystem::exists(path)) SKIP("MLIPCPP_TEST_LRC_GGUF not set");
+  mlipcpp::runtime::GraphModel m;
+  m.set_backend_preference(mlipcpp::BackendPreference::CPU);
+  REQUIRE(m.load_from_gguf(path));
+  if (!m.plato_lr().lrc.enabled || m.plato_lr().lrc.cond_global) SKIP("not a cluster-conditioned combined model");
+  const int32_t Z[2] = {3, 11};
+  const double u[3] = {0.92031, 0.34051, -0.19327}; // unit vector
+  auto run = [&](double d, bool forces) {
+    const float x[6] = {0, 0, 0, float(d * u[0]), float(d * u[1]), float(d * u[2])};
+    mlipcpp::AtomicSystem sys(2, x, Z, nullptr);
+    sys.set_charge(2), sys.set_spin_multiplicity(1);
+    return m.predict(sys, forces);
+  };
+  for (double d0 : {9.185, 9.217}) {
+    const mlipcpp::ModelResult r = run(d0, true);
+    REQUIRE(r.forces.size() == 6);
+    double Fu = 0; // force on Na+ along the separation
+    for (int k = 0; k < 3; k++) Fu += double(r.forces[3 + k]) * u[k];
+    double best = 1e30;
+    for (double h : {6.25e-4, 3.125e-4}) {
+      const double Fc = -(double(run(d0 + h, false).energy) - double(run(d0 - h, false).energy)) / (2 * h);
+      best = std::min(best, std::abs(Fc - Fu));
+    }
+    INFO("d " << d0 << ": F.u " << Fu << " eV/A, |F_c - F.u| " << best);
+    CHECK(std::abs(Fu) > 1.0);
+    CHECK(best < 0.05);
+  }
 }
