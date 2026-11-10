@@ -2855,10 +2855,14 @@ void train(const TrainOptions &o) {
     for (auto &g : set.groups) {
       for (int64_t sidx : g.ids)
         if (sidx < 0 || sidx >= split->size()) throw std::runtime_error(fmt::format("{}: structure index out of range", what));
-      for (TailPair &p : g.pairs) { // same geometry: same atoms in the same order (the composition cancels)
+      for (TailPair &p : g.pairs) { // the same atoms (the composition cancels; their order may differ: energies are per
+        // structure and forces per member)
         const int64_t k = g.ids[p.k], l = g.ids[p.l];
         const int nk = split->n_atoms(k);
-        if (nk != split->n_atoms(l) || !std::equal(split->numbers(k), split->numbers(k) + nk, split->numbers(l)))
+        std::vector<int32_t> zk(split->numbers(k), split->numbers(k) + nk), zl;
+        if (nk == split->n_atoms(l)) zl.assign(split->numbers(l), split->numbers(l) + nk);
+        std::sort(zk.begin(), zk.end()), std::sort(zl.begin(), zl.end());
+        if (zk != zl)
           throw std::runtime_error(fmt::format("{}: pair {} / {} of group {} is not the same atoms", what, k, l, g.name));
         p.de_ref = 0.0; // the scale is fixed (pair_scale)
       }
