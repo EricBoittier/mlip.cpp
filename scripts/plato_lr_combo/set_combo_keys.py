@@ -24,6 +24,7 @@ ap.add_argument("--flows", type=int, default=0); ap.add_argument("--flow-kernel"
 ap.add_argument("--flow-rc", type=float, default=5.0)
 ap.add_argument("--cond", choices=["cluster", "global", "neutral"])
 ap.add_argument("--readout", action="store_true"); ap.add_argument("--seed", type=int, default=13)
+ap.add_argument("--readout-init", help="NPZ with W [2, d] and b [2] in graph (scaled) units, e.g. from a ridge fit (ro_fit.py); replaces the random init")
 ap.add_argument("--readout-b0", type=float, default=-4.0, help="initial bias of b (softplus(-4) = 0.018 eV/e^2: small initial hardness term)")
 ap.add_argument("--readout-scale", type=float, default=0.01, help="W ~ scale N(0, 1/d) (default 0.01: a small non-zero init, not a gate: dE/dW = [h q, h q^2 ...] does not vanish with W; scale 1 perturbs C8q0 forces by ~2 eV/A)")
 a = ap.parse_args()
@@ -112,6 +113,8 @@ if a.readout:
     rng = np.random.default_rng(a.seed)
     W = (a.readout_scale * rng.standard_normal((2, d)) / math.sqrt(d)).astype(np.float32)
     b = np.array([0.0, a.readout_b0], np.float32)
+    if a.readout_init:
+        z = np.load(a.readout_init); W = np.asarray(z["W"], np.float32).reshape(2, d); b = np.asarray(z["b"], np.float32).reshape(2)
     ws["lrc_readout_weight"] = [2, d]; ws["lrc_readout_bias"] = [2]
     pn = json.loads(meta["train.param_names"]); pn += ["lrc_readout_weight", "lrc_readout_bias"]
     new["graph.weight_shapes"] = enc("graph.weight_shapes") + struct.pack("<I", 8) + enc(json.dumps(ws))

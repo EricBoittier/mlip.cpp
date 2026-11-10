@@ -1335,7 +1335,8 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
 
   // per-atom charge readout: F -= sum_i (dE/dq_i) dq_i/dx through the frozen charge chain (scaled units)
   if (lrc && lrc->readout) {
-    if (!gf.grad_q) throw std::runtime_error("lrc readout: no dE/dq from the graph");
+    // (gf may be a one-off graph already released: dE/dq was copied into gq before once.reset())
+    if (gq.size() != size_t(n)) throw std::runtime_error("lrc readout: no dE/dq from the graph");
     for (int k = 0; k < b.n_real_systems; k++) {
       const runtime::LrcCondition &c = lrc_cond_[k];
       const int a0 = lrc_a0_[k], ns = b.n_per_system[k];
