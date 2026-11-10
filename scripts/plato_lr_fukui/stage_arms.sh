@@ -14,7 +14,7 @@ arm FKU13 uniform uniform global      # U
 arm FKA13 atom atom global            # A
 arm FKA14 atom atom global            # A, data-order seed 14 (paired with FKE14)
 arm FKApm13 atom_pm atom_pm global    # A+-
-arm FKAC13 atom_cluster atom cluster  # AC (AC-trained passes; replaces qproj, feeds the conditioning)
+# AC not screened (stage-1 per-atom charges 2x worse than A; SUMMARY.md)
 # EC (element pass, cluster scope) dropped: offline 0.74 e fragment error (q_raw cluster sums of a globally trained pass are not near-integer)
 [ -d $F/atom_fl ] && arm FKAfl13 atom_fl atom global   # A with Fukui-label supervision (only if the signal check passed it)
 ls -la $M/FK*.gguf
