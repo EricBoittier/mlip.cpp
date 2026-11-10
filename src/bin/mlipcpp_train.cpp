@@ -62,7 +62,7 @@ int main(int argc, char **argv) {
                "  normalised tail loss on pulled-apart scans (train/tail_loss.h; DIR a split + tail_pairs.tsv), one scan per\n"
                "  step, classes in turn: W x mean_p Huber((dE_model - dE_DFT) / max(|dE_ref|, floor)), no absolute energies;\n"
                "--pair-data DIR [--pair-weight W] [--pair-scale 1] [--pair-delta 1] [--pair-rows-weight V] [--pair-every 1]\n"
-               "  [--pair-val DIR] (conservative): same-geometry charge / spin-state groups (vertical IP / EA, spin gaps; DIR a\n"
+               "  [--pair-val DIR[,DIR]] [--pair-val-dump PREFIX] (conservative): same-geometry charge / spin-state groups (vertical IP / EA, spin gaps; DIR a\n"
                "  split + pairs.tsv in the tail_pairs.tsv format), one group co-batched every N steps, classes in turn:\n"
                "  W x mean_p Huber_delta((dE_model - dE_DFT) / scale eV), plus (V > 0) the members' ordinary energy + force\n"
                "  loss at V x an ordinary row; --pair-val: the held-out groups' dE errors (eV) after each epoch;\n"
@@ -156,6 +156,7 @@ int main(int argc, char **argv) {
     else if (a == "--tail-delta") o.tail_delta = std::stod(val());
     else if (a == "--pair-data") o.pair_data = val();
     else if (a == "--pair-val") o.pair_val = val();
+    else if (a == "--pair-val-dump") o.pair_val_dump = val();
     else if (a == "--pair-weight") o.pair_weight = std::stod(val());
     else if (a == "--pair-scale") o.pair_scale = std::stod(val());
     else if (a == "--pair-delta") o.pair_delta = std::stod(val());

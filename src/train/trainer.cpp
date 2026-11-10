@@ -2872,9 +2872,9 @@ void train(const TrainOptions &o) {
     fmt::print("{}: {} structures, {} groups ({}), {} pairs ({})\n", what, split->size(), set.groups.size(), per,
                set.n_pairs(), f);
   };
-  std::unique_ptr<MemmapSplit> pair_split, pair_val_split;
-  NeighborCache nl_pair, nl_pair_val;
-  TailSet pair_set, pair_val_set;
+  std::unique_ptr<MemmapSplit> pair_split;
+  NeighborCache nl_pair;
+  TailSet pair_set;
   TailLoss pair_loss{o.pair_weight, o.pair_scale, o.pair_delta};
   const bool pair_on = !o.pair_data.empty() && (o.pair_weight > 0 || o.pair_rows_weight > 0) && !eval_only;
   if (pair_on) {
@@ -2891,7 +2891,25 @@ void train(const TrainOptions &o) {
                                                     o.pair_rows_weight)
                                       : std::string());
   }
-  if (!o.pair_val.empty()) load_pairs(o.pair_val, pair_val_split, nl_pair_val, pair_val_set, "pair val");
+  // --pair-val DIR[,DIR...]: held-out sets, each tagged by its directory's base name
+  struct PairVal {
+    std::string tag;
+    std::unique_ptr<MemmapSplit> split;
+    NeighborCache nl;
+    TailSet set;
+  };
+  std::vector<PairVal> pair_vals;
+  for (size_t p0 = 0; !o.pair_val.empty() && p0 <= o.pair_val.size();) {
+    const size_t p1 = std::min(o.pair_val.find(',', p0), o.pair_val.size());
+    const std::string dir = o.pair_val.substr(p0, p1 - p0);
+    p0 = p1 + 1;
+    if (dir.empty()) continue;
+    PairVal pv;
+    pv.tag = std::filesystem::path(dir).filename().string();
+    if (pv.tag.empty()) pv.tag = std::filesystem::path(dir).parent_path().filename().string();
+    load_pairs(dir, pv.split, pv.nl, pv.set, ("pair val " + pv.tag).c_str());
+    pair_vals.push_back(std::move(pv));
+  }
   std::vector<double> pair_log_l(pair_set.classes.size(), 0.0), pair_log_r(pair_set.classes.size(), 0.0);
   std::vector<int64_t> pair_log_n(pair_set.classes.size(), 0), pair_log_np(pair_set.classes.size(), 0);
   double pair_ep_l = 0, pair_ep_rows = 0;
@@ -2912,31 +2930,50 @@ void train(const TrainOptions &o) {
     return std::make_pair(&g, make_batch(*pair_split, nl_pair, g.ids, rot, species, scaling, cutoff));
   };
   // held-out pairs: dE_model - dE_DFT (eV) per pair, by class; no rotation, forward only
-  auto pair_val_eval = [&]() {
-    std::vector<std::vector<double>> err(pair_val_set.classes.size());
-    for (const TailGroup &g : pair_val_set.groups) {
-      const Batch b = make_batch(*pair_val_split, nl_pair_val, g.ids, {}, species, scaling, cutoff);
-      const std::vector<double> E = w0.energies(b, scaling.energy_scale);
-      for (const TailPair &p : g.pairs) err[p.cls].push_back(E[p.k] - E[p.l] - p.de_dft);
-    }
+  // and, with --pair-val-dump PREFIX, every pair's error to PREFIX.<tag>.epochNNNNN.tsv (group class k l dE_DFT err)
+  auto pair_val_eval = [&](int64_t epoch_done) {
     std::string txt, js;
-    for (size_t c = 0; c < err.size(); c++) {
-      auto &e = err[c];
-      if (e.empty()) continue;
-      double mae = 0, mse = 0, se = 0;
-      for (double x : e) mae += std::abs(x), mse += x, se += x * x;
-      std::vector<double> a(e.size());
-      std::transform(e.begin(), e.end(), a.begin(), [](double x) { return std::abs(x); });
-      std::nth_element(a.begin(), a.begin() + a.size() / 2, a.end());
-      const double n = double(e.size()), med = a[a.size() / 2];
-      txt += fmt::format("{}{} n {} MAE {:.4f} eV, median |err| {:.4f}, mean {:+.4f}, RMSE {:.4f}", c ? "; " : "",
-                         pair_val_set.classes[c], e.size(), mae / n, med, mse / n, std::sqrt(se / n));
-      js += fmt::format(",\"pair_val_{}_mae_ev\":{},\"pair_val_{}_median_ev\":{},\"pair_val_{}_mean_ev\":{}",
-                        pair_val_set.classes[c], mae / n, pair_val_set.classes[c], med, pair_val_set.classes[c], mse / n);
+    for (PairVal &pv : pair_vals) {
+      std::vector<std::vector<double>> err(pv.set.classes.size());
+      std::unique_ptr<std::FILE, int (*)(std::FILE *)> dump(nullptr, std::fclose);
+      if (!o.pair_val_dump.empty())
+        dump.reset(std::fopen(fmt::format("{}.{}.epoch{:05d}.tsv", o.pair_val_dump, pv.tag, epoch_done).c_str(), "w"));
+      if (dump) std::fprintf(dump.get(), "group\tclass\tk\tl\tdE_dft_eV\terr_eV\n");
+      for (const TailGroup &g : pv.set.groups) {
+        const Batch b = make_batch(*pv.split, pv.nl, g.ids, {}, species, scaling, cutoff);
+        const std::vector<double> E = w0.energies(b, scaling.energy_scale);
+        for (const TailPair &p : g.pairs) {
+          const double e = E[p.k] - E[p.l] - p.de_dft;
+          err[p.cls].push_back(e);
+          if (dump)
+            std::fprintf(dump.get(), "%s\t%s\t%lld\t%lld\t%.6f\t%.6f\n", g.name.c_str(), pv.set.classes[p.cls].c_str(),
+                         (long long)g.ids[p.k], (long long)g.ids[p.l], p.de_dft, e);
+        }
+      }
+      for (size_t c = 0; c < err.size(); c++) {
+        auto &e = err[c];
+        if (e.empty()) continue;
+        double mae = 0, mse = 0, se = 0;
+        for (double x : e) mae += std::abs(x), mse += x, se += x * x;
+        std::vector<double> a(e.size());
+        std::transform(e.begin(), e.end(), a.begin(), [](double x) { return std::abs(x); });
+        std::nth_element(a.begin(), a.begin() + a.size() / 2, a.end());
+        const double n = double(e.size()), med = a[a.size() / 2];
+        const std::string key = pv.tag + "_" + pv.set.classes[c];
+        txt += fmt::format("{}{} n {} MAE {:.4f} eV, median |err| {:.4f}, mean {:+.4f}, RMSE {:.4f}", txt.empty() ? "" : "; ",
+                           key, e.size(), mae / n, med, mse / n, std::sqrt(se / n));
+        js += fmt::format(",\"pair_val_{}_mae_ev\":{},\"pair_val_{}_median_ev\":{},\"pair_val_{}_mean_ev\":{}", key, mae / n, key,
+                          med, key, mse / n);
+      }
     }
     return std::make_pair(txt, js);
   };
 
+  if (!pair_vals.empty() && !eval_only && state.epoch == 0) { // the init's held-out pair errors (epoch 0 dump)
+    const auto t_pv = clock_type::now();
+    const std::string txt = pair_val_eval(0).first;
+    fmt::print("init held-out pairs ({:.1f} s): {}\n", seconds_since(t_pv), txt);
+  }
   if (pair_on && o.pair_grad_check > 0) {
     // end-to-end gradient check of the pair loss: g from run_tail's backward (mult 1), then the loss at
     // params +- h g/|g| (forward energies only); a correct gradient gives (L+ - L-) / 2h -> |g|
@@ -3281,9 +3318,9 @@ void train(const TrainOptions &o) {
                  epoch, o.charge_corr_target, std::sqrt(ep.se_frag / std::max<int64_t>(1, ep.n_frag)), ep.n_frag,
                  std::sqrt(val.se_frag / std::max<int64_t>(1, val.n_frag)), val.n_frag);
     std::string pair_js;
-    if (pair_val_split) {
+    if (!pair_vals.empty()) {
       const auto t_pv = clock_type::now();
-      auto [txt, js] = pair_val_eval();
+      auto [txt, js] = pair_val_eval(epoch + 1);
       fmt::print("epoch {} held-out pairs ({:.1f} s): {}\n", epoch, seconds_since(t_pv), txt);
       pair_js = js;
     }

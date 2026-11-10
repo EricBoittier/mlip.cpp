@@ -116,7 +116,7 @@ struct TrainOptions {
   // and, with pair_rows_weight V > 0, the ordinary energy + force loss of its members at V x the weight of an
   // ordinary row of the step batch (V alone, pair_weight 0: the "upweighted rows" alternative). Conservative only.
   // --pair-val DIR (same format): the held-out pairs' ΔE errors after each epoch (no gradient)
-  std::string pair_data, pair_val;
+  std::string pair_data, pair_val, pair_val_dump; // pair_val: DIR[,DIR...]; pair_val_dump: per-pair error TSV prefix
   double pair_weight = 0.0, pair_scale = 1.0, pair_delta = 1.0, pair_rows_weight = 0.0;
   int pair_every = 1;
   // --pair-grad-check N: before training, compare the pair loss's parameter gradient (run_tail's backward) with a
