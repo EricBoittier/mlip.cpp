@@ -2001,22 +2001,30 @@ TEST_CASE("lrc slab: forces and virial match differences (slab, separated cluste
     std::vector<double> x, h;
     std::vector<int32_t> Z;
     bool intra;
+    double gap = 0;
   };
   const std::vector<double> hsep = {21, 0, 0, 3, 22, 0, 0, 0, 0};
+  // (T, T, T) + gap rule: the slab + molecules in a cell with a tilted c row, some atoms wrapped across the vacuum
+  std::vector<double> hg = hs, xg = xm;
+  hg[6] = 1.5, hg[7] = -0.8, hg[8] = 42.0;
+  for (size_t i = 0; i < xg.size() / 3; i += 3)
+    for (int a = 0; a < 3; a++) xg[3 * i + a] += (i % 2 ? 1.0 : -1.0) * hg[6 + a];
   std::vector<Case> cases = {{"slab (bulk-like)", xs, hs, Zs, true},
                              {"separated X5", X5, hsep, std::vector<int32_t>(ZG, ZG + 5), true},
                              {"separated X5 inter", X5, hsep, std::vector<int32_t>(ZG, ZG + 5), false},
-                             {"slab + molecules", xm, hs, Zm, true}};
+                             {"slab + molecules", xm, hs, Zm, true},
+                             {"gap rule, tilted c", xg, hg, Zm, true, 10.5}};
   for (auto mode : {LrcSpec::Slab::YB, LrcSpec::Slab::Ewald2D})
     for (const Case &cs : cases)
       for (bool qp : {false, true})
         for (double Q : {0.0, 1.0}) {
           LrcSpec L = slab_spec(mode, nullptr, cs.intra);
-          L.qproj = qp;
+          L.qproj = qp, L.slab_gap = cs.gap;
           const int n = int(cs.Z.size());
           auto energy = [&](const std::vector<double> &x, const std::vector<double> &h) { return slab_E(L, S, x, cs.Z, h, Q); };
           const SlabRun r0 = slab_run(L, S, cs.x, cs.Z, cs.h, Q, true);
           REQUIRE(r0.c.cl.slab());
+          if (cs.gap > 0) CHECK(r0.c.cl.zshift.size() == cs.Z.size());
           double sum = 0;
           for (double v : r0.e.q) sum += v;
           CHECK(sum == Approx(Q).margin(1e-12));

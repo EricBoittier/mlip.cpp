@@ -65,7 +65,10 @@
 //    across exactly one lattice direction is a slab open along it (the classic Yeh-Berkowitz setting: the given cell
 //    height is the elongated cell; atoms are unwrapped across the gap). g must exceed a_off and lr_R. Absent / 0: off,
 //    so a (T, T, T) cell with vacuum stays a 3D-periodic system (tin-foil Ewald, as periodic DFT without a dipole
-//    correction).
+//    correction). In MD the rule is evaluated per structure: if molecules (vapour) leave no empty layer >= g, the cell
+//    falls back to 3D tin-foil (under lrc_intra; the energy jumps by about the dipole term) or throws, and a molecule
+//    crossing the cell boundary along the normal moves to the other side of the unwrapped slab. Pick g below the
+//    smallest vacuum the trajectory keeps; (T, T, F) has neither issue.
 // Models with the Plato mesh / LES heads (pet.plato_lr.mesh_coupling / les, e.g. the FTq family) refuse (T, T, F) cells
 // in the backbone (and mlipcpp-train refuses such slabs for them): give these a (T, T, T) cell with vacuum and the gap
 // rule; mesh / LES then see a 3D-periodic cell, the lrc term the slab.
