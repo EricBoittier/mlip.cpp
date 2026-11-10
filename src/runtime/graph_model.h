@@ -308,6 +308,10 @@ private:
   // combined model: dE/d(blend) per atom of the last predict_single_impl with forces (scaled to eV), when asked
   bool lrc_want_blend_grad_ = false;
   std::vector<double> lrc_blend_grad_;
+  // per-atom charge readout (lrc_readout): the reference charges (input lrc_q), dE/dq wanted, and dE/dq (eV / e)
+  std::vector<float> lrc_q_;
+  bool lrc_want_q_grad_ = false;
+  std::vector<double> lrc_q_grad_;
   // per-atom weights w of the differentiated energy sum_i w_i e_i (forces then -d/dx of it; the energy stays the plain
   // sum); empty: all 1. Used by the lrc charge pass (LrcGraphCharges), whose per-atom outputs are charges.
   std::vector<float> atom_w_;

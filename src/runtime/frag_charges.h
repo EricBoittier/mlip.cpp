@@ -41,6 +41,12 @@ void install_frag_cond_gate(GraphInterpreter &interp);
 /// charge_index_unit (the next row up), S = `blend` (F32 [n], one value per atom, broadcast over channels)
 void install_lrc_blend(GraphInterpreter &interp, ggml_tensor *blend);
 
+/// Per-atom charge readout of the combined model (pet.plato_lr.lrc_readout; after M. Langer, ipsum/PET-LR): adds
+/// E_i += a_i q_i + 1/2 softplus(b_i) q_i^2, [a_i, b_i] = W h_i + beta, to the per-atom energy, h_i the input of the last
+/// node-energy head (graph weights lrc_readout_weight [2, d] / lrc_readout_bias [2]; q: F32 [n], the reference charges).
+/// Composes with an installed post_node hook (call after install_lrc_blend).
+void install_lrc_readout(GraphInterpreter &interp, ggml_tensor *q);
+
 /// unit label per atom (0..U-1, numbered by first atom) by the bond rule; positions [n][3]
 std::vector<int32_t> frag_bonded_units(int n, const int32_t *Z, const float *positions, int *n_units = nullptr);
 

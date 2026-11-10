@@ -145,6 +145,44 @@ struct LrcSpec {
   bool pol = false;
   std::vector<int32_t> pol_Z;
   std::vector<double> pol_alpha;
+  // ---- combo components (feat/plato-lr-combo; after M. Langer, ipsum/PET-LR; ~/data/plato-lr-scratch/combo/SPEC.md).
+  // Graph mode only; every absent key keeps the behaviour above bit-identical.
+  // Charge reference (pet.plato_lr.lrc_q0_ref), r = Q - sum q_raw, n(x) = sum_{k=-K}^{K-1} sigmoid((x - k - 1/2) / T) - K
+  // (charge states -K..K, lrc_fermi_K / lrc_fermi_T), bounded scores s = B tanh(s_raw / B), B = K + 2, s_raw the score
+  // pass (lrc_smodel, a GGUF copy of the charge-pass backbone with the fitted score head, as lrc_fmodel):
+  //   "fukui" (absent)  q = q_raw + w r, w the Fukui weights above
+  //   "fermi"           q = q_raw + n(s - mu), one mu per structure with sum n(s - mu) = r (exact root, implicit gradient)
+  //   "threshold"       p = n(s - theta_Z) (lrc_thr_theta); q = q_raw + p + w (r - sum p) (no mu: local placement)
+  //   "species_fill"    q = q_raw + c_Z n(sigma_Z - mu), sum c_Z n = r; c_Z = softplus(lrc_sf_scale), sigma_Z = B tanh(lrc_sf_score / B)
+  //   "qeq"             q = argmin 1/2 sum J_i (q_i - q_raw_i)^2 + 1/2 q.K q, sum q = Q; J = softplus(lrc_qeq_eta) (eV/e^2),
+  //                     K_ij = KE erf(r / sqrt2 sigma) / r, K_ii = KE sqrt(2 / pi) / sigma (sigma = lrc_smear); dense solves
+  // ("species_weighted" of iris is the "fukui" reference with lrc_fukui_mode element: no separate value.)
+  enum class Q0Ref { Fukui, Fermi, Threshold, SpeciesFill, Qeq };
+  Q0Ref q0_ref = Q0Ref::Fukui;
+  int fermi_K = 3;
+  double fermi_T = 0.1, smear = 0.9;
+  std::string smodel;
+  std::shared_ptr<LrcQSource> ssrc;
+  std::vector<double> thr_theta, sf_score, sf_scale, qeq_eta; // per element, lrc_fukui_Z order
+  // Flows (lrc_flow_passes P, absent 0): P potential-driven passes on the reference charges,
+  //   phi_i = sum_{j != i} K_ij q_j,  dq_i = sum_{j != i} kappa_ij (phi_j - phi_i),  q <- q + dq,
+  //   kappa_ij = softplus((k_ZZ' + k_Z'Z) / 2) w(r_ij) (lrc_flow_kappa, E x E), w = 1 - smootherstep(r - rc + 1)
+  //   (lrc_flow_kernel "local", rc = lrc_flow_rc) or erf(r / sqrt2 sigma) / r (kernel "coulomb", all pairs).
+  //   Antisymmetric: the structure total is kept exactly. (His transfer / conductance MLPs on node embeddings are not
+  //   available to a frozen scalar pass; this is the species-pair simplification, fitted offline.)
+  int flow_passes = 0;
+  bool flow_coulomb = false;
+  double flow_rc = 5.0;
+  std::vector<double> flow_kappa;
+  // Per-atom charge readout (pet.plato_lr.lrc_readout): E_i += a_i q_i + 1/2 softplus(b_i) q_i^2, [a, b] = W h_i + beta
+  // (graph tensors lrc_readout_weight / _bias, trainable), q the reference charges after the flows, on every structure.
+  bool readout = false;
+  // conditioning "neutral" (lrc_cond): every atom on the Q = 0 row; Q enters only through the charges
+  bool cond_neutral = false;
+  bool combo() const { return q0_ref != Q0Ref::Fukui || flow_passes > 0; }
+  bool needs_q_always() const { return readout; }
+  int elem(int z) const; // index into fukui_Z (throws when absent)
+  void combo_check() const; // throws on an inconsistent combo configuration
   static LrcSpec from_gguf(const GGUFLoader &L, const SqeSpec &sqe);
   void to_gguf(gguf_context *g) const;
 };
@@ -165,6 +203,11 @@ struct LrcQ0 {
   // r = Q - sum q_raw, the +/- blend s and ds/dr
   std::vector<double> qraw, fp, fm, dfp, dfm;
   double Fp = 0, Fm = 0, r = 0, s = 0, ds = 0;
+  // combo references: bounded scores, occupation n and n' (per atom), mu, metallicity M = sum n' (species_fill: sum c n'),
+  // the sum of the threshold placements; qref: the reference before the flows; qflow[p]: the charges entering pass p
+  std::vector<double> score, occ, docc, qref;
+  std::vector<std::vector<double>> qflow;
+  double mu = 0, M = 0, sum_p = 0;
 };
 
 struct LrcClusters {
@@ -231,6 +274,11 @@ void lrc_moments_vjp(const LrcSpec &L, int n, const int32_t *Z, const double *x,
 
 /// lrc_qproj: the projected charges of charges q at positions x (diagnostics / parity with rdelta/neutralise)
 std::vector<double> lrc_project_charges(const LrcSpec &L, int n, const int32_t *Z, const double *x, const double *q);
+
+/// combo diagnostics: the metallicity of the reference (0 for the Fukui and QEq references) and the exact Born effective
+/// charges Z [n x 3 x 3], Z_i[a][b] = dP_a / dx_ib, P = sum_k q_k x_k over the reference charges q (after the flows), by
+/// three VJPs of the charge chain (open structures; sum_i Z_i = Q I)
+std::vector<double> lrc_bec(const LrcSpec &L, const SqeSpec &sqe, const LrcQ0 &q, int n, const int32_t *Z, const double *x);
 
 /// inter-cluster long-range energy and forces (zero, exactly, for a one-cluster structure)
 LrcEnergy lrc_energy(const LrcSpec &L, const SqeSpec &sqe, const LrcCondition &c, int n, const int32_t *Z,
