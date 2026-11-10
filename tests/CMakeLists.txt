@@ -242,7 +242,7 @@ target_include_directories(test_conditioning PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
 catch_discover_tests(test_conditioning)
 
 add_executable(test_lr_combined test_lr_combined.cpp)
-target_link_libraries(test_lr_combined PRIVATE mlipcpp Catch2::Catch2WithMain)
+target_link_libraries(test_lr_combined PRIVATE mlipcpp ggml Catch2::Catch2WithMain)
 target_include_directories(test_lr_combined PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/)
 catch_discover_tests(test_lr_combined)
 
