@@ -402,6 +402,18 @@ bool GraphModel::load_from_gguf(const std::string &path) {
       if (slash != std::string::npos) qp = path.substr(0, slash + 1) + qp;
     }
     plato_lr_.lrc.qsrc = make_lrc_graph_charges(qp, backend_preference_, device_);
+    // per-atom Fukui passes (lrc_fukui_mode atom / atom_pm), paths relative to the model like lrc_qmodel
+    auto rel = [&](std::string p) {
+      if (!p.empty() && p[0] != '/') {
+        const auto slash = path.find_last_of('/');
+        if (slash != std::string::npos) p = path.substr(0, slash + 1) + p;
+      }
+      return p;
+    };
+    if (!plato_lr_.lrc.fmodel.empty())
+      plato_lr_.lrc.fsrc = make_lrc_graph_charges(rel(plato_lr_.lrc.fmodel), backend_preference_, device_);
+    if (!plato_lr_.lrc.fmodel_minus.empty())
+      plato_lr_.lrc.fsrc_minus = make_lrc_graph_charges(rel(plato_lr_.lrc.fmodel_minus), backend_preference_, device_);
   }
   if (plato_lr_.enabled && !forces_mode_)
     throw std::runtime_error("Plato-PET-LR GGUFs are forces-mode exports");

@@ -143,8 +143,23 @@ LrcSpec LrcSpec::from_gguf(const GGUFLoader &G, const SqeSpec &S) {
     const auto z = get_f64(G, "pet.plato_lr.lrc_fukui_Z");
     L.fukui_phi = get_f64(G, "pet.plato_lr.lrc_fukui_phi");
     for (double v : z) L.fukui_Z.push_back(static_cast<int32_t>(std::lround(v)));
-    if (L.qmodel.empty() || L.fukui_Z.empty() || L.fukui_Z.size() != L.fukui_phi.size())
-      throw std::runtime_error("lrc graph: needs lrc_qmodel and lrc_fukui_Z / _phi of equal length");
+    {
+      const std::string fm = G.get_string("pet.plato_lr.lrc_fukui_mode", "element");
+      if (fm == "element") L.fukui_mode = LrcSpec::FukuiMode::Element;
+      else if (fm == "uniform") L.fukui_mode = LrcSpec::FukuiMode::Uniform;
+      else if (fm == "atom") L.fukui_mode = LrcSpec::FukuiMode::Atom;
+      else if (fm == "atom_pm") L.fukui_mode = LrcSpec::FukuiMode::AtomPM;
+      else throw std::runtime_error("lrc graph: lrc_fukui_mode must be element, uniform, atom or atom_pm");
+      const std::string sc = G.get_string("pet.plato_lr.lrc_fukui_scope", "global");
+      if (sc != "global" && sc != "cluster") throw std::runtime_error("lrc graph: lrc_fukui_scope must be global or cluster");
+      L.fukui_cluster = sc == "cluster";
+      scalar("fukui_cluster_w", L.fukui_cluster_w), scalar("fukui_pm_width", L.fukui_pm_width);
+      L.fmodel = G.get_string("pet.plato_lr.lrc_fmodel", "");
+      L.fmodel_minus = G.get_string("pet.plato_lr.lrc_fmodel_minus", "");
+      L.fukui_phi_minus = get_f64(G, "pet.plato_lr.lrc_fukui_phi_minus");
+      L.fukui_check();
+    }
+    if (L.qmodel.empty()) throw std::runtime_error("lrc graph: needs lrc_qmodel");
     if (!(L.a_off > L.a_on)) throw std::runtime_error("lrc: bad a_on / a_off");
     L.mp = G.get_int32("pet.plato_lr.lrc_mp", 0) != 0;
     if (L.mp) {
@@ -201,7 +216,16 @@ void LrcSpec::to_gguf(gguf_context *g) const {
     gguf_set_val_str(g, "pet.plato_lr.lrc_qmodel", qmodel.c_str());
     gguf_set_val_str(g, "pet.plato_lr.lrc_qpass_charge", qpass_neutral ? "zero" : "total");
     std::vector<double> z(fukui_Z.begin(), fukui_Z.end());
-    arr("fukui_Z", z), arr("fukui_phi", fukui_phi);
+    if (!z.empty()) arr("fukui_Z", z), arr("fukui_phi", fukui_phi);
+    if (fukui_mode != FukuiMode::Element || fukui_cluster) { // absent keys = element / global (bin4 GGUFs unchanged)
+      static const char *names[] = {"element", "uniform", "atom", "atom_pm"};
+      gguf_set_val_str(g, "pet.plato_lr.lrc_fukui_mode", names[static_cast<int>(fukui_mode)]);
+      gguf_set_val_str(g, "pet.plato_lr.lrc_fukui_scope", fukui_cluster ? "cluster" : "global");
+      scalar("fukui_cluster_w", fukui_cluster_w), scalar("fukui_pm_width", fukui_pm_width);
+      if (!fmodel.empty()) gguf_set_val_str(g, "pet.plato_lr.lrc_fmodel", fmodel.c_str());
+      if (!fmodel_minus.empty()) gguf_set_val_str(g, "pet.plato_lr.lrc_fmodel_minus", fmodel_minus.c_str());
+      if (!fukui_phi_minus.empty()) arr("fukui_phi_minus", fukui_phi_minus);
+    }
     if (mp) {
       gguf_set_val_i32(g, "pet.plato_lr.lrc_mp", 1);
       scalar("mp_rc", mp_rc), scalar("mp_width", mp_width);
@@ -510,12 +534,35 @@ void vjp_round(const LrcSpec &L, const SqeSpec &S, int n, const int32_t *Z, cons
 } // namespace
 
 double LrcSpec::fukui(int z) const {
+  if (fukui_mode == FukuiMode::Uniform) return 1.0;
   for (size_t k = 0; k < fukui_Z.size(); k++)
     if (fukui_Z[k] == z) {
       const double p = fukui_phi[k];
       return (p > 30 ? p : std::log1p(std::exp(p))) + 1e-6;
     }
   throw std::runtime_error("lrc graph: no Fukui parameter for atomic number " + std::to_string(z));
+}
+
+double LrcSpec::fukui_phi_of(int z, bool minus) const {
+  const std::vector<double> &phi = minus && !fukui_phi_minus.empty() ? fukui_phi_minus : fukui_phi;
+  for (size_t k = 0; k < fukui_Z.size(); k++)
+    if (fukui_Z[k] == z) return phi[k];
+  throw std::runtime_error("lrc graph: no Fukui parameter for atomic number " + std::to_string(z));
+}
+
+void LrcSpec::fukui_check() const {
+  if (fukui_mode != FukuiMode::Uniform && (fukui_Z.empty() || fukui_Z.size() != fukui_phi.size()))
+    throw std::runtime_error("lrc graph: needs lrc_fukui_Z / _phi of equal length");
+  if (!fukui_phi_minus.empty() && fukui_phi_minus.size() != fukui_Z.size())
+    throw std::runtime_error("lrc graph: lrc_fukui_phi_minus must have one value per lrc_fukui_Z");
+  if (fukui_atom() && fmodel.empty() && !fsrc) throw std::runtime_error("lrc graph: fukui_mode atom / atom_pm needs lrc_fmodel");
+  if (fukui_mode == FukuiMode::AtomPM && fmodel_minus.empty() && !fsrc_minus)
+    throw std::runtime_error("lrc graph: fukui_mode atom_pm needs lrc_fmodel_minus");
+  if (fukui_mode == FukuiMode::AtomPM && fukui_cluster)
+    throw std::runtime_error("lrc graph: fukui_scope cluster is implemented for uniform / element / atom weights only");
+  if (!(fukui_pm_width >= 0)) throw std::runtime_error("lrc graph: lrc_fukui_pm_width must be >= 0");
+  if (fukui_cluster && !(fukui_cluster_w > 0 && fukui_cluster_w <= 1))
+    throw std::runtime_error("lrc graph: lrc_fukui_cluster_w must be in (0, 1]");
 }
 
 // ---- atomic multipoles (graph mode, lrc_mp) ---------------------------------------------------------------------------
@@ -601,27 +648,9 @@ void lrc_moments_vjp(const LrcSpec &L, int n, const int32_t *Z, const double *x,
 }
 
 namespace {
-// graph mode: q0 = q_raw + f (Q - sum q_raw) / sum f; wt = f / sum f (f per element: no position dependence)
-LrcQ0 q0_graph(const LrcSpec &L, int n, const int32_t *Z, const double *x, double Q, int spin) {
-  if (!L.qsrc) throw std::runtime_error("lrc graph: the charge pass (lrc_qmodel) is not loaded");
-  LrcQ0 o;
-  o.Q = Q, o.spin = spin;
-  if (n == 0) return o;
-  o.q0 = L.qsrc->raw(n, Z, x, L.qpass_neutral ? 0.0 : Q, spin);
-  o.wt.resize(n);
-  double sq = 0, sf = 0;
-  for (int i = 0; i < n; i++) sq += o.q0[i], o.wt[i] = L.fukui(Z[i]), sf += o.wt[i];
-  for (int i = 0; i < n; i++) o.wt[i] /= sf, o.q0[i] += o.wt[i] * (Q - sq);
-  return o;
-}
-void vjp_graph(const LrcSpec &L, int n, const int32_t *Z, const double *x, const LrcQ0 &o, const double *c, double *g) {
-  double cb = 0;
-  for (int i = 0; i < n; i++) cb += c[i] * o.wt[i];
-  std::vector<double> w(n);
-  bool any = false;
-  for (int i = 0; i < n; i++) w[i] = c[i] - cb, any |= w[i] != 0;
-  if (any) L.qsrc->raw_vjp(n, Z, x, L.qpass_neutral ? 0.0 : o.Q, o.spin, w.data(), g);
-}
+// graph mode (defined after the soft-cluster projection, which the Fukui scope "cluster" uses)
+LrcQ0 q0_graph(const LrcSpec &L, int n, const int32_t *Z, const double *x, double Q, int spin);
+void vjp_graph(const LrcSpec &L, int n, const int32_t *Z, const double *x, const LrcQ0 &o, const double *c, double *g);
 } // namespace
 
 LrcQ0 lrc_q0(const LrcSpec &L, const SqeSpec &S, int n, const int32_t *Z, const double *x, double Q, int spin) {
@@ -904,8 +933,9 @@ inline void plateau(double Lq, double w, double &P, double &dP, double &ddP) {
 }
 
 struct LrcProjection {
-  std::vector<double> q, s, dpb, g, F, Q0;
-  double S = 0, G = 0;
+  std::vector<double> q, s, dpb, g, F, Q0, f;
+  double S = 0, G = 0, T = 0, w = 0.6;
+  bool resid = false;
 };
 constexpr double kProjEps = 1e-3;
 
@@ -942,50 +972,74 @@ template <class CB> void proj_groups(const LrcSpec &L, const LrcClusters &c, CB 
     if (!covered[a]) cb(1.0, std::vector<int>{a}, std::vector<int>{}, uint64_t(0), none, none, true);
 }
 
-LrcProjection lrc_project(const LrcSpec &L, const LrcClusters &c, int n, const int32_t *Z, const double *q) {
+// per-atom shares f (> 0), plateau width w; resid: also route the residual Q - sum q (Fukui scope "cluster"), else
+// (lrc_qproj) sum q' = sum q:
+//   q'_i = q_i + f_i / F_a (s_a + T g_a / G),  T = (resid ? Q - sum q : 0) - S
+LrcProjection lrc_project(const LrcSpec &L, const LrcClusters &c, int n, const double *f, const double *q, double w,
+                          bool resid, double Q) {
   LrcProjection o;
   const int s = c.s;
+  o.f.assign(f, f + n), o.w = w, o.resid = resid;
   o.Q0.assign(s, 0.0), o.F.assign(s, 0.0), o.s.assign(s, 0.0), o.dpb.assign(s, 0.0), o.g.assign(s, 0.0);
-  for (int i = 0; i < n; i++) o.Q0[c.sn[i]] += q[i], o.F[c.sn[i]] += L.fukui(Z[i]);
+  double sq = 0;
+  for (int i = 0; i < n; i++) o.Q0[c.sn[i]] += q[i], o.F[c.sn[i]] += f[i], sq += q[i];
   proj_groups(L, c, [&](double pr, const std::vector<int> &grp, const std::vector<int> &, uint64_t,
                         const std::vector<double> &, const std::vector<double> &, bool) {
     double QG = 0, FG = 0, P, dP, ddP;
     for (int a : grp) QG += o.Q0[a], FG += o.F[a];
-    plateau(QG, L.qproj_w, P, dP, ddP);
+    plateau(QG, w, P, dP, ddP);
     for (int a : grp) o.s[a] += pr * (P - QG) * o.F[a] / FG, o.dpb[a] += pr * dP;
   });
   for (int a = 0; a < s; a++) o.g[a] = o.F[a] * (kProjEps + o.dpb[a]), o.S += o.s[a], o.G += o.g[a];
+  o.T = (resid ? Q - sq : 0.0) - o.S;
   o.q.assign(q, q + n);
   for (int i = 0; i < n; i++) {
     const int a = c.sn[i];
-    o.q[i] += L.fukui(Z[i]) / o.F[a] * (o.s[a] - o.S * o.g[a] / o.G);
+    o.q[i] += f[i] / o.F[a] * (o.s[a] + o.T * o.g[a] / o.G);
   }
   return o;
 }
+// element shares (lrc_qproj on the long-range charges)
+LrcProjection lrc_project(const LrcSpec &L, const LrcClusters &c, int n, const int32_t *Z, const double *q) {
+  std::vector<double> f(n);
+  for (int i = 0; i < n; i++) f[i] = L.fukui(Z[i]);
+  return lrc_project(L, c, n, f.data(), q, L.qproj_w, false, 0.0);
+}
 
-// dq: dE/dq' on input, dE/dq on output (q the charge-pass charges); g [3n] += the link-probability part
-void lrc_project_vjp(const LrcSpec &L, const LrcClusters &c, const LrcProjection &o, int n, const int32_t *Z,
-                     const double *x, std::vector<double> &dq, double *g) {
+// dq: dE/dq' on input, dE/dq on output (q the charge-pass charges); g [3n] += the link-probability part; df (optional,
+// [n]) += dE/df_i
+void lrc_project_vjp(const LrcSpec &L, const LrcClusters &c, const LrcProjection &o, int n, const double *x,
+                     std::vector<double> &dq, double *g, double *df = nullptr) {
   const int s = c.s;
-  std::vector<double> h(s, 0.0), Ds(s), Dg(s), dQ0(s, 0.0), dp(c.se.size(), 0.0);
-  for (int i = 0; i < n; i++) h[c.sn[i]] += dq[i] * L.fukui(Z[i]) / o.F[c.sn[i]];
+  const double *f = o.f.data();
+  std::vector<double> h(s, 0.0), Ds(s), Dg(s), dQ0(s, 0.0), dp(c.se.size(), 0.0), dF(s, 0.0), t(s);
+  for (int i = 0; i < n; i++) h[c.sn[i]] += dq[i] * f[i] / o.F[c.sn[i]];
   double Hb = 0;
   for (int a = 0; a < s; a++) Hb += h[a] * o.g[a];
   Hb /= o.G;
-  for (int a = 0; a < s; a++) Ds[a] = h[a] - Hb, Dg[a] = -(o.S / o.G) * (h[a] - Hb);
+  for (int a = 0; a < s; a++) Ds[a] = h[a] - Hb, Dg[a] = (o.T / o.G) * (h[a] - Hb), t[a] = o.s[a] + o.T * o.g[a] / o.G;
   proj_groups(L, c, [&](double pr, const std::vector<int> &grp, const std::vector<int> &edges, uint64_t st,
                         const std::vector<double> &prk, const std::vector<double> &suk, bool single) {
     double QG = 0, FG = 0, P, dP, ddP, A = 0, B = 0;
     for (int a : grp) QG += o.Q0[a], FG += o.F[a];
-    plateau(QG, L.qproj_w, P, dP, ddP);
+    plateau(QG, o.w, P, dP, ddP);
     for (int a : grp) A += Ds[a] * o.F[a] / FG, B += Dg[a] * o.F[a];
     for (int a : grp) dQ0[a] += pr * (A * (dP - 1.0) + B * ddP);
+    if (df)
+      for (int a : grp) dF[a] += pr * (P - QG) * (Ds[a] - A) / FG;
     if (single) return;
     const double V = A * (P - QG) + B * dP; // this group's term per unit state probability
     const int m = static_cast<int>(edges.size());
     for (int k = 0; k < m; k++) dp[edges[k]] += V * prk[k] * suk[k + 1] * (((st >> k) & 1) ? 1.0 : -1.0);
   });
-  for (int i = 0; i < n; i++) dq[i] += dQ0[c.sn[i]];
+  if (df) {
+    for (int a = 0; a < s; a++) dF[a] += Dg[a] * (kProjEps + o.dpb[a]) - h[a] * t[a] / o.F[a];
+    for (int i = 0; i < n; i++) {
+      const int a = c.sn[i];
+      df[i] += dq[i] * t[a] / o.F[a] + dF[a];
+    }
+  }
+  for (int i = 0; i < n; i++) dq[i] += dQ0[c.sn[i]] - (o.resid ? Hb : 0.0);
   // p = 1 - prod (1 - A): dp/dA_w = prod over the other links (1 - A)
   for (size_t w = 0; w < c.weak.size(); w++) {
     const auto &wk = c.weak[w];
@@ -995,6 +1049,97 @@ void lrc_project_vjp(const LrcSpec &L, const LrcClusters &c, const LrcProjection
       if (v != w && c.weak[v].e == wk.e) others *= 1.0 - c.weak[v].A;
     add_pair(g, x, wk.i, wk.j, dist(x, wk.i, wk.j), dp[wk.e] * others * wk.dA);
   }
+}
+
+// graph mode Fukui weights of one channel: f_i = softplus(phi_Z + a_i) + 1e-6 (a = 0 without a pass), df = df/da
+void fukui_channel(const LrcSpec &L, int n, const int32_t *Z, const double *x, double Qp, int spin, bool minus,
+                   std::vector<double> &f, std::vector<double> &df) {
+  f.assign(n, 1.0), df.assign(n, 0.0);
+  if (L.fukui_mode == LrcSpec::FukuiMode::Uniform) return;
+  std::vector<double> a(n, 0.0);
+  LrcQSource *src = minus ? L.fsrc_minus.get() : L.fsrc.get();
+  if (L.fukui_atom()) {
+    if (!src) throw std::runtime_error("lrc graph: the Fukui pass (lrc_fmodel" + std::string(minus ? "_minus" : "") +
+                                       ") is not loaded");
+    a = src->raw(n, Z, x, Qp, spin);
+  }
+  for (int i = 0; i < n; i++) {
+    const double u = L.fukui_phi_of(Z[i], minus) + a[i];
+    f[i] = (u > 30 ? u : std::log1p(std::exp(u))) + 1e-6, df[i] = sig(u);
+  }
+}
+
+// graph mode: q0 = q_raw + w (Q - sum q_raw), w = f / sum f (A+-: blend of f+ / F+ and f- / F- by the residual's sign);
+// Fukui scope "cluster": the residual-routing soft-cluster projection of q_raw instead
+LrcQ0 q0_graph(const LrcSpec &L, int n, const int32_t *Z, const double *x, double Q, int spin) {
+  if (!L.qsrc) throw std::runtime_error("lrc graph: the charge pass (lrc_qmodel) is not loaded");
+  LrcQ0 o;
+  o.Q = Q, o.spin = spin;
+  if (n == 0) return o;
+  const double Qp = L.qpass_neutral ? 0.0 : Q;
+  o.qraw = L.qsrc->raw(n, Z, x, Qp, spin);
+  o.q0 = o.qraw;
+  fukui_channel(L, n, Z, x, Qp, spin, false, o.fp, o.dfp);
+  double sq = 0;
+  for (int i = 0; i < n; i++) sq += o.qraw[i], o.Fp += o.fp[i];
+  o.r = Q - sq;
+  if (L.fukui_cluster) {
+    const LrcClusters c = lrc_clusters(L, n, x);
+    o.q0 = lrc_project(L, c, n, o.fp.data(), o.qraw.data(), L.fukui_cluster_w, true, Q).q;
+    return o;
+  }
+  o.wt.resize(n);
+  if (L.fukui_mode == LrcSpec::FukuiMode::AtomPM) {
+    fukui_channel(L, n, Z, x, Qp, spin, true, o.fm, o.dfm);
+    for (int i = 0; i < n; i++) o.Fm += o.fm[i];
+    const double d = L.fukui_pm_width;
+    if (d > 0) o.s = sstep(o.r / d + 0.5), o.ds = dsstep(o.r / d + 0.5) / d;
+    else o.s = o.r > 0 ? 1.0 : 0.0, o.ds = 0.0;
+    for (int i = 0; i < n; i++) o.wt[i] = (1.0 - o.s) * o.fp[i] / o.Fp + o.s * o.fm[i] / o.Fm;
+  } else {
+    for (int i = 0; i < n; i++) o.wt[i] = o.fp[i] / o.Fp;
+  }
+  for (int i = 0; i < n; i++) o.q0[i] += o.wt[i] * o.r;
+  return o;
+}
+
+// dE/dx of sum_i c_i q0_i: the raw-charge pass with weights c_j - dE/dr, the Fukui pass(es) with r d(f / F)/da
+void vjp_graph(const LrcSpec &L, int n, const int32_t *Z, const double *x, const LrcQ0 &o, const double *c, double *g) {
+  const double Qp = L.qpass_neutral ? 0.0 : o.Q;
+  std::vector<double> w(n), u(n, 0.0);
+  bool any = false;
+  auto fpass = [&](LrcQSource *src, const std::vector<double> &df) { // u: dE/df_i
+    bool nz = false;
+    for (int i = 0; i < n; i++) u[i] *= df[i], nz |= u[i] != 0;
+    if (nz && src) src->raw_vjp(n, Z, x, Qp, o.spin, u.data(), g);
+  };
+  if (L.fukui_cluster) {
+    const LrcClusters cl = lrc_clusters(L, n, x);
+    const LrcProjection pr = lrc_project(L, cl, n, o.fp.data(), o.qraw.data(), L.fukui_cluster_w, true, o.Q);
+    std::vector<double> dq(c, c + n);
+    lrc_project_vjp(L, cl, pr, n, x, dq, g, L.fukui_atom() ? u.data() : nullptr);
+    for (int i = 0; i < n; i++) any |= dq[i] != 0;
+    if (any) L.qsrc->raw_vjp(n, Z, x, Qp, o.spin, dq.data(), g);
+    if (L.fukui_atom()) fpass(L.fsrc.get(), o.dfp);
+    return;
+  }
+  const bool pm = L.fukui_mode == LrcSpec::FukuiMode::AtomPM;
+  // dq0_i/dr = w_i + r dw_i/dr, dw_i/dr = (f-_i / F- - f+_i / F+) ds/dr
+  double cr = 0, cp = 0, cm = 0;
+  for (int i = 0; i < n; i++) {
+    cr += c[i] * o.wt[i];
+    if (L.fukui_atom()) cp += c[i] * o.fp[i] / o.Fp;
+    if (pm) cm += c[i] * o.fm[i] / o.Fm, cr += c[i] * o.r * (o.fm[i] / o.Fm - o.fp[i] / o.Fp) * o.ds;
+  }
+  for (int i = 0; i < n; i++) w[i] = c[i] - cr, any |= w[i] != 0;
+  if (any) L.qsrc->raw_vjp(n, Z, x, Qp, o.spin, w.data(), g);
+  if (!L.fukui_atom() || o.r == 0) return;
+  // sum_i c_i r (1 - s) d(f+_i / F+) = r (1 - s) / F+ sum_j (c_j - cp) df+_j
+  for (int i = 0; i < n; i++) u[i] = o.r * (1.0 - o.s) / o.Fp * (c[i] - cp);
+  fpass(L.fsrc.get(), o.dfp);
+  if (!pm) return;
+  for (int i = 0; i < n; i++) u[i] = o.r * o.s / o.Fm * (c[i] - cm);
+  fpass(L.fsrc_minus.get(), o.dfm);
 }
 
 LrcEnergy energy_fixed(const LrcSpec &L, const SqeSpec &S, const LrcCondition &c, int n, const int32_t *Z,
@@ -1009,13 +1154,14 @@ LrcEnergy energy_fixed(const LrcSpec &L, const SqeSpec &S, const LrcCondition &c
   const double *q = c.q0.q0.data();
   LrcProjection proj;
   std::vector<double> qp;
-  if (L.qproj) {
+  const bool qproj = L.qproj && !L.fukui_cluster; // AC: the reference charges are already projected
+  if (qproj) {
     proj = lrc_project(L, c.cl, n, Z, q);
     qp = proj.q, q = qp.data(), out.q = qp;
   }
   // dE/dq' (dq) -> dE/dq of the charge pass, and the link-state part of the projection into the position gradient
   auto unplateau = [&]() {
-    if (L.qproj) lrc_project_vjp(L, c.cl, proj, n, Z, x, dq, g.data());
+    if (qproj) lrc_project_vjp(L, c.cl, proj, n, x, dq, g.data());
   };
   // the switched inter-cluster pairs: (i, j, R, T, dT/dR, m = 1 - R_ab)
   struct P {

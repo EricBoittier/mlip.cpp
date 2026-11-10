@@ -231,6 +231,11 @@ def plato_lr_hypers(pet_model) -> Optional[dict]:
     hypers = getattr(pet_model, "hypers", None)
     if not h and isinstance(hypers, dict):
         h = dict(hypers.get("plato_lr", {}) or {})
+    if les is not None and str(getattr(les, "equilibration", "uniform")) != "uniform":
+        # metatrain feat/plato-lr-fukui: the LES Fukui modes are not in the PLATO_LES ops (uniform shift only); the
+        # mlip.cpp route for per-atom Fukui weights is the lrc graph mode (lrc_fukui_mode, separate charge passes)
+        raise ValueError(f"LES charge equilibration '{les.equilibration}' cannot be exported (uniform only); "
+                         "use the lrc graph mode (scripts/plato_lr_fukui)")
     return dict(
         frames=str(h.get("frames", "identity")), frame_mode=str(h.get("frame_mode", "attention")),
         rope_init=str(h.get("rope_init", "gate")), rope=frame_rope, edge_group_sum=edge,
