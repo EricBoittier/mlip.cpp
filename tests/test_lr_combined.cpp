@@ -244,40 +244,75 @@ TEST_CASE("lrc: head and soft-rounded q0 modes, forces match central differences
 namespace {
 // analytic stand-in for the frozen charge pass: q_raw_i = a_Z + sum_j b_ZZ' exp(-r_ij / 2) + 0.1 Q (position dependent,
 // smooth, like a backbone head); its VJP analytic
+// rcut > 0: the pair terms are cut smoothly at rcut, so that a periodic cell sums them over the images (the same
+// charges as the open structure while no image is within rcut)
 struct ToyQ final : LrcQSource {
+  double rcut = 0;
   static double a(int z) { return z == 11 ? 0.8 : z == 17 ? -0.7 : z == 8 ? -0.5 : 0.25; }
   static double b(int zi, int zj) { return 0.05 * ((zi * 7 + zj * 3) % 5) - 0.1; }
-  std::vector<double> raw(int n, const int32_t *Z, const double *x, double Q, int) override {
-    std::vector<double> q(n);
-    for (int i = 0; i < n; i++) {
-      q[i] = a(Z[i]) + 0.1 * Q;
-      for (int j = 0; j < n; j++)
-        if (j != i) q[i] += b(Z[i], Z[j]) * std::exp(-r(x, i, j) / 2);
+  double t(double r, double &dt) const { // exp(-r / 2) times the cutoff
+    double c = 1, dc = 0;
+    if (rcut > 0) {
+      if (r >= rcut) return dt = 0, 0.0;
+      c = 0.5 * (1 + std::cos(M_PI * r / rcut)), dc = -0.5 * M_PI / rcut * std::sin(M_PI * r / rcut);
     }
-    return q;
+    const double e = std::exp(-r / 2);
+    dt = e * (dc - 0.5 * c);
+    return e * c;
   }
-  void raw_vjp(int n, const int32_t *Z, const double *x, double, int, const double *w, double *g) override {
+  // f(i, j, d, r) over every partner j of i (periodic: its images up to two cells away), d = x_j' - x_i
+  template <class F> static void pairs(int n, const double *x, const double *cell, F &&f) {
+    const int m = cell ? 2 : 0;
     for (int i = 0; i < n; i++)
-      for (int j = 0; j < n; j++) {
-        if (j == i) continue;
-        const double d = r(x, i, j), dq = -0.5 * w[i] * b(Z[i], Z[j]) * std::exp(-d / 2);
-        for (int k = 0; k < 3; k++) {
-          const double u = (x[3 * i + k] - x[3 * j + k]) / d;
-          g[3 * i + k] += dq * u, g[3 * j + k] -= dq * u;
-        }
-      }
+      for (int j = 0; j < n; j++)
+        for (int s0 = -m; s0 <= m; s0++)
+          for (int s1 = -m; s1 <= m; s1++)
+            for (int s2 = -m; s2 <= m; s2++) {
+              if (i == j && !s0 && !s1 && !s2) continue;
+              double d[3], r2 = 0;
+              for (int k = 0; k < 3; k++) {
+                d[k] = x[3 * j + k] - x[3 * i + k];
+                if (cell) d[k] += s0 * cell[k] + s1 * cell[3 + k] + s2 * cell[6 + k];
+                r2 += d[k] * d[k];
+              }
+              f(i, j, d, std::sqrt(r2));
+            }
   }
   static double r(const double *x, int i, int j) {
     double s = 0;
     for (int k = 0; k < 3; k++) s += (x[3 * i + k] - x[3 * j + k]) * (x[3 * i + k] - x[3 * j + k]);
     return std::sqrt(s);
   }
+  std::vector<double> raw(int n, const int32_t *Z, const double *x, double Q, int, const double *cell) override {
+    std::vector<double> q(n);
+    for (int i = 0; i < n; i++) q[i] = a(Z[i]) + 0.1 * Q;
+    pairs(n, x, cell, [&](int i, int j, const double *, double r) {
+      double dt;
+      q[i] += b(Z[i], Z[j]) * t(r, dt);
+    });
+    return q;
+  }
+  void raw_vjp(int n, const int32_t *Z, const double *x, double, int, const double *cell, const double *w, double *g,
+               double *vir) override {
+    pairs(n, x, cell, [&](int i, int j, const double *d, double r) {
+      double dt;
+      t(r, dt);
+      const double f = w[i] * b(Z[i], Z[j]) * dt / r; // d(w_i q_i)/dd = f d
+      for (int k = 0; k < 3; k++) {
+        g[3 * j + k] += f * d[k], g[3 * i + k] -= f * d[k];
+        if (vir && cell)
+          for (int l = 0; l < 3; l++) vir[3 * k + l] += f * d[k] * d[l];
+      }
+    });
+  }
 };
-LrcSpec graph_spec() {
+LrcSpec graph_spec(double rcut = 0) {
   LrcSpec L;
   L.enabled = true, L.graph = true;
   L.fukui_Z = {1, 8, 11, 17}, L.fukui_phi = {0.3, -0.2, 1.1, 0.5};
-  L.qsrc = std::make_shared<ToyQ>();
+  auto q = std::make_shared<ToyQ>();
+  q->rcut = rcut;
+  L.qsrc = q;
   return L;
 }
 } // namespace
@@ -668,13 +703,14 @@ namespace {
 // raw charges with a spin dependence (ToyQ + 0.03 (spin - 1))
 struct ToyQS final : LrcQSource {
   ToyQ q;
-  std::vector<double> raw(int n, const int32_t *Z, const double *x, double Q, int spin) override {
-    auto v = q.raw(n, Z, x, Q, spin);
+  std::vector<double> raw(int n, const int32_t *Z, const double *x, double Q, int spin, const double *cell) override {
+    auto v = q.raw(n, Z, x, Q, spin, cell);
     for (double &e : v) e += 0.03 * (spin - 1);
     return v;
   }
-  void raw_vjp(int n, const int32_t *Z, const double *x, double Q, int spin, const double *w, double *g) override {
-    q.raw_vjp(n, Z, x, Q, spin, w, g);
+  void raw_vjp(int n, const int32_t *Z, const double *x, double Q, int spin, const double *cell, const double *w, double *g,
+               double *vir) override {
+    q.raw_vjp(n, Z, x, Q, spin, cell, w, g, vir);
   }
 };
 // stand-in for a per-atom Fukui pass: a_i = c_Z + sum_j d_ZZ' exp(-r_ij / 3) + 0.05 Q + 0.02 (spin - 1) (+ k for f-)
@@ -683,7 +719,7 @@ struct ToyA final : LrcQSource {
   explicit ToyA(double k_ = 0) : k(k_) {}
   static double c(int z) { return z == 11 ? 0.9 : z == 17 ? -0.4 : z == 8 ? 0.3 : -0.6; }
   double d(int zi, int zj) const { return 0.3 * ((zi * 5 + zj * 11) % 7) / 7.0 - 0.1 + k; }
-  std::vector<double> raw(int n, const int32_t *Z, const double *x, double Q, int spin) override {
+  std::vector<double> raw(int n, const int32_t *Z, const double *x, double Q, int spin, const double *) override {
     std::vector<double> a(n);
     for (int i = 0; i < n; i++) {
       a[i] = c(Z[i]) + 0.05 * Q + 0.02 * (spin - 1) + k;
@@ -692,7 +728,8 @@ struct ToyA final : LrcQSource {
     }
     return a;
   }
-  void raw_vjp(int n, const int32_t *Z, const double *x, double, int, const double *w, double *g) override {
+  void raw_vjp(int n, const int32_t *Z, const double *x, double, int, const double *, const double *w, double *g,
+               double *) override {
     for (int i = 0; i < n; i++)
       for (int j = 0; j < n; j++) {
         if (j == i) continue;
@@ -737,7 +774,7 @@ TEST_CASE("lrc fukui: E mode is the per-element equilibration of bin4 bit for bi
   for (double Q : {0.0, 1.0, -1.0}) {
     const LrcQ0 o = lrc_q0(L, S, 5, ZG, kX8.data(), Q, 1);
     // the bin4 formula
-    std::vector<double> q = L.qsrc->raw(5, ZG, kX8.data(), Q, 1), wt(5);
+    std::vector<double> q = L.qsrc->raw(5, ZG, kX8.data(), Q, 1, nullptr), wt(5);
     double sq = 0, sf = 0;
     for (int i = 0; i < 5; i++) sq += q[i], wt[i] = L.fukui(ZG[i]), sf += wt[i];
     for (int i = 0; i < 5; i++) wt[i] /= sf, q[i] += wt[i] * (Q - sq);
@@ -1020,4 +1057,206 @@ TEST_CASE("lrc edge-free: bare-ion forces of a conditioned model match central d
     CHECK(std::abs(Fu) > 1.0);
     CHECK(best < 0.05);
   }
+}
+
+// ---- periodic cells ----------------------------------------------------------------------------------------------------
+namespace {
+std::vector<double> cubic(double a) { return {a, 0, 0, 0, a, 0, 0, 0, a}; }
+// Na+, a water 3.4 A away, Cl- 5.5 A from the water (weak link) and 8-10 A from Na+ (inside the long-range switch)
+const std::vector<double> X5 = {0, 0, 0, 3.4, 0.1, 0.2, 4.3, 0.3, 0.1, 3.1, 1.0, -0.2, 9.6, 2.5, 0.4};
+constexpr double MADELUNG_SC = 2.837297479480620; // simple cubic, tin-foil, neutralising background
+struct NoQ final : LrcQSource { // a charge pass that must not run
+  std::vector<double> raw(int, const int32_t *, const double *, double, int, const double *) override {
+    throw std::logic_error("charge pass called");
+  }
+  void raw_vjp(int, const int32_t *, const double *, double, int, const double *, const double *, double *,
+               double *) override {
+    throw std::logic_error("charge pass called");
+  }
+};
+} // namespace
+
+TEST_CASE("lrc periodic: a bulk cell is one cluster, no long range, no charge pass", "[lrc][periodic]") {
+  SqeSpec S = sqe_spec();
+  S.lr_R = 10.0, S.lr_t = 2.0;
+  LrcSpec L = graph_spec();
+  L.qsrc = std::make_shared<NoQ>();
+  // rock salt, 2 x 2 x 2 sites 3 A apart in a 6 A cell: every atom linked to its images in all three directions
+  std::vector<double> x;
+  std::vector<int32_t> Z;
+  for (int a = 0; a < 2; a++)
+    for (int b = 0; b < 2; b++)
+      for (int c = 0; c < 2; c++) x.insert(x.end(), {3.0 * a + 0.1, 3.0 * b, 3.0 * c - 0.2}), Z.push_back((a + b + c) % 2 ? 17 : 11);
+  const auto h = cubic(6.0);
+  for (double Q : {0.0, 1.0}) {
+    const LrcCondition c = lrc_condition(L, S, 8, Z.data(), x.data(), Q, 10, 1, h.data());
+    CHECK(c.cl.bulk);
+    CHECK(c.cl.s == 1);
+    CHECK(!c.cl.images());
+    for (int i = 0; i < 8; i++) CHECK(c.row_charge[i] + double(c.blend[i]) == Approx(Q));
+    const LrcEnergy e = lrc_energy(L, S, c, 8, Z.data(), x.data(), Q, true);
+    CHECK(e.energy == 0.0);
+    for (double f : e.forces) CHECK(f == 0.0);
+    std::vector<double> F(24, 0.0), vir(9, 0.0);
+    lrc_condition_forces(L, S, c, 8, Z.data(), x.data(), {1.0}, F.data(), vir.data());
+    for (double f : F) CHECK(f == 0.0);
+  }
+}
+
+TEST_CASE("lrc periodic: one ion in a cubic cell has the Madelung energy", "[lrc][periodic]") {
+  SqeSpec S = sqe_spec();
+  S.lr_R = 10.0, S.lr_t = 2.0;
+  const LrcSpec L = graph_spec(6.0);
+  const int32_t Z1[] = {11};
+  const std::vector<double> x = {1.3, -0.4, 2.2};
+  for (double a : {12.0, 31.0})
+    for (double Q : {1.0, -1.0}) {
+      const auto h = cubic(a);
+      const LrcCondition c = lrc_condition(L, S, 1, Z1, x.data(), Q, 10, 1, h.data());
+      REQUIRE(c.cl.images());
+      const LrcEnergy e = lrc_energy(L, S, c, 1, Z1, x.data(), Q, true);
+      CHECK(e.q[0] == Approx(Q).margin(1e-14));
+      CHECK(e.energy == Approx(-KE * Q * Q * MADELUNG_SC / (2 * a)).epsilon(1e-10));
+      CHECK(std::abs(e.forces[0]) + std::abs(e.forces[1]) + std::abs(e.forces[2]) < 1e-10);
+      // E ~ 1 / a: dE/d strain = -E on the diagonal (three directions share it), zero off it
+      for (int k = 0; k < 9; k++) CHECK(e.virial[k] == Approx(k % 4 == 0 ? -e.energy / 3 : 0.0).margin(1e-10));
+    }
+}
+
+TEST_CASE("lrc periodic: separated clusters tend to the open structure as the cell grows", "[lrc][periodic]") {
+  SqeSpec S = sqe_spec();
+  S.lr_R = 10.0, S.lr_t = 2.0;
+  for (bool qp : {false, true})
+    for (double Q : {0.0, 1.0}) {
+      LrcSpec L = graph_spec(6.0);
+      L.qproj = qp;
+      const LrcCondition co = lrc_condition(L, S, 5, ZG, X5.data(), Q, 10, 1);
+      const double Eo = lrc_energy(L, S, co, 5, ZG, X5.data(), Q, false).energy;
+      REQUIRE(co.cl.s == 2);
+      std::vector<double> dev;
+      for (double a : {60.0, 120.0, 240.0}) {
+        const auto h = cubic(a);
+        const LrcCondition c = lrc_condition(L, S, 5, ZG, X5.data(), Q, 10, 1, h.data());
+        REQUIRE(c.cl.images());
+        REQUIRE(c.cl.s == 2);
+        for (int b = 0; b < 2; b++) CHECK(c.Qloc[b] == Approx(co.Qloc[b]).margin(1e-12));
+        // less the Madelung energy of the net charge, what is left (dipole and quadrupole terms) falls as 1 / a^3
+        dev.push_back(lrc_energy(L, S, c, 5, ZG, X5.data(), Q, false).energy - Eo + KE * Q * Q * MADELUNG_SC / (2 * a));
+      }
+      INFO("qproj " << qp << " Q " << Q << ": open " << Eo << ", deviations " << dev[0] << " " << dev[1] << " " << dev[2]);
+      CHECK(std::abs(dev[0]) < 0.05);
+      CHECK(std::abs(dev[1]) < std::abs(dev[0]) / 6 + 1e-9);
+      CHECK(std::abs(dev[2]) < std::abs(dev[1]) / 6 + 1e-9);
+    }
+}
+
+TEST_CASE("lrc periodic: separated clusters, forces and virial match central differences", "[lrc][periodic]") {
+  SqeSpec S = sqe_spec();
+  S.lr_R = 10.0, S.lr_t = 2.0;
+  const std::vector<double> h0 = {22, 0, 0, 3, 21, 0, -2, 4, 23}; // triclinic
+  // strained copies: x_a -> x_a + e x_b and the same for every lattice vector
+  auto strain = [](std::vector<double> v, int a, int b, double e) {
+    for (size_t i = 0; i < v.size() / 3; i++) v[3 * i + a] += e * v[3 * i + b];
+    return v;
+  };
+  for (bool qp : {false, true})
+    for (double Q : {0.0, 1.0}) {
+      LrcSpec L = graph_spec(6.0);
+      L.qproj = qp, L.qproj_w = 0.6;
+      auto energy = [&](const std::vector<double> &x, const std::vector<double> &h) {
+        const LrcCondition c = lrc_condition(L, S, 5, ZG, x.data(), Q, 10, 1, h.data());
+        return lrc_energy(L, S, c, 5, ZG, x.data(), Q, false).energy;
+      };
+      const LrcCondition c0 = lrc_condition(L, S, 5, ZG, X5.data(), Q, 10, 1, h0.data());
+      REQUIRE(c0.cl.images());
+      REQUIRE(c0.cl.s == 2);
+      REQUIRE(!c0.cl.trivial());
+      REQUIRE(c0.needs_cond_forces());
+      const LrcEnergy e0 = lrc_energy(L, S, c0, 5, ZG, X5.data(), Q, true);
+      double sum = 0;
+      for (double v : e0.q) sum += v;
+      CHECK(sum == Approx(Q).margin(1e-12));
+      double fmax = 0, err = 0;
+      for (size_t k = 0; k < 15; k++) {
+        const double num = -fd([&](const std::vector<double> &x) { return energy(x, h0); }, X5, k, 1e-5);
+        fmax = std::max(fmax, std::abs(num)), err = std::max(err, std::abs(num - e0.forces[k]));
+      }
+      double vmax = 0, verr = 0;
+      for (int a = 0; a < 3; a++)
+        for (int b = 0; b < 3; b++) {
+          const double ep = 1e-5;
+          const double num = (energy(strain(X5, a, b, ep), strain(h0, a, b, ep)) -
+                              energy(strain(X5, a, b, -ep), strain(h0, a, b, -ep))) / (2 * ep);
+          vmax = std::max(vmax, std::abs(num)), verr = std::max(verr, std::abs(num - e0.virial[3 * a + b]));
+        }
+      INFO("qproj " << qp << " Q " << Q << ": E " << e0.energy << ", max |F| " << fmax << " error " << err
+                    << ", max |virial| " << vmax << " error " << verr);
+      CHECK(fmax > 1e-4);
+      CHECK(err < 1e-6 * std::max(1.0, fmax));
+      CHECK(vmax > 1e-4);
+      CHECK(verr < 1e-6 * std::max(1.0, vmax));
+      // conditioning forces and virial
+      const double g[5] = {0.7, -0.3, 0.2, 0.5, -1.1};
+      auto fS = [&](const std::vector<double> &x, const std::vector<double> &h) {
+        const LrcCondition c = lrc_condition(L, S, 5, ZG, x.data(), Q, 10, 1, h.data());
+        double v = 0;
+        for (int i = 0; i < 5; i++) v += g[i] * (c.k[c.cl.sn[i]] + c.S[c.cl.sn[i]]);
+        return v;
+      };
+      std::vector<double> G(c0.cl.s, 0.0), F(15, 0.0), vir(9, 0.0);
+      for (int i = 0; i < 5; i++) G[c0.cl.sn[i]] += g[i];
+      lrc_condition_forces(L, S, c0, 5, ZG, X5.data(), G, F.data(), vir.data());
+      fmax = 0, err = 0, vmax = 0, verr = 0;
+      for (size_t k = 0; k < 15; k++) {
+        const double num = -fd([&](const std::vector<double> &x) { return fS(x, h0); }, X5, k, 1e-5);
+        fmax = std::max(fmax, std::abs(num)), err = std::max(err, std::abs(num - F[k]));
+      }
+      for (int a = 0; a < 3; a++)
+        for (int b = 0; b < 3; b++) {
+          const double ep = 1e-5;
+          const double num =
+              (fS(strain(X5, a, b, ep), strain(h0, a, b, ep)) - fS(strain(X5, a, b, -ep), strain(h0, a, b, -ep))) / (2 * ep);
+          vmax = std::max(vmax, std::abs(num)), verr = std::max(verr, std::abs(num - vir[3 * a + b]));
+        }
+      INFO("conditioning: max |F| " << fmax << " error " << err << ", max |virial| " << vmax << " error " << verr);
+      CHECK(fmax > 1e-3);
+      CHECK(err < 1e-6 * std::max(1.0, fmax));
+      CHECK(verr < 1e-6 * std::max(1.0, vmax));
+    }
+}
+
+TEST_CASE("lrc periodic: atoms moved by lattice vectors change nothing", "[lrc][periodic]") {
+  SqeSpec S = sqe_spec();
+  S.lr_R = 10.0, S.lr_t = 2.0;
+  LrcSpec L = graph_spec(6.0);
+  L.qproj = true;
+  const std::vector<double> h = {22, 0, 0, 3, 21, 0, -2, 4, 23};
+  std::vector<double> y = X5;
+  for (int a = 0; a < 3; a++) y[12 + a] -= h[a], y[3 + a] += h[3 + a] + h[6 + a], y[6 + a] += h[3 + a] + h[6 + a] - h[a];
+  const LrcCondition ca = lrc_condition(L, S, 5, ZG, X5.data(), 0.0, 10, 1, h.data());
+  const LrcCondition cb = lrc_condition(L, S, 5, ZG, y.data(), 0.0, 10, 1, h.data());
+  REQUIRE(cb.cl.s == ca.cl.s);
+  const LrcEnergy ea = lrc_energy(L, S, ca, 5, ZG, X5.data(), 0.0, true), eb = lrc_energy(L, S, cb, 5, ZG, y.data(), 0.0, true);
+  CHECK(eb.energy == Approx(ea.energy).epsilon(1e-10));
+  for (int k = 0; k < 15; k++) CHECK(eb.forces[k] == Approx(ea.forces[k]).margin(1e-10));
+  for (int k = 0; k < 9; k++) CHECK(eb.virial[k] == Approx(ea.virial[k]).margin(1e-10));
+  for (int i = 0; i < 5; i++) CHECK(eb.q[i] == Approx(ea.q[i]).margin(1e-12));
+}
+
+TEST_CASE("lrc periodic: slabs, wires and clusters linked to their own images are refused", "[lrc][periodic]") {
+  SqeSpec S = sqe_spec();
+  S.lr_R = 10.0, S.lr_t = 2.0;
+  const LrcSpec L = graph_spec(6.0);
+  const int32_t Z1[] = {11};
+  const std::vector<double> x1 = {0, 0, 0};
+  const std::vector<double> wire = {4, 0, 0, 0, 30, 0, 0, 0, 30}, slab = {4, 0, 0, 0, 4.5, 0, 0, 0, 30};
+  CHECK_THROWS(lrc_condition(L, S, 1, Z1, x1.data(), 1.0, 10, 1, wire.data()));
+  CHECK_THROWS(lrc_condition(L, S, 1, Z1, x1.data(), 1.0, 10, 1, slab.data()));
+  // a water whose H is 5.4 A from its own image's O: a weak link through the cell
+  const int32_t Zw[] = {8, 1, 1};
+  const std::vector<double> xw = {0, 0, 0, 0.96, 0, 0, -0.24, 0.93, 0}, hw = {6.5, 0, 0, 0, 30, 0, 0, 0, 30};
+  CHECK_THROWS(lrc_condition(L, S, 3, Zw, xw.data(), 0.0, 10, 1, hw.data()));
+  // a bulk cell is fine in any q0 mode; separated clusters need the graph mode
+  const LrcSpec Lf = lrc_spec();
+  CHECK_THROWS(lrc_condition(Lf, S, 5, ZG, X5.data(), 0.0, 10, 1, cubic(40.0).data()));
 }
