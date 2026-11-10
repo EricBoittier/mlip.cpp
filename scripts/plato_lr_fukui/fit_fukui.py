@@ -34,7 +34,7 @@ ap.add_argument("--clip", type=float, default=-1.0, help="gradient-norm clip (de
 ap.add_argument("--lr", type=float, default=1e-3)
 ap.add_argument("--wf", type=float, default=10.0)
 ap.add_argument("--wr", type=float, default=-1.0, help="raw cluster-sum anchor weight (e^2): (sum_c q_raw - sum_c q_DFT)^2 "
-                "per 8 A cluster; default 1 for atom_cluster (the plateau leaves the raw cluster totals a flat direction "
+                "per 8 A cluster of multi-cluster structures; default 1 for atom_cluster (the plateau leaves the raw cluster totals a flat direction "
                 "that drifts across the plateau edge without it), 0 otherwise")
 ap.add_argument("--fit", default="/home/boittier/data/petlr-chargehead/fit")
 ap.add_argument("--ipea", default="/home/boittier/data/plato-lr-scratch/ipea")
@@ -225,7 +225,7 @@ def loss_terms(model, ds):
         qk = q[off[k]:off[k + 1]]
         if d["lw"] is not None:
             lw = torch.tensor(d["lw"], dtype=torch.float32)
-            if WR > 0:
+            if WR > 0 and int(d["cl"].max()) > 0:  # multi-cluster structures only (one cluster: AC == A, nothing to anchor)
                 c = torch.tensor(d["cl"]); K = int(c.max()) + 1
                 lr = lr + ((torch.zeros(K).index_add_(0, c, raw[off[k]:off[k + 1]]) - torch.zeros(K).index_add_(0, c, lw)) ** 2).sum()
                 nr += K
@@ -316,9 +316,9 @@ for tag, sp in (("omol", "val"), ("mono", "val")):
         r["dipole_mae_au"] = float(np.mean([np.linalg.norm((q[:, None] * d["Xc"]).sum(0) - d["mu"]) for d, q in zip(ds, qs)]))
     res[f"{tag}_{sp}"] = r
 with torch.no_grad():
-    _, per_test = fukui_loss(model, fukui_pairs(sorted(test_par)))
+    per_test = fukui_loss(model, fukui_pairs(sorted(test_par)))[1] if test_par else []
     _, per_all = fukui_loss(model, fukui_pairs(parents))
-res["fukui_test_mae"] = float(np.mean(np.concatenate([np.abs(m - d) for _, _, m, d in per_test])))
+res["fukui_test_mae"] = float(np.mean(np.concatenate([np.abs(m - d) for _, _, m, d in per_test]))) if per_test else None
 json.dump(res, open(a.out + ".json", "w"), indent=1)
 pickle.dump({"points": points, "fukui_test": per_test, "fukui_all": per_all, "test_parents": sorted(test_par)},
             open(a.out + "_pred.pkl", "wb"))

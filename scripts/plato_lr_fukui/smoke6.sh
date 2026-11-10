@@ -8,4 +8,7 @@ read -r dd ee tt <<< "$(cat $M/$a.data)"; cp -n $M/q.gguf $d/ 2>/dev/null
 $B/$tb/mlipcpp-train --data $dd --exclude $ee --init $M/$a.gguf -o $d/model.gguf --gpus 1 --epochs 2 --max-steps 40 --conservative \
   --energy-weight 1 --force-weight 1 --nc-force-weight 0 $(cat $B/opt/chosen.args) --warmup-fraction 0.02 --seed 13 --threads 16 \
   --cache-dir $B/nlcache --log-every 10 $tt > $d/train.log 2>&1
-echo "$a $tb rc=$? $(grep -o '[0-9.]* struct/s' $d/train.log | tail -1)"
+rc=$?
+# checkpoints copy the init's metadata: the Fukui keys must survive (else evals would score the arm in E mode)
+keys=$(strings -n 8 $d/model.gguf | grep -c "lrc_fukui_mode\|lrc_fmodel")
+echo "$a $tb rc=$rc $(grep -o '[0-9.]* struct/s' $d/train.log | tail -1) fukui_keys_in_ckpt=$keys (init: $(strings -n 8 $M/$a.gguf | grep -c "lrc_fukui_mode\|lrc_fmodel"))"
