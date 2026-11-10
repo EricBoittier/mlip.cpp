@@ -38,7 +38,9 @@ import yaml
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
-PETJAX_CONVERT = Path.home() / "data/plato-lr-scratch/pet_lr_port/src/petjax/convert.py"
+# pet-jax c3f216c petjax/convert.py (his source, not vendored here); override with PETJAX_CONVERT
+PETJAX_CONVERT = Path(__import__("os").environ.get(
+    "PETJAX_CONVERT", Path.home() / "data/plato-lr-scratch/pet_lr_port/src/petjax/convert.py"))
 
 
 def load_petjax_convert(path):
