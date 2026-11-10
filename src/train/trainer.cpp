@@ -1063,10 +1063,17 @@ void Worker::lrc_prepare(const Batch &b, bool forces) {
   int a0 = 0;
   for (int k = 0; k < b.n_real_systems; k++) {
     const int ns = b.n_per_system[k];
-    // periodic structures only with lrc_intra (fully periodic cells: bulk, or separated clusters; no stress loss here)
-    if (b.periodic[k] && !lrc->intra) throw std::runtime_error("lrc: periodic structures are not supported");
+    // periodic structures only with lrc_intra (fully periodic cells: bulk, or separated clusters; no stress loss here);
+    // slabs (one zero cell row) only with lrc_slab (absent: taken as open structures, as before)
+    int nrow = 0;
+    for (int r = 0; r < 3; r++) nrow += b.cells[k][3 * r] != 0 || b.cells[k][3 * r + 1] != 0 || b.cells[k][3 * r + 2] != 0;
+    const bool slab = !b.periodic[k] && nrow == 2 && lrc->slab != runtime::LrcSpec::Slab::None;
+    if ((b.periodic[k] || slab) && !lrc->intra) throw std::runtime_error("lrc: periodic structures are not supported");
+    if (slab && model_.plato_lr().long_range()) // its mesh / LES would take the slab as an open structure
+      throw std::runtime_error("lrc_slab: (T, T, F) training slabs with the Plato mesh / LES heads are not supported; "
+                               "store them as full cells with vacuum and set lrc_slab_gap");
     std::vector<double> cell;
-    if (b.periodic[k]) cell.assign(b.cells[k].begin(), b.cells[k].end());
+    if (b.periodic[k] || slab) cell.assign(b.cells[k].begin(), b.cells[k].end());
     std::vector<double> x(b.positions.begin() + 3 * size_t(a0), b.positions.begin() + 3 * size_t(a0 + ns));
     const int32_t *Z = b.atomic_number.data() + a0;
     const int spin = b.atom_spin.empty() ? 1 : int(b.atom_spin[a0]);
@@ -2408,6 +2415,11 @@ void train(const TrainOptions &o) {
         fmt::print("lrc: q0 mode graph (frozen backbone charge head {} + element Fukui equilibration), fixed-charge "
                    "inter-cluster Coulomb, switch {} -> {} A, clusters a_on {} A, a_off {} A, local-charge conditioning\n",
                    L.qmodel, g_sqe.lr_R - g_sqe.lr_t, g_sqe.lr_R, L.a_on, L.a_off);
+      if (L.slab != runtime::LrcSpec::Slab::None)
+        fmt::print("lrc: lrc_slab = {}: slabs (a zero cell row{}) as 2D-periodic tilings, {}\n",
+                   L.slab == runtime::LrcSpec::Slab::YB ? "yb" : "ewald2d",
+                   L.slab_gap > 0 ? fmt::format(", or an empty layer >= {} A in a full cell", L.slab_gap) : "",
+                   L.slab == runtime::LrcSpec::Slab::YB ? "Yeh-Berkowitz + net-charge terms" : "exact 2D Ewald");
       if (L.intra)
         fmt::print("lrc: lrc_intra = ewald: the Coulomb term acts on every pair beyond the switch, inside clusters too "
                    "(open: direct sum; periodic: Ewald, tin-foil, neutralising background); the charge pass runs on every "

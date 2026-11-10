@@ -55,10 +55,44 @@
 // tin-foil boundary, neutralising background for a charged cell (-pi Q^2 / 2 V alpha^2; the open limit differs by the
 // Madelung term of the net charge, -alpha_M KE Q^2 / 2 L). The clusters, their reliabilities, the local-charge
 // conditioning and lrc_qproj's link states are unchanged (only the energy loses its mask). Graph q0 mode without
-// lrc_mp / lrc_pol only. Slabs (Yeh-Berkowitz) are not handled: a slab still throws in the cluster code.
+// lrc_mp / lrc_pol only.
+//
+// Slabs (pet.plato_lr.lrc_slab = "yb" | "ewald2d"; absent key or "none" = slabs throw, everything else bit for bit):
+// periodic in two lattice directions, open along the third. Detection:
+//  - pbc (T, T, F) (any one direction open): the cell given to the lrc functions has that row ZERO (graph_model and
+//    mlipcpp-train pass it so; the training data already store an open direction as a zero cell row);
+//  - pbc (T, T, T) with pet.plato_lr.lrc_slab_gap = g > 0 (A): a cell whose atoms leave an empty layer at least g wide
+//    across exactly one lattice direction is a slab open along it (the classic Yeh-Berkowitz setting: the given cell
+//    height is the elongated cell; atoms are unwrapped across the gap). g must exceed a_off and lr_R. Absent / 0: off,
+//    so a (T, T, T) cell with vacuum stays a 3D-periodic system (tin-foil Ewald, as periodic DFT without a dipole
+//    correction). In MD the rule is evaluated per structure: if molecules (vapour) leave no empty layer >= g, the cell
+//    falls back to 3D tin-foil (under lrc_intra; the energy jumps by about the dipole term) or throws, and a molecule
+//    crossing the cell boundary along the normal moves to the other side of the unwrapped slab. Pick g below the
+//    smallest vacuum the trajectory keeps; (T, T, F) has neither issue.
+// Models with the Plato mesh / LES heads (pet.plato_lr.mesh_coupling / les, e.g. the FTq family) refuse (T, T, F) cells
+// in the backbone (and mlipcpp-train refuses such slabs for them): give these a (T, T, T) cell with vacuum and the gap
+// rule; mesh / LES then see a 3D-periodic cell, the lrc term the slab.
+// Electrostatics of the 2D-periodic tiling (n the unit normal, z_i = n . x_i unwrapped, A the in-plane area):
+//  - "yb" (default): 3D Ewald (tin-foil, neutralising background) in an elongated cell of height Lz plus the
+//    Yeh-Berkowitz dipole term with Ballenegger-Arnold-Cerda's net-charge terms,
+//      E_c = 2 pi / V [ M_z^2 - Q sum_i q_i z_i^2 - Q^2 Lz^2 / 12 ],   M_z = sum_i q_i z_i,  V = A Lz,
+//    which equals the exact 2D Ewald energy up to the interactions of the elongated cell's z-images beyond the mean
+//    field, O(exp(-2 pi gap / L_inplane)). (T, T, F): Lz is internal, the slab extent plus a vacuum of
+//    max(lrc_slab_vacuum, 4 L_inplane, lr_R + 1) rounded up to 4 A steps (locally constant, so forces are exact; the
+//    energy steps by ~1e-11 relative where the extent crosses a step). (T, T, T) + gap: Lz the given cell's height.
+//  - "ewald2d": the exact 2D Ewald sum (Parry / de Leeuw-Perram, O(N^2) per in-plane wave vector; validation).
+//  Net charge: the h = 0 divergence of the 2D sum is dropped (the standard convention; with it E depends only on the
+//  z_ij, so a charged slab is translation invariant along n). Forces are those of the 2D-periodic system.
+// Clusters: one cluster through every in-plane image is the slab analogue of a bulk cell (conditioned on Q; no long
+// range without lrc_intra); finite clusters in the 2D tiling are separated clusters (inter-cluster sum over the images,
+// as for 3D cells). A slab beside separate molecules (or any cluster wrapping only some periodic directions) needs
+// lrc_intra (the energy does not depend on the clusters then); weak links to a wrapping cluster then use their
+// image displacements (R on the quotient graph of the cell's super-nodes). With lrc_slab set, (T, T, T) cells with such
+// layered clusters also run under lrc_intra (3D Ewald).
 
 #include "sqe.h"
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -171,6 +205,11 @@ struct LrcSpec {
   double qproj_w = 0.6;
   // pet.plato_lr.lrc_intra = "ewald": the long-range energy also inside clusters and bulk cells (header comment above)
   bool intra = false;
+  // slabs (header comment above): lrc_slab mode, the (T, T, F) minimum vacuum (A, 0 = automatic), the (T, T, T) gap rule
+  // (A, 0 = off); slab_rc: real-space cutoff override of the slab Ewald sums (A, 0 = automatic; tests, not in the GGUF)
+  enum class Slab { None, YB, Ewald2D };
+  Slab slab = Slab::None;
+  double slab_vacuum = 0, slab_gap = 0, slab_rc = 0;
   bool pol = false;
   std::vector<int32_t> pol_Z;
   std::vector<double> pol_alpha;
@@ -213,6 +252,14 @@ struct LrcClusters {
   // component unwrapped across the cell, so that its links are plain differences of xh (xh = x when open)
   std::vector<double> cell, xh;
   bool bulk = false;
+  // slabs: the open lattice direction (-1: none), whether some cluster wraps only part of the periodic directions
+  // (layered: xh = x, weak links carry their image displacement wd), and per atom the multiple of the open row added
+  // to unwrap it across the vacuum ((T, T, T) gap rule only; empty otherwise)
+  int open = -1;
+  bool layered = false;
+  std::vector<std::array<double, 3>> wd;
+  std::vector<int32_t> zshift;
+  bool slab() const { return open >= 0; }
   bool periodic() const { return !cell.empty(); }
   bool images() const { return periodic() && !bulk; } // the long range runs over the periodic images
   bool trivial() const; // one super-node, or no weak links (R binary)
@@ -239,7 +286,8 @@ struct LrcEnergy {
 
 int lrc_index(const SqeSpec &sqe, int z); // element index, throws when absent
 
-/// cell (here and below): the lattice vectors as rows (9, A), all three directions periodic; null for open structures
+/// cell (here and below): the lattice vectors as rows (9, A), all three directions periodic, or one row zero for a slab
+/// open along it (needs lrc_slab); null for open structures
 LrcQ0 lrc_q0(const LrcSpec &L, const SqeSpec &sqe, int n, const int32_t *Z, const double *x, double Q, int spin = 1,
              const double *cell = nullptr);
 /// dE/dx (added into g, [3n]) of sum_i c_i q0_i(x); vir (periodic, may be null) += its strain derivative

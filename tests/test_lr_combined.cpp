@@ -1793,3 +1793,488 @@ TEST_CASE("lrc intra: unsupported combinations throw", "[lrc][intra]") {
   Lm.pol = true, Lm.pol_Z = {8}, Lm.pol_alpha = {1.0};
   CHECK_THROWS(lrc_condition(Lm, S, 5, ZG, kX8.data(), 0.0, 10, 1));
 }
+
+// ---- lrc_slab: slabs (2D-periodic, open along one lattice direction) --------------------------------------------------
+namespace {
+// partner images for the toy charge passes: two cells in every periodic (nonzero) row, none along a zero (open) row
+template <class F> void pairs_pbc(int n, const double *x, const double *cell, F &&f) {
+  int m[3] = {0, 0, 0};
+  for (int k = 0; k < 3 && cell; k++) m[k] = (cell[3 * k] || cell[3 * k + 1] || cell[3 * k + 2]) ? 2 : 0;
+  for (int i = 0; i < n; i++)
+    for (int j = 0; j < n; j++)
+      for (int s0 = -m[0]; s0 <= m[0]; s0++)
+        for (int s1 = -m[1]; s1 <= m[1]; s1++)
+          for (int s2 = -m[2]; s2 <= m[2]; s2++) {
+            if (i == j && !s0 && !s1 && !s2) continue;
+            double d[3], r2 = 0;
+            for (int k = 0; k < 3; k++) {
+              d[k] = x[3 * j + k] - x[3 * i + k];
+              if (cell) d[k] += s0 * cell[k] + s1 * cell[3 + k] + s2 * cell[6 + k];
+              r2 += d[k] * d[k];
+            }
+            f(i, j, d, std::sqrt(r2));
+          }
+}
+// ToyQ (position-dependent, smooth, cut at rcut) over the slab's images
+struct ToyQ2 final : LrcQSource {
+  ToyQ t;
+  explicit ToyQ2(double rcut) { t.rcut = rcut; }
+  std::vector<double> raw(int n, const int32_t *Z, const double *x, double Q, int, const double *cell) override {
+    std::vector<double> q(n);
+    for (int i = 0; i < n; i++) q[i] = ToyQ::a(Z[i]) + 0.1 * Q;
+    pairs_pbc(n, x, cell, [&](int i, int j, const double *, double r) {
+      double dt;
+      q[i] += ToyQ::b(Z[i], Z[j]) * t.t(r, dt);
+    });
+    return q;
+  }
+  void raw_vjp(int n, const int32_t *Z, const double *x, double, int, const double *cell, const double *w, double *g,
+               double *vir) override {
+    pairs_pbc(n, x, cell, [&](int i, int j, const double *d, double r) {
+      double dt;
+      t.t(r, dt);
+      const double f = w[i] * ToyQ::b(Z[i], Z[j]) * dt / r;
+      for (int k = 0; k < 3; k++) {
+        g[3 * j + k] += f * d[k], g[3 * i + k] -= f * d[k];
+        if (vir && cell)
+          for (int l = 0; l < 3; l++) vir[3 * k + l] += f * d[k] * d[l];
+      }
+    });
+  }
+};
+LrcSpec slab_spec(LrcSpec::Slab mode, std::shared_ptr<LrcQSource> src, bool intra = true) {
+  LrcSpec L = graph_spec(5.0);
+  L.qsrc = src ? std::move(src) : std::make_shared<ToyQ2>(5.0);
+  L.intra = intra, L.slab = mode;
+  return L;
+}
+// rock-salt (100) slab: in-plane conventional a x a (4 ions per layer, layers a / 2 apart), the open row zero; rattle
+// deterministic; z0 the first layer; skew shears the in-plane cell (triclinic)
+void nacl_slab(double a, int layers, double rattle, double z0, std::vector<double> &x, std::vector<int32_t> &Z,
+               std::vector<double> &h, double skew = 0) {
+  x.clear(), Z.clear();
+  int k = 0;
+  for (int l = 0; l < layers; l++)
+    for (int i = 0; i < 2; i++)
+      for (int j = 0; j < 2; j++, k++) {
+        x.insert(x.end(), {0.5 * a * i + skew * 0.5 * a * j + rattle * std::sin(1.3 * k + 0.2),
+                           0.5 * a * j + rattle * std::sin(2.1 * k + 0.5), z0 + 0.5 * a * l + rattle * std::sin(0.7 * k + 1.1)});
+        Z.push_back((i + j + l) % 2 ? 17 : 11);
+      }
+  h = {a, 0, 0, skew * a, a, 0, 0, 0, 0};
+}
+struct SlabRun {
+  LrcCondition c;
+  LrcEnergy e;
+};
+SlabRun slab_run(const LrcSpec &L, const SqeSpec &S, const std::vector<double> &x, const std::vector<int32_t> &Z,
+                 const std::vector<double> &h, double Q, bool forces) {
+  const int n = int(Z.size());
+  SlabRun r{lrc_condition(L, S, n, Z.data(), x.data(), Q, 10, 1, h.data()), {}};
+  r.e = lrc_energy(L, S, r.c, n, Z.data(), x.data(), Q, forces);
+  return r;
+}
+double slab_E(const LrcSpec &L, const SqeSpec &S, const std::vector<double> &x, const std::vector<int32_t> &Z,
+              const std::vector<double> &h, double Q) {
+  return slab_run(L, S, x, Z, h, Q, false).e.energy;
+}
+} // namespace
+
+TEST_CASE("lrc slab: without lrc_slab a slab still throws; wires always throw", "[lrc][slab]") {
+  const SqeSpec S = intra_sqe();
+  std::vector<double> x, h;
+  std::vector<int32_t> Z;
+  nacl_slab(5.64, 4, 0.0, 0.0, x, Z, h);
+  for (bool intra : {false, true}) {
+    LrcSpec L = slab_spec(LrcSpec::Slab::None, std::make_shared<FixedQ>(), intra);
+    CHECK_THROWS(lrc_condition(L, S, int(Z.size()), Z.data(), x.data(), 0.0, 10, 1, h.data()));
+    L.slab = LrcSpec::Slab::YB;
+    const std::vector<double> wire = {5.64, 0, 0, 0, 0, 0, 0, 0, 0};
+    CHECK_THROWS(lrc_condition(L, S, int(Z.size()), Z.data(), x.data(), 0.0, 10, 1, wire.data()));
+    // (T, T, T) with vacuum and no gap rule: layered, so only with lrc_intra
+    const std::vector<double> h3 = {5.64, 0, 0, 0, 5.64, 0, 0, 0, 60};
+    if (intra) CHECK_NOTHROW(slab_E(L, S, x, Z, h3, 0.0));
+    else CHECK_THROWS(lrc_condition(L, S, int(Z.size()), Z.data(), x.data(), 0.0, 10, 1, h3.data()));
+  }
+}
+
+TEST_CASE("lrc slab: the exact 2D sum and Yeh-Berkowitz do not depend on the Ewald splitting (neutral, charged)",
+          "[lrc][slab]") {
+  const SqeSpec S = intra_sqe();
+  std::vector<double> x, h;
+  std::vector<int32_t> Z;
+  nacl_slab(5.64, 4, 0.15, 1.0, x, Z, h, 0.2);
+  for (auto mode : {LrcSpec::Slab::Ewald2D, LrcSpec::Slab::YB})
+    for (double Q : {0.0, 1.0, -2.0}) {
+      std::vector<double> Es;
+      for (double rc : {10.0, 12.5, 16.0}) {
+        LrcSpec L = slab_spec(mode, std::make_shared<FixedQ>());
+        L.slab_rc = rc;
+        Es.push_back(slab_E(L, S, x, Z, h, Q));
+      }
+      std::printf("SLAB-ALPHA %s Q %+.0f: E %.12f, spread over rc 10 / 12.5 / 16 A: %.2e %.2e eV\n",
+                  mode == LrcSpec::Slab::YB ? "yb     " : "ewald2d", Q, Es[0], Es[1] - Es[0], Es[2] - Es[0]);
+      CHECK(std::abs(Es[1] - Es[0]) < 1e-10);
+      CHECK(std::abs(Es[2] - Es[0]) < 1e-10);
+    }
+}
+
+TEST_CASE("lrc slab: Yeh-Berkowitz (automatic vacuum) equals the exact 2D sum; classic YB converges with the vacuum",
+          "[lrc][slab]") {
+  const SqeSpec S = intra_sqe();
+  std::vector<double> x, h;
+  std::vector<int32_t> Z;
+  nacl_slab(5.64, 5, 0.15, 1.0, x, Z, h, 0.2); // 5 layers: a net dipole along z, and position-dependent charges
+  const int n = int(Z.size());
+  for (double Q : {0.0, 1.0}) {
+    const double E2 = slab_E(slab_spec(LrcSpec::Slab::Ewald2D, nullptr), S, x, Z, h, Q);
+    const double Ey = slab_E(slab_spec(LrcSpec::Slab::YB, nullptr), S, x, Z, h, Q);
+    // classic Yeh-Berkowitz: a (T, T, T) cell of height thickness + vacuum, the slab found by the gap rule
+    double lo = 1e9, hi = -1e9;
+    for (int i = 0; i < n; i++) lo = std::min(lo, x[3 * i + 2]), hi = std::max(hi, x[3 * i + 2]);
+    std::vector<double> dev;
+    for (double vac : {11.0, 15.0, 20.0, 30.0, 45.0}) {
+      LrcSpec L = slab_spec(LrcSpec::Slab::YB, nullptr);
+      L.slab_gap = 10.5;
+      std::vector<double> h3 = h;
+      h3[8] = hi - lo + vac;
+      std::vector<double> xs = x;
+      for (int i = 0; i < n; i++) xs[3 * i + 2] += i % 3 == 0 ? h3[8] : 0.0; // some atoms wrapped across the cell
+      const SlabRun r = slab_run(L, S, xs, Z, h3, Q, false);
+      REQUIRE(r.c.cl.open == 2);
+      dev.push_back(r.e.energy - E2);
+    }
+    std::printf("SLAB-YB Q %+.0f: E_2D %.10f eV, YB(auto) - 2D %.2e; classic YB - 2D at vacuum 11 / 15 / 20 / 30 / 45 A: "
+                "%.2e %.2e %.2e %.2e %.2e\n",
+                Q, E2, Ey - E2, dev[0], dev[1], dev[2], dev[3], dev[4]);
+    CHECK(std::abs(Ey - E2) < 1e-9);
+    CHECK(std::abs(dev[4]) < 1e-9);
+    for (int k = 0; k + 1 < 4; k++) CHECK(std::abs(dev[k + 1]) < std::abs(dev[k]) + 1e-12);
+  }
+}
+
+TEST_CASE("lrc slab: a finite cluster in a growing in-plane cell tends to the open direct sum", "[lrc][slab]") {
+  const SqeSpec S = intra_sqe();
+  std::vector<int32_t> Zc;
+  const std::vector<double> xc = chain(Zc);
+  const int n = int(Zc.size());
+  for (auto mode : {LrcSpec::Slab::YB, LrcSpec::Slab::Ewald2D})
+    for (double Q : {0.0, 1.0}) {
+      const LrcSpec L = slab_spec(mode, std::make_shared<ToyQ2>(6.0));
+      const LrcSpec Li = slab_spec(mode, std::make_shared<FixedQ>());
+      const LrcCondition co = lrc_condition(L, S, n, Zc.data(), xc.data(), Q, 10, 1);
+      const double Eo = lrc_energy(L, S, co, n, Zc.data(), xc.data(), Q, false).energy;
+      std::vector<double> dev;
+      const int32_t Z1[] = {11};
+      for (double a : {40.0, 80.0, 160.0, 320.0}) {
+        const std::vector<double> h = {a, 0, 0, 0, a, 0, 0, 0, 0};
+        const SlabRun r = slab_run(L, S, xc, Zc, h, Q, false);
+        REQUIRE(r.c.cl.images());
+        // the 2D lattice energy of the net charge (one point charge per cell, the h = 0 term dropped: ~ Q^2 / L)
+        const double Eq = Q == 0 ? 0.0 : slab_E(Li, S, {0.3, 0.1, 0.2}, std::vector<int32_t>(Z1, Z1 + 1), h, 1.0);
+        dev.push_back(r.e.energy - Eo - Q * Q * Eq);
+      }
+      std::printf("SLAB-OPEN %s Q %+.0f: E_open %.8f; E_slab - E_open - Q^2 E_point at L = 40 / 80 / 160 / 320 A: "
+                  "%.3e %.3e %.3e %.3e (ratios %.2f %.2f %.2f)\n",
+                  mode == LrcSpec::Slab::YB ? "yb     " : "ewald2d", Q, Eo, dev[0], dev[1], dev[2], dev[3],
+                  dev[0] / dev[1], dev[1] / dev[2], dev[2] / dev[3]);
+      // neutral: dipole-dipole lattice sums, 1 / L^3; charged, less the point-charge lattice: 1 / L^2 or faster
+      for (int k = 0; k < 3; k++) CHECK(std::abs(dev[k + 1]) < std::abs(dev[k]) / 3.5 + 1e-10);
+    }
+}
+
+TEST_CASE("lrc slab: forces and virial match differences (slab, separated clusters, slab beside a molecule)",
+          "[lrc][slab]") {
+  const SqeSpec S = intra_sqe();
+  std::vector<double> xs, hs;
+  std::vector<int32_t> Zs;
+  nacl_slab(5.64, 3, 0.12, 0.5, xs, Zs, hs, 0.15);
+  // slab + Na+ 7.5 A above the top layer (outside a_off = 6: its own cluster; within the 8-10 A switch of some ions) +
+  // a water 5.5 A from the Na+ (weak link) -> layered
+  std::vector<double> xm = xs;
+  std::vector<int32_t> Zm = Zs;
+  const double top = 0.5 + 5.64 + 7.5;
+  xm.insert(xm.end(), {1.1, 0.7, top, 1.3, 0.9, top + 5.5, 2.2, 1.0, top + 5.6, 1.0, 1.6, top + 5.9});
+  Zm.insert(Zm.end(), {11, 8, 1, 1});
+  struct Case {
+    const char *name;
+    std::vector<double> x, h;
+    std::vector<int32_t> Z;
+    bool intra;
+    double gap = 0;
+  };
+  const std::vector<double> hsep = {21, 0, 0, 3, 22, 0, 0, 0, 0};
+  // (T, T, T) + gap rule: the slab + molecules in a cell with a tilted c row, some atoms wrapped across the vacuum
+  std::vector<double> hg = hs, xg = xm;
+  hg[6] = 1.5, hg[7] = -0.8, hg[8] = 42.0;
+  for (size_t i = 0; i < xg.size() / 3; i += 3)
+    for (int a = 0; a < 3; a++) xg[3 * i + a] += (i % 2 ? 1.0 : -1.0) * hg[6 + a];
+  std::vector<Case> cases = {{"slab (bulk-like)", xs, hs, Zs, true},
+                             {"separated X5", X5, hsep, std::vector<int32_t>(ZG, ZG + 5), true},
+                             {"separated X5 inter", X5, hsep, std::vector<int32_t>(ZG, ZG + 5), false},
+                             {"slab + molecules", xm, hs, Zm, true},
+                             {"gap rule, tilted c", xg, hg, Zm, true, 10.5}};
+  for (auto mode : {LrcSpec::Slab::YB, LrcSpec::Slab::Ewald2D})
+    for (const Case &cs : cases)
+      for (bool qp : {false, true})
+        for (double Q : {0.0, 1.0}) {
+          LrcSpec L = slab_spec(mode, nullptr, cs.intra);
+          L.qproj = qp, L.slab_gap = cs.gap;
+          const int n = int(cs.Z.size());
+          auto energy = [&](const std::vector<double> &x, const std::vector<double> &h) { return slab_E(L, S, x, cs.Z, h, Q); };
+          const SlabRun r0 = slab_run(L, S, cs.x, cs.Z, cs.h, Q, true);
+          REQUIRE(r0.c.cl.slab());
+          if (cs.gap > 0) CHECK(r0.c.cl.zshift.size() == cs.Z.size());
+          double sum = 0;
+          for (double v : r0.e.q) sum += v;
+          CHECK(sum == Approx(Q).margin(1e-12));
+          double fmax = 0, err = 0, vmax = 0, verr = 0;
+          for (size_t k = 0; k < cs.x.size(); k++) {
+            // steps: the toy charge pass makes the 5th derivatives large here; the differences converge as h^4
+            // (virial: 4e-4 / 1e-4 / 2.5e-5 -> 2e-5 / 4e-8 / 1e-9 eV), so the steps are smaller than in the 3D tests
+            const double hfd = std::getenv("SLAB_H") ? std::atof(std::getenv("SLAB_H")) : 5e-4;
+            const double num = -fd4([&](const std::vector<double> &x) { return energy(x, cs.h); }, cs.x, k, hfd);
+            fmax = std::max(fmax, std::abs(num)), err = std::max(err, std::abs(num - r0.e.forces[k]));
+          }
+          for (int a = 0; a < 3; a++)
+            for (int b = 0; b < 3; b++) {
+              const double ep = std::getenv("SLAB_EP") ? std::atof(std::getenv("SLAB_EP")) : 2.5e-5;
+              auto at = [&](double s) { return energy(strained(cs.x, a, b, s * ep), strained(cs.h, a, b, s * ep)); };
+              const double num = (8 * (at(1) - at(-1)) - (at(2) - at(-2))) / (12 * ep);
+              vmax = std::max(vmax, std::abs(num)), verr = std::max(verr, std::abs(num - r0.e.virial[3 * a + b]));
+            }
+          std::printf("SLAB-FD %s %-19s qproj %d Q %+.0f: E %+.6e eV, layered %d, max |F| %.3e err %.2e eV/A, "
+                      "max |vir| %.3e err %.2e eV\n",
+                      mode == LrcSpec::Slab::YB ? "yb     " : "ewald2d", cs.name, qp, Q, r0.e.energy, int(r0.c.cl.layered),
+                      fmax, err, vmax, verr);
+          CHECK(fmax > 1e-3);
+          CHECK(err < 1e-8);
+          CHECK(vmax > 1e-3);
+          CHECK(verr < 1e-8);
+          (void)n;
+        }
+}
+
+TEST_CASE("lrc slab: layered conditioning (a molecule weakly linked to a slab) has exact conditioning forces",
+          "[lrc][slab]") {
+  const SqeSpec S = intra_sqe();
+  std::vector<double> x, h;
+  std::vector<int32_t> Z;
+  nacl_slab(5.64, 2, 0.1, 0.0, x, Z, h);
+  // a Cl- 5.4 A above the top layer: inside the a_on / a_off = 5 / 6 A link window of several slab ions (and images)
+  x.insert(x.end(), {1.0, 0.6, 2.82 + 5.4});
+  Z.push_back(17);
+  const int n = int(Z.size());
+  for (bool qp : {false, true}) {
+    LrcSpec L = slab_spec(LrcSpec::Slab::YB, nullptr);
+    L.qproj = qp;
+    const LrcCondition c = lrc_condition(L, S, n, Z.data(), x.data(), -1.0, 10, 1, h.data());
+    REQUIRE(c.cl.layered);
+    REQUIRE(c.cl.s == 2);
+    CHECK(c.cl.R[1] > 0.01);
+    CHECK(c.cl.R[1] < 0.99);
+    const std::vector<double> G = {0.7, -1.3};
+    std::vector<double> F(3 * size_t(n), 0.0);
+    lrc_condition_forces(L, S, c, n, Z.data(), x.data(), G, F.data());
+    double err = 0, fmax = 0;
+    for (int k = 0; k < 3 * n; k++) {
+      const double num = -fd4(
+          [&](const std::vector<double> &y) {
+            const LrcCondition cc = lrc_condition(L, S, n, Z.data(), y.data(), -1.0, 10, 1, h.data());
+            REQUIRE(cc.cl.s == 2);
+            return G[0] * cc.S[cc.cl.sn[0]] + G[1] * cc.S[cc.cl.sn[n - 1]];
+          },
+          x, k, 1e-4);
+      fmax = std::max(fmax, std::abs(num)), err = std::max(err, std::abs(num - F[k]));
+    }
+    std::printf("SLAB-COND qproj %d: R_slab,ion %.4f, max |F_cond| %.3e, err %.2e\n", qp, c.cl.R[1], fmax, err);
+    CHECK(fmax > 1e-3);
+    CHECK(err < 1e-8);
+  }
+}
+
+TEST_CASE("lrc slab: parallel-plate capacitor and like-charged planes: energy slope and field are analytic",
+          "[lrc][slab]") {
+  // two square planes of formal ions (spacing 3 A, 4 per 6 x 6 A cell) at z = 0 and d; the switch (0.5 -> 1 A) lies below
+  // every distance, so the sum is the bare Coulomb energy. Uniform sheets: dE/dd = -2 pi KE Q1 Q2 / A and every ion of
+  // plane 2 feels the field 2 pi KE Q1 / A of plane 1 (corrugation ~ exp(-2 pi d / 3 A))
+  const SqeSpec S = intra_sqe(1.0, 0.5);
+  const std::vector<double> h = {6, 0, 0, 0, 6, 0, 0, 0, 0};
+  const double A = 36;
+  for (auto mode : {LrcSpec::Slab::YB, LrcSpec::Slab::Ewald2D})
+    for (int like : {0, 1}) {
+      const LrcSpec L = slab_spec(mode, std::make_shared<FixedQ>());
+      auto build = [&](double d, std::vector<int32_t> &Z) {
+        std::vector<double> x;
+        Z.clear();
+        for (int p = 0; p < 2; p++)
+          for (int i = 0; i < 2; i++)
+            for (int j = 0; j < 2; j++)
+              x.insert(x.end(), {3.0 * i + 1.5 * p, 3.0 * j, p * d}), Z.push_back(p == 0 || like ? 11 : 17);
+        return x;
+      };
+      const double Q1 = 4, Q2 = like ? 4 : -4, Q = Q1 + Q2;
+      std::vector<int32_t> Z;
+      std::vector<double> E;
+      double Fz = 0;
+      for (double d : {12.0, 15.0, 18.0}) {
+        const std::vector<double> x = build(d, Z);
+        const SlabRun r = slab_run(L, S, x, Z, h, Q, true);
+        REQUIRE(r.c.cl.s == 2);
+        E.push_back(r.e.energy);
+        if (d == 15.0) Fz = r.e.forces[3 * 4 + 2];
+        for (int i = 0; i < 8; i++)
+          CHECK(r.e.forces[3 * i + 2] == Approx((i < 4 ? -1 : 1) * 2 * M_PI * KE * Q1 * Q2 / A / 4).epsilon(1e-9));
+      }
+      const double slope = -2 * M_PI * KE * Q1 * Q2 / A;
+      std::printf("SLAB-PLATES %s %s: dE/dd %.10f %.10f eV/A (analytic %.10f), F_z(plane 2 ion) %.10f (analytic %.10f)\n",
+                  mode == LrcSpec::Slab::YB ? "yb     " : "ewald2d", like ? "like-charged" : "capacitor   ",
+                  (E[1] - E[0]) / 3, (E[2] - E[1]) / 3, slope, Fz, -slope / 4);
+      CHECK((E[1] - E[0]) / 3 == Approx(slope).epsilon(1e-9));
+      CHECK((E[2] - E[1]) / 3 == Approx(slope).epsilon(1e-9));
+    }
+}
+
+TEST_CASE("lrc slab: a dipolar slab in a 3D cell differs by the dipole term 2 pi M^2 / V (tin-foil vs slab)",
+          "[lrc][slab]") {
+  // the capacitor in a (T, T, T) cell of height Lz (3D tin-foil Ewald, layered clusters under lrc_intra) against the
+  // slab: E_3D + 2 pi KE M_z^2 / V -> E_slab exponentially in the vacuum, while E_3D alone misses it as 1 / Lz
+  const SqeSpec S = intra_sqe(1.0, 0.5);
+  const LrcSpec L = slab_spec(LrcSpec::Slab::YB, std::make_shared<FixedQ>());
+  std::vector<double> x;
+  std::vector<int32_t> Z;
+  for (int p = 0; p < 2; p++)
+    for (int i = 0; i < 2; i++)
+      for (int j = 0; j < 2; j++) x.insert(x.end(), {3.0 * i, 3.0 * j + 1.5 * p, 2.0 + 6.0 * p}), Z.push_back(p ? 17 : 11);
+  const double Es = slab_E(L, S, x, Z, {6, 0, 0, 0, 6, 0, 0, 0, 0}, 0.0);
+  const double Mz = 4 * 2.0 - 4 * 8.0;
+  for (double Lz : {20.0, 40.0, 80.0}) {
+    const std::vector<double> h3 = {6, 0, 0, 0, 6, 0, 0, 0, Lz};
+    const double E3 = slab_E(L, S, x, Z, h3, 0.0), Ec = 2 * M_PI * KE * Mz * Mz / (36 * Lz);
+    std::printf("SLAB-DIPOLE Lz %3.0f: E_3D tin-foil %.10f, + 2 pi KE M^2 / V = %.10f, E_slab %.10f (diff %.1e)\n", Lz, E3,
+                E3 + Ec, Es, E3 + Ec - Es);
+    CHECK(E3 + Ec == Approx(Es).margin(1e-8));
+    CHECK(std::abs(E3 - Es) > 0.1);
+  }
+}
+
+TEST_CASE("lrc slab: a thick slab's interior layers have the 3D bulk energy (formal rock salt)", "[lrc][slab]") {
+  const SqeSpec S = intra_sqe();
+  for (auto mode : {LrcSpec::Slab::YB, LrcSpec::Slab::Ewald2D}) {
+    const LrcSpec L = slab_spec(mode, std::make_shared<FixedQ>());
+    std::vector<double> xb, hb, x, h;
+    std::vector<int32_t> Zb, Z;
+    rocksalt(5.64, 1, 0.0, xb, Zb, hb);
+    const double per_layer = slab_E(L, S, xb, Zb, hb, 0.0) / 2; // 3D Ewald, 2 layers per conventional cell
+    std::vector<double> E;
+    for (int layers : {8, 10, 12}) {
+      nacl_slab(5.64, layers, 0.0, 0.0, x, Z, h);
+      E.push_back(slab_E(L, S, x, Z, h, 0.0));
+    }
+    std::printf("SLAB-THICK %s: 3D per layer %.12f eV; slab (E10 - E8) / 2 %.12f, (E12 - E10) / 2 %.12f\n",
+                mode == LrcSpec::Slab::YB ? "yb     " : "ewald2d", per_layer, (E[1] - E[0]) / 2, (E[2] - E[1]) / 2);
+    CHECK((E[2] - E[1]) / 2 == Approx(per_layer).epsilon(1e-9));
+  }
+}
+
+TEST_CASE("lrc slab: invariance (translations incl. along the normal when charged, permutation, lattice shifts, rotation)",
+          "[lrc][slab]") {
+  const SqeSpec S = intra_sqe();
+  std::vector<double> x, h;
+  std::vector<int32_t> Z;
+  nacl_slab(5.64, 3, 0.12, 0.5, x, Z, h, 0.15);
+  x.insert(x.end(), {1.1, 0.7, 13.6});
+  Z.push_back(11);
+  const int n = int(Z.size());
+  for (auto mode : {LrcSpec::Slab::YB, LrcSpec::Slab::Ewald2D})
+    for (double Q : {0.0, 1.0}) {
+      const LrcSpec L = slab_spec(mode, nullptr);
+      const double E0 = slab_E(L, S, x, Z, h, Q);
+      double worst = 0;
+      // translation (in plane and along z)
+      std::vector<double> y = x;
+      for (int i = 0; i < n; i++) y[3 * i] += 0.37, y[3 * i + 1] -= 1.21, y[3 * i + 2] += 3.3;
+      worst = std::max(worst, std::abs(slab_E(L, S, y, Z, h, Q) - E0));
+      // single atoms moved by in-plane lattice vectors
+      y = x;
+      for (int a = 0; a < 3; a++) y[3 * 2 + a] += h[a], y[3 * 7 + a] -= h[3 + a]; // (toy charge pass: images to 2 cells)
+      worst = std::max(worst, std::abs(slab_E(L, S, y, Z, h, Q) - E0));
+      // permutation
+      std::vector<int> perm(n);
+      std::iota(perm.begin(), perm.end(), 0);
+      std::reverse(perm.begin(), perm.end());
+      std::vector<double> yp(3 * n);
+      std::vector<int32_t> Zp(n);
+      for (int i = 0; i < n; i++) {
+        Zp[i] = Z[perm[i]];
+        for (int a = 0; a < 3; a++) yp[3 * i + a] = x[3 * perm[i] + a];
+      }
+      worst = std::max(worst, std::abs(slab_E(L, S, yp, Zp, h, Q) - E0));
+      // rotation of positions and cell (the open row stays zero)
+      const double c1 = std::cos(0.7), s1 = std::sin(0.7), c2 = std::cos(-0.4), s2 = std::sin(-0.4);
+      const double R[9] = {c1, -s1 * c2, s1 * s2, s1, c1 * c2, -c1 * s2, 0, s2, c2};
+      auto rot = [&](const std::vector<double> &v) {
+        std::vector<double> o(v.size());
+        for (size_t i = 0; i < v.size() / 3; i++)
+          for (int a = 0; a < 3; a++) o[3 * i + a] = R[3 * a] * v[3 * i] + R[3 * a + 1] * v[3 * i + 1] + R[3 * a + 2] * v[3 * i + 2];
+        return o;
+      };
+      worst = std::max(worst, std::abs(slab_E(L, S, rot(x), Z, rot(h), Q) - E0));
+      std::printf("SLAB-INV %s Q %+.0f: E %.10f, worst |dE| %.1e eV\n", mode == LrcSpec::Slab::YB ? "yb     " : "ewald2d", Q,
+                  E0, worst);
+      CHECK(worst < 1e-10);
+    }
+}
+
+TEST_CASE("lrc slab: continuity of an ion above a slab through the 8 and 10 A switch", "[lrc][slab]") {
+  const SqeSpec S = intra_sqe();
+  const LrcSpec L = slab_spec(LrcSpec::Slab::YB, std::make_shared<FixedQ>());
+  std::vector<double> xs, h;
+  std::vector<int32_t> Zs;
+  nacl_slab(5.64, 2, 0.0, 0.0, xs, Zs, h);
+  Zs.push_back(11);
+  const int n = int(Zs.size());
+  // Na+ directly above a top-layer Cl- (at (2.82, 0, 2.82)): the pair distance d sweeps through 8 and 10 A
+  auto E = [&](double d, bool forces, double *F = nullptr) {
+    std::vector<double> x = xs;
+    x.insert(x.end(), {2.82, 0.0, 2.82 + d});
+    const SlabRun r = slab_run(L, S, x, Zs, h, 1.0, forces);
+    if (F) *F = r.e.forces[3 * (n - 1) + 2];
+    return r.e.energy;
+  };
+  for (double d0 : {8.0, 10.0}) {
+    for (double eps : {1e-4, 1e-6}) {
+      double Fm, Fp;
+      const double Em = E(d0 - eps, true, &Fm), Ep = E(d0 + eps, true, &Fp);
+      CHECK(std::abs(Ep - Em) < 10 * eps);
+      CHECK(std::abs(Fp - Fm) < 50 * eps); // continuous: the jump falls with the gap (smootherstep: C2)
+    }
+    const double hh = 1e-4;
+    double F0;
+    E(d0, true, &F0);
+    const double num = -(E(d0 + hh, false) - E(d0 - hh, false)) / (2 * hh);
+    std::printf("SLAB-SWITCH d %.1f A: F_z %.8f eV/A, central difference %.8f, |diff| %.1e\n", d0, F0, num, std::abs(num - F0));
+    CHECK(std::abs(num - F0) < 1e-6);
+  }
+}
+
+TEST_CASE("lrc slab: one slab cluster without lrc_intra is the plain model (no long range, no charge pass)",
+          "[lrc][slab]") {
+  const SqeSpec S = intra_sqe();
+  LrcSpec L = slab_spec(LrcSpec::Slab::YB, std::make_shared<NoQ>(), false);
+  std::vector<double> x, h;
+  std::vector<int32_t> Z;
+  nacl_slab(5.64, 3, 0.1, 0.0, x, Z, h);
+  for (double Q : {0.0, 1.0}) {
+    const SlabRun r = slab_run(L, S, x, Z, h, Q, true);
+    CHECK(r.c.cl.bulk);
+    CHECK(r.c.cl.slab());
+    CHECK(r.e.energy == 0.0);
+    for (int i = 0; i < int(Z.size()); i++) CHECK(r.c.row_charge[i] + double(r.c.blend[i]) == Approx(Q));
+  }
+  // a slab beside a separate molecule needs lrc_intra
+  x.insert(x.end(), {1.0, 1.0, 20.0});
+  Z.push_back(11);
+  L.qsrc = std::make_shared<FixedQ>();
+  CHECK_THROWS(lrc_condition(L, S, int(Z.size()), Z.data(), x.data(), 1.0, 10, 1, h.data()));
+}

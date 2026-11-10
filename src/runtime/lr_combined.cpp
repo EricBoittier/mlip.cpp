@@ -45,6 +45,22 @@ void add_pair(double *g, const double *x, int i, int j, double r, double dEdr, d
       for (int b = 0; b < 3; b++) vir[3 * a + b] += dEdr * d[a] * d[b] / r;
 }
 
+// g += dE/dx of weak link w's energy term with dE/dr = dEdr (cluster-frame positions x = c.xh, or the link's image
+// displacement for layered clusters); vir (may be null) += its strain derivative
+void link_grad(const LrcClusters &c, size_t w, const double *x, double dEdr, double *g, double *vir) {
+  const auto &wk = c.weak[w];
+  if (!c.layered) return add_pair(g, x, wk.i, wk.j, dist(x, wk.i, wk.j), dEdr, vir);
+  const auto &d = c.wd[w];
+  const double r = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+  for (int k = 0; k < 3; k++) {
+    const double f = dEdr * d[k] / r;
+    g[3 * wk.i + k] -= f, g[3 * wk.j + k] += f;
+  }
+  if (vir)
+    for (int a = 0; a < 3; a++)
+      for (int b = 0; b < 3; b++) vir[3 * a + b] += dEdr * d[a] * d[b] / r;
+}
+
 // ---- periodic geometry ------------------------------------------------------------------------------------------------
 // cell rows a_k; fractional f = x inv (x = f h); perp[k]: spacing of the lattice planes normal to a_k
 struct Cell3 {
@@ -283,6 +299,18 @@ LrcSpec LrcSpec::from_gguf(const GGUFLoader &G, const SqeSpec &S) {
     if (im != "none" && im != "ewald") throw std::runtime_error("lrc: lrc_intra must be none or ewald");
     L.intra = im == "ewald";
   }
+  {
+    const std::string sm = G.get_string("pet.plato_lr.lrc_slab", "none");
+    if (sm == "none") L.slab = LrcSpec::Slab::None;
+    else if (sm == "yb") L.slab = LrcSpec::Slab::YB;
+    else if (sm == "ewald2d") L.slab = LrcSpec::Slab::Ewald2D;
+    else throw std::runtime_error("lrc: lrc_slab must be none, yb or ewald2d");
+    if (const auto v = get_f64(G, "pet.plato_lr.lrc_slab_vacuum"); !v.empty()) L.slab_vacuum = v[0];
+    if (const auto v = get_f64(G, "pet.plato_lr.lrc_slab_gap"); !v.empty()) L.slab_gap = v[0];
+    if ((L.slab_vacuum != 0 || L.slab_gap != 0) && L.slab == LrcSpec::Slab::None)
+      throw std::runtime_error("lrc: lrc_slab_vacuum / lrc_slab_gap need lrc_slab = yb or ewald2d");
+    if (!(L.slab_vacuum >= 0) || !(L.slab_gap >= 0)) throw std::runtime_error("lrc: lrc_slab_vacuum / _gap must be >= 0");
+  }
   if (L.graph) {
     L.qmodel = G.get_string("pet.plato_lr.lrc_qmodel", "");
     {
@@ -327,9 +355,13 @@ LrcSpec LrcSpec::from_gguf(const GGUFLoader &G, const SqeSpec &S) {
         throw std::runtime_error("lrc pol: needs lrc_pol_Z and lrc_pol_alpha of equal length");
     }
     if (L.intra && (L.mp || L.pol)) throw std::runtime_error("lrc_intra: not with lrc_mp / lrc_pol");
+    if (L.slab != LrcSpec::Slab::None && (L.mp || L.pol)) throw std::runtime_error("lrc_slab: not with lrc_mp / lrc_pol");
+    if (L.slab_gap > 0 && !(L.slab_gap > L.a_off && L.slab_gap > S.lr_R))
+      throw std::runtime_error("lrc_slab_gap must exceed lrc_a_off and sqe_lr_R");
     return L;
   }
   if (L.intra) throw std::runtime_error("lrc_intra: needs the graph q0 mode");
+  if (L.slab != LrcSpec::Slab::None) throw std::runtime_error("lrc_slab: needs the graph q0 mode");
   const size_t E = S.Z.size();
   if (!(L.a_off > L.a_on)) throw std::runtime_error("lrc: bad a_on / a_off");
   if (L.round || L.head_only) {
@@ -362,6 +394,11 @@ void LrcSpec::to_gguf(gguf_context *g) const {
   gguf_set_val_i32(g, "pet.plato_lr.lrc_qproj", qproj ? 1 : 0);
   scalar("qproj_w", qproj_w);
   if (intra) gguf_set_val_str(g, "pet.plato_lr.lrc_intra", "ewald"); // absent key = none (earlier GGUFs unchanged)
+  if (slab != Slab::None) { // absent keys = slabs refused (earlier GGUFs unchanged)
+    gguf_set_val_str(g, "pet.plato_lr.lrc_slab", slab == Slab::YB ? "yb" : "ewald2d");
+    if (slab_vacuum != 0) scalar("slab_vacuum", slab_vacuum);
+    if (slab_gap != 0) scalar("slab_gap", slab_gap);
+  }
   auto arr = [&](const char *k, const std::vector<double> &v) {
     gguf_set_arr_data(g, (std::string("pet.plato_lr.lrc_") + k).c_str(), GGUF_TYPE_FLOAT64, v.data(), v.size());
   };
@@ -871,9 +908,12 @@ template <class F> void enumerate(const LrcClusters &c, const std::vector<int> &
 namespace {
 // super-edges, link probabilities and reliabilities from the super-nodes (c.s, c.sn) and the weak atom pairs, whose
 // distances are those of the cluster-frame positions c.xh
-void finish_clusters(const LrcSpec &L, LrcClusters &c, const std::vector<std::pair<int, int>> &weak) {
+// (layered clusters: disp[k] the image displacement of weak link k, stored in c.wd; its distance replaces c.xh's)
+void finish_clusters(const LrcSpec &L, LrcClusters &c, const std::vector<std::pair<int, int>> &weak,
+                     const std::vector<std::array<double, 3>> *disp = nullptr) {
   const double *x = c.xh.data();
-  for (auto [i, j] : weak) {
+  for (size_t l = 0; l < weak.size(); l++) {
+    const int i = weak[l].first, j = weak[l].second;
     int a = c.sn[i], b = c.sn[j];
     if (a == b) continue;
     if (a > b) std::swap(a, b);
@@ -881,7 +921,15 @@ void finish_clusters(const LrcSpec &L, LrcClusters &c, const std::vector<std::pa
     for (size_t q = 0; q < c.se.size(); q++)
       if (c.se[q].first == a && c.se[q].second == b) k = int(q);
     if (k < 0) k = int(c.se.size()), c.se.push_back({a, b}), c.p.push_back(0.0);
-    const double r = dist(x, i, j), w = L.a_off - L.a_on, u = (r - L.a_on) / w;
+    double r;
+    if (disp) {
+      const auto &d = (*disp)[l];
+      r = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+      c.wd.push_back(d);
+    } else {
+      r = dist(x, i, j);
+    }
+    const double w = L.a_off - L.a_on, u = (r - L.a_on) / w;
     c.weak.push_back({i, j, k, 1.0 - sstep(u), -dsstep(u) / w});
   }
   std::vector<double> none(c.se.size(), 1.0); // prod (1 - A)
@@ -909,22 +957,86 @@ void finish_clusters(const LrcSpec &L, LrcClusters &c, const std::vector<std::pa
   }
 }
 
+// slabs: the zero row of a (T, T, F) cell (-1: none; two or more throw), and the unit normal / area of the other two
+int zero_row(const double *cell) {
+  int k = -1, m = 0;
+  for (int r = 0; r < 3; r++)
+    if (cell[3 * r] == 0 && cell[3 * r + 1] == 0 && cell[3 * r + 2] == 0) k = r, m++;
+  if (m > 1) throw std::runtime_error("lrc: a cell with two or three open directions (a wire) is not supported");
+  return k;
+}
+double plane_normal(const double *cell, int open, double *nrm) {
+  const double *u = cell + 3 * ((open + 1) % 3), *v = cell + 3 * ((open + 2) % 3);
+  const double c0 = u[1] * v[2] - u[2] * v[1], c1 = u[2] * v[0] - u[0] * v[2], c2 = u[0] * v[1] - u[1] * v[0];
+  const double A = std::sqrt(c0 * c0 + c1 * c1 + c2 * c2);
+  if (!(A > 1e-9)) throw std::runtime_error("lrc: degenerate slab cell (in-plane rows parallel)");
+  nrm[0] = c0 / A, nrm[1] = c1 / A, nrm[2] = c2 / A;
+  return A;
+}
+// (T, T, T) gap rule (lrc_slab_gap): the one lattice direction across which the atoms leave an empty layer >= gap (A),
+// and per atom the multiple of that row that unwraps the slab into one piece; -1 when no or several directions have one
+int gap_axis(double gap, int n, const double *x, const double *cell, std::vector<int32_t> &zshift) {
+  const Cell3 C = cell3(cell);
+  int axis = -1, hits = 0;
+  double base = 0;
+  for (int k = 0; k < 3; k++) {
+    std::vector<double> u(n);
+    for (int i = 0; i < n; i++) {
+      double f = 0;
+      for (int a = 0; a < 3; a++) f += x[3 * i + a] * C.inv[a][k];
+      u[i] = f - std::floor(f);
+    }
+    std::sort(u.begin(), u.end());
+    double best = n ? 1.0 - u[n - 1] + u[0] : 1.0, b = n ? u[0] : 0.0; // the gap through the cell boundary
+    for (int i = 0; i + 1 < n; i++)
+      if (u[i + 1] - u[i] > best) best = u[i + 1] - u[i], b = u[i + 1];
+    if (best * C.perp[k] >= gap) axis = k, base = b, hits++;
+  }
+  if (hits != 1) return -1;
+  zshift.assign(n, 0);
+  for (int i = 0; i < n; i++) {
+    double f = 0;
+    for (int a = 0; a < 3; a++) f += x[3 * i + a] * C.inv[a][axis];
+    zshift[i] = -static_cast<int32_t>(std::floor(f - base));
+  }
+  return axis;
+}
+
 // periodic: links through the images; super-nodes are the strong components of the tiling, either one bulk cluster
-// (connected to all its images) or all finite, and then each weak component is unwrapped into c.xh
+// (connected to all its images) or all finite, and then each weak component is unwrapped into c.xh. Slabs (lrc_slab):
+// the same in the 2D tiling (bulk = one cluster through every in-plane image); with lrc_intra also clusters that wrap
+// only part of the periodic directions (layered: weak links by image displacement, no unwrapping)
 LrcClusters clusters_periodic(const LrcSpec &L, int n, const double *x, const double *cell) {
   LrcClusters c;
   c.cell.assign(cell, cell + 9);
-  const Cell3 C = cell3(cell);
+  int open = zero_row(cell);
+  std::vector<double> hs(cell, cell + 9); // the cell of the pair search
+  if (open >= 0) {
+    if (L.slab == LrcSpec::Slab::None)
+      throw std::runtime_error("lrc: a slab (a cell with one open direction) needs pet.plato_lr.lrc_slab = yb or ewald2d");
+    double nrm[3], lo = 0, hi = 0;
+    plane_normal(cell, open, nrm);
+    for (int i = 0; i < n; i++) {
+      const double z = nrm[0] * x[3 * i] + nrm[1] * x[3 * i + 1] + nrm[2] * x[3 * i + 2];
+      lo = i ? std::min(lo, z) : z, hi = i ? std::max(hi, z) : z;
+    }
+    for (int a = 0; a < 3; a++) hs[3 * open + a] = nrm[a] * (hi - lo + L.a_off + 1.0); // no open-direction image within a_off
+  } else if (L.slab != LrcSpec::Slab::None && L.slab_gap > 0) {
+    open = gap_axis(L.slab_gap, n, x, cell, c.zshift);
+  }
+  c.open = open;
+  const Cell3 C = cell3(hs.data());
   OffsetUF u(n);
   std::vector<Wraps> wr(n);
   struct Link {
     int i, j;
     I3 s;
+    std::array<double, 3> d;
   };
   std::vector<Link> weak;
-  periodic_pairs(n, x, C, L.a_off, [&](int i, int j, const I3 &s, const double *, double r) {
+  periodic_pairs(n, x, C, L.a_off, [&](int i, int j, const I3 &s, const double *d, double r) {
     if (r <= L.a_on) u.unite(i, j, s, &wr);
-    else weak.push_back({i, j, s});
+    else weak.push_back({i, j, s, {d[0], d[1], d[2]}});
   });
   std::vector<int> root(n);
   std::vector<I3> phi(n);
@@ -936,31 +1048,62 @@ LrcClusters clusters_periodic(const LrcSpec &L, int n, const double *x, const do
     if (lab[root[i]] < 0) lab[root[i]] = c.s++;
     c.sn[i] = lab[root[i]];
   }
-  if (c.s == 1 && wr[root[0]].full()) { // bulk: one cluster through every image
+  // through every image of the periodic directions (a slab: the two in-plane ones)
+  auto full = [&](const Wraps &w) {
+    if (open < 0) return w.full();
+    for (int k = 0; k < 3; k++)
+      if (k != open && w.b[k][k] != 1) return false;
+    return w.b[open][open] == 0;
+  };
+  if (c.s == 1 && full(wr[root[0]])) { // bulk: one cluster through every image
     c.bulk = true, c.xh.assign(x, x + 3 * size_t(n)), c.R.assign(1, 1.0);
     return c;
   }
+  const bool may_layer = L.intra && L.slab != LrcSpec::Slab::None;
+  bool layered = false;
   for (int i = 0; i < n; i++)
-    if (!wr[root[i]].none())
-      throw std::runtime_error(
-          "lrc: a cluster wraps the periodic cell without being one bulk cluster (a slab, a wire, interpenetrating "
-          "networks, or a network beside separate molecules); only bulk cells, where every atom has a neighbour within "
-          "a_on = " + std::to_string(L.a_on) + " A through the images, and fully separated clusters are supported");
+    if (!wr[root[i]].none()) {
+      if (!may_layer)
+        throw std::runtime_error(
+            "lrc: a cluster wraps the periodic cell without being one bulk cluster (a slab, a wire, interpenetrating "
+            "networks, or a network beside separate molecules); only bulk cells, where every atom has a neighbour within "
+            "a_on = " + std::to_string(L.a_on) + " A through the images, and fully separated clusters are supported" +
+            (L.slab != LrcSpec::Slab::None ? " (with lrc_slab: also any layered structure under lrc_intra)" : ""));
+      layered = true;
+    }
   // weak links between super-nodes, with the cell offset between the two clusters' frames
   OffsetUF v(c.s);
   std::vector<std::pair<int, int>> wk;
   const char *wrap = "lrc: clusters within a_off of their own periodic images, directly or through a chain of weak "
                      "links, are not supported (use a larger cell)";
-  for (const Link &l : weak) {
-    const int a = c.sn[l.i], b = c.sn[l.j];
+  for (size_t l = 0; l < weak.size() && !layered; l++) {
+    const Link &lk = weak[l];
+    const int a = c.sn[lk.i], b = c.sn[lk.j];
     I3 d;
-    for (int k = 0; k < 3; k++) d[k] = l.s[k] - phi[l.j][k] + phi[l.i][k];
+    for (int k = 0; k < 3; k++) d[k] = lk.s[k] - phi[lk.j][k] + phi[lk.i][k];
+    bool bad = false;
     if (a == b) {
-      if (nonzero(d)) throw std::runtime_error(wrap);
-      continue;
+      if (nonzero(d)) bad = true;
+      else continue;
+    } else if (nonzero(v.unite(a, b, d))) {
+      bad = true;
     }
-    if (nonzero(v.unite(a, b, d))) throw std::runtime_error(wrap);
-    wk.push_back({l.i, l.j});
+    if (bad) {
+      if (!may_layer) throw std::runtime_error(wrap);
+      layered = true;
+      break;
+    }
+    wk.push_back({lk.i, lk.j});
+  }
+  if (layered) { // links by image displacement; R on the quotient graph of the cell's super-nodes (self-links dropped)
+    c.layered = true;
+    c.xh.assign(x, x + 3 * size_t(n));
+    std::vector<std::pair<int, int>> lk;
+    std::vector<std::array<double, 3>> disp;
+    for (const Link &l : weak)
+      if (c.sn[l.i] != c.sn[l.j]) lk.push_back({l.i, l.j}), disp.push_back(l.d);
+    finish_clusters(L, c, lk, &disp);
+    return c;
   }
   c.xh.resize(3 * size_t(n));
   for (int i = 0; i < n; i++) {
@@ -1031,7 +1174,7 @@ void lrc_clusters_vjp(const LrcSpec &L, const LrcClusters &c, int n, const doubl
     double others = 1.0;
     for (size_t v = 0; v < c.weak.size(); v++)
       if (v != w && c.weak[v].e == wk.e) others *= 1.0 - c.weak[v].A;
-    add_pair(g, x, wk.i, wk.j, dist(x, wk.i, wk.j), dp[wk.e] * others * wk.dA, vir);
+    link_grad(c, w, x, dp[wk.e] * others * wk.dA, g, vir);
   }
 }
 
@@ -1287,7 +1430,7 @@ void lrc_project_vjp(const LrcSpec &L, const LrcClusters &c, const LrcProjection
     double others = 1.0;
     for (size_t v = 0; v < c.weak.size(); v++)
       if (v != w && c.weak[v].e == wk.e) others *= 1.0 - c.weak[v].A;
-    add_pair(g, x, wk.i, wk.j, dist(x, wk.i, wk.j), dp[wk.e] * others * wk.dA, vir);
+    link_grad(c, w, x, dp[wk.e] * others * wk.dA, g, vir);
   }
 }
 
@@ -1518,6 +1661,293 @@ LrcEnergy energy_images(const LrcSpec &L, const SqeSpec &S, const LrcCondition &
   return out;
 }
 
+// ---- slabs (lrc_slab): the long-range sums of a 2D-periodic tiling ----------------------------------------------------
+// geometry: unit normal, in-plane area, the elongated 3D cell h (in-plane rows as given; the open row n Lz: internal for
+// (T, T, F), the given cell for the (T, T, T) gap rule unless ewald2d), positions unwrapped across the vacuum
+struct SlabGeom {
+  int open = -1;
+  double nrm[3] = {0, 0, 0}, A = 0, Lz = 0;
+  std::vector<double> h, xs;
+};
+SlabGeom slab_geom(const LrcSpec &L, const SqeSpec &S, const LrcClusters &c, int n, const double *x, double rc_min,
+                   bool own_height) {
+  SlabGeom g;
+  g.open = c.open;
+  g.h = c.cell;
+  g.A = plane_normal(c.cell.data(), g.open, g.nrm);
+  g.xs.assign(x, x + 3 * size_t(n));
+  if (!c.zshift.empty())
+    for (int i = 0; i < n; i++)
+      for (int a = 0; a < 3; a++) g.xs[3 * i + a] += c.zshift[i] * c.cell[3 * g.open + a];
+  const bool given = !c.zshift.empty() && !own_height; // (T, T, T) gap rule, Yeh-Berkowitz in the given cell
+  if (given) {
+    g.Lz = cell3(c.cell.data()).V / g.A;
+    return g;
+  }
+  double lo = 0, hi = 0, lmax = 0;
+  for (int i = 0; i < n; i++) {
+    const double z = g.nrm[0] * g.xs[3 * i] + g.nrm[1] * g.xs[3 * i + 1] + g.nrm[2] * g.xs[3 * i + 2];
+    lo = i ? std::min(lo, z) : z, hi = i ? std::max(hi, z) : z;
+  }
+  for (int r = 0; r < 3; r++)
+    if (r != g.open) lmax = std::max(lmax, std::sqrt(c.cell[3 * r] * c.cell[3 * r] + c.cell[3 * r + 1] * c.cell[3 * r + 1] +
+                                                     c.cell[3 * r + 2] * c.cell[3 * r + 2]));
+  // vacuum: the z-images' interactions beyond the mean field fall as exp(-2 pi G / L_inplane) (4 L: ~1e-11); no z-image
+  // inside the switch (lr_R) or the real-space cutoff; Lz on a 4 A grid (locally constant in the positions)
+  const double G = std::max({L.slab_vacuum, 4.0 * lmax, S.lr_R + 1.0, rc_min + 1.0});
+  g.Lz = 4.0 * std::ceil((hi - lo + G) / 4.0);
+  for (int a = 0; a < 3; a++) g.h[3 * g.open + a] = g.nrm[a] * g.Lz;
+  return g;
+}
+
+// e^{h z} erfc(h / 2 alpha + alpha z) without overflow (exp(h z + log erfc), 0 where erfc underflows)
+inline double exp_erfc(double a, double u) {
+  const double e = std::erfc(u);
+  return e > 0 ? std::exp(a + std::log(e)) : 0.0;
+}
+
+// separated clusters / lrc_intra in a slab:
+//   E = KE [ E_2D(q) - sum_{pairs r < lr_R} q_i q_j (1 - T) / r - sum_{i < j, R_ab > 0} q_i q_j T R_ab / r^_ij ]
+// (the last term not with lrc_intra), E_2D the 2D-periodic Coulomb energy (lr_combined.h: Yeh-Berkowitz with the
+// net-charge terms, or the exact 2D Ewald sum)
+LrcEnergy energy_slab(const LrcSpec &L, const SqeSpec &S, const LrcCondition &c, int n, const int32_t *Z,
+                      const double *x, bool forces) {
+  constexpr double KE = 14.399645, acc = 5.0;
+  LrcEnergy out;
+  out.q0 = c.q0.q0, out.q = c.q0.q0;
+  const int s = c.cl.s;
+  const bool exact = L.slab == LrcSpec::Slab::Ewald2D;
+  const double r0 = S.lr_R - S.lr_t;
+  std::vector<double> g(3 * size_t(n), 0.0), dq(n, 0.0), W(size_t(s) * s, 0.0), vir(9, 0.0);
+  std::vector<double> q = c.q0.q0;
+  LrcProjection proj;
+  const bool qproj = L.qproj && !L.fukui_cluster;
+  if (qproj) proj = lrc_project(L, c.cl, n, Z, q.data()), q = proj.q, out.q = q;
+  double E = 0, Qt = 0;
+  for (double v : q) Qt += v;
+  auto pair = [&](int i, int j, const double *d, double r, double u, double du) {
+    E += q[i] * q[j] * u;
+    dq[i] += q[j] * u, dq[j] += q[i] * u;
+    if (!forces) return;
+    const double f = q[i] * q[j] * du / r;
+    for (int a = 0; a < 3; a++) {
+      g[3 * j + a] += f * d[a], g[3 * i + a] -= f * d[a];
+      for (int b = 0; b < 3; b++) vir[3 * a + b] += f * d[a] * d[b];
+    }
+  };
+  auto sw = [&](double r, double &T, double &dT) {
+    const double t = (r - r0) / S.lr_t;
+    T = sstep(t), dT = dsstep(t) / S.lr_t;
+  };
+  // real-space cutoff: the exact sum needs no z-image inside it (the internal vacuum exceeds it)
+  double rc = L.slab_rc;
+  if (exact && !(rc > 0)) rc = std::max(S.lr_R, 10.0);
+  const SlabGeom geo = slab_geom(L, S, c.cl, n, x, exact ? rc : 0.0, exact);
+  const double *xs = geo.xs.data();
+  const Cell3 C = cell3(geo.h.data());
+  if (!(rc > 0)) rc = std::max(S.lr_R, acc * std::cbrt(C.V) / (std::sqrt(M_PI) * std::pow(double(n), 1.0 / 6.0)));
+  const double al = acc / rc, kmax = 2 * acc * al;
+  periodic_pairs(n, xs, C, std::max(rc, S.lr_R), [&](int i, int j, const I3 &, const double *d, double r) {
+    double u = 0, du = 0;
+    if (r < rc) {
+      const double e = std::erfc(al * r) / r;
+      u += e, du -= (e + 2 * al / std::sqrt(M_PI) * std::exp(-al * al * r * r)) / r;
+    }
+    if (r < S.lr_R) {
+      double T, dT;
+      sw(r, T, dT);
+      u -= (1 - T) / r, du += dT / r + (1 - T) / (r * r);
+    }
+    pair(i, j, d, r, u, du);
+  });
+  const double self = al / std::sqrt(M_PI);
+  for (int i = 0; i < n; i++) E -= self * q[i] * q[i], dq[i] -= 2 * self * q[i];
+  const double *nv = geo.nrm;
+  if (!exact) {
+    // 3D Ewald of the elongated cell: background (- pi Q^2 / 2 V alpha^2) and the reciprocal sum, as energy_images
+    const double bg = M_PI / (2 * C.V * al * al);
+    for (int i = 0; i < n; i++) dq[i] -= 2 * bg * Qt;
+    E -= bg * Qt * Qt;
+    for (int a = 0; a < 3; a++) vir[4 * a] += bg * Qt * Qt;
+    int M[3];
+    for (int k = 0; k < 3; k++)
+      M[k] = static_cast<int>(kmax * std::sqrt(C.h[k][0] * C.h[k][0] + C.h[k][1] * C.h[k][1] + C.h[k][2] * C.h[k][2]) /
+                              (2 * M_PI));
+    if (double(2 * M[0] + 1) * (2 * M[1] + 1) * (2 * M[2] + 1) * n > 4e9)
+      throw std::runtime_error("lrc slab: long range too large for the direct Ewald sum (cell / atom count)");
+    std::vector<std::complex<double>> ph[3];
+    for (int k = 0; k < 3; k++) {
+      const int w = 2 * M[k] + 1;
+      ph[k].resize(size_t(n) * w);
+      for (int j = 0; j < n; j++) {
+        double f = 0;
+        for (int a = 0; a < 3; a++) f += xs[3 * j + a] * C.inv[a][k];
+        for (int m = -M[k]; m <= M[k]; m++) ph[k][size_t(j) * w + m + M[k]] = std::polar(1.0, 2 * M_PI * m * f);
+      }
+    }
+    std::vector<std::complex<double>> e(n);
+    for (int m0 = 0; m0 <= M[0]; m0++)
+      for (int m1 = -M[1]; m1 <= M[1]; m1++)
+        for (int m2 = -M[2]; m2 <= M[2]; m2++) {
+          if (m0 == 0 && (m1 < 0 || (m1 == 0 && m2 <= 0))) continue;
+          double k[3], k2 = 0;
+          for (int a = 0; a < 3; a++) {
+            k[a] = 2 * M_PI * (m0 * C.inv[a][0] + m1 * C.inv[a][1] + m2 * C.inv[a][2]);
+            k2 += k[a] * k[a];
+          }
+          if (k2 > kmax * kmax) continue;
+          std::complex<double> Sk = 0;
+          for (int j = 0; j < n; j++) {
+            e[j] = ph[0][size_t(j) * (2 * M[0] + 1) + m0 + M[0]] * ph[1][size_t(j) * (2 * M[1] + 1) + m1 + M[1]] *
+                   ph[2][size_t(j) * (2 * M[2] + 1) + m2 + M[2]];
+            Sk += q[j] * e[j];
+          }
+          const double A = 4 * M_PI / C.V * std::exp(-k2 / (4 * al * al)) / k2, S2 = std::norm(Sk);
+          E += A * S2;
+          for (int j = 0; j < n; j++) {
+            const std::complex<double> z = std::conj(Sk) * e[j];
+            dq[j] += 2 * A * z.real();
+            if (forces)
+              for (int a = 0; a < 3; a++) g[3 * j + a] -= 2 * A * q[j] * z.imag() * k[a];
+          }
+          if (forces)
+            for (int a = 0; a < 3; a++)
+              for (int b = 0; b < 3; b++)
+                vir[3 * a + b] += A * S2 * ((a == b ? -1.0 : 0.0) + 2 * k[a] * k[b] * (1 / (4 * al * al) + 1 / k2));
+        }
+    // Yeh-Berkowitz with Ballenegger-Arnold-Cerda's net-charge terms (V = A Lz; origin independent):
+    //   E_c = 2 pi / V [ M_z^2 - Q sum q z^2 - Q^2 Lz^2 / 12 ],  dE_c/d strain = E_c (2 n n^T - I)
+    double Mz = 0, Sz2 = 0;
+    std::vector<double> zz(n);
+    for (int i = 0; i < n; i++) {
+      zz[i] = nv[0] * xs[3 * i] + nv[1] * xs[3 * i + 1] + nv[2] * xs[3 * i + 2];
+      Mz += q[i] * zz[i], Sz2 += q[i] * zz[i] * zz[i];
+    }
+    const double V = geo.A * geo.Lz, p = 2 * M_PI / V;
+    const double Ec = p * (Mz * Mz - Qt * Sz2 - Qt * Qt * geo.Lz * geo.Lz / 12);
+    E += Ec;
+    for (int i = 0; i < n; i++) {
+      dq[i] += p * (2 * Mz * zz[i] - Sz2 - Qt * zz[i] * zz[i] - Qt * geo.Lz * geo.Lz / 6);
+      if (forces)
+        for (int a = 0; a < 3; a++) g[3 * i + a] += p * 2 * q[i] * (Mz - Qt * zz[i]) * nv[a];
+    }
+    if (forces)
+      for (int a = 0; a < 3; a++)
+        for (int b = 0; b < 3; b++) vir[3 * a + b] += Ec * (2 * nv[a] * nv[b] - (a == b ? 1.0 : 0.0));
+  } else {
+    // exact 2D Ewald (Parry), in the frame e1 = u / |u|, e2 = n x e1, n; half plane of in-plane wave vectors h:
+    //   E_h = (pi / A) sum_{i,j} q_i q_j cos(h . rho_ij) Phi(h, z_ij) / h,
+    //   Phi = e^{h z} erfc(h / 2a + a z) + e^{-h z} erfc(h / 2a - a z);
+    //   E_0 = -(pi / A) sum_{i,j} q_i q_j [ z_ij erf(a z_ij) + exp(-a^2 z_ij^2) / (a sqrt(pi)) ]  (h = 0, divergence dropped)
+    const double *uu = &geo.h[3 * ((geo.open + 1) % 3)], *vv = &geo.h[3 * ((geo.open + 2) % 3)];
+    double B[3][3];
+    const double ul = std::sqrt(uu[0] * uu[0] + uu[1] * uu[1] + uu[2] * uu[2]);
+    for (int a = 0; a < 3; a++) B[0][a] = uu[a] / ul, B[2][a] = nv[a];
+    B[1][0] = nv[1] * B[0][2] - nv[2] * B[0][1], B[1][1] = nv[2] * B[0][0] - nv[0] * B[0][2],
+    B[1][2] = nv[0] * B[0][1] - nv[1] * B[0][0];
+    auto dot = [](const double *a, const double *b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
+    const double v0 = dot(vv, B[0]), v1 = dot(vv, B[1]), det = ul * v1, A = std::abs(det);
+    const double b1[2] = {2 * M_PI * v1 / det, -2 * M_PI * v0 / det}, b2[2] = {0.0, 2 * M_PI * ul / det};
+    std::vector<double> rx(n), ry(n), zc(n);
+    for (int i = 0; i < n; i++) rx[i] = dot(&xs[3 * i], B[0]), ry[i] = dot(&xs[3 * i], B[1]), zc[i] = dot(&xs[3 * i], B[2]);
+    std::vector<double> gc(3 * size_t(n), 0.0); // gradient in the frame
+    double Wc[3][3] = {};
+    const double hmax = kmax, vl = std::sqrt(v0 * v0 + v1 * v1), sp = std::sqrt(M_PI);
+    const int M1 = static_cast<int>(std::ceil(hmax * ul / (2 * M_PI))), M2 = static_cast<int>(std::ceil(hmax * vl / (2 * M_PI)));
+    std::vector<std::complex<double>> e(n);
+    double Erec = 0;
+    for (int m1 = 0; m1 <= M1; m1++)
+      for (int m2 = -M2; m2 <= M2; m2++) {
+        if (m1 == 0 && m2 <= 0) continue;
+        const double hv[2] = {m1 * b1[0] + m2 * b2[0], m1 * b1[1] + m2 * b2[1]};
+        const double hh = std::sqrt(hv[0] * hv[0] + hv[1] * hv[1]);
+        if (hh > hmax) continue;
+        for (int j = 0; j < n; j++) e[j] = std::polar(1.0, hv[0] * rx[j] + hv[1] * ry[j]);
+        double dEdh = 0;
+        const double Gh = std::exp(-hh * hh / (4 * al * al));
+        { // i = j: Phi(h, 0) = 2 erfc(h / 2a)
+          const double P0 = 2 * std::erfc(hh / (2 * al)), dP0 = -2 * Gh / (al * sp);
+          for (int i = 0; i < n; i++) {
+            const double t = M_PI / A * q[i] * q[i];
+            Erec += t * P0 / hh, dq[i] += 2 * M_PI / A * q[i] * P0 / hh, dEdh += t * (dP0 / hh - P0 / (hh * hh));
+          }
+        }
+        for (int i = 0; i < n; i++)
+          for (int j = i + 1; j < n; j++) {
+            const std::complex<double> z = e[j] * std::conj(e[i]); // e^{i h . rho_ij}
+            const double cs = z.real(), sn = z.imag(), zij = zc[j] - zc[i];
+            const double ep = exp_erfc(hh * zij, hh / (2 * al) + al * zij), em = exp_erfc(-hh * zij, hh / (2 * al) - al * zij);
+            const double Phi = ep + em, Psi = ep - em, Gs = Gh * std::exp(-al * al * zij * zij);
+            const double pre = 2 * M_PI / A, qq = q[i] * q[j];
+            Erec += pre * qq * cs * Phi / hh;
+            dq[i] += pre * q[j] * cs * Phi / hh, dq[j] += pre * q[i] * cs * Phi / hh;
+            if (!forces) continue;
+            const double dr = -pre * qq * sn * Phi / hh, dz = pre * qq * cs * Psi; // dE/d(h . rho), dE/dz
+            const double d3[3] = {dr * hv[0], dr * hv[1], dz};
+            for (int a = 0; a < 3; a++) gc[3 * j + a] += d3[a], gc[3 * i + a] -= d3[a];
+            const double rij[2] = {rx[j] - rx[i], ry[j] - ry[i]};
+            Wc[2][2] += dz * zij;
+            for (int a = 0; a < 2; a++) Wc[a][2] += d3[a] * zij, Wc[2][a] += d3[a] * zij;
+            (void)rij;
+            dEdh += pre * qq * cs * ((zij * Psi - 2 * Gs / (al * sp)) / hh - Phi / (hh * hh));
+          }
+        if (forces)
+          for (int a = 0; a < 2; a++)
+            for (int b = 0; b < 2; b++) Wc[a][b] -= dEdh * hv[a] * hv[b] / hh;
+      }
+    double E0 = 0;
+    for (int i = 0; i < n; i++) {
+      const double t = M_PI / A / (al * sp);
+      E0 -= t * q[i] * q[i], dq[i] -= 2 * t * q[i];
+      for (int j = i + 1; j < n; j++) {
+        const double zij = zc[j] - zc[i], er = std::erf(al * zij);
+        const double f = zij * er + std::exp(-al * al * zij * zij) / (al * sp), pre = 2 * M_PI / A;
+        E0 -= pre * q[i] * q[j] * f, dq[i] -= pre * q[j] * f, dq[j] -= pre * q[i] * f;
+        if (!forces) continue;
+        const double dz = -pre * q[i] * q[j] * er;
+        gc[3 * j + 2] += dz, gc[3 * i + 2] -= dz, Wc[2][2] += dz * zij;
+      }
+    }
+    E += Erec + E0;
+    if (forces) {
+      for (int a = 0; a < 2; a++) Wc[a][a] -= Erec + E0; // both ~ 1 / A
+      for (int i = 0; i < n; i++)
+        for (int a = 0; a < 3; a++)
+          for (int b = 0; b < 3; b++) g[3 * i + a] += B[b][a] * gc[3 * i + b];
+      for (int a = 0; a < 3; a++)
+        for (int b = 0; b < 3; b++)
+          for (int k = 0; k < 3; k++)
+            for (int l = 0; l < 3; l++) vir[3 * a + b] += B[k][a] * Wc[k][l] * B[l][b];
+    }
+  }
+  // separated clusters (not lrc_intra): the linked pairs, as energy_images
+  const double *xh = c.cl.xh.data();
+  for (int i = 0; i < n && !L.intra; i++)
+    for (int j = i + 1; j < n; j++) {
+      const int a = c.cl.sn[i], b = c.cl.sn[j];
+      const double R = a == b ? 1.0 : c.cl.R[size_t(a) * s + b];
+      if (R == 0) continue;
+      const double d[3] = {xh[3 * j] - xh[3 * i], xh[3 * j + 1] - xh[3 * i + 1], xh[3 * j + 2] - xh[3 * i + 2]};
+      const double r = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+      if (r <= r0) continue;
+      double T, dT;
+      sw(r, T, dT);
+      pair(i, j, d, r, -T * R / r, -R * (dT / r - T / (r * r)));
+      if (a != b) W[size_t(a) * s + b] -= 0.5 * q[i] * q[j] * T / r, W[size_t(b) * s + a] -= 0.5 * q[i] * q[j] * T / r;
+    }
+  out.energy = KE * E;
+  if (!forces) return out;
+  for (std::vector<double> *v : {&g, &dq, &W, &vir})
+    for (double &t : *v) t *= KE;
+  if (qproj) lrc_project_vjp(L, c.cl, proj, n, x, dq, g.data(), nullptr, vir.data());
+  if (!L.intra) lrc_clusters_vjp(L, c.cl, n, x, W, g.data(), vir.data());
+  lrc_q0_vjp(L, S, n, Z, x, c.q0, dq.data(), g.data(), vir.data());
+  out.forces.resize(g.size());
+  for (size_t k = 0; k < g.size(); k++) out.forces[k] = -g[k];
+  out.virial = vir;
+  return out;
+}
+
 LrcEnergy energy_fixed(const LrcSpec &L, const SqeSpec &S, const LrcCondition &c, int n, const int32_t *Z,
                        const double *x, bool forces) {
   constexpr double KE = 14.399645;
@@ -1701,12 +2131,14 @@ LrcEnergy lrc_energy(const LrcSpec &L, const SqeSpec &S, const LrcCondition &c, 
   if (L.intra) { // every pair beyond the switch, inside clusters and bulk cells too
     if (!L.graph || L.mp || L.pol) throw std::runtime_error("lrc_intra: needs the graph q0 mode without lrc_mp / lrc_pol");
     if (c.q0.q0.size() != size_t(n)) throw std::logic_error("lrc_intra: no reference charges in the conditioning");
+    if (c.cl.slab()) return energy_slab(L, S, c, n, Z, x, forces);
     return c.cl.periodic() ? energy_images(L, S, c, n, Z, x, forces) : energy_fixed(L, S, c, n, Z, x, forces);
   }
   if (c.cl.s == 1 && !c.cl.images()) return out; // one cluster / bulk: E*(gamma) - E*(gamma) = 0 exactly
   if (c.cl.images()) {
     if (!L.graph || L.mp || L.pol)
       throw std::runtime_error("lrc: separated clusters in a periodic cell need the graph q0 mode without lrc_mp / lrc_pol");
+    if (c.cl.slab()) return energy_slab(L, S, c, n, Z, x, forces);
     return energy_images(L, S, c, n, Z, x, forces);
   }
   if (L.graph) return energy_fixed(L, S, c, n, Z, x, forces);

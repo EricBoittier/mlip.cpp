@@ -70,6 +70,27 @@ bool parse_exyz_lattice(const std::string &comment_line, double cell[3][3]) {
   return true;
 }
 
+// pbc="T T F" (ASE: T / F / True / False / 1 / 0); absent: periodic in every direction of the Lattice
+static void parse_exyz_pbc(const std::string &comment_line, bool pbc[3]) {
+  pbc[0] = pbc[1] = pbc[2] = true;
+  for (size_t pos = comment_line.find("pbc="); pos != std::string::npos; pos = comment_line.find("pbc=", pos + 1)) {
+    if (pos > 0 && !std::isspace(static_cast<unsigned char>(comment_line[pos - 1]))) continue;
+    size_t start = pos + 4;
+    const bool quoted = start < comment_line.size() && comment_line[start] == '"';
+    if (quoted) start++;
+    const size_t end = quoted ? comment_line.find('"', start) : comment_line.find_first_of(" \t\r", start);
+    std::istringstream iss(comment_line.substr(start, end == std::string::npos ? std::string::npos : end - start));
+    for (int k = 0; k < 3; k++) {
+      std::string t;
+      if (!(iss >> t)) throw std::runtime_error("XYZ: cannot parse pbc= in: " + comment_line);
+      if (t == "T" || t == "True" || t == "true" || t == "1") pbc[k] = true;
+      else if (t == "F" || t == "False" || t == "false" || t == "0") pbc[k] = false;
+      else throw std::runtime_error("XYZ: cannot parse pbc= in: " + comment_line);
+    }
+    return;
+  }
+}
+
 bool parse_exyz_number(const std::string &comment_line, const std::string &key, double &value) {
   // key=value or key="value", the key at the start of the line or after a space
   for (size_t pos = comment_line.find(key + "="); pos != std::string::npos;
@@ -174,7 +195,9 @@ AtomicSystem read_xyz(std::istream &stream) {
         cell_f[i][j] = static_cast<float>(cell[i][j]);
       }
     }
-    Cell cell_obj(cell_f);
+    bool pbc[3];
+    parse_exyz_pbc(comment, pbc);
+    Cell cell_obj(cell_f, pbc[0], pbc[1], pbc[2]);
 
     // Convert to float positions
     std::vector<float> positions_f(positions.begin(), positions.end());
