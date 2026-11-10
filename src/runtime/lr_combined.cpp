@@ -509,13 +509,17 @@ void vjp_round(const LrcSpec &L, const SqeSpec &S, int n, const int32_t *Z, cons
 }
 } // namespace
 
+// An element absent from lrc_fukui_Z (e.g. the rare gases: the Fukui fits list only the elements in their data) takes
+// phi = 0, the value the fits start every element from (an element listed without data keeps it). It used to throw,
+// which failed every structure with such an atom once it had more than one cluster (Ar ... Xe at 9 A; He ... Ne).
 double LrcSpec::fukui(int z) const {
+  double p = 0.0;
   for (size_t k = 0; k < fukui_Z.size(); k++)
     if (fukui_Z[k] == z) {
-      const double p = fukui_phi[k];
-      return (p > 30 ? p : std::log1p(std::exp(p))) + 1e-6;
+      p = fukui_phi[k];
+      break;
     }
-  throw std::runtime_error("lrc graph: no Fukui parameter for atomic number " + std::to_string(z));
+  return (p > 30 ? p : std::log1p(std::exp(p))) + 1e-6;
 }
 
 // ---- atomic multipoles (graph mode, lrc_mp) ---------------------------------------------------------------------------
