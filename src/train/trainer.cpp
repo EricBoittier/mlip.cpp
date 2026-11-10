@@ -1141,14 +1141,12 @@ void Worker::lrc_prepare(const Batch &b, bool forces) {
   lrc_batch_ = &b;
 }
 
-double Worker::run_tail(const Batch &b, double energy_scale, const std::vector<TailPair> &pairs, const TailLoss &tl,
-                        double mult, std::vector<double> *r) {
-  if (!tail_cotangent) throw std::logic_error("run_tail: tail_cotangent is off");
+std::vector<double> Worker::energies(const Batch &b, double energy_scale) {
   t_build = t_alloc = t_upload = t_compute = t_download = t_cpu = 0;
   plato_batch_ = &b;
   const int n = b.n_atoms, m = b.max_neighbors, S = b.n_systems;
   if (lrc) lrc_prepare(b, false);
-  // 1. the model energies (eV, without the composition: it cancels within a scan)
+  // the model energies (eV, without the composition: it cancels between structures of the same atoms)
   std::vector<double> E(b.n_real_systems);
   {
     std::unique_ptr<StepGraph> once;
@@ -1162,7 +1160,26 @@ double Worker::run_tail(const Batch &b, double energy_scale, const std::vector<T
     if (lrc)
       for (int k = 0; k < b.n_real_systems; k++) E[k] += lrc_e_[k];
   }
-  // split-charge equilibration (host-side energy): its energy joins E, its parameter gradient comes after the loss
+  if (sqe) { // split-charge equilibration (host-side energy)
+    std::vector<int> sys_off(S + 1, 0);
+    for (int k = 0; k < S; k++) sys_off[k + 1] = sys_off[k] + b.n_per_system[k];
+    for (int k = 0; k < b.n_real_systems; k++) {
+      if (b.periodic[k]) throw std::runtime_error("sqe: periodic tail / pair structures are not supported");
+      const std::vector<double> x(b.positions.begin() + 3 * size_t(sys_off[k]), b.positions.begin() + 3 * size_t(sys_off[k + 1]));
+      const double *q0 = !sqe->q0_learned && !b.sqe_q0_ok.empty() && b.sqe_q0_ok[k] ? b.sqe_q0.data() + sys_off[k] : nullptr;
+      E[k] += runtime::sqe_compute(*sqe, b.n_per_system[k], b.atomic_number.data() + sys_off[k], x.data(),
+                                   double(b.system_charge[k]), q0, false).energy;
+    }
+  }
+  return E;
+}
+
+double Worker::run_tail(const Batch &b, double energy_scale, const std::vector<TailPair> &pairs, const TailLoss &tl,
+                        double mult, std::vector<double> *r) {
+  if (!tail_cotangent) throw std::logic_error("run_tail: tail_cotangent is off");
+  const int n = b.n_atoms, m = b.max_neighbors, S = b.n_systems;
+  // 1. the model energies (eV, without the composition: it cancels within a scan / a pair group)
+  const std::vector<double> E = energies(b, energy_scale);
   std::vector<int> sys_off(S + 1, 0);
   for (int k = 0; k < S; k++) sys_off[k + 1] = sys_off[k] + b.n_per_system[k];
   auto sqe_q0 = [&](int k) {
@@ -1171,13 +1188,6 @@ double Worker::run_tail(const Batch &b, double energy_scale, const std::vector<T
   auto sqe_x = [&](int k) {
     return std::vector<double>(b.positions.begin() + 3 * size_t(sys_off[k]), b.positions.begin() + 3 * size_t(sys_off[k + 1]));
   };
-  if (sqe)
-    for (int k = 0; k < b.n_real_systems; k++) {
-      if (b.periodic[k]) throw std::runtime_error("sqe: periodic tail structures are not supported");
-      const auto x = sqe_x(k);
-      E[k] += runtime::sqe_compute(*sqe, b.n_per_system[k], b.atomic_number.data() + sys_off[k], x.data(),
-                                   double(b.system_charge[k]), sqe_q0(k), false).energy;
-    }
   for (const TailPair &p : pairs)
     if (b.n_per_system.at(p.k) != b.n_per_system.at(p.l)) throw std::runtime_error("tail pair of different sizes");
   // 2. the loss and dL/dE; dE_k / d(d_energy_k) = s_E N_k
@@ -2834,6 +2844,211 @@ void train(const TrainOptions &o) {
     return std::make_pair(&g, make_batch(*tail_split, nl_tail, g.ids, rot, species, scaling, cutoff));
   };
 
+  // --pair-data: same-geometry charge / spin-state groups (a MemmapSplit + pairs.tsv); one group per pair_every-th
+  // step, co-batched (all states of the geometry in one batch), classes in turn; --pair-val: held-out groups
+  auto load_pairs = [&](const std::string &dir, std::unique_ptr<MemmapSplit> &split, NeighborCache &nlc, TailSet &set,
+                        const char *what) {
+    split = std::make_unique<MemmapSplit>(dir);
+    split->set_sqe(false, train_split.sqe_backbone_neutral());
+    const std::string f = std::filesystem::exists(dir + "/pairs.tsv") ? dir + "/pairs.tsv" : dir + "/tail_pairs.tsv";
+    set = TailSet::load(f, true);
+    for (auto &g : set.groups) {
+      for (int64_t sidx : g.ids)
+        if (sidx < 0 || sidx >= split->size()) throw std::runtime_error(fmt::format("{}: structure index out of range", what));
+      for (TailPair &p : g.pairs) { // the same atoms (the composition cancels; their order may differ: energies are per
+        // structure and forces per member)
+        const int64_t k = g.ids[p.k], l = g.ids[p.l];
+        const int nk = split->n_atoms(k);
+        std::vector<int32_t> zk(split->numbers(k), split->numbers(k) + nk), zl;
+        if (nk == split->n_atoms(l)) zl.assign(split->numbers(l), split->numbers(l) + nk);
+        std::sort(zk.begin(), zk.end()), std::sort(zl.begin(), zl.end());
+        if (zk != zl)
+          throw std::runtime_error(fmt::format("{}: pair {} / {} of group {} is not the same atoms", what, k, l, g.name));
+        p.de_ref = 0.0; // the scale is fixed (pair_scale)
+      }
+    }
+    nlc = NeighborCache::load_or_build(*split, cutoff, cache_path(o.cache_dir, *split, cutoff, adaptive), o.n_threads,
+                                       adaptive);
+    nlc.taper = o.conservative && adaptive.enabled(); // as the training split: the members' forces may enter
+    std::string per;
+    for (size_t c = 0; c < set.classes.size(); c++)
+      per += fmt::format("{}{} {}", c ? ", " : "", set.classes[c], set.by_class[c].size());
+    fmt::print("{}: {} structures, {} groups ({}), {} pairs ({})\n", what, split->size(), set.groups.size(), per,
+               set.n_pairs(), f);
+  };
+  std::unique_ptr<MemmapSplit> pair_split;
+  NeighborCache nl_pair;
+  TailSet pair_set;
+  TailLoss pair_loss{o.pair_weight, o.pair_scale, o.pair_delta};
+  const bool pair_on = !o.pair_data.empty() && (o.pair_weight > 0 || o.pair_rows_weight > 0) && !eval_only;
+  if (pair_on) {
+    if (!o.conservative) throw std::runtime_error("--pair-data: conservative training only");
+    if (o.pair_every < 1 || !(o.pair_scale > 0) || !(o.pair_delta > 0))
+      throw std::runtime_error("--pair-every >= 1, --pair-scale > 0 and --pair-delta > 0");
+    load_pairs(o.pair_data, pair_split, nl_pair, pair_set, "pair loss");
+    if (o.pair_weight > 0)
+      for (auto &wk : workers) wk->tail_cotangent = true;
+    fmt::print("pair loss: every {} step(s) one group (classes in turn): {} x mean over its pairs of Huber_{}((dE_model - "
+               "dE_DFT) / {} eV){}\n",
+               o.pair_every, o.pair_weight, o.pair_delta, o.pair_scale,
+               o.pair_rows_weight > 0 ? fmt::format(", and its members' energy + force loss at {} x an ordinary row",
+                                                    o.pair_rows_weight)
+                                      : std::string());
+  }
+  // --pair-val DIR[,DIR...]: held-out sets, each tagged by its directory's base name
+  struct PairVal {
+    std::string tag;
+    std::unique_ptr<MemmapSplit> split;
+    NeighborCache nl;
+    TailSet set;
+  };
+  std::vector<PairVal> pair_vals;
+  for (size_t p0 = 0; !o.pair_val.empty() && p0 <= o.pair_val.size();) {
+    const size_t p1 = std::min(o.pair_val.find(',', p0), o.pair_val.size());
+    const std::string dir = o.pair_val.substr(p0, p1 - p0);
+    p0 = p1 + 1;
+    if (dir.empty()) continue;
+    PairVal pv;
+    pv.tag = std::filesystem::path(dir).filename().string();
+    if (pv.tag.empty()) pv.tag = std::filesystem::path(dir).parent_path().filename().string();
+    load_pairs(dir, pv.split, pv.nl, pv.set, ("pair val " + pv.tag).c_str());
+    pair_vals.push_back(std::move(pv));
+  }
+  std::vector<double> pair_log_l(pair_set.classes.size(), 0.0), pair_log_r(pair_set.classes.size(), 0.0);
+  std::vector<int64_t> pair_log_n(pair_set.classes.size(), 0), pair_log_np(pair_set.classes.size(), 0);
+  double pair_ep_l = 0, pair_ep_rows = 0;
+  int64_t pair_ep_n = 0;
+  // the group of step s and its batch (one random rotation for the group); its own stream, so the OMol25 batches
+  // (and the tail groups) are those of the run without the pair loss
+  std::vector<int> pair_group_classes; // classes that are some group's (first pair's) class
+  for (size_t c = 0; c < pair_set.by_class.size(); c++)
+    if (!pair_set.by_class[c].empty()) pair_group_classes.push_back(int(c));
+  auto pair_batch = [&](int64_t s, int &cls) {
+    const int64_t visit = s / o.pair_every;
+    cls = pair_group_classes[size_t(visit % int64_t(pair_group_classes.size()))];
+    std::mt19937_64 rng((o.seed + 0x9A12ULL) * 0x9E3779B97F4A7C15ULL + uint64_t(visit));
+    const auto &gs = pair_set.by_class[cls];
+    const TailGroup &g = pair_set.groups[gs[std::uniform_int_distribution<size_t>(0, gs.size() - 1)(rng)]];
+    const auto R = random_o3(rng);
+    std::vector<std::array<float, 9>> rot(g.ids.size(), R);
+    return std::make_pair(&g, make_batch(*pair_split, nl_pair, g.ids, rot, species, scaling, cutoff));
+  };
+  // held-out pairs: dE_model - dE_DFT (eV) per pair, by class; no rotation, forward only
+  // and, with --pair-val-dump PREFIX, every pair's error to PREFIX.<tag>.epochNNNNN.tsv (group class k l dE_DFT err)
+  auto pair_val_eval = [&](int64_t epoch_done) {
+    std::string txt, js;
+    for (PairVal &pv : pair_vals) {
+      std::vector<std::vector<double>> err(pv.set.classes.size());
+      std::unique_ptr<std::FILE, int (*)(std::FILE *)> dump(nullptr, std::fclose);
+      if (!o.pair_val_dump.empty())
+        dump.reset(std::fopen(fmt::format("{}.{}.epoch{:05d}.tsv", o.pair_val_dump, pv.tag, epoch_done).c_str(), "w"));
+      if (dump) std::fprintf(dump.get(), "group\tclass\tk\tl\tdE_dft_eV\terr_eV\n");
+      for (const TailGroup &g : pv.set.groups) {
+        const Batch b = make_batch(*pv.split, pv.nl, g.ids, {}, species, scaling, cutoff);
+        const std::vector<double> E = w0.energies(b, scaling.energy_scale);
+        for (const TailPair &p : g.pairs) {
+          const double e = E[p.k] - E[p.l] - p.de_dft;
+          err[p.cls].push_back(e);
+          if (dump)
+            std::fprintf(dump.get(), "%s\t%s\t%lld\t%lld\t%.6f\t%.6f\n", g.name.c_str(), pv.set.classes[p.cls].c_str(),
+                         (long long)g.ids[p.k], (long long)g.ids[p.l], p.de_dft, e);
+        }
+      }
+      for (size_t c = 0; c < err.size(); c++) {
+        auto &e = err[c];
+        if (e.empty()) continue;
+        double mae = 0, mse = 0, se = 0;
+        for (double x : e) mae += std::abs(x), mse += x, se += x * x;
+        std::vector<double> a(e.size());
+        std::transform(e.begin(), e.end(), a.begin(), [](double x) { return std::abs(x); });
+        std::nth_element(a.begin(), a.begin() + a.size() / 2, a.end());
+        const double n = double(e.size()), med = a[a.size() / 2];
+        const std::string key = pv.tag + "_" + pv.set.classes[c];
+        txt += fmt::format("{}{} n {} MAE {:.4f} eV, median |err| {:.4f}, mean {:+.4f}, RMSE {:.4f}", txt.empty() ? "" : "; ",
+                           key, e.size(), mae / n, med, mse / n, std::sqrt(se / n));
+        js += fmt::format(",\"pair_val_{}_mae_ev\":{},\"pair_val_{}_median_ev\":{},\"pair_val_{}_mean_ev\":{}", key, mae / n, key,
+                          med, key, mse / n);
+      }
+    }
+    return std::make_pair(txt, js);
+  };
+
+  if (!pair_vals.empty() && !eval_only && state.epoch == 0) { // the init's held-out pair errors (epoch 0 dump)
+    const auto t_pv = clock_type::now();
+    const std::string txt = pair_val_eval(0).first;
+    fmt::print("init held-out pairs ({:.1f} s): {}\n", seconds_since(t_pv), txt);
+  }
+  if (pair_on && o.pair_grad_check > 0) {
+    // end-to-end gradient check of the pair loss: g from run_tail's backward (mult 1), then the loss at
+    // params +- h g/|g| (forward energies only); a correct gradient gives (L+ - L-) / 2h -> |g|
+    if (o.pair_weight <= 0) throw std::runtime_error("--pair-grad-check needs --pair-weight > 0");
+    const std::vector<float> p0 = w0.get_params();
+    int checked = 0, bad = 0, bad_batch = 0;
+    for (size_t gi = 0; gi < pair_set.groups.size() && checked < o.pair_grad_check; gi++) {
+      const TailGroup &g = pair_set.groups[gi];
+      const Batch b = make_batch(*pair_split, nl_pair, g.ids, {}, species, scaling, cutoff);
+      // co-batching: the group's energies in one batch (states of different Q / M side by side) against each
+      // structure alone, and against a randomly rotated batch
+      const std::vector<double> Eg = w0.energies(b, scaling.energy_scale);
+      double dmax = 0, drot = 0;
+      for (size_t q = 0; q < g.ids.size(); q++) {
+        const Batch b1 = make_batch(*pair_split, nl_pair, {g.ids[q]}, {}, species, scaling, cutoff);
+        dmax = std::max(dmax, std::abs(w0.energies(b1, scaling.energy_scale)[0] - Eg[q]));
+      }
+      {
+        std::mt19937_64 rng(uint64_t(gi) + 17);
+        const auto R = random_o3(rng);
+        const Batch br = make_batch(*pair_split, nl_pair, g.ids, std::vector<std::array<float, 9>>(g.ids.size(), R),
+                                    species, scaling, cutoff);
+        const std::vector<double> Er = w0.energies(br, scaling.energy_scale);
+        // PET is not exactly rotation invariant: report the pair differences' change (a model property, no gate)
+        for (const TailPair &p : g.pairs) drot = std::max(drot, std::abs((Er[p.k] - Er[p.l]) - (Eg[p.k] - Eg[p.l])));
+      }
+      std::string states;
+      for (size_t q = 0; q < g.ids.size(); q++)
+        states += fmt::format(" [Q {} M {}: E {:.5f} eV]", pair_split->charge(g.ids[q]),
+                              pair_split->spin_multiplicity(g.ids[q]), Eg[q]);
+      fmt::print("pair batch check group {}:{}; max |E(co-batched) - E(alone)| {:.2e} eV; one common rotation moves dE by {:.2e} eV (not gated)\n", g.name,
+                 states, dmax, drot);
+      bad_batch += dmax > 1e-4;
+      w0.zero_grads();
+      const double L0 = w0.run_tail(b, scaling.energy_scale, g.pairs, pair_loss, 1.0);
+      const std::vector<float> gr = w0.get_grads();
+      double gn = 0;
+      for (float x : gr) gn += double(x) * x;
+      gn = std::sqrt(gn);
+      if (!(gn > 0)) {
+        fmt::print("pair grad check: group {} has a zero gradient (L {:.6g})\n", g.name, L0);
+        continue;
+      }
+      std::string line;
+      double best = 1e30;
+      for (double h : {3e-2, 1e-2, 3e-3, 1e-3}) {
+        const double step = h / gn; // parameter displacement h along g / |g|
+        auto loss_at = [&](double sgn) {
+          std::vector<float> p = p0;
+          for (size_t q = 0; q < p.size(); q++) p[q] += static_cast<float>(sgn * step * gr[q]);
+          w0.set_params(p);
+          return pair_loss.eval(g.pairs, w0.energies(b, scaling.energy_scale), nullptr);
+        };
+        const double fd = (loss_at(+1) - loss_at(-1)) / (2 * h);
+        const double rel = std::abs(fd - gn) / gn;
+        best = std::min(best, rel);
+        line += fmt::format(" h {:.0e}: FD {:.6g} (rel {:.2e})", h, fd, rel);
+      }
+      w0.set_params(p0);
+      fmt::print("pair grad check group {} ({} structures, {} pairs): L {:.6g}, |g| {:.6g};{}\n", g.name, g.ids.size(),
+                 g.pairs.size(), L0, gn, line);
+      checked++, bad += best > 2e-2;
+    }
+    w0.zero_grads();
+    fmt::print("pair grad check: {} groups, {} with no step size within 2% of |g|: {}\n", checked, bad,
+               bad ? "FAIL" : "PASS");
+    fmt::print("pair batch check: {} groups with a co-batched energy off its single-structure value by > 0.1 meV: {}\n", bad_batch,
+               bad_batch ? "FAIL" : "PASS");
+    return;
+  }
+
   // --log-errors: each training structure's errors before the update it takes part in
   std::unique_ptr<std::FILE, int (*)(std::FILE *)> log_file(nullptr, std::fclose);
   if (!o.log_errors.empty() && !eval_only) {
@@ -2904,6 +3119,34 @@ void train(const TrainOptions &o) {
           const double L = workers[0]->run_tail(tb, scaling.energy_scale, g->pairs, tail_loss, double(W), &r);
           tail_log_l[cls] += L, tail_log_n[cls]++, tail_ep_l += L, tail_ep_n++;
           for (double x : r) tail_log_r[cls] += std::abs(x), tail_log_np[cls]++;
+        }
+        if (pair_on && w == 0 && global_step % o.pair_every == 0) { // the pair group (worker 0, as the tail)
+          int cls = 0;
+          auto [g, pb] = pair_batch(global_step, cls);
+          if (o.pair_rows_weight > 0) {
+            // its members as ordinary rows x V: the step batch's per-structure and per-atom loss norms (they carry
+            // the DDP factor W already); no per-row weights or error records (they index the training split)
+            const Batch *ref = nullptr;
+            for (const auto &bw : batches)
+              if (!ref && !bw.empty()) ref = &bw.front();
+            pb.energy_norm = static_cast<float>(o.pair_rows_weight) * (ref ? ref->energy_norm : 1.0f / B);
+            pb.force_norm = static_cast<float>(o.pair_rows_weight) * (ref ? ref->force_norm : 1.0f / (3.0f * pb.n_atoms));
+            Worker &wk = *workers[0];
+            const auto *sw = wk.energy_sw;
+            auto *se = wk.system_errors;
+            auto *ae = wk.atom_errors;
+            wk.energy_sw = nullptr, wk.system_errors = nullptr, wk.atom_errors = nullptr;
+            const StepStats ps = wk.run(pb, scaling.energy_scale, true);
+            wk.energy_sw = sw, wk.system_errors = se, wk.atom_errors = ae;
+            pair_ep_rows += ps.loss;
+          }
+          if (o.pair_weight > 0) {
+            std::vector<double> r;
+            const double L = workers[0]->run_tail(pb, scaling.energy_scale, g->pairs, pair_loss, double(W), &r);
+            pair_log_l[cls] += L, pair_log_n[cls]++, pair_ep_l += L;
+            for (size_t q = 0; q < r.size(); q++) pair_log_r[g->pairs[q].cls] += std::abs(r[q]), pair_log_np[g->pairs[q].cls]++;
+          }
+          pair_ep_n++;
         }
         optimizer.stage(w); // ship the gradients while the other workers still compute
       });
@@ -3005,6 +3248,16 @@ void train(const TrainOptions &o) {
           }
           fmt::print("  tail loss per group: {}\n", per);
         }
+        if (pair_on && o.pair_weight > 0) {
+          std::string per;
+          for (size_t c = 0; c < pair_set.classes.size(); c++) {
+            per += fmt::format("{}{} groups {:.4g}, pairs mean |dE err| {:.3f} eV", c ? ", " : "", pair_set.classes[c],
+                               pair_log_l[c] / std::max<int64_t>(1, pair_log_n[c]),
+                               o.pair_scale * pair_log_r[c] / std::max<int64_t>(1, pair_log_np[c]));
+            pair_log_l[c] = pair_log_r[c] = 0, pair_log_n[c] = pair_log_np[c] = 0;
+          }
+          fmt::print("  pair loss per class: {}\n", per);
+        }
         if (w0.lrc && w0.lrc_seen > 0)
           fmt::print("  lrc: {} structures ({} charge-model evaluations, cached), {} with > 1 cluster, {} with dS != 0 ({}), "
                      "{} large-component fallbacks\n",
@@ -3068,6 +3321,17 @@ void train(const TrainOptions &o) {
       fmt::print("epoch {} fragment charges ({}): RMSE train {:.4f} e ({} fragments), val {:.4f} e ({} fragments)\n",
                  epoch, o.charge_corr_target, std::sqrt(ep.se_frag / std::max<int64_t>(1, ep.n_frag)), ep.n_frag,
                  std::sqrt(val.se_frag / std::max<int64_t>(1, val.n_frag)), val.n_frag);
+    std::string pair_js;
+    if (!pair_vals.empty()) {
+      const auto t_pv = clock_type::now();
+      auto [txt, js] = pair_val_eval(epoch + 1);
+      fmt::print("epoch {} held-out pairs ({:.1f} s): {}\n", epoch, seconds_since(t_pv), txt);
+      pair_js = js;
+    }
+    if (pair_on)
+      pair_js += fmt::format(",\"train_pair_loss\":{},\"train_pair_rows_loss\":{}", pair_ep_l / std::max<int64_t>(1, pair_ep_n),
+                             pair_ep_rows / std::max<int64_t>(1, pair_ep_n));
+    pair_ep_l = pair_ep_rows = 0, pair_ep_n = 0;
     std::fflush(stdout);
     params = w0.get_params(); // the master copy lives on device 0
     const int64_t done_epochs = epoch + 1;
@@ -3082,7 +3346,8 @@ void train(const TrainOptions &o) {
                          ep.loss / done, tre, trf, t_train, t_val, best) +
                  (grouped ? ",\"lr_groups\":" + grouped->lr_json(std::max<int64_t>(0, global_step - 1), steps_per_epoch, total_steps)
                           : std::string()) +
-                 (tail_on ? fmt::format(",\"train_tail_loss\":{}", tail_ep_l / std::max<int64_t>(1, tail_ep_n)) : std::string()));
+                 (tail_on ? fmt::format(",\"train_tail_loss\":{}", tail_ep_l / std::max<int64_t>(1, tail_ep_n)) : std::string()) +
+                 pair_js);
     tail_ep_l = 0, tail_ep_n = 0;
     if (o.save_every <= 0)
       write_gguf(o.init_gguf, fmt::format("{}.epoch{}", o.output, epoch), w0, params, scaling);

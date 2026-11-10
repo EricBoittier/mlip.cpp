@@ -17,6 +17,7 @@ struct TailPair {
   double de_dft = 0;      // E_DFT(k) - E_DFT(l), eV
   double de_ref = 0;      // ΔE_ref(k) - ΔE_ref(l), eV (signed)
   double d = 0;           // closest-atom distance of k, Å
+  int cls = -1;           // the pair's own class (TailSet::load with mixed classes; else the group's)
 };
 
 struct TailGroup {
@@ -32,7 +33,9 @@ struct TailSet {
   std::vector<std::string> classes;
   std::vector<TailGroup> groups;
   std::vector<std::vector<int>> by_class; // group indices per class
-  static TailSet load(const std::string &path);
+  /// mixed: a group may hold pairs of several classes (pair data: IP and EA of one geometry); the group's class,
+  /// used to sample groups, is that of its first pair, and each pair keeps its own in TailPair::cls
+  static TailSet load(const std::string &path, bool mixed = false);
   size_t n_pairs() const;
 };
 
