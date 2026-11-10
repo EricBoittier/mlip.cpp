@@ -278,6 +278,11 @@ LrcSpec LrcSpec::from_gguf(const GGUFLoader &G, const SqeSpec &S) {
     if (L.qproj && !(L.qproj_w > 0 && L.qproj_w <= 1)) throw std::runtime_error("lrc: lrc_qproj_w must be in (0, 1]");
     if (!(L.cond_w > 0 && L.cond_w <= 1)) throw std::runtime_error("lrc: lrc_cond_w must be in (0, 1]");
   }
+  {
+    const std::string im = G.get_string("pet.plato_lr.lrc_intra", "none");
+    if (im != "none" && im != "ewald") throw std::runtime_error("lrc: lrc_intra must be none or ewald");
+    L.intra = im == "ewald";
+  }
   if (L.graph) {
     L.qmodel = G.get_string("pet.plato_lr.lrc_qmodel", "");
     {
@@ -321,8 +326,10 @@ LrcSpec LrcSpec::from_gguf(const GGUFLoader &G, const SqeSpec &S) {
       if (L.pol_Z.empty() || L.pol_Z.size() != L.pol_alpha.size())
         throw std::runtime_error("lrc pol: needs lrc_pol_Z and lrc_pol_alpha of equal length");
     }
+    if (L.intra && (L.mp || L.pol)) throw std::runtime_error("lrc_intra: not with lrc_mp / lrc_pol");
     return L;
   }
+  if (L.intra) throw std::runtime_error("lrc_intra: needs the graph q0 mode");
   const size_t E = S.Z.size();
   if (!(L.a_off > L.a_on)) throw std::runtime_error("lrc: bad a_on / a_off");
   if (L.round || L.head_only) {
@@ -354,6 +361,7 @@ void LrcSpec::to_gguf(gguf_context *g) const {
   scalar("cond_w", cond_w);
   gguf_set_val_i32(g, "pet.plato_lr.lrc_qproj", qproj ? 1 : 0);
   scalar("qproj_w", qproj_w);
+  if (intra) gguf_set_val_str(g, "pet.plato_lr.lrc_intra", "ewald"); // absent key = none (earlier GGUFs unchanged)
   auto arr = [&](const char *k, const std::vector<double> &v) {
     gguf_set_arr_data(g, (std::string("pet.plato_lr.lrc_") + k).c_str(), GGUF_TYPE_FLOAT64, v.data(), v.size());
   };
@@ -1043,8 +1051,11 @@ LrcCondition lrc_condition(const LrcSpec &L, const SqeSpec &S, int n, const int3
   if (c.cl.images() && (!L.graph || L.mp || L.pol))
     throw std::runtime_error("lrc: separated clusters in a periodic cell need the graph q0 mode without lrc_mp / "
                              "lrc_pol (bulk cells work in every mode)");
-  if (s == 1 && !c.cl.images()) { // one open cluster or a bulk cell: the structure's charge, no long range
+  if (L.intra && (!L.graph || L.mp || L.pol))
+    throw std::runtime_error("lrc_intra: needs the graph q0 mode without lrc_mp / lrc_pol");
+  if (s == 1 && !c.cl.images()) { // one open cluster or a bulk cell: conditioned on the structure's charge
     c.Q0[0] = c.Qloc[0] = Q;
+    if (L.intra) c.q0 = lrc_q0(L, S, n, Z, x, Q, spin, cell); // the long range still acts inside (charge pass in the cell)
   } else { // (a single periodic cluster still meets its images: the charges are needed)
     c.q0 = lrc_q0(L, S, n, Z, x, Q, spin, cell);
     for (int i = 0; i < n; i++) c.Q0[c.cl.sn[i]] += c.q0.q0[i];
@@ -1379,6 +1390,8 @@ void vjp_graph(const LrcSpec &L, int n, const int32_t *Z, const double *x, const
 // (every image pair counted once; r^ the distance in the unwrapped weak component, the only image of j linked to i).
 // Ewald: point charges, tin-foil boundary, neutralising background for a charged cell; real-space cutoff balancing the
 // real and reciprocal sums (at least lr_R) with erfc(alpha rc) = erfc(5) ~ 1e-12.
+// lrc_intra: no linked-pair term (R = 0 in the energy), so also a bulk cell (one cluster through its images):
+//   E = KE [ Ewald(q) - sum_{pairs r < lr_R} q_i q_j (1 - T) / r ]
 LrcEnergy energy_images(const LrcSpec &L, const SqeSpec &S, const LrcCondition &c, int n, const int32_t *Z,
                         const double *x, bool forces) {
   constexpr double KE = 14.399645, acc = 5.0;
@@ -1390,7 +1403,8 @@ LrcEnergy energy_images(const LrcSpec &L, const SqeSpec &S, const LrcCondition &
   std::vector<double> g(3 * size_t(n), 0.0), dq(n, 0.0), W(size_t(s) * s, 0.0), vir(9, 0.0);
   std::vector<double> q = c.q0.q0;
   LrcProjection proj;
-  if (L.qproj) proj = lrc_project(L, c.cl, n, Z, q.data()), q = proj.q, out.q = q;
+  const bool qproj = L.qproj && !L.fukui_cluster; // AC: the reference charges are already projected
+  if (qproj) proj = lrc_project(L, c.cl, n, Z, q.data()), q = proj.q, out.q = q;
   double E = 0, Qt = 0;
   for (double v : q) Qt += v;
   // one pair's energy q_i q_j u(r), j's image at d = x_j' - x_i, du = du/dr
@@ -1476,9 +1490,9 @@ LrcEnergy energy_images(const LrcSpec &L, const SqeSpec &S, const LrcCondition &
             for (int b = 0; b < 3; b++)
               vir[3 * a + b] += A * S2 * ((a == b ? -1.0 : 0.0) + 2 * k[a] * k[b] * (1 / (4 * al * al) + 1 / k2));
       }
-  // the linked pairs: each cluster with itself (R = 1) and with the clusters of its weak component
+  // the linked pairs: each cluster with itself (R = 1) and with the clusters of its weak component (not with lrc_intra)
   const double *xh = c.cl.xh.data();
-  for (int i = 0; i < n; i++)
+  for (int i = 0; i < n && !L.intra; i++)
     for (int j = i + 1; j < n; j++) {
       const int a = c.cl.sn[i], b = c.cl.sn[j];
       const double R = a == b ? 1.0 : c.cl.R[size_t(a) * s + b];
@@ -1495,8 +1509,8 @@ LrcEnergy energy_images(const LrcSpec &L, const SqeSpec &S, const LrcCondition &
   if (!forces) return out;
   for (std::vector<double> *v : {&g, &dq, &W, &vir})
     for (double &t : *v) t *= KE;
-  if (L.qproj) lrc_project_vjp(L, c.cl, proj, n, x, dq, g.data(), nullptr, vir.data());
-  lrc_clusters_vjp(L, c.cl, n, x, W, g.data(), vir.data());
+  if (qproj) lrc_project_vjp(L, c.cl, proj, n, x, dq, g.data(), nullptr, vir.data());
+  if (!L.intra) lrc_clusters_vjp(L, c.cl, n, x, W, g.data(), vir.data());
   lrc_q0_vjp(L, S, n, Z, x, c.q0, dq.data(), g.data(), vir.data());
   out.forces.resize(g.size());
   for (size_t k = 0; k < g.size(); k++) out.forces[k] = -g[k];
@@ -1646,26 +1660,27 @@ LrcEnergy energy_fixed(const LrcSpec &L, const SqeSpec &S, const LrcCondition &c
     for (size_t k = 0; k < g.size(); k++) out.forces[k] = -g[k];
     return out;
   }
+  // lrc_intra: every pair, inside clusters too, unmasked (m = 1: R = 0 in the energy), so no cluster gradient
   for (int i = 0; i < n; i++)
     for (int j = i + 1; j < n; j++) {
       const int a = c.cl.sn[i], b = c.cl.sn[j];
-      if (a == b) continue;
+      if (a == b && !L.intra) continue;
       const double r = dist(x, i, j);
       if (r <= r0) continue;
       const double t = (r - r0) / S.lr_t;
       const double T = sstep(t), dT = dsstep(t) / S.lr_t;
-      const double m = 1.0 - c.cl.R[size_t(a) * s + b];
+      const double m = L.intra ? 1.0 : 1.0 - c.cl.R[size_t(a) * s + b];
       if (m == 0) continue;
       const double k = KE / r, e = q[i] * q[j] * k;
       out.energy += e * T * m;
       if (!forces) continue;
       add_pair(g.data(), x, i, j, r, q[i] * q[j] * m * (dT * k - T * k / r));
       dq[i] += q[j] * k * T * m, dq[j] += q[i] * k * T * m;
-      W[size_t(a) * s + b] -= 0.5 * e * T, W[size_t(b) * s + a] -= 0.5 * e * T;
+      if (!L.intra) W[size_t(a) * s + b] -= 0.5 * e * T, W[size_t(b) * s + a] -= 0.5 * e * T;
     }
   if (!forces) return out;
   unplateau();
-  lrc_clusters_vjp(L, c.cl, n, x, W, g.data());
+  if (!L.intra) lrc_clusters_vjp(L, c.cl, n, x, W, g.data());
   lrc_q0_vjp(L, S, n, Z, x, c.q0, dq.data(), g.data());
   for (size_t k = 0; k < g.size(); k++) out.forces[k] = -g[k];
   return out;
@@ -1682,7 +1697,13 @@ LrcEnergy lrc_energy(const LrcSpec &L, const SqeSpec &S, const LrcCondition &c, 
                      const double *x, double Q, bool forces) {
   LrcEnergy out;
   if (forces) out.forces.assign(3 * size_t(n), 0.0);
-  if (n == 0 || (c.cl.s == 1 && !c.cl.images())) return out; // one cluster / bulk: E*(gamma) - E*(gamma) = 0 exactly
+  if (n == 0) return out;
+  if (L.intra) { // every pair beyond the switch, inside clusters and bulk cells too
+    if (!L.graph || L.mp || L.pol) throw std::runtime_error("lrc_intra: needs the graph q0 mode without lrc_mp / lrc_pol");
+    if (c.q0.q0.size() != size_t(n)) throw std::logic_error("lrc_intra: no reference charges in the conditioning");
+    return c.cl.periodic() ? energy_images(L, S, c, n, Z, x, forces) : energy_fixed(L, S, c, n, Z, x, forces);
+  }
+  if (c.cl.s == 1 && !c.cl.images()) return out; // one cluster / bulk: E*(gamma) - E*(gamma) = 0 exactly
   if (c.cl.images()) {
     if (!L.graph || L.mp || L.pol)
       throw std::runtime_error("lrc: separated clusters in a periodic cell need the graph q0 mode without lrc_mp / lrc_pol");

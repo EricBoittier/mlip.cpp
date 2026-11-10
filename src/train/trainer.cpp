@@ -1063,7 +1063,10 @@ void Worker::lrc_prepare(const Batch &b, bool forces) {
   int a0 = 0;
   for (int k = 0; k < b.n_real_systems; k++) {
     const int ns = b.n_per_system[k];
-    if (b.periodic[k]) throw std::runtime_error("lrc: periodic structures are not supported");
+    // periodic structures only with lrc_intra (fully periodic cells: bulk, or separated clusters; no stress loss here)
+    if (b.periodic[k] && !lrc->intra) throw std::runtime_error("lrc: periodic structures are not supported");
+    std::vector<double> cell;
+    if (b.periodic[k]) cell.assign(b.cells[k].begin(), b.cells[k].end());
     std::vector<double> x(b.positions.begin() + 3 * size_t(a0), b.positions.begin() + 3 * size_t(a0 + ns));
     const int32_t *Z = b.atomic_number.data() + a0;
     const int spin = b.atom_spin.empty() ? 1 : int(b.atom_spin[a0]);
@@ -1077,6 +1080,7 @@ void Worker::lrc_prepare(const Batch &b, bool forces) {
     mix(Z, sizeof(int32_t) * ns), mix(b.positions.data() + 3 * size_t(a0), sizeof(float) * 3 * ns);
     const float qs[2] = {float(b.system_charge[k]), float(spin)};
     mix(qs, sizeof qs);
+    if (!cell.empty()) mix(b.cells[k].data(), sizeof(float) * 9);
     lrc_key_[k] = h;
     lrc_a0_[k] = a0;
     // bounded: with rotation augmentation every visit has new coordinates, so the cache never hits across epochs and
@@ -1087,8 +1091,9 @@ void Worker::lrc_prepare(const Batch &b, bool forces) {
     auto it = lrc_cache_.find(h);
     if (it == lrc_cache_.end() || (forces && !it->second.has_f)) {
       LrcCacheEntry e;
-      e.c = runtime::lrc_condition(*lrc, *lrc_sqe, ns, Z, x.data(), double(b.system_charge[k]), maxq, spin);
-      if (e.c.cl.s > 1) {
+      e.c = runtime::lrc_condition(*lrc, *lrc_sqe, ns, Z, x.data(), double(b.system_charge[k]), maxq, spin,
+                                   cell.empty() ? nullptr : cell.data());
+      if (e.c.cl.s > 1 || lrc->intra) { // lrc_intra: also one cluster / a bulk cell
         const runtime::LrcEnergy le = runtime::lrc_energy(*lrc, *lrc_sqe, e.c, ns, Z, x.data(), double(b.system_charge[k]), forces);
         e.e = le.energy, e.f = le.forces, e.has_f = forces;
       } else {
@@ -1108,6 +1113,9 @@ void Worker::lrc_prepare(const Batch &b, bool forces) {
       lrc_e_[k] = e.e;
       if (forces) std::copy(e.f.begin(), e.f.end(), lrc_f_.begin() + 3 * size_t(a0));
       if (lrc_exact) lrc_cond_[k] = c;
+    } else if (lrc->intra) { // one cluster: plain conditioning rows, the long range inside it
+      lrc_e_[k] = e.e;
+      if (forces) std::copy(e.f.begin(), e.f.end(), lrc_f_.begin() + 3 * size_t(a0));
     }
     a0 += ns;
   }
@@ -2400,7 +2408,11 @@ void train(const TrainOptions &o) {
         fmt::print("lrc: q0 mode graph (frozen backbone charge head {} + element Fukui equilibration), fixed-charge "
                    "inter-cluster Coulomb, switch {} -> {} A, clusters a_on {} A, a_off {} A, local-charge conditioning\n",
                    L.qmodel, g_sqe.lr_R - g_sqe.lr_t, g_sqe.lr_R, L.a_on, L.a_off);
-      else
+      if (L.intra)
+        fmt::print("lrc: lrc_intra = ewald: the Coulomb term acts on every pair beyond the switch, inside clusters too "
+                   "(open: direct sum; periodic: Ewald, tin-foil, neutralising background); the charge pass runs on every "
+                   "structure; charge pass frozen, so the long range adds energies and forces but no parameter gradient\n");
+      if (!L.graph)
         fmt::print("lrc: combined model, frozen charge model: two-level Fermi q0 (T {} eV, D {} eV), clusters a_on {} A, "
                  "a_off {} A, inter-cluster SQE long range lr_R {} A (switch {} A), local-charge conditioning\n",
                  L.T, L.D, L.a_on, L.a_off, g_sqe.lr_R, g_sqe.lr_t);

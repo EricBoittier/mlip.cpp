@@ -43,6 +43,19 @@
 //    neutralising background for a charged cell. The open-structure value is its large-cell limit.
 //  - anything else (a slab, a wire, a network next to separate molecules, weak links that wrap the cell) throws.
 // Forces and the virial (dE/d strain, for the stress) are exact in both cases.
+//
+// Intra-cluster long range (pet.plato_lr.lrc_intra = "ewald"; absent key or "none" = everything above, bit for bit):
+// the reliability mask leaves the energy (R = 0 there, consistently, open and periodic), so the Coulomb term of the
+// charges also acts inside a connected cluster and in a bulk cell,
+//   E_lr = KE [ Ewald(q) - sum_{pairs r < lr_R} (1 - T(r)) q_i q_j / r ]       (periodic: every image pair once)
+//        = KE sum_{i < j} T(r_ij) q_i q_j / r_ij                                (open: the direct sum, its limit)
+// T the smootherstep 0 -> 1 on [lr_R - lr_t, lr_R]: the part inside lr_R - lr_t, which the backbone covers, is removed
+// smoothly, so point charges have no short-range singularity (T = 0 there) and need no Gaussian smearing. The charge
+// pass runs on every structure, with the cell (also in a bulk cell), and is equilibrated to the structure's Q. Ewald:
+// tin-foil boundary, neutralising background for a charged cell (-pi Q^2 / 2 V alpha^2; the open limit differs by the
+// Madelung term of the net charge, -alpha_M KE Q^2 / 2 L). The clusters, their reliabilities, the local-charge
+// conditioning and lrc_qproj's link states are unchanged (only the energy loses its mask). Graph q0 mode without
+// lrc_mp / lrc_pol only. Slabs (Yeh-Berkowitz) are not handled: a slab still throws in the cluster code.
 
 #include "sqe.h"
 
@@ -156,6 +169,8 @@ struct LrcSpec {
   // only (no labels); the conditioning is unchanged. Validated offline in rdelta/neutralise (project.py).
   bool qproj = false;
   double qproj_w = 0.6;
+  // pet.plato_lr.lrc_intra = "ewald": the long-range energy also inside clusters and bulk cells (header comment above)
+  bool intra = false;
   bool pol = false;
   std::vector<int32_t> pol_Z;
   std::vector<double> pol_alpha;
@@ -205,7 +220,7 @@ struct LrcClusters {
 
 struct LrcCondition {
   LrcClusters cl;
-  LrcQ0 q0;                    // empty when cl.s == 1
+  LrcQ0 q0;                    // empty when cl.s == 1 (open or bulk) unless lrc_intra
   std::vector<double> Q0, Qloc; // per super-node
   std::vector<double> S, dS;    // per super-node: blend and dS/dQloc
   std::vector<int32_t> k;       // per super-node: floor(Qloc)
@@ -258,8 +273,8 @@ void lrc_moments_vjp(const LrcSpec &L, int n, const int32_t *Z, const double *x,
 std::vector<double> lrc_project_charges(const LrcSpec &L, int n, const int32_t *Z, const double *x, const double *q,
                                         const double *cell = nullptr);
 
-/// inter-cluster long-range energy and forces (zero, exactly, for a one-cluster open structure and a bulk cell); the
-/// cell is the conditioning's (c.cl.cell)
+/// inter-cluster long-range energy and forces (zero, exactly, for a one-cluster open structure and a bulk cell; with
+/// lrc_intra every pair beyond the switch, inside clusters too); the cell is the conditioning's (c.cl.cell)
 LrcEnergy lrc_energy(const LrcSpec &L, const SqeSpec &sqe, const LrcCondition &c, int n, const int32_t *Z,
                      const double *x, double Q, bool forces);
 

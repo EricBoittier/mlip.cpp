@@ -795,7 +795,8 @@ ModelResult GraphModel::predict_single_lrc(const AtomicSystem &system, bool comp
   ModelResult r = predict_single_impl(system, compute_forces, post_compute_hook, parameter_gradients);
   lrc_want_blend_grad_ = false;
   const std::vector<double> blend_grad = lrc_blend_grad_;
-  if (cond.cl.s == 1 && !cond.cl.images()) return r; // one open cluster or a bulk cell: the plain model
+  // one open cluster or a bulk cell: the plain model (lrc_intra: the long range still acts inside)
+  if (cond.cl.s == 1 && !cond.cl.images() && !L.intra) return r;
   const LrcEnergy le = lrc_energy(L, sq, cond, n, system.atomic_numbers(), x.data(), double(system.charge()),
                                   compute_forces);
   r.energy = static_cast<float>(double(r.energy) + le.energy);
