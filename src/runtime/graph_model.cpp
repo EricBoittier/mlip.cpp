@@ -414,6 +414,8 @@ bool GraphModel::load_from_gguf(const std::string &path) {
       plato_lr_.lrc.fsrc = make_lrc_graph_charges(rel(plato_lr_.lrc.fmodel), backend_preference_, device_);
     if (!plato_lr_.lrc.fmodel_minus.empty())
       plato_lr_.lrc.fsrc_minus = make_lrc_graph_charges(rel(plato_lr_.lrc.fmodel_minus), backend_preference_, device_);
+    if (!plato_lr_.lrc.smodel.empty()) // combo: the score pass of the fermi / threshold references
+      plato_lr_.lrc.ssrc = make_lrc_graph_charges(rel(plato_lr_.lrc.smodel), backend_preference_, device_);
   }
   if (plato_lr_.enabled && !forces_mode_)
     throw std::runtime_error("Plato-PET-LR GGUFs are forces-mode exports");
@@ -776,7 +778,9 @@ ModelResult GraphModel::predict_single_lrc(const AtomicSystem &system, bool comp
   ModelResult r = predict_single_impl(system, compute_forces, post_compute_hook, parameter_gradients);
   lrc_want_blend_grad_ = false;
   const std::vector<double> blend_grad = lrc_blend_grad_;
-  if (L.readout && compute_forces && r.forces.size() == 3 * size_t(n) && n > 0) { // readout forces through the charges
+  static const bool no_qforce = [] { const char *e = std::getenv("MLIPCPP_LRC_READOUT_NO_QFORCE"); return e && *e == '1'; }();
+  if (L.readout && compute_forces && r.forces.size() == 3 * size_t(n) && n > 0 && !no_qforce) { // readout forces via q
+    // (MLIPCPP_LRC_READOUT_NO_QFORCE=1 drops this term: a sensitivity check for the tests only)
     if (lrc_q_grad_.size() != static_cast<size_t>(n)) throw std::runtime_error("lrc readout: no dE/dq from the graph");
     std::vector<double> g(3 * size_t(n), 0.0);
     lrc_q0_vjp(L, sq, n, system.atomic_numbers(), x.data(), cond.q0, lrc_q_grad_.data(), g.data());

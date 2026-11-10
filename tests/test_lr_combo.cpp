@@ -387,3 +387,50 @@ TEST_CASE("lrc combo: dump for the torch reference (MLIPCPP_COMBO_PARITY=out.jso
   std::fprintf(f, "]}\n");
   std::fclose(f);
 }
+
+// Per-atom charge readout through the real graph (a GGUF made with scripts/plato_lr_combo/set_combo_keys.py --readout,
+// e.g. --readout-scale 30 to amplify the term): float32 energies, forces against central differences in every
+// coordinate, a one-cluster cation and a two-cluster ion pair.
+TEST_CASE("lrc combo readout: forces of the real graph match central differences", "[lrc][combo][gguf]") {
+  const char *path = std::getenv("MLIPCPP_TEST_COMBO_GGUF");
+  if (!path || !*path || !std::filesystem::exists(path)) SKIP("MLIPCPP_TEST_COMBO_GGUF not set");
+  GraphModel m;
+  m.set_backend_preference(mlipcpp::BackendPreference::CPU);
+  REQUIRE(m.load_from_gguf(path));
+  REQUIRE(m.plato_lr().lrc.readout);
+  struct Case {
+    std::vector<float> x;
+    std::vector<int32_t> Z;
+    int Q, spin;
+  };
+  const std::vector<Case> cases = {
+      {{0, -2.35, 0.1, 0, 0, 0, 0.757, 0.586, 0, -0.757, 0.586, 0}, {11, 8, 1, 1}, 1, 1},              // Na+ water
+      {{0, -2.35, 0.1, 0, 0, 0, 0.757, 0.586, 0, -0.757, 0.586, 0, 0.3, 9.8, 0.4}, {11, 8, 1, 1, 17}, 0, 1}, // + Cl- 9 A
+      {{0, 0, 0, 0.757, 0.586, 0, -0.757, 0.586, 0}, {8, 1, 1}, -1, 2}};                                    // water anion
+  for (const auto &c : cases) {
+    const int n = static_cast<int>(c.Z.size());
+    auto run = [&](const std::vector<float> &x, bool f) {
+      mlipcpp::AtomicSystem sys(n, x.data(), c.Z.data(), nullptr);
+      sys.set_charge(c.Q), sys.set_spin_multiplicity(c.spin);
+      return m.predict(sys, f);
+    };
+    const mlipcpp::ModelResult r = run(c.x, true);
+    REQUIRE(r.forces.size() == 3 * size_t(n));
+    double err = 0, fmax = 0;
+    for (int k = 0; k < 3 * n; k++) {
+      const double h = 2e-3;
+      std::vector<float> xp = c.x, xm = c.x;
+      xp[k] += float(h), xm[k] -= float(h);
+      const double hp = double(xp[k]) - double(c.x[k]), hm = double(c.x[k]) - double(xm[k]);
+      const double num = -(double(run(xp, false).energy) - double(run(xm, false).energy)) / (hp + hm);
+      err = std::max(err, std::abs(num - double(r.forces[k]))), fmax = std::max(fmax, std::abs(num));
+    }
+    double qs = 0;
+    for (double v : r.sqe_charges) qs += v;
+    std::printf("READOUT n %d Q %+d E %.6f  max |F| %.4f  max |F - FD| %.2e eV/A  sum q %.6f\n", n, c.Q, r.energy, fmax, err, qs);
+    CHECK(qs == Approx(c.Q).margin(1e-5));
+    // float32 energies (~3e-5 eV of ~400 eV) over 2h = 4e-3 A: FD noise ~1e-2 eV/A; with the readout q term dropped
+    // (MLIPCPP_LRC_READOUT_NO_QFORCE=1) the same check fails by 5-15 eV/A at --readout-scale 30
+    CHECK(err < 1e-3 * std::max(1.0, fmax));
+  }
+}

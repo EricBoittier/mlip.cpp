@@ -637,6 +637,10 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
       g->blend = bl;
     }
   }
+  if (lrc && lrc->readout) { // per-atom charge readout (after M. Langer, ipsum/PET-LR): the charges as an input
+    g->lrc_q = in(GGML_TYPE_F32, {n}, "lrc_q");
+    runtime::install_lrc_readout(interp, g->lrc_q);
+  }
   if (model_.plato_lr().enabled) {
     plato_create(*g, ctx, n, mode == FORCES);
     g->plato->set_padding_mask(padding_mask);
@@ -652,6 +656,7 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
     // the weights are not differentiated (their flags restored after)
     ggml_set_param(edges), ggml_set_param(cv);
     if (lrc_exact && g->blend) ggml_set_param(g->blend); // dE/dS of the local-charge blend
+    if (g->lrc_q) ggml_set_param(g->lrc_q);              // dE/dq of the readout (forces through the charges)
     for (ggml_tensor *p : params_) p->flags &= ~GGML_TENSOR_FLAG_PARAM;
     g->out = interp.build(ctx);
     ggml_set_output(g->out); // (an energy-only export's [n]: the source of the view below, kept too)
@@ -673,6 +678,10 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
     if (lrc_exact && g->blend) {
       g->grad_blend = ggml_graph_get_grad(g->gf, g->blend);
       if (g->grad_blend) ggml_set_output(g->grad_blend);
+    }
+    if (g->lrc_q) {
+      g->grad_q = ggml_graph_get_grad(g->gf, g->lrc_q);
+      if (g->grad_q) ggml_set_output(g->grad_q);
     }
     if (g->plato) {
       g->grad_x = ggml_graph_get_grad(g->gf, g->plato->positions);
@@ -700,6 +709,7 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
     ggml_tensor *dv = mode == MIXED ? in(GGML_TYPE_F32, {3, m, n}, "edge_tangent") : nullptr;
     ggml_tensor *dc = mode == MIXED ? in(GGML_TYPE_F32, {m, n}, "cutoff_tangent") : nullptr;
     if (mode == MIXED && lrc_exact && g->blend) g->dblend = in(GGML_TYPE_F32, {n}, "blend_tangent");
+    if (mode == MIXED && g->lrc_q) g->dq = in(GGML_TYPE_F32, {n}, "q_tangent");
     if (mode == MIXED && g->plato) { // not in g->inputs: uploaded with the Plato inputs
       g->dx = input(ctx, GGML_TYPE_F32, {3, n}, "position_tangent");
       g->jvp_scale = input(ctx, GGML_TYPE_F32, {1}, "jvp_scale");
@@ -741,6 +751,7 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
       jvp.seed(edges, dv);
       jvp.seed(cv, dc);
       if (g->dblend) jvp.seed(g->blend, g->dblend);
+      if (g->dq) jvp.seed(g->lrc_q, g->dq);
       if (g->dx) jvp.seed(g->plato->positions, g->dx);
       ggml_tensor *J = jvp(ggml_sum(ctx, energy));
       if (!J) throw std::runtime_error("conservative forces: E has no tangent");
@@ -862,6 +873,10 @@ void Worker::upload_inputs(StepGraph &g, const Batch &b, const std::vector<float
       src.insert(src.end(), {span(cond_rows_[2]), span(lrc_blend_)});
     }
   }
+  if (g.lrc_q) {
+    if (lrc_qv_.size() != size_t(b.n_atoms)) throw std::logic_error("upload_inputs: readout charges");
+    src.insert(src.end(), {span(lrc_qv_)});
+  }
   if (g.inputs.size() > src.size()) {
     const bool ov = dv && !et_override_.empty(); // MIXED step of run_conservative: shifted / weighted energy residual
     src.insert(src.end(), {ov ? span(aw_override_) : span(b.atom_weight), ov ? span(et_override_) : span(b.energy_target),
@@ -871,6 +886,10 @@ void Worker::upload_inputs(StepGraph &g, const Batch &b, const std::vector<float
   if (dv && g.dblend) {
     if (lrc_dblend_.size() != size_t(b.n_atoms)) throw std::logic_error("upload_inputs: blend tangent");
     src.insert(src.end(), {span(lrc_dblend_)});
+  }
+  if (dv && g.dq) {
+    if (lrc_dq_.size() != size_t(b.n_atoms)) throw std::logic_error("upload_inputs: readout charge tangent");
+    src.insert(src.end(), {span(lrc_dq_)});
   }
   if (src.size() != g.inputs.size()) throw std::logic_error("upload_inputs: input count");
   if (g.ecot) {
@@ -1057,6 +1076,7 @@ void Worker::lrc_prepare(const Batch &b, bool forces) {
   lrc_lo_.assign(b.atom_charge.begin(), b.atom_charge.end());
   lrc_hi_ = lrc_lo_;
   lrc_blend_.assign(n, 0.0f);
+  lrc_qv_.assign(lrc->readout ? n : 0, 0.0f);
   lrc_e_.assign(S, 0.0), lrc_f_.assign(forces ? 3 * size_t(n) : 0, 0.0);
   lrc_cond_.assign(b.n_real_systems, {}), lrc_a0_.assign(b.n_real_systems, 0), lrc_key_.assign(b.n_real_systems, 0);
   const int maxq = model_.conditioning().max_charge;
@@ -1100,6 +1120,13 @@ void Worker::lrc_prepare(const Batch &b, bool forces) {
     const LrcCacheEntry &e = it->second;
     const runtime::LrcCondition &c = e.c;
     if (c.cl.fallback) lrc_fallback++;
+    if (lrc->readout) {
+      if (c.q0.q0.size() != size_t(ns)) throw std::logic_error("lrc readout: no reference charges");
+      for (int i = 0; i < ns; i++) lrc_qv_[a0 + i] = static_cast<float>(c.q0.q0[i]);
+      lrc_cond_[k] = c; // the charge chain's VJP and tangent
+    }
+    if (c.cl.s == 1 && lrc->cond_neutral) // neutral conditioning: every atom on the Q = 0 row, also for one cluster
+      for (int i = 0; i < ns; i++) lrc_lo_[a0 + i] = c.row_charge[i], lrc_hi_[a0 + i] = c.row_charge_hi[i], lrc_blend_[a0 + i] = c.blend[i];
     if (c.cl.s > 1) {
       lrc_multi++;
       if (c.needs_cond_forces()) lrc_transition++;
@@ -1217,6 +1244,11 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
     gblend.resize(n);
     ggml_backend_tensor_get(gf.grad_blend, gblend.data(), 0, n * sizeof(float));
   }
+  std::vector<float> gq;
+  if (gf.grad_q) {
+    gq.resize(n);
+    ggml_backend_tensor_get(gf.grad_q, gq.data(), 0, n * sizeof(float));
+  }
   if (gf.grad_x) { // Plato-PET-LR: the explicit position dependence (mesh, LES)
     gx.resize(3 * static_cast<size_t>(n));
     ggml_backend_tensor_get(gf.grad_x, gx.data(), 0, gx.size() * sizeof(float));
@@ -1298,6 +1330,21 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
         F[3 * size_t(a0) + q] += f, fmax = std::max(fmax, std::abs(f) * energy_scale);
       }
       lrc_cond_force_sum += fmax, lrc_cond_n++;
+    }
+  }
+
+  // per-atom charge readout: F -= sum_i (dE/dq_i) dq_i/dx through the frozen charge chain (scaled units)
+  if (lrc && lrc->readout) {
+    if (!gf.grad_q) throw std::runtime_error("lrc readout: no dE/dq from the graph");
+    for (int k = 0; k < b.n_real_systems; k++) {
+      const runtime::LrcCondition &c = lrc_cond_[k];
+      const int a0 = lrc_a0_[k], ns = b.n_per_system[k];
+      std::vector<double> x(b.positions.begin() + 3 * size_t(a0), b.positions.begin() + 3 * size_t(a0 + ns));
+      std::vector<double> cq(gq.begin() + a0, gq.begin() + a0 + ns), g(3 * size_t(ns), 0.0);
+      runtime::lrc_q0_vjp(*lrc, *lrc_sqe, ns, b.atomic_number.data() + a0, x.data(), c.q0, cq.data(), g.data());
+      double fmax = 0;
+      for (int q = 0; q < 3 * ns; q++) F[3 * size_t(a0) + q] -= g[q], fmax = std::max(fmax, std::abs(g[q]) * energy_scale);
+      lrc_ro_force_sum += fmax, lrc_ro_n++;
     }
   }
 
@@ -1426,6 +1473,30 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
         for (int i = 0; i < ns; i++)
           if (c.cl.sn[i] == a) lrc_dblend_[a0 + i] = static_cast<float>(t * inv);
       }
+    }
+  }
+  if (lrc && lrc->readout) { // readout charge tangent (dq/dx) u: central difference of the frozen charge chain along u
+    // (h = 1e-3 A at the structure's largest |u| component; a training-gradient approximation, not a force)
+    lrc_dq_.assign(n, 0.0f);
+    const double inv = model_.plato_lr().enabled ? 1.0 / plato_jvp_scale_ : 1.0;
+    for (int k = 0; k < b.n_real_systems; k++) {
+      const runtime::LrcCondition &c = lrc_cond_[k];
+      const int a0 = lrc_a0_[k], ns = b.n_per_system[k];
+      double um = 0;
+      for (int q = 0; q < 3 * ns; q++) um = std::max(um, std::abs(u[3 * size_t(a0) + q]));
+      if (!(um > 0)) continue;
+      const double eps = 1e-3 / um;
+      const int spin = b.atom_spin.empty() ? 1 : int(b.atom_spin[a0]);
+      std::vector<double> xp(3 * size_t(ns)), xm(3 * size_t(ns));
+      for (int q = 0; q < 3 * ns; q++) {
+        const double x0 = b.positions[3 * size_t(a0) + q], d = eps * u[3 * size_t(a0) + q];
+        xp[q] = x0 + d, xm[q] = x0 - d;
+      }
+      const int32_t *Z = b.atomic_number.data() + a0;
+      const std::vector<double> qp = runtime::lrc_q0(*lrc, *lrc_sqe, ns, Z, xp.data(), double(b.system_charge[k]), spin).q0;
+      const std::vector<double> qm = runtime::lrc_q0(*lrc, *lrc_sqe, ns, Z, xm.data(), double(b.system_charge[k]), spin).q0;
+      for (int i = 0; i < ns; i++) lrc_dq_[a0 + i] = static_cast<float>((qp[i] - qm[i]) / (2 * eps) * inv);
+      (void)c;
     }
   }
   // the MIXED graph's energy residual: host energies (lrc / SQE) in the target (exact), per-structure weights
@@ -2396,11 +2467,18 @@ void train(const TrainOptions &o) {
         for (auto &w : workers) w->lrc_exact = exact;
         fmt::print("lrc: conditioning forces dE/dS dS/dx in training: {}\n", exact ? "exact (graph gradient + JVP tangent)" : "off");
       }
-      if (L.graph)
+      if (L.graph) {
         fmt::print("lrc: q0 mode graph (frozen backbone charge head {} + element Fukui equilibration), fixed-charge "
                    "inter-cluster Coulomb, switch {} -> {} A, clusters a_on {} A, a_off {} A, local-charge conditioning\n",
                    L.qmodel, g_sqe.lr_R - g_sqe.lr_t, g_sqe.lr_R, L.a_on, L.a_off);
-      else
+        {
+          static const char *refs[] = {"fukui", "fermi", "threshold", "species_fill", "qeq"};
+          if (L.combo() || L.readout || L.cond_neutral)
+            fmt::print("lrc combo (after M. Langer, ipsum/PET-LR): reference {}, {} flow pass(es) ({}), readout {}, conditioning {}\n",
+                       refs[static_cast<int>(L.q0_ref)], L.flow_passes, L.flow_coulomb ? "coulomb" : "local",
+                       L.readout ? "on" : "off", L.cond_neutral ? "neutral" : L.cond_global ? "global" : "cluster");
+        }
+      } else
         fmt::print("lrc: combined model, frozen charge model: two-level Fermi q0 (T {} eV, D {} eV), clusters a_on {} A, "
                  "a_off {} A, inter-cluster SQE long range lr_R {} A (switch {} A), local-charge conditioning\n",
                  L.T, L.D, L.a_on, L.a_off, g_sqe.lr_R, g_sqe.lr_t);
@@ -2934,6 +3012,9 @@ void train(const TrainOptions &o) {
                                                 w0.lrc_cond_force_sum / std::max<int64_t>(1, w0.lrc_cond_n), w0.lrc_cond_n)
                                   : std::string("no dE/dS dS/dx in the training forces"),
                      w0.lrc_fallback);
+        if (w0.lrc && w0.lrc->readout && w0.lrc_ro_n > 0)
+          fmt::print("  lrc readout: mean max |F_q| {:.3g} eV/A over {} structures (charge tangent: central difference)\n",
+                     w0.lrc_ro_force_sum / std::max<int64_t>(1, w0.lrc_ro_n), w0.lrc_ro_n);
         // MLIPCPP_LOG_PARAMS=a,b: mean |x| and max |x| of those tensors (GGUF names) at each log line
         if (const char *lp = std::getenv("MLIPCPP_LOG_PARAMS"); lp && *lp) {
           std::string names = lp, out;

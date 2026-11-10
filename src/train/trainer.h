@@ -286,6 +286,9 @@ public:
   std::vector<uint64_t> lrc_key_;
   int64_t lrc_cache_misses = 0;
   std::vector<float> lrc_dblend_;
+  std::vector<float> lrc_qv_, lrc_dq_; // readout: the reference charges per atom, their tangent along u
+  double lrc_ro_force_sum = 0;          // readout: sum over structures of max |F_q| (eV/A), for the log
+  int64_t lrc_ro_n = 0;
   double lrc_cond_force_sum = 0; // sum over structures of max |F_cond| (eV/A), for the log
   int64_t lrc_cond_n = 0;
   void lrc_prepare(const Batch &b, bool forces);
@@ -371,6 +374,8 @@ private:
     ggml_tensor *ecot = nullptr; // tail loss: dL/d(d_energy) per structure [S, 1]
     // lrc exact conditioning forces: the blend input, FORCES its gradient, MIXED its tangent
     ggml_tensor *blend = nullptr, *grad_blend = nullptr, *dblend = nullptr;
+    // lrc per-atom charge readout: the charge input, FORCES its gradient dE/dq, MIXED its tangent (dq/dx) u
+    ggml_tensor *lrc_q = nullptr, *grad_q = nullptr, *dq = nullptr;
     ~StepGraph();
   };
   /// graph kinds: the loss (FORWARD / BACKWARD to the weights); conservative

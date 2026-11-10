@@ -187,7 +187,9 @@ void install_lrc_readout(GraphInterpreter &interp, ggml_tensor *q) {
     ab = ggml_add(ctx, ab, ggml_repeat(ctx, ggml_reshape_2d(ctx, beta, 2, 1), ab));
     ggml_tensor *a = ggml_cont(ctx, ggml_view_2d(ctx, ab, 1, n, ab->nb[1], 0));
     ggml_tensor *b = ggml_cont(ctx, ggml_view_2d(ctx, ab, 1, n, ab->nb[1], sizeof(float)));
-    ggml_tensor *sp = ggml_neg(ctx, ggml_log(ctx, ggml_sigmoid(ctx, ggml_neg(ctx, b)))); // softplus(b)
+    // softplus(b) = relu(b) + log(1 + exp(-|b|)): finite for any b (-log sigmoid(-b) overflows for b > ~88)
+    ggml_tensor *sp = ggml_add(ctx, ggml_relu(ctx, b),
+                               ggml_log(ctx, ggml_scale_bias(ctx, ggml_exp(ctx, ggml_neg(ctx, ggml_abs(ctx, b))), 1.0f, 1.0f)));
     ggml_tensor *qq = ggml_reshape_2d(ctx, q, 1, n);
     ggml_tensor *e = ggml_add(ctx, ggml_mul(ctx, a, qq), ggml_scale(ctx, ggml_mul(ctx, sp, ggml_sqr(ctx, qq)), 0.5f));
     if (ggml_nelements(out) != n) throw std::runtime_error("lrc readout: per-atom energy of the wrong size");
