@@ -2,10 +2,15 @@
 // on a neutral partner, the local charge's smoothness through the cluster link window, forces of the long-range term and
 // of the conditioning against central differences, the reduction to the structure's charge for one cluster, and a zero
 // long-range energy when no inter-cluster pair reaches lr_R - lr_t.
+#include "runtime/graph_model.h"
 #include "runtime/lr_combined.h"
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
+
+#include <filesystem>
+
+#include <cstdlib>
 
 #include <array>
 #include <cmath>
@@ -949,4 +954,157 @@ TEST_CASE("lrc fukui: dump for the torch parity check (MLIPCPP_FUKUI_PARITY=out.
   }
   std::fprintf(f, "]}\n");
   std::fclose(f);
+}
+
+// Elements absent from lrc_fukui_Z (the rare gases in the FTq models: the Fukui fits list only the elements in their
+// data) take phi = 0. Before, the lookup threw on every structure with such an atom and more than one cluster (Ar ...
+// Xe at 9 A, He ... Ne, or Ar-Xe in contact plus a far water). Host side (double): an unlisted He behaves exactly as He
+// listed with phi = 0; sum q0 = Q; long-range and conditioning forces against central differences, also with qproj.
+TEST_CASE("lrc graph: an element without a Fukui parameter takes phi = 0 (rare gases), exact forces", "[lrc]") {
+  SqeSpec S = sqe_spec();
+  S.lr_R = 10.0, S.lr_t = 2.0;
+  const int32_t Z[5] = {11, 8, 1, 1, 2}; // Na+, water, He (Z = 2 not in graph_spec's Fukui table)
+  for (bool qproj : {false, true}) {
+    LrcSpec L = graph_spec(), Llisted = graph_spec();
+    L.qproj = Llisted.qproj = qproj, L.qproj_w = Llisted.qproj_w = 0.6;
+    Llisted.fukui_Z.push_back(2), Llisted.fukui_phi.push_back(0.0);
+    CHECK(L.fukui(2) == Llisted.fukui(2));
+    CHECK(L.fukui(2) == Approx(std::log(2.0) + 1e-6).epsilon(1e-15));
+    for (double d : {9.2, 14.0, 30.0}) { // He inside the 8-10 A link window, beyond it, far
+      const std::vector<double> x0{0, 0, 0, 2.3, 0, 0, 3.26, 0, 0, 2.06, 0.93, 0, -0.3 * d, 0.2 * d, std::sqrt(0.87) * d};
+      for (double Q : {0.0, 1.0}) {
+        const LrcQ0 q = lrc_q0(L, S, 5, Z, x0.data(), Q, 1), ql = lrc_q0(Llisted, S, 5, Z, x0.data(), Q, 1);
+        double sum = 0;
+        for (int i = 0; i < 5; i++) {
+          sum += q.q0[i];
+          CHECK(q.q0[i] == ql.q0[i]);
+        }
+        CHECK(sum == Approx(Q).margin(1e-12));
+      }
+      const double Q = 1.0;
+      const LrcCondition c0 = lrc_condition(L, S, 5, Z, x0.data(), Q, 10, 1);
+      REQUIRE(c0.cl.s == 2);
+      const LrcEnergy e0 = lrc_energy(L, S, c0, 5, Z, x0.data(), Q, true);
+      const LrcEnergy el = lrc_energy(Llisted, S, lrc_condition(Llisted, S, 5, Z, x0.data(), Q, 10, 1), 5, Z,
+                                      x0.data(), Q, true);
+      CHECK(std::isfinite(e0.energy));
+      CHECK(e0.energy == el.energy);
+      auto energy = [&](const std::vector<double> &x) {
+        return lrc_energy(L, S, lrc_condition(L, S, 5, Z, x.data(), Q, 10, 1), 5, Z, x.data(), Q, false).energy;
+      };
+      double err = 0, fmax = 0;
+      for (size_t k = 0; k < x0.size(); k++) {
+        CHECK(std::isfinite(e0.forces[k]));
+        const double num = -fd(energy, x0, k, 1e-5);
+        fmax = std::max(fmax, std::abs(num)), err = std::max(err, std::abs(num - e0.forces[k]));
+      }
+      INFO("qproj " << qproj << ", He at " << d << " A: long-range max |F| " << fmax << ", max error " << err);
+      CHECK(err < 1e-6 * std::max(1.0, fmax));
+      if (!c0.needs_cond_forces()) continue;
+      const double g[5] = {0.7, -0.3, 0.2, 0.5, -1.1};
+      auto fS = [&](const std::vector<double> &x) {
+        const LrcCondition c = lrc_condition(L, S, 5, Z, x.data(), Q, 10, 1);
+        double v = 0;
+        for (int i = 0; i < 5; i++) v += g[i] * (c.k[c.cl.sn[i]] + c.S[c.cl.sn[i]]);
+        return v;
+      };
+      std::vector<double> G(c0.cl.s, 0.0), F(15, 0.0);
+      for (int i = 0; i < 5; i++) G[c0.cl.sn[i]] += g[i];
+      lrc_condition_forces(L, S, c0, 5, Z, x0.data(), G, F.data());
+      err = 0, fmax = 0;
+      for (size_t k = 0; k < x0.size(); k++) {
+        const double num = -fd(fS, x0, k, 1e-5);
+        fmax = std::max(fmax, std::abs(num)), err = std::max(err, std::abs(num - F[k]));
+      }
+      INFO("qproj " << qproj << ", He at " << d << " A: conditioning max |F| " << fmax << ", max error " << err);
+      CHECK(err < 1e-6 * std::max(1.0, fmax));
+    }
+  }
+}
+
+// Whole model (MLIPCPP_TEST_LRC_GGUF, e.g. FTq13, CPU): a water plus one isolated atom (He, Ne, Li+, Cl-) from 6 to 30
+// A: finite energy and forces, forces against central differences of the energy (fp32 tolerance as above), and no jump
+// in E(d) (consecutive points differ by the trapezoid work of the force along the path within a fp32 margin). A
+// rare gas inside one cluster plus a far fragment (Ar-Xe in contact, water at 15 A) is finite too.
+TEST_CASE("lrc: molecule plus an isolated atom (He, Ne, Li+, Cl-) at 6-30 A, finite, FD forces, continuous",
+          "[lrc][gguf]") {
+  const char *path = std::getenv("MLIPCPP_TEST_LRC_GGUF");
+  if (!path || !*path || !std::filesystem::exists(path)) SKIP("MLIPCPP_TEST_LRC_GGUF not set");
+  mlipcpp::runtime::GraphModel m;
+  m.set_backend_preference(mlipcpp::BackendPreference::CPU);
+  REQUIRE(m.load_from_gguf(path));
+  if (!m.plato_lr().lrc.enabled) SKIP("not a combined long-range model");
+  const double u[3] = {-0.3, 0.2, std::sqrt(0.87)}; // unit vector, the lone atom's direction from the oxygen
+  const float W[9] = {0, 0, 0, 0.757f, 0.586f, 0, -0.757f, 0.586f, 0};
+  auto run = [&](int32_t z, int Q, double d, bool forces) {
+    float x[12];
+    std::copy(W, W + 9, x);
+    for (int k = 0; k < 3; k++) x[9 + k] = float(d * u[k]);
+    const int32_t Z[4] = {8, 1, 1, z};
+    mlipcpp::AtomicSystem sys(4, x, Z, nullptr);
+    sys.set_charge(Q), sys.set_spin_multiplicity(1);
+    return m.predict(sys, forces);
+  };
+  for (auto [z, Q] : std::vector<std::pair<int32_t, int>>{{2, 0}, {10, 0}, {3, 1}, {17, -1}}) {
+    std::vector<double> ds;
+    for (double d = 6.0; d < 11.0; d += 0.025) ds.push_back(d); // fine through the 8-10 A cluster link window
+    for (double d = 11.0; d <= 30.0; d += 0.5) ds.push_back(d);
+    // energy and force along u at d; a segment whose energy change departs from the trapezoid work by more than the fp32
+    // margin is split in ten (down to 1e-3 A): steep but smooth stretches (2 eV/A over 0.03 A for Li+ at 7.94 A, where
+    // the oxygen leaves the 8 A cutoff) pass at the finer step, a jump does not
+    auto eval = [&](double d) {
+      const mlipcpp::ModelResult r = run(z, Q, d, true);
+      REQUIRE(std::isfinite(r.energy));
+      REQUIRE(r.forces.size() == 12);
+      double Fu = 0;
+      for (int k = 0; k < 12; k++) REQUIRE(std::isfinite(r.forces[k]));
+      for (int k = 0; k < 3; k++) Fu += double(r.forces[9 + k]) * u[k];
+      return std::pair<double, double>{double(r.energy), Fu};
+    };
+    std::function<double(double, std::pair<double, double>, double, std::pair<double, double>)> seg =
+        [&](double a, std::pair<double, double> ea, double b, std::pair<double, double> eb) {
+          const double mis = std::abs(eb.first - ea.first + 0.5 * (ea.second + eb.second) * (b - a)) - 2e-3;
+          if (mis <= 0 || b - a < 1e-3) return std::max(mis, 0.0);
+          double worst = 0, x0 = a;
+          std::pair<double, double> e0 = ea;
+          for (int t = 1; t <= 10; t++) {
+            const double x1 = a + (b - a) * t / 10;
+            const std::pair<double, double> e1 = t == 10 ? eb : eval(x1);
+            worst = std::max(worst, seg(x0, e0, x1, e1));
+            x0 = x1, e0 = e1;
+          }
+          return worst;
+        };
+    double worst_jump = 0, worst_fd = 0;
+    std::pair<double, double> prev = eval(ds[0]);
+    for (size_t p = 1; p < ds.size(); p++) {
+      const std::pair<double, double> cur = eval(ds[p]);
+      worst_jump = std::max(worst_jump, seg(ds[p - 1], prev, ds[p], cur));
+      prev = cur;
+    }
+    for (double d0 : {8.5, 9.2, 9.8, 15.0}) {
+      const mlipcpp::ModelResult r = run(z, Q, d0, true);
+      double Fu = 0;
+      for (int k = 0; k < 3; k++) Fu += double(r.forces[9 + k]) * u[k];
+      double best = 1e30;
+      for (double h : {6.25e-4, 3.125e-4}) {
+        const double Fc = -(double(run(z, Q, d0 + h, false).energy) - double(run(z, Q, d0 - h, false).energy)) / (2 * h);
+        best = std::min(best, std::abs(Fc - Fu));
+      }
+      worst_fd = std::max(worst_fd, best);
+    }
+    INFO("Z " << z << ", Q " << Q << ": worst |dE - trapezoid work| beyond fp32 margin " << worst_jump
+              << " eV, worst |F_c - F.u| " << worst_fd << " eV/A");
+    CHECK(worst_jump < 0.005);
+    CHECK(worst_fd < 0.05);
+  }
+  {
+    const float x[15] = {0, 0, 0, 0, 0, 4.0f, 0, 0, 19.0f, 0.757f, 0.586f, 19.0f, -0.757f, 0.586f, 19.0f};
+    const int32_t Z[5] = {18, 54, 8, 1, 1};
+    mlipcpp::AtomicSystem sys(5, x, Z, nullptr);
+    sys.set_charge(0), sys.set_spin_multiplicity(1);
+    const mlipcpp::ModelResult r = m.predict(sys, true);
+    CHECK(std::isfinite(r.energy));
+    for (float f : r.forces) CHECK(std::isfinite(f));
+  }
 }
