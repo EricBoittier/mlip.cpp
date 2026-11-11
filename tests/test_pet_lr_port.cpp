@@ -440,7 +440,10 @@ TEST_CASE("pet_lr_port: iris Ewald parameters frozen per run (his calculator) vs
   const AtomicSystem s0 = sys(x, n, cell, false);
   const auto r0a = a.predict(s0, true), r0b = b.predict(s0, true);
   CHECK(r0a.energy == r0b.energy);
-  CHECK(r0a.forces == r0b.forces);
+  // (forces: bit for bit on CPU; CUDA's backward scatter is not run-to-run deterministic, ~1e-6 eV/A)
+  double df = 0;
+  for (size_t k = 0; k < r0a.forces.size(); k++) df = std::max(df, double(std::fabs(r0a.forces[k] - r0b.forces[k])));
+  CHECK(df < 1e-5);
   const std::vector<double> p0 = b.iris_frozen_ewald();
   CHECK(p0 == fresh(s0));
   // a 6 % larger cell (an NPT-like move): frozen keeps the first frame's parameters; per call re-derives them
