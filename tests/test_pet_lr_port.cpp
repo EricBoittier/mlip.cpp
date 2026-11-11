@@ -153,7 +153,7 @@ double iris_energy(Predictor &m, const std::vector<float> &x, const std::vector<
   return m.predict(int(Z.size()), x.data(), Z.data(), nullptr, nullptr, po).energy;
 }
 
-// forces = -dE/dx by central differences, Richardson-extrapolated from h = 4e-3 and 2e-3 A (O(h^4): the tiny
+// forces = -dE/dx by central differences, Richardson-extrapolated from h = 8e-3 and 4e-3 A (the error falls with h: fp32 noise, not truncation) (O(h^4): the tiny
 // seeded models are rough, forces up to 1e5 eV/A on close contacts); tolerance ftol + 1e-3 max|F|; charges sum to Q;
 // the dipole is sum_i q_i (r_i - r0); max|F| > fmin (not trivially zero)
 double iris_check(Predictor &m, const std::vector<float> &x, const std::vector<int32_t> &Z, int Q, double ftol,
@@ -180,7 +180,7 @@ double iris_check(Predictor &m, const std::vector<float> &x, const std::vector<i
   };
   double worst = 0, fmax = 0;
   for (size_t k = 0; k < x.size(); k++) {
-    const double f = (4.0 * fd(k, 2e-3) - fd(k, 4e-3)) / 3.0;
+    const double f = (4.0 * fd(k, 4e-3) - fd(k, 8e-3)) / 3.0;
     worst = std::max(worst, std::fabs(f - r.forces[k]));
     fmax = std::max(fmax, double(std::fabs(r.forces[k])));
   }

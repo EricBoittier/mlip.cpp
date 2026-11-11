@@ -1799,10 +1799,26 @@ ModelResult GraphModel::predict_single_impl(
   }
 
   // Sum and scale
+  // MLIPCPP_ATOMIC_E_DUMP=<file>: append n and the per-atom graph energies (unscaled) + energy_scale (diagnostics)
+  if (static const char *ep = std::getenv("MLIPCPP_ATOMIC_E_DUMP"); ep && *ep)
+    if (FILE *fp = std::fopen(ep, "ab")) {
+      const int32_t n32 = n_atoms;
+      const float sc = energy_scale_;
+      std::fwrite(&n32, 4, 1, fp);
+      std::fwrite(atomic_energies.data(), 4, n_atoms, fp);
+      std::fwrite(&sc, 4, 1, fp);
+      std::fclose(fp);
+    }
   float model_energy = 0.0f;
-  for (int i = 0; i < n_atoms; i++) {
-    model_energy += atomic_energies[i];
-  }
+  static const bool energy_double = [] { const char *e = std::getenv("MLIPCPP_ENERGY_DOUBLE"); return e && *e == '1'; }();
+  if (energy_double) { // diagnostics (parity work): the per-atom sum in double, rounded once
+    double acc = 0.0;
+    for (int i = 0; i < n_atoms; i++) acc += atomic_energies[i];
+    model_energy = static_cast<float>(acc);
+  } else
+    for (int i = 0; i < n_atoms; i++) {
+      model_energy += atomic_energies[i];
+    }
   float scaled_energy = model_energy * energy_scale_;
 
   // Add composition energies

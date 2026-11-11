@@ -1086,6 +1086,18 @@ ModelResult GraphModel::predict_cached_device(const AtomicSystem &system, bool c
       for (int i = 0; i < n; i++)
         for (int c = 0; c < 6; c++) w[c] += v[6 * i + c];
       set_stress(*cell, energy_scale_, w, result);
+      if (!plato_lr_.enabled) { // the full virial (as the host path; Plato's strain term has no 9-component form here)
+        double *w9d = nullptr;
+        cuda_check(cudaMalloc(&w9d, 9 * size_t(n) * sizeof(double)), "virial9 alloc");
+        md::gpu::virial9(st, cut, gg, w9d);
+        std::vector<double> v9(9 * size_t(n));
+        download(v9.data(), w9d, v9.size());
+        cuda_check(cudaFree(w9d), "virial9 free");
+        result.virial.assign(9, 0.0);
+        for (int i = 0; i < n; i++)
+          for (int c = 0; c < 9; c++) result.virial[c] += v9[9 * size_t(i) + c];
+        for (auto &x : result.virial) x *= energy_scale_;
+      }
     }
   }
   if (no_edges && forces_requested) { // energy independent of the positions

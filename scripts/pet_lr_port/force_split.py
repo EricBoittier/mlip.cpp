@@ -66,6 +66,7 @@ def main():
     ap.add_argument("--ref", nargs="*", default=[])
     ap.add_argument("--fp64", default=None, help="his fp64 npz (sanity: torch vs JAX fp64)")
     ap.add_argument("--save", default=None)
+    ap.add_argument("--save-torch", default=None, help="npz of the torch per-frame pieces (split_compare.py input)")
     ap.add_argument("--torch32", action="store_true", help="also the traced trunk in torch fp32 (trunk-only)")
     a = ap.parse_args()
     torch.set_default_dtype(torch.float64)
@@ -206,6 +207,10 @@ def main():
                   f"{np.mean(ar_c > ar_h):.2f}")
         s = " ".join(f"{k} P {np.mean(np.array(v) > his):.2f} (med {np.median(v):.2e})" for k, v in hyb.items())
         print(f"  vs {Path(ref).name} (his med {np.median(his):.2e}): {s}")
+    if a.save_torch:
+        keys = ("F_t", "F_edge_t", "F_cut_t", "F_pos_t", "F_ein", "F_e32p")
+        np.savez(a.save_torch, nf=nf, **{f"{k}_{f}": per[f][k] for f in range(nf) for k in keys
+                                         if per[f].get(k) is not None})
     if a.save:
         np.savez(a.save, **{k: np.array(v) for k, v in rows.items()})
 

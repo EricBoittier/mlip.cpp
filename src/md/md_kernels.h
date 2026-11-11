@@ -96,6 +96,8 @@ void conservative_forces(State &s, const Cutoff &c, const Graph &g, double energ
 /// Per-atom virials sum over edges of v (x) dE/dv, symmetrised, [n, 6] as
 /// xx yy zz yz xz xy, unscaled; w is device memory. After conservative_forces.
 void virial(State &s, const Cutoff &c, const Graph &g, double *w, const int32_t *skip = nullptr);
+/// The full (unsymmetrised) per-atom virials, [n, 9] row-major W_ab = sum r_a dE/dr_b (same terms as virial()).
+void virial9(State &s, const Cutoff &c, const Graph &g, double *w);
 
 // ---- an engine's own device arrays (LAMMPS's KOKKOS package) ----
 /// s.x[i] = x(i) (+ shift[i], if given), with x(i, c) at x[i * xs0 + c * xs1];
