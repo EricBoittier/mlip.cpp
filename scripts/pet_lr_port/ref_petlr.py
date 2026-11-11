@@ -48,6 +48,8 @@ def main():
     fdt = jnp.float64 if a.x64 else jnp.float32
     if a.x64:
         params = cast_floats(params, jnp.float64)
+    # device arrays: a numpy leaf indexed by a traced array fails under jit (the species reference's table)
+    params = jax.tree.map(jnp.asarray, params)
 
     def run(batch):
         res = predict(model, params, batch, stress=True)

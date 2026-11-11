@@ -12,7 +12,7 @@ import json
 
 import numpy as np
 
-KEYS = ("E", "F", "q", "mu", "dipole", "metallicity")
+KEYS = ("E", "F", "q", "q_rel", "mu", "dipole", "dipole_abs", "metallicity")
 
 
 def per_frame(get, z):
@@ -30,8 +30,10 @@ def per_frame(get, z):
         out["F"].append(np.abs(g["F"] - z["forces"][A]).max() / np.abs(z["forces"][A]).max())
         if "atom/charges" in z.files:
             out["q"].append(np.abs(g["q"] - z["atom/charges"][A]).max())
+            out["q_rel"].append(out["q"][-1] / np.abs(z["atom/charges"][A]).max())
             D = z["struct/dipole"][f]
             out["dipole"].append(np.abs(g["dipole"] - D).max() / max(np.abs(D).max(), 1e-12))
+            out["dipole_abs"].append(np.abs(g["dipole"] - D).max())
         if "int/fermi_level" in z.files:
             out["mu"].append(abs(g["mu"] - z["int/fermi_level"][A][0]))
             out["metallicity"].append(abs(g["metallicity"] - z["struct/metallicity"][f]))
@@ -66,7 +68,7 @@ def from_ref(path, z):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cpp"); ap.add_argument("ref64"); ap.add_argument("runs", nargs="+")
+    ap.add_argument("cpp"); ap.add_argument("ref64"); ap.add_argument("runs", nargs="*")
     ap.add_argument("--label", default="")
     a = ap.parse_args()
     z = np.load(a.ref64)

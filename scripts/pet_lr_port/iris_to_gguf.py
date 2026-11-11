@@ -196,6 +196,15 @@ def main():
     graph, weights = export_checked(
         export_torch_model, model_export, inputs, output_path=None, input_names=names, input_dtypes=dtypes,
         dynamic_shapes=shapes, strict=False)
+    # a symbolic size in arithmetic (x / n with n = species.shape[0]) is traced as an op ON the size's source
+    # tensor ("DIV [x, input:species]"): integer / mask inputs must never be arithmetic operands
+    gd = graph.to_dict()
+    int_inputs = {f"input:{i['name']}" for i in gd["inputs"] if i.get("dtype") in ("i32", "bool")}
+    for g_ in [gd] + ([graph_scores.to_dict()] if graph_scores is not None else []):
+        for nd in g_["nodes"]:
+            if nd["op"] in ("ADD", "SUB", "MUL", "DIV", "POW", "MATMUL") and int_inputs & set(nd["inputs"]):
+                raise ValueError(f"node {nd['id']} {nd['op']} {nd['inputs']}: an integer input as an arithmetic operand "
+                                 "(a symbolic size?)")
     # the converter writes graph weight refs lower-cased (his flax names MLP_0 / LayerNorm_0 keep their case in
     # the state dict): store the tensors under the names the graph reads
     refs = {x[7:] for nd in graph.to_dict()["nodes"] for x in nd["inputs"] if x.startswith("weight:")}

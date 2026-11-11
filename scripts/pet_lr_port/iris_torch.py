@@ -368,10 +368,10 @@ class IrisLR(_AuxMixin, nn.Module):
             aux.update(scores=s, fermi_level=mu, metallicity=self.density(x).sum())
             if self.ref == "both":
                 c = self.species_charge[species]
-                q = q + c - c.sum() / n
+                q = q + c - c.sum() / torch.ones_like(c).sum()  # / n as a tensor (a symbolic size traced as a species DIV)
         else:
             c = self.species_charge[species]
-            q = c - (c.sum() - total_charge) / n
+            q = c - (c.sum() - total_charge) / torch.ones_like(c).sum()  # / n as a tensor, as above
         aux["charges_base"] = q
         # --- transfer passes: edge MLP on node embeddings, charges and SR potentials ---
         if self.sigma is None:
