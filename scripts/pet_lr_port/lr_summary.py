@@ -32,7 +32,7 @@ def main():
     a = ap.parse_args()
     os.chdir(a.root)
     for m, fam in itertools.product(a.models, a.fams):
-        rd = a.refdir.format(model=m); pre = a.refpat.format(fam=fam)
+        rd = a.refdir.format(model=m); pre = a.refpat.format(fam=fam, model=m)
         r64 = f"{rd}/{pre}cpu64.npz"
         if not os.path.exists(r64):
             continue
