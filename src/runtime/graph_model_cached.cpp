@@ -362,6 +362,7 @@ void GraphModel::finish_cached_graph(std::unique_ptr<CachedGraph, CachedGraphDel
                                      const std::vector<ggml_tensor *> &inputs,
                                      std::vector<std::pair<ggml_tensor *, float>> constants) {
   const int n = g->n_atoms, M = g->ragged ? g->max_len : g->M;
+  mark_precise(g->graph), mark_precise(g->forward); // CUDA precise-math flags (iris graphs only; see precise_math())
   for (auto &c : constants) ggml_set_input(c.first);
 
   // inputs and constants in a buffer of their own (the allocator skips

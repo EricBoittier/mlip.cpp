@@ -238,6 +238,13 @@ private:
   bool nc_forces_ = false;
   IrisLRSpec iris_lr_;
   int iris_max_neighbors_ = 0;
+  bool precise_math_gguf_ = false; // GGUF pet.precise_math (iris trunks): CUDA precise-math flags on its graphs
+public:
+  /// the CUDA precise-math flags (LOG / SIN / COS / EXP / SIGMOID / DIV, see graph_model.cpp) apply to this model's
+  /// graphs: iris PET-LR, iris GGUFs with pet.precise_math = 1, or MLIPCPP_PRECISE_MATH=1 (0: never)
+  bool precise_math() const;
+  void mark_precise(ggml_cgraph *g) const;
+private:
   GraphInterpreter scores_interp_; // iris PET-LR: trunk + score head (fermi / both references)
   PetPlatoLRSpec plato_lr_;
   std::vector<PetPlatoLRStructure> plato_st_; // the cached path's structure (set before fit_cached_graph)

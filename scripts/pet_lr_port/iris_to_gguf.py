@@ -293,6 +293,9 @@ def main():
     ts_all = (yaml.safe_load(open(f"{a.ckpt}/config.yaml"))["training_pipeline"]["to_sample"]
               if Path(f"{a.ckpt}/config.yaml").exists() else {})
     w.add_int32("pet.iris.max_neighbors", int(ts_all.get("max_neighbors") or 0))
+    # his XLA keeps libm-accurate transcendentals and IEEE division on the GPU: the CUDA kernels of iris graphs run
+    # the precise variants (graph_model.cpp mark_precise_math; the PET-LR graphs get them regardless)
+    w.add_int32("pet.precise_math", 1)
     w.add_string("pet.cutoff_function", "bump")
     w.add_int32("pet.forces_mode", 1)
     w.add_int32("pet.nc_forces", 0)

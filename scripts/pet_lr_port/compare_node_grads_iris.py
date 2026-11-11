@@ -201,6 +201,12 @@ def rel(a, b):
     return float(np.abs(a - b).max()) / s
 
 
+def elem(a, b):
+    """Element-wise statistic (not max-normalised): the 99th percentile of |a - b| / (|b| + 1e-6 max|b|)."""
+    s = max(float(np.abs(b).max()), 1e-30)
+    return float(np.percentile(np.abs(a - b) / (np.abs(b) + 1e-6 * s), 99))
+
+
 def local_errors(gm, rec64, cpp, exact, bad):
     """Local error per op on mlip.cpp's own inputs (see the module doc). `exact`: placeholder names whose values are
     exact in both (parameters, constants, integer inputs); `bad`: nodes whose dumped tensor is not the FX value
@@ -344,6 +350,7 @@ def analyse(ep, names, dumps, kind, frame):
     rows = {}
     order = [n.name for n in gm.graph.nodes if n.name in rec64.saved and n.name in first]
     bad = {lab: set() for lab in dumps}
+    dropped = {lab: [] for lab in dumps}
     for nm in order:
         t64 = rec64.saved[nm]
         r = {}
@@ -356,18 +363,29 @@ def analyse(ep, names, dumps, kind, frame):
             _, v, g = cpp[nm]
             if v is not None and v.size == t64.numel() and v.dtype == np.float32:
                 r[f"v_{lab}"] = rel(v.reshape(tuple(t64.shape)).astype(np.float64), t64.detach().numpy())
+                r[f"e_{lab}"] = elem(v.reshape(tuple(t64.shape)).astype(np.float64), t64.detach().numpy())
                 if r[f"v_{lab}"] > 0.05 and r.get("v_t32", 0) < 1e-3:
                     bad[lab].add(nm)  # not the FX value (fused / laid out differently in the interpreter)
+                    dropped[lab].append((nm, "value", r[f"v_{lab}"]))
             else:
                 bad[lab].add(nm)
+                dropped[lab].append((nm, "shape" if v is not None else "no data", float("nan")))
             if g is not None and t64.grad is not None and g.size == t64.numel() and nm not in bad[lab]:
                 r[f"g_{lab}"] = rel(g.reshape(tuple(t64.shape)).astype(np.float64), t64.grad.numpy())
                 if not np.isfinite(r[f"g_{lab}"]) or (r[f"g_{lab}"] > 0.05 and r.get("g_t32", 1.0) < 1e-3):
                     # a gradient tensor ggml allocated but never computed (unused views): not comparable
+                    dropped[lab].append((nm, "grad", r[f"g_{lab}"]))
                     cpp[nm] = (cpp[nm][0], v, None)
                     del r[f"g_{lab}"]
         rows[nm] = r
-    out = {"rows": rows, "order": order, "bad": bad, "local": {}}
+    out = {"rows": rows, "order": order, "bad": bad, "dropped": dropped, "local": {}}
+    # coverage: float FX nodes without a comparable mlip.cpp tensor, by op
+    unc = {}
+    for n in gm.graph.nodes:
+        if n.op == "call_function" and n.name in rec64.saved and (n.name not in first or n.name in bad[next(iter(dumps))]):
+            k = str(n.target).replace("aten.", "").split(".")[0]
+            unc[k] = unc.get(k, 0) + 1
+    out["uncovered"] = unc
     # the output: energy (frame sum, |dE| / sum|E_i|) and, for the LR graphs, charges (max |dq|)
     for lab, cpp in dumps.items():
         out["local"][lab] = local_errors(gm, rec64, cpp, exact, bad[lab])
@@ -417,6 +435,17 @@ def main():
         print(f"frame {f}: " + "; ".join(f"{lab} " + " ".join(f"{k} {v:.2e}" for k, v in s[lab].items())
                                           for lab in labs + ["t32"]) +
               "; nodes not comparable: " + ", ".join(f"{lab} {len(res['bad'][lab])}" for lab in labs), flush=True)
+        if f == frames[0]:
+            print("  uncovered float FX nodes by op (no comparable mlip.cpp tensor): " +
+                  ", ".join(f"{k} {v}" for k, v in sorted(res["uncovered"].items(), key=lambda kv: -kv[1])))
+            for lab in labs:
+                print(f"  dropped for {lab}: " + ", ".join(f"{nm} ({why}{'' if why in ('shape', 'no data') else f' {e:.1e}'})"
+                                                      for nm, why, e in res["dropped"][lab]))
+            if len(labs) > 1:
+                sets = {lab: {(nm, why) for nm, why, _ in res["dropped"][lab]} for lab in labs}
+                for lab in labs:
+                    only = sets[lab] - set.union(*[sets[o] for o in labs if o != lab])
+                    print(f"  DROPPED FOR {lab} ONLY (a finding, not a layout issue): {sorted(only) or 'none'}")
         for nm in res["order"]:
             for k, v in res["rows"][nm].items():
                 glob_.setdefault(nm, {}).setdefault(k, []).append(v)
@@ -438,6 +467,16 @@ def main():
     for nm in [x for x in glob_ if x.startswith(("edge_vectors", "cutoff_values", "positions"))] + \
             [x for x in glob_][-3:]:
         print(f"  {nm:28s} " + " ".join(f"{k} {np.median(v):.2e}" for k, v in sorted(glob_[nm].items())))
+    if len(labs) > 1:
+        print("\nLOCAL error by op type, median over nodes and structures of local / max(fp32 replay, 2^-24):")
+        for key in ("fwd", "bwd"):
+            byop = {}
+            for lab in labs:
+                for nm, ts in agg[lab][key].items():
+                    op = nm.rstrip("0123456789").rstrip("_")
+                    byop.setdefault(op, {}).setdefault(lab, []).extend(x[0] / max(x[1], FLOOR) for x in ts)
+            print(f"  {key}: " + "; ".join(f"{op} " + " ".join(f"{lab} {np.median(v):.2f}" for lab, v in d.items())
+                                         for op, d in sorted(byop.items()) if all(l in d for l in labs)))
     for lab in labs:
         print(f"\nLOCAL errors, {lab} (op replayed in fp64 on mlip.cpp's own inputs vs mlip.cpp; fp32 = torch fp32 "
               f"replay on the same inputs; ratio = median over structures of local / max(fp32 replay, 2^-24); "

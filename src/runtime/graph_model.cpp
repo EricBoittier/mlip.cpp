@@ -41,8 +41,7 @@ namespace {
 /// double-precision kernels; the CPU backend's kernels are already accurate and ignore the flag. Other models
 /// never call this (their CUDA kernels stay the fast ones, bit for bit). MLIPCPP_PRECISE_MATH=0 turns it off.
 void mark_precise_math(ggml_cgraph *g) {
-  static const bool off = [] { const char *e = std::getenv("MLIPCPP_PRECISE_MATH"); return e && !std::strcmp(e, "0"); }();
-  if (off || !g) return;
+  if (!g) return;
   constexpr int slot = GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1;
   for (int i = 0; i < ggml_graph_n_nodes(g); i++) {
     ggml_tensor *t = ggml_graph_node(g, i);
@@ -415,6 +414,7 @@ bool GraphModel::load_from_gguf(const std::string &path) {
   iris_lr_ = {};
   iris_lr_.enabled = loader.get_int32("pet.iris_lr", 0) != 0;
   iris_max_neighbors_ = loader.get_int32("pet.iris.max_neighbors", 0);
+  precise_math_gguf_ = loader.get_int32("pet.precise_math", 0) != 0;
   if (iris_lr_.enabled) {
     iris_lr_.n_out = loader.get_int32("pet.iris_lr.n_out", 8);
     iris_lr_.reference = loader.get_string("pet.iris_lr.reference", "");
@@ -670,6 +670,21 @@ void GraphModel::set_weight(const std::string &name, ggml_tensor *tensor) {
 
 ModelResult GraphModel::predict(const AtomicSystem &system) {
   return predict_single(system, false);
+}
+
+bool GraphModel::precise_math() const {
+  // MLIPCPP_PRECISE_MATH=0 / 1 forces the CUDA precise-math flags off / on for every graph (diagnostics); default:
+  // iris graphs (the PET-LR ones, and iris trunks exported with pet.precise_math = 1)
+  static const int env = [] {
+    const char *e = std::getenv("MLIPCPP_PRECISE_MATH");
+    return !e || !*e ? -1 : std::strcmp(e, "0") ? 1 : 0;
+  }();
+  if (env >= 0) return env == 1;
+  return iris_lr_.enabled || precise_math_gguf_;
+}
+
+void GraphModel::mark_precise(ggml_cgraph *g) const {
+  if (precise_math()) mark_precise_math(g);
 }
 
 ModelResult GraphModel::predict(const AtomicSystem &system,
@@ -1851,7 +1866,7 @@ ModelResult GraphModel::predict_single_impl(
     if (nc_output) ggml_build_forward_expand(cgraph, nc_output);
   }
 
-  if (iris_lr_.enabled) mark_precise_math(cgraph);
+  if (precise_math()) mark_precise_math(cgraph);
 
   ggml_cgraph *charge_graph = nullptr;
   if (lr_charges) {
@@ -1900,7 +1915,7 @@ ModelResult GraphModel::predict_single_impl(
     if (iris_scores) {
       ggml_cgraph *sg = ggml_new_graph_custom(compute_ctx, 32768, false);
       ggml_build_forward_expand(sg, iris_scores);
-      mark_precise_math(sg);
+      if (precise_math()) mark_precise_math(sg);
       if (backend_provider_->compute(sg) != GGML_STATUS_SUCCESS)
         throw std::runtime_error("iris PET-LR: scores graph failed");
       std::vector<float> sf(n_atoms);
