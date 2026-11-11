@@ -170,6 +170,7 @@ def main():
     ap.add_argument("--no-baseline", action="store_true")
     ap.add_argument("--n-atoms", type=int, default=7); ap.add_argument("--max-neighbors", type=int, default=11)
     ap.add_argument("--dump-json", help="also write the graph JSON(s) to this path prefix (inspection)")
+    ap.add_argument("--allow-charge-layer", action="store_true", help="export charge_layer with --lr (unvalidated)")
     ap.add_argument("--config", help="the training config.yaml (his to_sample: num_k, max_neighbors) when CKPT_DIR has "
                     "none; the seeded presets' is scripts/pet_lr_port/presets/seeded_config.yaml")
     ap.add_argument("--lr", action="store_true",
@@ -181,6 +182,10 @@ def main():
     if cfg.get("fixed_neighbors") is not None:  # his older fixed-neighbour mode (KnnToSample): the hard cutoff
         cfg["num_neighbors_adaptive"] = None
     # his les-water backbones (NoFinalCombineBackbone / LayeredBackbone; iris_torch.backbone_kind raises on others)
+    if cfg.get("charge_layer") is not None and cfg.get("lr") and a.lr and not a.allow_charge_layer:
+        raise ValueError("charge_layer with the LR branch: ported (the chosen layer's node features feed the LR branch) "
+                         "but not validated against an oracle (his les-water branch's LR side is not the ported flows "
+                         "allocation); --allow-charge-layer to export anyway")
     if cfg.get("charge_layer") is not None and not cfg.get("lr"):
         cfg["charge_layer"] = None  # (charge_layer only picks the LR branch's node features: no effect trunk-only)
     if cfg.get("direct_forces") or cfg.get("direct_stress"):
