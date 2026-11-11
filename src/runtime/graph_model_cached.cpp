@@ -787,6 +787,7 @@ ModelResult GraphModel::predict_cached(const AtomicSystem &system, bool compute_
     nkept[i] = k;
   }
   const int max_kept = n ? *std::max_element(nkept.begin(), nkept.end()) : 0;
+  check_iris_overflow(max_kept);
 
   const bool no_edges = max_kept == 0, forces_requested = compute_forces;
   if (no_edges) compute_forces = false;
@@ -1021,6 +1022,7 @@ ModelResult GraphModel::predict_cached_device(const AtomicSystem &system, bool c
     int32_t total = 0;
     download(&total, st.offsets + n, 1);
     download(&max_kept, st.scalars + 1, 1);
+    check_iris_overflow(max_kept);
     fit_ragged_graph(n, total, max_kept);
     gg = device_graph(*cached_);
     md::gpu::pack_ragged(st, cut, gg);
@@ -1033,6 +1035,7 @@ ModelResult GraphModel::predict_cached_device(const AtomicSystem &system, bool c
       gg = device_graph(*cached_);
       md::gpu::prepare_inputs(st, cut, gg);
       download(&max_kept, st.scalars + 1, 1);
+      check_iris_overflow(max_kept);
       if (!fit_cached_graph(n, max_kept)) break;
     }
   }

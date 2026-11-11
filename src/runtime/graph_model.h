@@ -244,6 +244,8 @@ public:
   /// graphs: iris PET-LR, iris GGUFs with pet.precise_math = 1, or MLIPCPP_PRECISE_MATH=1 (0: never)
   bool precise_math() const;
   void mark_precise(ggml_cgraph *g) const;
+  /// raises his calculator's overflow error when an atom's selected neighbours exceed pet.iris.max_neighbors
+  void check_iris_overflow(int max_selected) const;
 private:
   GraphInterpreter scores_interp_; // iris PET-LR: trunk + score head (fermi / both references)
   PetPlatoLRSpec plato_lr_;

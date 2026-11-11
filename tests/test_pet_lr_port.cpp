@@ -486,7 +486,7 @@ TEST_CASE("pet_lr_port: iris models raise when an atom has more than max_neighbo
   std::vector<float> x;
   std::vector<int32_t> Z;
   float cell[9];
-  water_box(x, Z, cell); // 72 atoms in a 9 A cube: every atom has ~40 neighbours within 5 A
+  water_box(x, Z, cell); // 72 atoms in a 9 A cube: ~50 neighbours within 5 A, more than 4 selected
   const int n = int(Z.size());
   const bool pbc[3] = {true, true, true};
   PredictOptions po;
@@ -494,10 +494,12 @@ TEST_CASE("pet_lr_port: iris models raise when an atom has more than max_neighbo
   for (const char *g : {"petlr_tiny_trunk.gguf", "petlr_tiny_fermi.gguf"}) {
     INFO(g);
     ModelOptions lim, off, wide;
-    lim.iris_max_neighbors = 20, off.iris_max_neighbors = 0, wide.iris_max_neighbors = 500;
+    lim.iris_max_neighbors = 4, off.iris_max_neighbors = 0, wide.iris_max_neighbors = 500;
     Predictor ml(resource(g), lim), mo(resource(g), off), mw(resource(g), wide);
     CHECK_THROWS_WITH(ml.predict(n, x.data(), Z.data(), cell, pbc, po),
-                      Catch::Matchers::ContainsSubstring("more than max_neighbors=20"));
+                      Catch::Matchers::ContainsSubstring("more than max_neighbors=4"));
+    // (the count is of the SELECTED neighbours, as his forward's overflow: every pair within the cutoff for hard
+    // cutoffs, the adaptive cutoff's pairs otherwise)
     const Result a = mo.predict(n, x.data(), Z.data(), cell, pbc, po), b = mw.predict(n, x.data(), Z.data(), cell, pbc, po);
     CHECK(a.energy == b.energy); // below the limit: the check changes nothing
   }

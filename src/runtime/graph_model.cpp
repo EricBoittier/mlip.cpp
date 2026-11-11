@@ -683,6 +683,17 @@ bool GraphModel::precise_math() const {
   return iris_lr_.enabled || precise_math_gguf_;
 }
 
+void GraphModel::check_iris_overflow(int max_selected) const {
+  // his Calculator.calculate raises when the forward's selection needs more than max_neighbors slots for one atom
+  // (iris.pet.predict truncate_edges / pack_edges overflow): with differentiable (adaptive) cutoffs the pairs the
+  // adaptive cutoff keeps, with hard cutoffs every pair within the cutoff. mlip.cpp would keep them all and silently
+  // differ from every run of his; so it raises too (GGUF pet.iris.max_neighbors, ModelOptions::iris_max_neighbors)
+  if (iris_max_neighbors_ > 0 && max_selected > iris_max_neighbors_)
+    throw std::runtime_error("an atom has more than max_neighbors=" + std::to_string(iris_max_neighbors_) +
+                             " neighbours selected within the cutoff " + std::to_string(cutoff_) + " (" +
+                             std::to_string(max_selected) + ")");
+}
+
 void GraphModel::mark_precise(ggml_cgraph *g) const {
   if (precise_math()) mark_precise_math(g);
 }
@@ -750,17 +761,6 @@ ModelResult GraphModel::predict_single(
     const AtomicSystem &system, bool compute_forces,
     const std::function<void()> &post_compute_hook,
     std::vector<float> *parameter_gradients) {
-  if (iris_max_neighbors_ > 0 && system.num_atoms() > 0) {
-    // his Calculator.calculate: more than max_neighbors pairs within the cutoff of one atom is an error (training
-    // trimmed the farthest; mlip.cpp would keep them all and silently differ from every run of his)
-    const NeighborList nl = NeighborListBuilder(NeighborListOptions{cutoff_, true, false}).build(system);
-    std::vector<int> cnt(system.num_atoms(), 0);
-    for (int p = 0; p < nl.num_pairs(); p++)
-      if (nl.distances[p] < cutoff_) cnt[nl.centers[p]]++;
-    if (*std::max_element(cnt.begin(), cnt.end()) > iris_max_neighbors_)
-      throw std::runtime_error("an atom has more than max_neighbors=" + std::to_string(iris_max_neighbors_) +
-                               " neighbours within the cutoff " + std::to_string(cutoff_));
-  }
   if (plato_lr_.lrc.enabled && system.num_atoms() > 0)
     return predict_single_lrc(system, compute_forces, post_compute_hook, parameter_gradients);
   const SqeSpec &sq = plato_lr_.sqe;
@@ -1227,6 +1227,7 @@ ModelResult GraphModel::predict_single_impl(
   for (int i = 0; i < n_atoms; i++) {
     max_neighbors = std::max(max_neighbors, neighbor_counts[i]);
   }
+  check_iris_overflow(max_neighbors);
   // A system without any edge: metatrain has no neighbour slot, so the
   // attention sees the central token alone. ggml needs at least one slot, and
   // through PET's finite -34.5 bias a padded slot still competes with the
