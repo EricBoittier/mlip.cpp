@@ -160,6 +160,7 @@ struct LrcSpec {
   std::shared_ptr<LrcQSource> fsrc, fsrc_minus;
   double fukui_phi_of(int z, bool minus = false) const; // phi_Z
   void fukui_check() const;                              // throws on an inconsistent Fukui configuration
+  void links_check() const;                              // throws on an unsupported lrc_links configuration
   bool fukui_atom() const { return fukui_mode == FukuiMode::Atom || fukui_mode == FukuiMode::AtomPM; }
   // per element in SqeSpec::Z order
   std::vector<double> ip, ea, h, l, ap, am, bp, bm; // bp, bm: E x E (row: the atom's element)
@@ -210,6 +211,26 @@ struct LrcSpec {
   enum class Slab { None, YB, Ewald2D };
   Slab slab = Slab::None;
   double slab_vacuum = 0, slab_gap = 0, slab_rc = 0;
+  // cluster links from the backbone's own edges (pet.plato_lr.lrc_links = "backbone"; absent key or "window" = the fixed
+  // a_on / a_off window above, bit for bit). The link of a pair is tied to the backbone's (adaptive) pair cutoff
+  //   c_ij = (r_i + r_j) / 2   (r_i the adaptive radius of atom i, pet.adaptive_cutoff_method; the plain cutoff without
+  //                             an adaptive cutoff), the same pair cutoff at which the backbone drops edge ij,
+  //   A_ij = 1 - smootherstep((d_ij - lo_ij) / (c_ij - lo_ij)),   lo_ij = link_a c_ij + link_b   (lrc_link_a / _b),
+  // so a link is exactly 0 where the backbone has no edge (d >= c_ij) and exactly 1 (a strong link: one super-node)
+  // inside lo_ij. With the defaults (0.5, 1 A) the taper is 3 A wide at c = 8 A (bare ions) and 1 A at c = 4 A (dense
+  // structures, where a fixed 3 A taper would cut covalent bonds). Clusters, reliabilities, the local-charge conditioning
+  // and lrc_qproj's link states are then those of the backbone's graph: joint conditioning exactly while the backbone
+  // connects two fragments, split once it does not. The radii depend on every neighbour within the cutoff, so the link
+  // gradients carry the adaptive-cutoff chain rule (d r_i / d d_ik, as the backbone's forces). The inter-cluster
+  // Coulomb term has no distance switch under these links (weight 1 - R_ab on every inter-cluster pair; such pairs are
+  // at least lo_ij apart): it is fully on exactly where the backbone has disconnected the two clusters.
+  // Open structures, graph q0 mode without lrc_mp / lrc_pol / lrc_intra only (others throw).
+  bool links_backbone = false;
+  double link_a = 0.5, link_b = 1.0;
+  // the backbone's cutoff (pet.cutoff, pet.num_neighbors_adaptive, pet.cutoff_width_adaptive, pet.adaptive_cutoff_method;
+  // read from the model's GGUF, not written by to_gguf)
+  double bb_cutoff = 0, bb_nadapt = 0, bb_width = 0.5;
+  bool bb_grid = true;
   bool pol = false;
   std::vector<int32_t> pol_Z;
   std::vector<double> pol_alpha;
@@ -243,6 +264,7 @@ struct LrcClusters {
   struct Weak {
     int i, j, e; // atoms, super-edge index
     double A, dA; // link value and dA/dr
+    double dAc = 0; // backbone links: dA/dc_ij (c_ij the pair cutoff, through the adaptive radii)
   };
   std::vector<Weak> weak;
   std::vector<std::pair<int, int>> se; // super-edges (a < b)
@@ -262,6 +284,10 @@ struct LrcClusters {
   bool slab() const { return open >= 0; }
   bool periodic() const { return !cell.empty(); }
   bool images() const { return periodic() && !bulk; } // the long range runs over the periodic images
+  // backbone links: the adaptive radius of every atom and, per atom i, its neighbours k within the backbone cutoff with
+  // d r_i / d d_ik (CSR: nb_start [n + 1], nb_j, nb_jac); empty for the window links
+  std::vector<double> rad, nb_jac;
+  std::vector<int32_t> nb_start, nb_j;
   bool trivial() const; // one super-node, or no weak links (R binary)
 };
 

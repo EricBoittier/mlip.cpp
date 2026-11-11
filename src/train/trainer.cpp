@@ -2415,6 +2415,11 @@ void train(const TrainOptions &o) {
         fmt::print("lrc: q0 mode graph (frozen backbone charge head {} + element Fukui equilibration), fixed-charge "
                    "inter-cluster Coulomb, switch {} -> {} A, clusters a_on {} A, a_off {} A, local-charge conditioning\n",
                    L.qmodel, g_sqe.lr_R - g_sqe.lr_t, g_sqe.lr_R, L.a_on, L.a_off);
+      if (L.links_backbone)
+        fmt::print("lrc: lrc_links = backbone: cluster links from the backbone's adaptive pair cutoffs c_ij (cutoff {} A, "
+                   "{} neighbours, {}), taper from {} c + {} A to c; inter-cluster Coulomb on 1 - R without the distance "
+                   "switch (the a_on / a_off and switch values above are not used)\n",
+                   L.bb_cutoff, L.bb_nadapt, L.bb_grid ? "grid" : "solver", L.link_a, L.link_b);
       if (L.slab != runtime::LrcSpec::Slab::None)
         fmt::print("lrc: lrc_slab = {}: slabs (a zero cell row{}) as 2D-periodic tilings, {}\n",
                    L.slab == runtime::LrcSpec::Slab::YB ? "yb" : "ewald2d",

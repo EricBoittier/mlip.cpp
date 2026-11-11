@@ -1,5 +1,6 @@
 #include "lr_combined.h"
 
+#include "core/adaptive_cutoff.h"
 #include "core/gguf_loader.h"
 
 #include <ggml.h>
@@ -311,6 +312,23 @@ LrcSpec LrcSpec::from_gguf(const GGUFLoader &G, const SqeSpec &S) {
       throw std::runtime_error("lrc: lrc_slab_vacuum / lrc_slab_gap need lrc_slab = yb or ewald2d");
     if (!(L.slab_vacuum >= 0) || !(L.slab_gap >= 0)) throw std::runtime_error("lrc: lrc_slab_vacuum / _gap must be >= 0");
   }
+  {
+    const std::string lm = G.get_string("pet.plato_lr.lrc_links", "window");
+    if (lm != "window" && lm != "backbone") throw std::runtime_error("lrc: lrc_links must be window or backbone");
+    L.links_backbone = lm == "backbone";
+    if (L.links_backbone) {
+      scalar("link_a", L.link_a), scalar("link_b", L.link_b);
+      // as GraphModel reads them (float32), so the radii are the backbone's
+      L.bb_cutoff = double(G.get_float32("pet.cutoff", 0.0f));
+      L.bb_nadapt = double(G.get_float32("pet.num_neighbors_adaptive", 0.0f));
+      L.bb_width = double(G.get_float32("pet.cutoff_width_adaptive", G.get_float32("pet.cutoff_width", 0.5f)));
+      const std::string am = G.get_string("pet.adaptive_cutoff_method", "grid");
+      if (am != "grid" && am != "solver") throw std::runtime_error("lrc_links backbone: unknown adaptive cutoff " + am);
+      L.bb_grid = am == "grid";
+      if (!L.graph) throw std::runtime_error("lrc_links backbone: needs the graph q0 mode");
+      L.links_check();
+    }
+  }
   if (L.graph) {
     L.qmodel = G.get_string("pet.plato_lr.lrc_qmodel", "");
     {
@@ -358,6 +376,7 @@ LrcSpec LrcSpec::from_gguf(const GGUFLoader &G, const SqeSpec &S) {
     if (L.slab != LrcSpec::Slab::None && (L.mp || L.pol)) throw std::runtime_error("lrc_slab: not with lrc_mp / lrc_pol");
     if (L.slab_gap > 0 && !(L.slab_gap > L.a_off && L.slab_gap > S.lr_R))
       throw std::runtime_error("lrc_slab_gap must exceed lrc_a_off and sqe_lr_R");
+    L.links_check();
     return L;
   }
   if (L.intra) throw std::runtime_error("lrc_intra: needs the graph q0 mode");
@@ -394,6 +413,10 @@ void LrcSpec::to_gguf(gguf_context *g) const {
   gguf_set_val_i32(g, "pet.plato_lr.lrc_qproj", qproj ? 1 : 0);
   scalar("qproj_w", qproj_w);
   if (intra) gguf_set_val_str(g, "pet.plato_lr.lrc_intra", "ewald"); // absent key = none (earlier GGUFs unchanged)
+  if (links_backbone) { // absent key = window (earlier GGUFs unchanged)
+    gguf_set_val_str(g, "pet.plato_lr.lrc_links", "backbone");
+    scalar("link_a", link_a), scalar("link_b", link_b);
+  }
   if (slab != Slab::None) { // absent keys = slabs refused (earlier GGUFs unchanged)
     gguf_set_val_str(g, "pet.plato_lr.lrc_slab", slab == Slab::YB ? "yb" : "ewald2d");
     if (slab_vacuum != 0) scalar("slab_vacuum", slab_vacuum);
@@ -739,6 +762,19 @@ double LrcSpec::fukui_phi_of(int z, bool minus) const {
   return 0.0;
 }
 
+void LrcSpec::links_check() const {
+  if (!links_backbone) return;
+  if (!graph) throw std::runtime_error("lrc_links backbone: needs the graph q0 mode");
+  if (mp || pol || intra) throw std::runtime_error("lrc_links backbone: not with lrc_mp / lrc_pol / lrc_intra");
+  if (slab != Slab::None) throw std::runtime_error("lrc_links backbone: not with lrc_slab (open structures only)");
+  if (!(bb_cutoff > 0)) throw std::runtime_error("lrc_links backbone: needs the backbone cutoff (pet.cutoff)");
+  if (!(link_a >= 0 && link_a < 1) || !(link_b >= 0))
+    throw std::runtime_error("lrc_links backbone: lrc_link_a must be in [0, 1) and lrc_link_b >= 0");
+  if (!((1 - link_a) * bb_cutoff - link_b > 0.5))
+    throw std::runtime_error("lrc_links backbone: the link taper at the full cutoff is narrower than 0.5 A");
+  if (bb_nadapt > 0 && !(bb_width > 0)) throw std::runtime_error("lrc_links backbone: bad adaptive cutoff width");
+}
+
 void LrcSpec::fukui_check() const {
   if (fukui_mode != FukuiMode::Uniform && (fukui_Z.empty() || fukui_Z.size() != fukui_phi.size()))
     throw std::runtime_error("lrc graph: needs lrc_fukui_Z / _phi of equal length");
@@ -905,6 +941,63 @@ template <class F> void enumerate(const LrcClusters &c, const std::vector<int> &
 } // namespace
 
 namespace {
+// backbone links (LrcSpec::links_backbone): A of a pair at distance r with pair cutoff c, dA/dr and dA/dc
+inline void backbone_link(const LrcSpec &L, double r, double c, double &A, double &dA, double &dAc) {
+  const double lo = L.link_a * c + L.link_b, w = c - lo;
+  if (!(w > 1e-3))
+    throw std::runtime_error("lrc_links backbone: pair cutoff " + std::to_string(c) + " A leaves no link taper");
+  const double u = (r - lo) / w, ds = dsstep(u);
+  A = 1.0 - sstep(u), dA = -ds / w, dAc = ds * (L.link_a + u * (1.0 - L.link_a)) / w;
+}
+
+// the backbone's adaptive radius of every atom (c.rad) and d r_i / d d_ik for its neighbours within the cutoff (open
+// structures; the same function as GraphModel's, on the same neighbours, so the pair cutoffs are the backbone's)
+void backbone_radii(const LrcSpec &L, int n, const double *x, LrcClusters &c) {
+  const double rc = L.bb_cutoff;
+  c.rad.assign(n, rc);
+  c.nb_start.assign(n + 1, 0), c.nb_j.clear(), c.nb_jac.clear();
+  if (!(L.bb_nadapt > 0)) return; // a plain cutoff: c_ij = rc, no position dependence
+  std::vector<double> d;
+  for (int i = 0; i < n; i++) {
+    d.clear();
+    for (int k = 0; k < n; k++) {
+      if (k == i) continue;
+      const double r = dist(x, i, k);
+      if (r < rc) d.push_back(r), c.nb_j.push_back(k);
+    }
+    const size_t e0 = c.nb_jac.size();
+    c.nb_jac.resize(e0 + d.size());
+    c.rad[i] = adaptive::radius(L.bb_grid, static_cast<int>(d.size()), [&](int k) { return d[k]; }, rc, L.bb_nadapt,
+                                L.bb_width, c.nb_jac.data() + e0);
+    c.nb_start[i + 1] = static_cast<int32_t>(c.nb_jac.size());
+  }
+}
+
+// g += d/dx sum_w K_w A_w over the weak links, K_w = dp_e prod_{v != w in e} (1 - A_v) (dp: dE/dp per super-edge):
+// the pair term, and for backbone links the pair cutoff's chain through both atoms' adaptive radii; vir (may be null)
+void weak_links_grad(const LrcSpec &L, const LrcClusters &c, const std::vector<double> &dp, const double *x, double *g,
+                     double *vir) {
+  std::vector<double> gr(L.links_backbone ? c.rad.size() : 0, 0.0); // dE/dr_i
+  for (size_t w = 0; w < c.weak.size(); w++) {
+    const auto &wk = c.weak[w];
+    if (dp[wk.e] == 0 || (wk.dA == 0 && wk.dAc == 0)) continue;
+    double others = 1.0;
+    for (size_t v = 0; v < c.weak.size(); v++)
+      if (v != w && c.weak[v].e == wk.e) others *= 1.0 - c.weak[v].A;
+    const double K = dp[wk.e] * others;
+    if (wk.dA != 0) link_grad(c, w, x, K * wk.dA, g, vir);
+    if (wk.dAc != 0) gr[wk.i] += 0.5 * K * wk.dAc, gr[wk.j] += 0.5 * K * wk.dAc;
+  }
+  for (size_t i = 0; i < gr.size(); i++) {
+    if (gr[i] == 0) continue;
+    for (int32_t e = c.nb_start[i]; e < c.nb_start[i + 1]; e++)
+      if (c.nb_jac[e] != 0) {
+        const int k = c.nb_j[e];
+        add_pair(g, x, int(i), k, dist(x, int(i), k), gr[i] * c.nb_jac[e], vir);
+      }
+  }
+}
+
 // super-edges, link probabilities and reliabilities from the super-nodes (c.s, c.sn) and the weak atom pairs, whose
 // distances are those of the cluster-frame positions c.xh
 // (layered clusters: disp[k] the image displacement of weak link k, stored in c.wd; its distance replaces c.xh's)
@@ -927,6 +1020,12 @@ void finish_clusters(const LrcSpec &L, LrcClusters &c, const std::vector<std::pa
       c.wd.push_back(d);
     } else {
       r = dist(x, i, j);
+    }
+    if (L.links_backbone) {
+      double A, dA, dAc;
+      backbone_link(L, r, 0.5 * (c.rad[i] + c.rad[j]), A, dA, dAc);
+      c.weak.push_back({i, j, k, A, dA, dAc});
+      continue;
     }
     const double w = L.a_off - L.a_on, u = (r - L.a_on) / w;
     c.weak.push_back({i, j, k, 1.0 - sstep(u), -dsstep(u) / w});
@@ -1006,6 +1105,7 @@ int gap_axis(double gap, int n, const double *x, const double *cell, std::vector
 // the same in the 2D tiling (bulk = one cluster through every in-plane image); with lrc_intra also clusters that wrap
 // only part of the periodic directions (layered: weak links by image displacement, no unwrapping)
 LrcClusters clusters_periodic(const LrcSpec &L, int n, const double *x, const double *cell) {
+  if (L.links_backbone) throw std::runtime_error("lrc_links backbone: open structures only (no periodic cells yet)");
   LrcClusters c;
   c.cell.assign(cell, cell + 9);
   int open = zero_row(cell);
@@ -1125,9 +1225,23 @@ LrcClusters lrc_clusters(const LrcSpec &L, int n, const double *x, const double 
   std::vector<int> par(n);
   std::iota(par.begin(), par.end(), 0);
   std::vector<std::pair<int, int>> weak;
+  if (L.links_backbone) backbone_radii(L, n, x, c);
   for (int i = 0; i < n; i++)
     for (int j = i + 1; j < n; j++) {
       const double r = dist(x, i, j);
+      if (L.links_backbone) { // strong inside lo_ij, weak up to the pair cutoff c_ij, none beyond (no backbone edge)
+        if (r >= L.bb_cutoff) continue;
+        const double cij = 0.5 * (c.rad[i] + c.rad[j]), lo = L.link_a * cij + L.link_b;
+        if (!(cij - lo > 1e-3))
+          throw std::runtime_error("lrc_links backbone: pair cutoff " + std::to_string(cij) + " A leaves no link taper");
+        if (r <= lo) {
+          const int a = uf_find(par, i), b = uf_find(par, j);
+          if (a != b) par[std::max(a, b)] = std::min(a, b);
+        } else if (r < cij) {
+          weak.push_back({i, j});
+        }
+        continue;
+      }
       if (r <= L.a_on) {
         const int a = uf_find(par, i), b = uf_find(par, j);
         if (a != b) par[std::max(a, b)] = std::min(a, b);
@@ -1167,14 +1281,7 @@ void lrc_clusters_vjp(const LrcSpec &L, const LrcClusters &c, int n, const doubl
     });
   }
   // p = 1 - prod (1 - A): dp/dA_w = prod over the other links (1 - A)
-  for (size_t w = 0; w < c.weak.size(); w++) {
-    const auto &wk = c.weak[w];
-    if (dp[wk.e] == 0 || wk.dA == 0) continue;
-    double others = 1.0;
-    for (size_t v = 0; v < c.weak.size(); v++)
-      if (v != w && c.weak[v].e == wk.e) others *= 1.0 - c.weak[v].A;
-    link_grad(c, w, x, dp[wk.e] * others * wk.dA, g, vir);
-  }
+  weak_links_grad(L, c, dp, x, g, vir);
 }
 
 // ---- conditioning --------------------------------------------------------------------------------------------------
@@ -1423,14 +1530,7 @@ void lrc_project_vjp(const LrcSpec &L, const LrcClusters &c, const LrcProjection
   }
   for (int i = 0; i < n; i++) dq[i] += dQ0[c.sn[i]] - (o.resid ? Hb : 0.0);
   // p = 1 - prod (1 - A): dp/dA_w = prod over the other links (1 - A)
-  for (size_t w = 0; w < c.weak.size(); w++) {
-    const auto &wk = c.weak[w];
-    if (dp[wk.e] == 0 || wk.dA == 0) continue;
-    double others = 1.0;
-    for (size_t v = 0; v < c.weak.size(); v++)
-      if (v != w && c.weak[v].e == wk.e) others *= 1.0 - c.weak[v].A;
-    link_grad(c, w, x, dp[wk.e] * others * wk.dA, g, vir);
-  }
+  weak_links_grad(L, c, dp, x, g, vir);
 }
 
 // graph mode Fukui weights of one channel: f_i = softplus(phi_Z + a_i) + 1e-6 (a = 0 without a pass), df = df/da
@@ -1979,9 +2079,13 @@ LrcEnergy energy_fixed(const LrcSpec &L, const SqeSpec &S, const LrcCondition &c
       const int a = c.cl.sn[i], b = c.cl.sn[j];
       if (a == b) continue;
       const double R = dist(x, i, j);
-      if (R <= r0) continue;
+      if (R <= r0 && !L.links_backbone) continue;
       const double m = 1.0 - c.cl.R[size_t(a) * s + b];
       if (m == 0) continue;
+      if (L.links_backbone) { // no distance switch: 1 - R_ab alone (lr_combined.h)
+        pairs.push_back({i, j, R, 1.0, 0.0, m});
+        continue;
+      }
       const double t = (R - r0) / S.lr_t;
       pairs.push_back({i, j, R, sstep(t), dsstep(t) / S.lr_t, m});
     }
@@ -2095,9 +2199,10 @@ LrcEnergy energy_fixed(const LrcSpec &L, const SqeSpec &S, const LrcCondition &c
       const int a = c.cl.sn[i], b = c.cl.sn[j];
       if (a == b && !L.intra) continue;
       const double r = dist(x, i, j);
-      if (r <= r0) continue;
+      if (r <= r0 && !L.links_backbone) continue;
       const double t = (r - r0) / S.lr_t;
-      const double T = sstep(t), dT = dsstep(t) / S.lr_t;
+      // backbone links: no distance switch, the weight is 1 - R_ab alone (lr_combined.h)
+      const double T = L.links_backbone ? 1.0 : sstep(t), dT = L.links_backbone ? 0.0 : dsstep(t) / S.lr_t;
       const double m = L.intra ? 1.0 : 1.0 - c.cl.R[size_t(a) * s + b];
       if (m == 0) continue;
       const double k = KE / r, e = q[i] * q[j] * k;
