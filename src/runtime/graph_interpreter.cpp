@@ -2033,7 +2033,10 @@ ggml_tensor *GraphInterpreter::build_index(ggml_context *ctx,
 
   // a 1-D source x[idx] (iris PET-LR: per-atom and per-slot gathers): ggml_get_rows takes rows of ne0
   // elements, so gather [1, N] rows and flatten (a plain get_rows would give [N, M])
-  if (ggml_n_dims(a) == 1 && ggml_n_dims(indices) == 1) {
+  // The rank comes from the graph, not from ggml_n_dims: ggml drops trailing size-1 dims, so a [1, d] source (one
+  // atom, one padded slot: n_edges = 1) has n_dims 1 and would be gathered as a d-vector, giving 1 element, not d.
+  const bool src_1d = node.output_shape.empty() ? ggml_n_dims(a) == 1 : node.output_shape.size() == 1;
+  if (src_1d && ggml_n_dims(indices) == 1) {
     ggml_tensor *rows = ggml_get_rows(ctx, ggml_reshape_2d(ctx, a, 1, a->ne[0]), indices);
     return ggml_reshape_1d(ctx, rows, indices->ne[0]);
   }
