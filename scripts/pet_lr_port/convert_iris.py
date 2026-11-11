@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """Iris PET-LR checkpoint (ipsum/PET-LR, after M. Langer) -> mlip.cpp pet-graph GGUF: the PET trunk.
 
-    python convert_iris.py PARAMS.npz CKPT_DIR -o OUT.gguf [--no-baseline] [--keep-pt OUT.pt]
+    python -I ~/data/petlr-export/run.py convert_iris.py PARAMS.npz CKPT_DIR -o OUT.gguf [--no-baseline] [--keep-pt OUT.pt]
+
+Needs the metatrain that mlip.cpp's FX exporter is written against (the plato_lr fork, put first on sys.path by
+the export env's run.py); stock metatrain 2026.4 fails in the tracer (`token_positions`). The converter refuses
+`final_message_passing: False` (his biotrimers / multivalent / water-fields / water-screening trunks) and custom
+`backbone` paths (les-water): metatrain's PET cannot express them, so they need a dedicated export (phase 2).
 
 PARAMS.npz is the flat parameter tree of the checkpoint (dump_params.py, read with his own
 marathon.io.read_msgpack); CKPT_DIR holds model/model.yaml and model/baseline.yaml.

@@ -29,8 +29,13 @@ def rel(xs, ys):
     return f"max {max(r):.3g} median {np.median(r):.3g} (n={len(r)})"
 
 
-ref = frames(sys.argv[1]); cpp = read_bin(sys.argv[2])
-assert len(ref) == len(cpp) and all(x.shape == y.shape for x, y in zip(ref, cpp))
-print("cpp vs ref :", rel(cpp, ref))
-if len(sys.argv) > 3:
-    ref2 = frames(sys.argv[3]); print("ref2 vs ref:", rel(ref2, ref))
+def main():
+    ref = frames(sys.argv[1]); cpp = read_bin(sys.argv[2])
+    assert len(ref) == len(cpp) and all(x.shape == y.shape for x, y in zip(ref, cpp))
+    print("cpp vs ref :", rel(cpp, ref))
+    if len(sys.argv) > 3:
+        ref2 = frames(sys.argv[3]); print("ref2 vs ref:", rel(ref2, ref))
+
+
+if __name__ == "__main__":
+    main()
