@@ -168,13 +168,22 @@ Batch make_part_batch(const MemmapSplit &split, const NeighborCache &nl, int64_t
   return make_batch_impl(split, nl, {id}, rot, species_to_index, scaling, cutoff, 0, 0, 0, &planner, &copies);
 }
 
+// MLIPCPP_MB_MAX_ATOMS=A > 0: at most A packed atoms per micro-batch (besides the attention budget; a single unit is
+// always allowed). The Plato-LR open-boundary terms grow with the square of a micro-batch's atoms, which the attention
+// budget n (m+1)^2 does not see for sparse structures (few neighbours). Unset: no cap.
+static int mb_max_atoms() {
+  static const int v = [] { const char *e = std::getenv("MLIPCPP_MB_MAX_ATOMS"); return e && *e ? std::atoi(e) : 0; }();
+  return v;
+}
+
 int part_copies(int c, int n, int m, double budget) {
   static const int forced = [] { const char *e = std::getenv("MLIPCPP_VS_SPLIT_COPIES"); return e && *e ? std::atoi(e) : 0; }();
   if (c <= 1) return c;
   if (forced > 0) return std::min(c, forced);
   const double one = double(n) * (m + 1.0) * (m + 1.0);
-  if (c * one <= budget) return c;
-  return std::max(1, static_cast<int>(budget / one));
+  int pc = c * one <= budget ? c : std::max(1, static_cast<int>(budget / one));
+  if (mb_max_atoms() > 0 && pc * n > mb_max_atoms()) pc = std::max(1, mb_max_atoms() / n);
+  return pc;
 }
 
 namespace {
@@ -472,6 +481,7 @@ std::vector<Batch> make_microbatches(const MemmapSplit &split, const NeighborCac
     out.back().frag_norm = frag_norm;
     g_ids.clear(), g_rot.clear(), g_atoms = 0, g_packed = 0;
   };
+  const int max_atoms = mb_max_atoms();
   std::vector<size_t> splits; // lrc_states: structures whose copies exceed the budget, packed as parts below
   for (size_t k : order) {
     const int64_t s = ids[k];
@@ -483,7 +493,7 @@ std::vector<Batch> make_microbatches(const MemmapSplit &split, const NeighborCac
     const int64_t atoms = g_packed + int64_t(copies[k]) * split.n_atoms(s);
     // never close a single-atom micro-batch: a leading PyTorch dim of 1 is
     // invisible to ggml_n_dims, which some interpreter ops rely on
-    if (g_atoms >= 2 && (m1 > growth * g_min || atoms * m1 * m1 > budget)) flush();
+    if (g_atoms >= 2 && (m1 > growth * g_min || atoms * m1 * m1 > budget || (max_atoms > 0 && atoms > max_atoms))) flush();
     if (g_ids.empty()) g_min = m1;
     g_ids.push_back(s);
     if (!rotations.empty()) g_rot.push_back(rotations[k]);
@@ -560,6 +570,7 @@ std::vector<std::vector<Batch>> make_step_batches(const MemmapSplit &split, cons
     return cost(n, m);
   };
 
+  const int max_atoms = mb_max_atoms();
   using Groups = std::vector<std::pair<size_t, size_t>>;
   auto plan = [&](double cap) -> Groups {
     const double inf = std::numeric_limits<double>::infinity();
@@ -572,7 +583,7 @@ std::vector<std::vector<Batch>> make_step_batches(const MemmapSplit &split, cons
         const int64_t n = atoms[j] - atoms[i];
         const double c = group_cost(i, j);
         // a single structure is always allowed; groups grow monotonically in n and cost
-        if (j - i > 1 && (n * m1 * m1 > budget || c > cap)) break;
+        if (j - i > 1 && (n * m1 * m1 > budget || c > cap || (max_atoms > 0 && n > max_atoms))) break;
         // never a single-atom micro-batch (see make_microbatches)
         if (n >= 2 && best[i] + c < best[j]) best[j] = best[i] + c, cut[j] = i;
       }
