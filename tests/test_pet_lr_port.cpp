@@ -210,8 +210,12 @@ double iris_check(Predictor &m, const std::vector<float> &x, const std::vector<i
     worst = std::max(worst, std::fabs(f - r.forces[k]));
     fmax = std::max(fmax, double(std::fabs(r.forces[k])));
   }
-  INFO("max |F_FD - F| = " << worst << " eV/A, max |F| = " << fmax);
-  CHECK(worst < ftol + 1e-3 * fmax);
+  // + the a-priori fp32 noise of the Richardson FD: 4 ulps of |E| per energy, (4 / (2 h1) + 1 / (2 h2)) / 3 x 2 = 375
+  // per unit energy noise (h1 = 4e-3, h2 = 8e-3); binding on the GPU (unordered reductions) for nearly force-free
+  // structures (species_weighted Na / Cl 8 A apart: max|F| 1e-4, FD 2.4e-5 off on the H100, 2026-11-11)
+  const double noise = 375.0 * 4.0 * 5.96e-8 * std::fabs(double(r.energy));
+  INFO("max |F_FD - F| = " << worst << " eV/A, max |F| = " << fmax << ", fp32 FD noise bound " << noise);
+  CHECK(worst < ftol + 1e-3 * fmax + noise);
   CHECK(fmax > fmin);
   return r.metallicity;
 }
