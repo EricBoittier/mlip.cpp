@@ -638,15 +638,30 @@ ggml_tensor *PetPlatoLR::mesh_op(ggml_context *ctx, const GIRNode &node, const s
     ggml_tensor *diag = ggml_scale_bias(ctx, ggml_reshape_2d(ctx, ggml_sum_rows(ctx, A), C, 1), 1.0f, k0); // [C, 1]
     acc(ggml_mul(ctx, ggml_mul(ctx, v, diag), open_mask_));
     if (n_pairs_ > 0) {
-      ggml_tensor *r = pair_r(ctx); // [1, P]
-      ggml_tensor *kr = ggml_mul(ctx, ggml_repeat(ctx, r, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nq, n_pairs_)),
-                                 ggml_reshape_2d(ctx, kq, nq, 1)); // [nq, P]
-      ggml_tensor *j0 = ggml_div(ctx, ggml_sin(ctx, kr), kr);
-      ggml_tensor *K = ggml_add(ctx, mm_f32(ctx, A, j0),
-                                ggml_div(ctx, ggml_plato_erf(ctx, ggml_scale(ctx, r, 1.0f / (std::sqrt(2.0f) * sigma))), r)); // [C, P]
-      // both directions of each pair (i < j): m_i += K_ij v_j, m_j += K_ij v_i
-      acc(ggml_get_rows_back(ctx, ggml_mul(ctx, K, ggml_get_rows(ctx, v, pair_j_)), pair_i_, v));
-      acc(ggml_get_rows_back(ctx, ggml_mul(ctx, K, ggml_get_rows(ctx, v, pair_i_)), pair_j_, v));
+      ggml_tensor *r_all = pair_r(ctx); // [1, P]
+      // the [nq, P] tensors of large open structures exceed the 32-bit element indexing of ggml-cuda's broadcast
+      // kernels (an illegal address near nq P = 2^31, 5184 atoms): above nq P = 2^30 the pairs go in blocks of at most
+      // 2^30 / nq (MLIPCPP_PLATO_PAIR_CHUNK: pairs per block). Below it the graph is unchanged; in blocks the per-atom
+      // sums are added block by block (another summation order). Memory stays O(nq P): the backward keeps every block.
+      static const int64_t chunk_env = [] { const char *e = std::getenv("MLIPCPP_PLATO_PAIR_CHUNK"); return e ? std::atoll(e) : 0LL; }();
+      int64_t B = n_pairs_;
+      if (chunk_env > 0) B = chunk_env;
+      else if (nq * n_pairs_ > (int64_t(1) << 30)) B = std::max<int64_t>(1, (int64_t(1) << 30) / nq);
+      for (int64_t p0 = 0; p0 < n_pairs_; p0 += B) {
+        const int64_t b = std::min(B, n_pairs_ - p0);
+        const bool whole = b == n_pairs_;
+        ggml_tensor *r = whole ? r_all : ggml_view_2d(ctx, r_all, 1, b, r_all->nb[1], size_t(p0) * r_all->nb[1]);
+        ggml_tensor *pi = whole ? pair_i_ : ggml_view_1d(ctx, pair_i_, b, size_t(p0) * ggml_element_size(pair_i_));
+        ggml_tensor *pj = whole ? pair_j_ : ggml_view_1d(ctx, pair_j_, b, size_t(p0) * ggml_element_size(pair_j_));
+        ggml_tensor *kr = ggml_mul(ctx, ggml_repeat(ctx, r, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nq, b)),
+                                   ggml_reshape_2d(ctx, kq, nq, 1)); // [nq, b]
+        ggml_tensor *j0 = ggml_div(ctx, ggml_sin(ctx, kr), kr);
+        ggml_tensor *K = ggml_add(ctx, mm_f32(ctx, A, j0),
+                                  ggml_div(ctx, ggml_plato_erf(ctx, ggml_scale(ctx, r, 1.0f / (std::sqrt(2.0f) * sigma))), r)); // [C, b]
+        // both directions of each pair (i < j): m_i += K_ij v_j, m_j += K_ij v_i
+        acc(ggml_get_rows_back(ctx, ggml_mul(ctx, K, ggml_get_rows(ctx, v, pj)), pi, v));
+        acc(ggml_get_rows_back(ctx, ggml_mul(ctx, K, ggml_get_rows(ctx, v, pi)), pj, v));
+      }
     }
   }
   // periodic groups (runtime/plato_graph.cpp's mesh coupling), times the mesh points
