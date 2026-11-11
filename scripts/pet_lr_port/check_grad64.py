@@ -117,6 +117,9 @@ def main():
         if "charges" in aux and "atom/charges" in zf.files:
             add("charges", np.abs(aux["charges"].detach().numpy() - zf["atom/charges"][A]).max()
                 / max(np.abs(zf["atom/charges"][A]).max(), 1e-300))
+        for key, ref in (("metallicity", "struct/metallicity"), ("charge_residual", "struct/charge_residual")):
+            if key in aux and ref in zf.files:  # per-structure outputs (absolute difference)
+                add(key + " |d|", abs(float(aux[key]) - float(zf[ref][f])))
         _, Fsr, _ = forces(cfg, trunk, lr, scale, mk(), Z, spin, Q, r0, hard=a.hard, lr_on=False)
         add("share |F_LR|/|F| (max over atoms)", np.abs(F - Fsr).max() / np.abs(F).max())
         if a.split and not a.hard:

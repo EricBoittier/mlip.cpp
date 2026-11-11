@@ -5,7 +5,7 @@
  * (scripts/conditioning/parity_*.py).
  *
  *   mlipcpp-eval MODEL.gguf IN.xyz OUT.json [--backend cpu|cuda|...] [--charge Q] [--spin S] [--repeat N]
- *                [--iris-freeze-ewald 0|1] [--iris-max-neighbors N]
+ *                [--iris-freeze-ewald 0|1] [--iris-max-neighbors N] [--no-forces]
  * (iris models: --iris-freeze-ewald 1 freezes the Ewald parameters over the frames of the file as his calculator does
  * over a run; --iris-max-neighbors overrides the GGUF's overflow limit, 0 = no check)
  *
@@ -58,6 +58,7 @@ int main(int argc, char *argv[]) {
     return 1;
   }
   std::optional<int> charge, spin;
+  bool no_forces = false;
   int repeat = 0, max_nb = -1, qeq_maxiter = -1;
   double qeq_tol = -1.0;
   bool freeze = false;
@@ -72,6 +73,7 @@ int main(int argc, char *argv[]) {
     else if (a == "--iris-max-neighbors") max_nb = std::stoi(argv[++i]);
     else if (a == "--iris-qeq-maxiter") qeq_maxiter = std::stoi(argv[++i]); // iris QEq: override his cg settings
     else if (a == "--iris-qeq-tol") qeq_tol = std::stod(argv[++i]);
+    else if (a == "--no-forces") no_forces = true; // energies (and charges / dipoles) only
     else {
       std::cerr << "unknown option " << a << "\n";
       return 1;
@@ -108,6 +110,8 @@ int main(int argc, char *argv[]) {
       po.charge = sys.charge();
       po.spin_multiplicity = sys.spin_multiplicity();
       if (sys.has_dipole_origin()) po.dipole_origin.assign(sys.dipole_origin().begin(), sys.dipole_origin().end());
+      if (sys.has_field()) po.field.assign(sys.field().begin(), sys.field().end());
+      if (no_forces) po.compute_forces = false, po.compute_stress = false;
       po.formal_charges = sys.formal_charges(); // per-atom formal_charges array (fragment-constrained charges)
       nlohmann::json f;
       f["charge"] = sys.charge();
@@ -146,6 +150,8 @@ int main(int argc, char *argv[]) {
           f["dipole"] = r.dipole;
           f["fermi_level"] = r.fermi_level;
           f["metallicity"] = r.metallicity;
+          if (r.has_charge_residual) f["charge_residual"] = r.charge_residual;
+          if (!r.dipole_flow.empty()) f["dipole_flow"] = r.dipole_flow;
         }
       } catch (const std::exception &e) {
         f["error"] = e.what();

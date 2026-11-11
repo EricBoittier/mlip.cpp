@@ -31,6 +31,12 @@ struct ModelResult {
   std::vector<double> dipole;
   double fermi_level = 0.0, metallicity = 0.0;
   bool has_charges = false;
+  /// threshold reference (his feat/threshold-reference): the residual its species spread supplied,
+  /// R = sum_i (c_Z + f_i) - Q (e)
+  double charge_residual = 0.0;
+  bool has_charge_residual = false;
+  /// conserving charges (his feat/conserving-charges): the dipole of the edge flows, P_flow = -1/2 sum_e F_e R_e (e A)
+  std::vector<double> dipole_flow;
 
   bool has_forces = false;
   bool has_stress = false;

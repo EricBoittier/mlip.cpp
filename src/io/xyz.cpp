@@ -123,6 +123,17 @@ void read_exyz_conditioning(const std::string &comment_line, AtomicSystem &syste
     system.set_dipole_origin(r0);
     break;
   }
+  // field="x y z" (V/A; his iris `field` input, atoms.info["field"]): three numbers, quoted
+  for (size_t pos = comment_line.find("field="); pos != std::string::npos; pos = comment_line.find("field=", pos + 1)) {
+    if (pos > 0 && !std::isspace(static_cast<unsigned char>(comment_line[pos - 1]))) continue;
+    size_t start = pos + 6;
+    if (start < comment_line.size() && comment_line[start] == '"') start++;
+    std::istringstream iss(comment_line.substr(start));
+    std::array<double, 3> E{};
+    if (!(iss >> E[0] >> E[1] >> E[2])) throw std::runtime_error("XYZ: cannot parse field= in: " + comment_line);
+    system.set_field(E);
+    break;
+  }
 }
 
 // the token column of a per-atom extxyz array (Properties=name:type:count:...), -1 if absent

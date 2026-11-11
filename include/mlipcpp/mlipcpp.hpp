@@ -57,6 +57,11 @@ struct Result {
   std::vector<float> charges;
   std::vector<double> dipole;
   double fermi_level = 0.0, metallicity = 0.0;
+  /// threshold reference: the residual its species spread supplied, R = sum_i (c_Z + f_i) - Q (e)
+  double charge_residual = 0.0;
+  bool has_charge_residual = false;
+  /// conserving charges: the dipole of the edge flows (e A) [3]; empty otherwise
+  std::vector<double> dipole_flow;
   // periodic graph models: the full virial dE/d(strain) [9], row-major, eV, before symmetrisation; empty otherwise
   std::vector<double> virial;
 
@@ -148,6 +153,8 @@ struct PredictOptions {
   std::vector<float> formal_charges;
   /// Dipole origin (A) for models that output a dipole (iris PET-LR); empty: the model's default (centre of mass)
   std::vector<double> dipole_origin;
+  /// Uniform external field (V/A) for iris PET-LR models with a `field` input; empty: none (zero)
+  std::vector<double> field;
 };
 
 /**

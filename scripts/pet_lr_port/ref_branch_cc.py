@@ -52,14 +52,20 @@ def main():
     if not model.conserving_charges or model.fixed_neighbors is None:
         raise ValueError("ref_branch_cc.py: a conserving_charges model with fixed_neighbors")
     width = int(model.fixed_neighbors)
-    inputs = ("charge",)
-    props = {**DEFAULT_PROPERTIES, "charge": {"shape": (1,), "storage": "atoms.info"}}
+    # the uniform external field (his `field` input, atoms.info["field"] [3], V/A) when the model reads it
+    inputs = ("charge", "field") if "field" in (getattr(model, "inputs", None) or ()) else ("charge",)
+    props = {**DEFAULT_PROPERTIES, "charge": {"shape": (1,), "storage": "atoms.info"},
+             "field": {"shape": (3,), "storage": "atoms.info"}}
     keys = ("energy", "forces")
     prep = KnnToSample(cutoff=model.cutoff, num_neighbors=width, inputs=inputs, keys=keys, properties=props,
                        with_lr=True, num_k=a.num_k, conserving_charges=True,
                        charge_state_min=model.charge_state_min, charge_state_max=model.charge_state_max)
     run = jax.jit(lambda b: predict(model, params, b))
     run_pbc = jax.jit(lambda b: predict(model, params, b, stress=True))
+    field_forces = None
+    if "field" in inputs:  # his field force E . Z0 on the pass-1 charges (predict adds it to `forces`), on its own
+        from iris.pet.predict import _field_forces
+        field_forces = jax.jit(lambda b: _field_forces(model, params, b, b["inputs"]["field"]))
     frames = read(a.frames, ":")
     if a.max:
         frames = frames[:a.max]
@@ -68,6 +74,8 @@ def main():
     up = lambda x, m: int(-(-x // m) * m)
     for f, at in enumerate(frames):
         at.info.setdefault("charge", 0.0)
+        if "field" in inputs:
+            at.info.setdefault("field", np.zeros(3))
         n = len(at)
         pbc = bool(at.pbc.any())
         if pbc:
@@ -105,11 +113,15 @@ def main():
             res = {**res, "virial": np.asarray(st)[:1]}
         else:
             res.pop("stress", None)
+        if field_forces is not None:
+            res = {**res, "field_forces": field_forces(batch)}
         res = jax.tree.map(np.asarray, res)
         err.append(0)
         for k, v in res.items():
             v = np.asarray(v)
-            if k == "virial":
+            if k in ("dipole_flow", "dipole_induced"):  # per-structure vectors [S, 3] (before: the first component only)
+                out.setdefault(k, []).append(v.reshape(-1, 3)[:1])
+            elif k == "virial":
                 out.setdefault(k, []).append(v.reshape(1, 3, 3))
             elif v.ndim >= 1 and v.shape[0] >= n and k != "energy":
                 out.setdefault(k, []).append(v[:n])

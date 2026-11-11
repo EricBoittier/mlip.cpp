@@ -86,6 +86,19 @@ PRESETS.update({
                           polarisation_passes=1),
 })
 
+# his branch feat/threshold-reference (101575d, two commits on 3ed96b0; run in the long-range-transfer env with
+# PYTHONPATH=<a worktree at 101575d>, kuma /scratch/boittier/ipsum/src/iris-threshold): charge_reference "threshold",
+# q0_i = c_Z + f(s_i - theta_Z) - w_i R / sum w, R = sum_i (c_Z + f_i) - Q (emitted as charge_residual), no Fermi level.
+# The init randomises theta_Z and c_Z (zero-initialised leaves) and jitters the softplus weights per species (else they
+# stay equal and cancel in the spread), so every term carries
+PRESETS.update({
+    "thr": dict(_LRT, charge_reference="threshold", transfer_passes=1, polarisation_passes=2,
+                polarisation_shared=True, conductance_form="layerscale", hardness=True, _jitter={"species_weight": 0.8}),
+    # gapped placement (T 0.02) with the long-range transfer, Gaussian charges, one pass
+    "thr_cold_lrt": dict(_LRT, charge_reference="threshold", charge_temperature=0.02, long_range_transfer=True,
+                         smearing=1.0, transfer_passes=1, polarisation_passes=1, _jitter={"species_weight": 0.8}),
+})
+
 # his branch feat/conserving-charges (a98c2f6; env kuma /scratch/boittier/ipsum/envs/iris-conserving-charges; the
 # water-screening branch bb5a5ea carries the same model code): conserving_charges (per-component Fermi level, or the
 # residual allocation, plus one edge transfer, then the polarisation passes). That PETLR has no `conditioning` list
@@ -103,6 +116,11 @@ PRESETS.update({
                         conductance_form="softplus", hardness=False),
     # residual allocation, plain heads, one pass
     "cc_residual_plain": dict(_CC, charge_allocation="residual", polarisation_passes=1),
+    # with his `field` input (a uniform external field per structure: the pass drives' -E . R / 2 and the enthalpy
+    # -E . P_flow; dipole_flow): fermi with 2 shared passes, and residual with the transfer alone (one pass)
+    "cc_fermi_field": dict(_CC, charge_allocation="fermi", polarisation_passes=2, hardness=True,
+                           inputs=["charge", "field"]),
+    "cc_residual_field": dict(_CC, charge_allocation="residual", polarisation_passes=1, inputs=["charge", "field"]),
 })
 
 # his les-water backbones (ipsum-work play/les-water/backbones.py; iris branch explore/alessandro-strict-local-20261012-v1
@@ -142,6 +160,9 @@ def main():
     from iris.pet.petlr import PETLR
     cfg = {"lr": False, **PRESETS[a.preset]}
     damp = cfg.pop("_damp", {})  # {path substring: factor} on the last Dense of matching heads, after the randomisation
+    # {leaf name: s}: an ELEMENTWISE factor in [1 - s, 1 + s] on those leaves (a constant-initialised per-species leaf,
+    # e.g. species_weight, otherwise stays uniform under the per-leaf factor and its species dependence is untested)
+    jitter = cfg.pop("_jitter", {})
     lr_on = bool(cfg["lr"])
     model = PETLR(**cfg)
     key = jax.random.PRNGKey(a.seed)
@@ -155,6 +176,17 @@ def main():
             x = 0.1 * jax.random.normal(k1, x.shape, x.dtype)
         out.append(x * (1.0 + a.scale * jax.random.uniform(k2, (), x.dtype, -1.0, 1.0)))
     params = jax.tree.unflatten(tree, out)
+    if jitter:
+        from flax.traverse_util import flatten_dict, unflatten_dict
+        flat = flatten_dict(params)
+        jk = jax.random.PRNGKey(a.seed + 2)
+        for path in sorted(flat, key=str):
+            if str(path[-1]) in jitter:
+                jk, k1 = jax.random.split(jk)
+                x = flat[path]
+                flat[path] = x * (1.0 + jitter[str(path[-1])] * jax.random.uniform(k1, x.shape, x.dtype, -1.0, 1.0))
+                print("jittered:", "/".join(map(str, path)))
+        params = unflatten_dict(flat)
     if damp:
         from flax.traverse_util import flatten_dict, unflatten_dict
         flat = flatten_dict(params)

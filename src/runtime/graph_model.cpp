@@ -468,15 +468,34 @@ bool GraphModel::load_from_gguf(const std::string &path) {
     iris_lr_.slab_margin = loader.get_float32("pet.iris_lr.slab_margin", 2.0f);
     iris_lr_.long_range_transfer = loader.get_int32("pet.iris_lr.long_range_transfer", 0) != 0;
     iris_lr_.conserving_charges = loader.get_int32("pet.iris_lr.conserving_charges", 0) != 0;
+    iris_lr_.field = loader.get_int32("pet.iris_lr.field", 0) != 0;
     if (loader.get_int32("pet.iris_lr.halfspace", 1) != 1)
       throw std::runtime_error("pet.iris_lr.halfspace = 0: only his default halfspace k grid is ported");
     // species_weighted / species_fill: his branch feat/long-range-transfer (3ed96b0); residual: his
     // feat/conserving-charges (a98c2f6), conserving_charges only
     if (iris_lr_.reference != "fermi" && iris_lr_.reference != "species" && iris_lr_.reference != "both" &&
         iris_lr_.reference != "species_weighted" && iris_lr_.reference != "species_fill" &&
-        iris_lr_.reference != "qeq" && !(iris_lr_.reference == "residual" && iris_lr_.conserving_charges))
+        iris_lr_.reference != "qeq" && iris_lr_.reference != "threshold" &&
+        !(iris_lr_.reference == "residual" && iris_lr_.conserving_charges))
       throw std::runtime_error("pet.iris_lr.reference: " + iris_lr_.reference);
-    if (iris_lr_.n_out != 8) throw std::runtime_error("pet.iris_lr.n_out != 8");
+    // threshold: his feat/threshold-reference (101575d): no Fermi level, no scores graph
+    iris_lr_.columns.clear();
+    {
+      std::stringstream cs(loader.get_string("pet.iris_lr.columns", ""));
+      std::string item;
+      int width_sum = 0;
+      while (std::getline(cs, item, ',')) {
+        const auto c = item.find(':');
+        if (c == std::string::npos) throw std::runtime_error("pet.iris_lr.columns: " + item);
+        const std::string name = item.substr(0, c);
+        const int width = std::stoi(item.substr(c + 1));
+        if ((name != "charge_residual" || width != 1) && (name != "dipole_flow" || width != 3))
+          throw std::runtime_error("pet.iris_lr.columns: unknown column " + item);
+        iris_lr_.columns.emplace_back(name, width);
+        width_sum += width;
+      }
+      if (iris_lr_.n_out != 8 + width_sum) throw std::runtime_error("pet.iris_lr.n_out != 8 + the extra columns");
+    }
     iris_lr_.qeq_maxiter = loader.get_int32("pet.iris_lr.qeq_maxiter", 20);
     iris_lr_.qeq_tol = loader.get_float32("pet.iris_lr.qeq_tol", 1e-5f);
   }
@@ -586,7 +605,7 @@ bool GraphModel::load_from_gguf(const std::string &path) {
   }
   scores_interp_ = GraphInterpreter();
   if (iris_lr_.enabled && iris_lr_.reference != "species" && iris_lr_.reference != "species_weighted" &&
-      iris_lr_.reference != "residual") {
+      iris_lr_.reference != "residual" && iris_lr_.reference != "threshold") {
     const std::string sj = loader.get_string("graph_scores.json", "");
     if (sj.empty()) {
       ggml_free(temp_ctx);
@@ -1468,7 +1487,7 @@ ModelResult GraphModel::predict_single_impl(
   // iris PET-LR (pet.iris_lr): the LR branch's own inputs; positions are a gradient input
   ggml_tensor *iris_nbr = nullptr, *iris_pos = nullptr, *iris_Q = nullptr, *iris_mu = nullptr,
               *iris_gapped = nullptr, *iris_mround = nullptr, *iris_top = nullptr, *iris_bottom = nullptr,
-              *iris_r0 = nullptr;
+              *iris_r0 = nullptr, *iris_field = nullptr;
   // iris QEq: the host cg's solution z (a gradient input: d(sum E)/dz is the cotangent), the cotangent's solution
   // lambda (0 in the first pass) and the operator graph's argument x
   ggml_tensor *qeq_z = nullptr, *qeq_lambda = nullptr, *qeq_x = nullptr;
@@ -1599,6 +1618,7 @@ ModelResult GraphModel::predict_single_impl(
     iris_top = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, n_atoms), "top");
     iris_bottom = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, n_atoms), "bottom");
     iris_r0 = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, 3), "dipole_origin");
+    if (iris_lr_.field) iris_field = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, 3), "field");
     if (iris_qeq) {
       qeq_z = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, n_atoms), "qeq_z");
       qeq_lambda = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, n_atoms), "qeq_lambda");
@@ -1823,6 +1843,18 @@ ModelResult GraphModel::predict_single_impl(
       ggml_backend_tensor_set(t, zeros.data(), 0, zeros.size() * sizeof(float));
     for (ggml_tensor *t : {iris_nbr, iris_pos, iris_Q, iris_mu, iris_gapped, iris_mround, iris_top, iris_bottom, iris_r0})
       interp_.set_input(ggml_get_name(t), t);
+    if (iris_field) { // the uniform external field (V/A; his `field` input), zero when the system carries none
+      const std::array<double, 3> E = system.has_field() ? system.field() : std::array<double, 3>{0, 0, 0};
+      // his forces under a field are -dE/dr PLUS E . Z0 (the exact Born charges of the pass-1 charges at a frozen
+      // Fermi level, iris.pet.predict._field_forces), which is not the gradient of anything this graph outputs: not
+      // ported (it needs two more backward passes of the pass-1 charges), so forces under a nonzero field raise
+      if (compute_forces && (E[0] != 0 || E[1] != 0 || E[2] != 0))
+        throw std::runtime_error("iris PET-LR: forces under a nonzero field need the field force E . Z0 (not ported); "
+                                 "energies, charges and dipoles only (mlipcpp-eval --no-forces)");
+      const float Ef[3] = {float(E[0]), float(E[1]), float(E[2])};
+      ggml_backend_tensor_set(iris_field, Ef, 0, sizeof(Ef));
+      interp_.set_input("field", iris_field);
+    }
     if (iris_pbc) {
       ggml_backend_tensor_set(ew_index, ew_index_d.data(), 0, ew_index_d.size() * sizeof(int32_t));
       ggml_backend_tensor_set(ew_shift, ew_shift_d.data(), 0, ew_shift_d.size() * sizeof(float));
@@ -2573,6 +2605,16 @@ ModelResult GraphModel::predict_single_impl(
       result.charges[i] = aux[size_t(i) * C + 1];
       for (int a = 0; a < 3; a++) result.dipole[a] += aux[size_t(i) * C + 2 + a];
       result.metallicity += aux[size_t(i) * C + 7];
+    }
+    // extra columns: structure sums (in double) of per-atom terms
+    int col = 8;
+    for (const auto &[name, width] : iris_lr_.columns) {
+      std::vector<double> sum(width, 0.0);
+      for (int i = 0; i < n_atoms; i++)
+        for (int a = 0; a < width; a++) sum[a] += aux[size_t(i) * C + col + a];
+      if (name == "charge_residual") result.charge_residual = sum[0], result.has_charge_residual = true;
+      if (name == "dipole_flow") result.dipole_flow = sum;
+      col += width;
     }
     result.fermi_level = n_atoms ? aux[5] : 0.0;
     result.has_charges = true;

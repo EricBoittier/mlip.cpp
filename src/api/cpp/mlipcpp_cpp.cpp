@@ -193,6 +193,9 @@ struct Predictor::Impl {
     result.dipole = std::move(internal_result.dipole);
     result.fermi_level = internal_result.fermi_level;
     result.metallicity = internal_result.metallicity;
+    result.charge_residual = internal_result.charge_residual;
+    result.has_charge_residual = internal_result.has_charge_residual;
+    result.dipole_flow = std::move(internal_result.dipole_flow);
     result.virial = std::move(internal_result.virial);
     return result;
   }
@@ -295,6 +298,10 @@ struct Predictor::Impl {
       system.set_dipole_origin({options.dipole_origin[0], options.dipole_origin[1], options.dipole_origin[2]});
     else if (!options.dipole_origin.empty())
       throw std::invalid_argument("dipole_origin: three values");
+    if (options.field.size() == 3)
+      system.set_field({options.field[0], options.field[1], options.field[2]});
+    else if (!options.field.empty())
+      throw std::invalid_argument("field: three values");
     if (!options.formal_charges.empty()) {
       if (options.formal_charges.size() != static_cast<size_t>(system.num_atoms()))
         throw std::invalid_argument("formal_charges: one value per atom");

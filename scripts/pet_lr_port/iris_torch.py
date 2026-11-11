@@ -343,10 +343,21 @@ class IrisLR(_AuxMixin, nn.Module):
                                     or cfg.get("num_charges", 1) != 1):
             raise ValueError("IrisLR: physical charges, charge_allocation=flows and num_charges=1 only")
         # species_weighted / species_fill: his branch feat/long-range-transfer (3ed96b0, iris.pet.charges)
-        if self.ref not in ("fermi", "species", "both", "species_weighted", "species_fill", "residual", "qeq"):
+        if self.ref not in ("fermi", "species", "both", "species_weighted", "species_fill", "residual", "qeq",
+                            "threshold"):
             raise ValueError(f"IrisLR: charge_reference {self.ref!r} not yet ported")
         # long_range_transfer (feat/long-range-transfer): per transfer pass a drive a_i moved through the Coulomb kernel of
         # Gaussian charges (width smearing) over the whole structure, dq = G a - a (G 1)
+        # a uniform external field (his feat/conserving-charges a98c2f6: the per-structure input `field` [3], V/A): the
+        # pass drives' external potential difference -E . R_ij / 2 and the enthalpy -E . P_flow; single-component
+        # conserving charges only here. The field force E . Z0 on the pass-1 charges is not part of the energy (his
+        # iris.pet.predict adds it): see field_forces below; mlip.cpp refuses forces under a nonzero field
+        self.field = "field" in (cfg.get("inputs") or [])
+        if self.field and not self.conserving:
+            raise ValueError("IrisLR: the field input is ported with conserving_charges only")
+        # frozen Fermi level (his frozen_fermi_level, the Born charges' tapped charges): mu (fermi) or the residual
+        # correction (residual) out of the gradient; never exported (the field-force oracle check only)
+        self.frozen = False
         self.lrt = bool(cfg.get("long_range_transfer"))
         if self.lrt and cfg.get("smearing") is None:
             raise ValueError("long_range_transfer needs smearing")
@@ -354,11 +365,13 @@ class IrisLR(_AuxMixin, nn.Module):
             cfg.get("charge_temperature", 0.1)
         self.cutoff, self.width, self.num_rbf = float(cfg["cutoff"]), float(cfg["cutoff_width"]), 8
         self.sigma = cfg.get("smearing")
-        if self.ref in ("fermi", "both"):
+        if self.ref in ("fermi", "both", "threshold"):
             self.score = nn.Linear(d, 1)
-        if self.ref in ("species", "both", "species_weighted"):
+        if self.ref in ("species", "both", "species_weighted", "threshold"):
             self.species_charge = nn.Parameter(torch.zeros(cfg["max_atomic_number"] + 1))
-        if self.ref == "species_weighted":  # softplus per species, the share of the excess
+        if self.ref == "threshold":  # his feat/threshold-reference (101575d): a learned threshold per species
+            self.species_threshold = nn.Parameter(torch.zeros(cfg["max_atomic_number"] + 1))
+        if self.ref in ("species_weighted", "threshold"):  # softplus per species, the share of the excess
             self.species_weight = nn.Parameter(torch.zeros(cfg["max_atomic_number"] + 1))
         if self.ref == "species_fill":  # one score and one softplus prefactor per species
             self.species_score = nn.Parameter(torch.zeros(cfg["max_atomic_number"] + 1))
@@ -420,6 +433,16 @@ class IrisLR(_AuxMixin, nn.Module):
             self.LayerNorm_1 = nn.LayerNorm(d, eps=1e-6)
             self.MLP_2 = _flax_mlp((d, dh, dh, 1))
             self.lr_scale = nn.Parameter(torch.zeros(1))
+
+    def extra_columns(self):
+        """[(name, width)] of the graph's output columns after the first 8 (GGUF pet.iris_lr.columns): per-atom terms
+        whose structure sum is the output: charge_residual (threshold reference)."""
+        out = []
+        if self.ref == "threshold":
+            out.append(("charge_residual", 1))
+        if self.conserving:
+            out.append(("dipole_flow", 3))
+        return out
 
     # -- charge states (iris.pet.charges) --
     def steps(self):
@@ -516,7 +539,7 @@ class IrisLR(_AuxMixin, nn.Module):
 
     def forward(self, node, species, positions, neighbor_index, padding_mask, reverse_neighbor_index, edge_vectors,
                 env, total_charge, mu_bisect, gapped, m_round, top, bottom, dipole_origin, ewald=None, qeq_z=None,
-                qeq_lambda=None, qeq_apply_x=None):
+                qeq_lambda=None, qeq_apply_x=None, field=None):
         """Per-atom LR energy [n] and the charges. Inputs beyond the trunk's: neighbor_index [n, k] (atom index of
         each slot), positions [n, 3], total_charge [1], the host's frozen-score bisection mu_bisect [1] and gapped
         decision (gapped [1] in {0, 1}, m_round [n] rounded occupations, top / bottom [n] indicator weights of the
@@ -579,6 +602,8 @@ class IrisLR(_AuxMixin, nn.Module):
             # derivative splits over ties
             d_top, d_bot = ((s - m_round) * top).sum(), ((s - m_round) * bottom).sum()
             mu = gapped * (0.5 * (d_top + d_bot)) + (-gapped + 1.0) * mu_n
+            if self.frozen:
+                mu = mu.detach()
             x = s - mu
             q = self.occupation(x)
             if w is None:
@@ -610,10 +635,25 @@ class IrisLR(_AuxMixin, nn.Module):
             else:
                 wq = softplus(self.allocation_weight(node)[:, 0])
             deficit = total_charge - p_free.sum()
-            q = p_free + wq / torch.clamp(wq.sum(), min=1e-6) * deficit
+            corr = wq / torch.clamp(wq.sum(), min=1e-6) * deficit
+            q = p_free + (corr.detach() if self.frozen else corr)
             # his per-atom residual |deficit| / atoms_c, summed per structure (one component): |deficit|; as a per-atom
             # column (graph output 7) that sums to it
             aux["residual_atoms"] = torch.abs(deficit) / torch.ones_like(p_free).sum() + torch.zeros_like(p_free)
+        elif self.ref == "threshold":
+            # iris.pet.charges.threshold_reference (101575d): q = c_Z + f(s_i - theta_Z), spread by the softplus
+            # species weights to sum to Q: q0 = q - w (sum q - Q) / max(sum w, 1e-12); the residual R = sum q - Q
+            # (charge_residual [S]) and metallicity sum_i f'(s_i - theta_Z). No Fermi level, no host bisection
+            s = self.scores(node, species)
+            x = s - self.species_threshold[species]
+            qt = self.species_charge[species] + self.occupation(x)
+            wz = softplus(self.species_weight)[species]
+            resid = qt.sum() - total_charge
+            q = qt - wz * (resid / torch.clamp(wz.sum(), min=1e-12))
+            dens_atoms = self.density(x)
+            aux.update(scores=s, metallicity=dens_atoms.sum(), density_atoms=dens_atoms, charge_residual=resid,
+                       # per-atom terms that sum to R (graph output column charge_residual)
+                       charge_residual_atoms=qt - total_charge / torch.ones_like(qt).sum())
         elif self.ref == "species_weighted":  # q0 = c_Z - w_Z (sum_j c_Z_j - Q) / sum_j w_Z_j
             c = self.species_charge[species]
             wz = softplus(self.species_weight)[species]
@@ -630,6 +670,7 @@ class IrisLR(_AuxMixin, nn.Module):
                 parts += [q[:, None, None].expand(n, k, 1), gather_atoms(q)[..., None]]
             t = self.transfer_mlp(torch.cat(parts, dim=-1))[..., 0] * self.transfer_gate
             q = q + flow_sum(t)
+            drives = t  # his `drives`: the transfer's edge values, then each pass's drive (dipole_flow, enthalpy)
         # --- transfer passes: edge MLP on node embeddings, charges and SR potentials ---
         if self.sigma is None:
             kern = keep / torch.where(padding_mask, torch.ones_like(r), r)
@@ -668,6 +709,8 @@ class IrisLR(_AuxMixin, nn.Module):
         aux["transfers"] = moved
         phi = potentials(q)
         extra = torch.zeros_like(q)
+        if field is not None:
+            proj = (edge_vectors * field[None, None, :]).sum(dim=-1)  # E . R_ij per slot
         if self.passes > 1:
             if not self.conserving:
                 aux["charges_pass1"] = q
@@ -684,7 +727,12 @@ class IrisLR(_AuxMixin, nn.Module):
                 else:
                     z = getattr(self, f"pol_conductance{sx}")(sym)[..., 0] + self.cinit
                     sigma_c = softplus(z)
-                drive = sigma_c * (gather_atoms(phi) - phi[:, None])
+                if field is not None:  # potentials are half the physical potential: the field enters as -E . R / 2
+                    drive = sigma_c * (gather_atoms(phi) - phi[:, None] - 0.5 * proj)
+                else:
+                    drive = sigma_c * (gather_atoms(phi) - phi[:, None])
+                if self.conserving:
+                    drives = drives + drive
                 step = flow_sum(drive)
                 if self.hard:
                     zh = getattr(self, f"hardness_head{sx}")(node)[:, 0] + 2.0
@@ -694,6 +742,15 @@ class IrisLR(_AuxMixin, nn.Module):
                 q = q + step
                 phi = potentials(q)
             aux["delta_charges"] = delta
+        if self.conserving:
+            # dipole_flow = -1/2 sum_e F_e R_e over the antisymmetrised flows F = (d_ij - d_ji) / 2 w_ij of the summed
+            # drives (the transfer and every pass): a per-atom column; under a field the enthalpy
+            # 1/2 sum_j F_ij E . R_ij per atom (= -E . P_flow summed)
+            d_rev = drives.reshape(n * k)[rev_flat].reshape(n, k)
+            flow = 0.5 * (drives - d_rev) * weight
+            aux["dipole_flow_atoms"] = -0.5 * (flow[..., None] * edge_vectors).sum(dim=1)
+            if field is not None:
+                extra = extra + 0.5 * (flow * proj).sum(dim=1)
         aux["charges"] = q
         aux["dipole"] = ((positions - dipole_origin[None, :]) * q[:, None]).sum(dim=0)
         energy = q * phi + extra
@@ -819,7 +876,7 @@ class IrisPETLRGraph(IrisTrunk):
     charge, the dipole contribution q_i (r_i - r_0) [3], mu (every row), score s_i, occupation density f'(s_i - mu).
     The energy column alone is differentiated for forces / virial."""
 
-    N_OUT = 8
+    N_OUT = 8  # without extra columns; n_out = N_OUT + the widths of lr.extra_columns()
 
     def __init__(self, trunk, lr, energy_scale):
         # an IrisTrunk itself (trunk parameter names as in the trunk-only GGUF, within GGUF's 64-char limit)
@@ -828,6 +885,7 @@ class IrisPETLRGraph(IrisTrunk):
         self.lr = lr
         self.energy_scale = nn.Parameter(torch.tensor([float(energy_scale)]))
         self.n_cond = 2 if trunk.conditioning else 0
+        self.n_out = self.N_OUT + sum(w for _, w in lr.extra_columns())
 
     def forward(self, species, neighbor_species, edge_vectors, *args):
         return self._forward(species, neighbor_species, edge_vectors, args, None)
@@ -839,12 +897,13 @@ class IrisPETLRGraph(IrisTrunk):
          dipole_origin) = lr_args[:9]
         # QEq: the host cg's solution z and the cotangent solution lam (QEQ_INPUTS, after dipole_origin)
         qz, qlam = lr_args[9:11] if self.lr.ref == "qeq" else (None, None)
+        field = lr_args[9] if self.lr.field else None  # [3] (FIELD_INPUTS, after dipole_origin)
         e_sr = IrisTrunk.forward(self, species, neighbor_species, edge_vectors, *trunk_args) * self.energy_scale
         node, env = self._aux["node"], self._aux["env"]
         padding_mask, reverse = args[0], args[1]
         e_lr = self.lr(node, species, positions, neighbor_index, padding_mask, reverse, edge_vectors, env,
                        total_charge, mu_bisect, gapped, m_round, top, bottom, dipole_origin, ewald=ew, qeq_z=qz,
-                       qeq_lambda=qlam)
+                       qeq_lambda=qlam, field=field)
         aux = self.lr._aux
         q = aux["charges"]
         zero = torch.zeros_like(q)
@@ -855,8 +914,12 @@ class IrisPETLRGraph(IrisTrunk):
         dens = aux["residual_atoms"] if "residual_atoms" in aux else aux["density_atoms"] if "density_atoms" in aux else (
             self.lr.density(s_col - mu) if mu is not None else zero)
         dip = (positions - dipole_origin[None, :]) * q[:, None]
-        return torch.cat([(e_sr + e_lr)[:, None], q[:, None], dip, mu_col[:, None], s_col[:, None], dens[:, None]],
-                         dim=-1)
+        cols = [(e_sr + e_lr)[:, None], q[:, None], dip, mu_col[:, None], s_col[:, None], dens[:, None]]
+        # extra columns (pet.iris_lr.columns, after the 8 above): per-atom terms the host sums over the structure
+        for name, width in self.lr.extra_columns():
+            v = aux[name + "_atoms"]
+            cols.append(v[:, None] if width == 1 else v)
+        return torch.cat(cols, dim=-1)
 
 
 class IrisPETLRGraphPBC(IrisPETLRGraph):

@@ -50,7 +50,10 @@ std::vector<std::pair<std::string, std::string>> lr_ggufs() {
            resource("petlr_tiny_ccresidual.gguf")},
           // his QEq (a2658e3 qeq_reference: cg + custom_linear_solve; make_seeded.py tiny_qeq, 2 shared passes):
           // mlip.cpp's three-stage evaluation (host cg, cotangent cg, second backward)
-          {"qeq (cg + custom_linear_solve, Gaussian charges, 2 shared passes)", resource("petlr_tiny_qeq.gguf")}};
+          {"qeq (cg + custom_linear_solve, Gaussian charges, 2 shared passes)", resource("petlr_tiny_qeq.gguf")},
+          // his branch feat/threshold-reference (101575d): make_seeded.py thr (threshold reference: no Fermi level,
+          // species weights jittered per species, 1 transfer, 2 shared passes with hardness)
+          {"threshold (1 transfer, 2 shared passes, hardness)", resource("petlr_tiny_thr.gguf")}};
 }
 
 // 24 water molecules in a 9.0 A cube, a fixed jittered lattice (deterministic)

@@ -243,6 +243,10 @@ def main():
             inputs = inputs + (torch.zeros(n), torch.zeros(n))
             names = names + ["qeq_z", "qeq_lambda"]
             shapes = shapes[:3] + (shapes[3] + ({0: atom}, {0: atom}),)
+        if lr.field:  # the uniform external field [3] (V/A; conserving charges)
+            inputs = inputs + (0.1 * torch.randn(3, generator=g),)
+            names = names + ["field"]
+            shapes = shapes[:3] + (shapes[3] + (None,),)
         model_export = export
         # the periodic graph (his jax-pme Ewald), same parameters
         kl, K = 13, 17
@@ -350,7 +354,9 @@ def main():
     w.add_float32("pet.energy_scale", 1.0 if a.lr else energy_scale)
     if a.lr:
         w.add_int32("pet.iris_lr", 1)
-        w.add_int32("pet.iris_lr.n_out", IrisPETLRGraph.N_OUT)
+        w.add_int32("pet.iris_lr.n_out", model_export.n_out)
+        if lr.extra_columns():  # (absent without extras: existing exports unchanged)
+            w.add_string("pet.iris_lr.columns", ",".join(f"{nm}:{wd}" for nm, wd in lr.extra_columns()))
         w.add_string("pet.iris_lr.reference", lr.ref)
         w.add_int32("pet.iris_lr.charge_state_min", int(lr.m_min))
         w.add_int32("pet.iris_lr.charge_state_max", int(lr.m_max))
@@ -360,6 +366,8 @@ def main():
         w.add_string("pet.iris_lr.dipole_origin", "center_of_mass")
         if lr.conserving:  # one component per structure (his sample prep raises on more without fragment labels)
             w.add_int32("pet.iris_lr.conserving_charges", 1)
+        if lr.field:  # graph input `field` [3]; forces under a nonzero field need E . Z0: not ported (C++ raises)
+            w.add_int32("pet.iris_lr.field", 1)
         if lr.lrt:  # his ToSample refuses slabs with the long-range transfer; mlip.cpp too
             w.add_int32("pet.iris_lr.long_range_transfer", 1)
         if graph_scores is not None:

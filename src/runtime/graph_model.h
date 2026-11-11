@@ -172,6 +172,9 @@ public:
   struct IrisLRSpec {
     bool enabled = false;
     int n_out = 8;
+    // output columns after the first 8 (GGUF pet.iris_lr.columns "name:width,..."): per-atom terms the host sums over
+    // the structure (charge_residual: the threshold reference's R = sum_i (c_Z + f_i) - Q; dipole_flow (3))
+    std::vector<std::pair<std::string, int>> columns;
     std::string reference;          // fermi / species / both
     int m_min = -3, m_max = 3;
     double temperature = 0.1;
@@ -183,6 +186,9 @@ public:
     double slab_margin = 2.0;
     bool long_range_transfer = false; // his feat/long-range-transfer: refused on a slab (his ToSample raises)
     bool conserving_charges = false;  // his feat/conserving-charges: one component per structure (else raises)
+    // his `field` input (conserving charges): graph input field [3]; forces under a nonzero field need his E . Z0
+    // (the Born charges of the pass-1 charges, added outside the energy): not ported, so they raise
+    bool field = false;
     // QEq (reference "qeq", his qeq_reference, a2658e3): the host cg's settings and its operator graphs
     // (graph_qeq_apply{,_pbc}.json: [n, 2] = (J x + 2 phi(x) + self x, J + self)); the scores graph returns chi
     int qeq_maxiter = 20;
