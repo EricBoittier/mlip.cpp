@@ -1,0 +1,24 @@
+#!/bin/bash
+# His branch presets (ref_branch.py oracle, kuma ref/seeded_branch/) vs mlip.cpp CPU (out/branch*/<preset>_<fam>.json)
+# and CUDA (out/branch_cuda/<preset>_<fam>_cuda.json): sync, convert (branch_to_ref.py), lr_parity per preset x family.
+# Run from ~/data/plato-lr-scratch/pet_lr_port.  usage: branch_tables.sh OUT.txt "PRESETS" "FAMS" [CPU_DIR]
+set -uo pipefail
+S=$(cd $(dirname $0) && pwd); PY=${PY:-$HOME/miniforge3/envs/b4ff/bin/python}
+OUT=$1; PRE=$2; FAMS=$3; CPU=${4:-out/branch}
+rsync -a --include='*.npz' --exclude='*' boittier@kuma.hpc.epfl.ch:/scratch/boittier/pet_lr_port/ref/seeded_branch/ ref/seeded_branch/ 2>/dev/null
+: > $OUT
+for p in $PRE; do for s in $FAMS; do
+  o=ref/seeded_branch/${p}_${s}
+  [ -f ${o}_cpu64.npz ] || { echo "== $p $s: no fp64 reference" >> $OUT; continue; }
+  runs=()
+  for r in cpu64 cpu32 cpu32_v2 gpu32; do
+    [ -f ${o}_$r.npz ] && $PY $S/branch_to_ref.py ${o}_$r.npz ${o}_$r.ref.npz && [ $r != cpu64 ] && runs+=(${o}_$r.ref.npz)
+  done
+  for side in cpu cuda; do
+    j=$CPU/${p}_${s}.json; [ $side = cuda ] && j=out/branch_cuda/${p}_${s}_cuda.json
+    [ -f $j ] || continue
+    echo "== $p $s $side (his runs: ${#runs[@]})" >> $OUT
+    $PY $S/lr_parity.py $j ${o}_cpu64.ref.npz "${runs[@]}" --label "$p $s $side" >> $OUT 2>&1
+  done
+done; done
+echo "wrote $OUT"

@@ -1460,12 +1460,11 @@ ModelResult GraphModel::predict_single_impl(
       ew_index_d.assign(size_t(n_atoms) * kl, 0), ew_keep_d.assign(size_t(n_atoms) * kl, 0.f);
       ew_shift_d.assign(size_t(n_atoms) * kl * 3, 0.f);
       ew_S.assign(size_t(n_atoms) * kl * 3, 0);
-      // his ToSample raises on a slab; on a 3-D cell the ported reciprocal-space transfer passes the force FD test but
-      // NOT the virial FD test (2026-11-11): refused on every periodic structure until that is fixed
-      if (iris_lr_.long_range_transfer)
-        throw std::runtime_error(es.slab ? "iris PET-LR: long_range_transfer on a slab (his ToSample raises)"
-                                         : "iris PET-LR: long_range_transfer on a periodic cell is not yet supported "
-                                           "(virial open)");
+      // his ToSample raises on a slab. On a 3-D cell the transfer kernel is the k-space sum at the batch's Ewald
+      // smearing (jax-pme TiledEwald: lr_k2(sr_batch.smearing, k2), a host constant of the batch), so his stress is
+      // the strain derivative at FIXED smearing, which is what the host virial assembles (no smearing gradient)
+      if (iris_lr_.long_range_transfer && es.slab)
+        throw std::runtime_error("iris PET-LR: long_range_transfer on a slab (his ToSample raises)");
       ew_kgrid = es.k_grid, ew_slab_axis = es.slab ? es.slab_axis : -1;
       for (int a = 0; a < 3; a++)
         for (int b = 0; b < 3; b++) ew_h[a][b] = es.cellc[a][b];

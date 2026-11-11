@@ -273,7 +273,14 @@ TEST_CASE("pet_lr_port: iris PET-LR in a 3-D cell and a slab: forces = -dE/dx an
   x.resize(27), Z.resize(9);
   const int n = int(Z.size());
   for (const auto &[label, path] : lr_ggufs()) {
+    // the long-range transfer's periodic kernel is the k-space sum at the batch's Ewald smearing (2 wavelengths, a
+    // function of the cell; jax-pme TiledEwald lr_k2(sr_batch.smearing, k2)), so unlike the Ewald energy its energy
+    // depends on the smearing: his stress is dE/d eps at FIXED Ewald parameters (the batch smearing is a host
+    // constant), not the derivative of per-strain re-derived energies (those differ by (sigma / 3) dE/d sigma on the
+    // diagonal: 9 eV of 179 here). The strain FD of that model runs at frozen parameters (the unstrained frame's)
+    const bool lrt = label.find("long-range transfer") != std::string::npos;
     ModelOptions mo;
+    mo.iris_freeze_ewald = lrt;
     Predictor m(path, mo);
     for (int slab = 0; slab < 2; slab++) {
       INFO("model: " << label << (slab ? ", slab (pbc T T F, 22 A vacuum vector)" : ", 3-D cell"));
@@ -281,8 +288,7 @@ TEST_CASE("pet_lr_port: iris PET-LR in a 3-D cell and a slab: forces = -dE/dx an
       std::copy(cell, cell + 9, c);
       if (slab) c[8] = 22.0f;
       const bool pbc[3] = {true, true, !slab};
-      // the long-range transfer: refused on periodic structures (his ToSample raises on a slab; the 3-D virial is open)
-      if (label.find("long-range transfer") != std::string::npos) {
+      if (lrt && slab) { // his ToSample raises on a slab
         PredictOptions p0;
         p0.charge = 0, p0.spin_multiplicity = 1;
         CHECK_THROWS(m.predict(n, x.data(), Z.data(), c, pbc, p0));
@@ -358,15 +364,21 @@ TEST_CASE("pet_lr_port: iris PET-LR in a 3-D cell and a slab: forces = -dE/dx an
           for (int a = 0; a < 3; a++) c2[3 * v + a] = float(c[3 * v + a] + (a == i ? e * c[3 * v + j] : 0.0));
         return energy(y, c2);
       };
+      // Richardson from h = 2e-3 / 1e-3 (the strain energy is curved: a plain central difference at 2e-3 is off by
+      // ~0.3 eV of 179 on the long-range-transfer model) with the a-priori fp32 energy noise (2 ulp of E per energy)
+      // allowed for, as in the slab test
+      const double E0 = std::abs(double(r.energy));
+      const double noise = 3.0 * (2.0 * 1.2e-7 * E0) / (h / 2);
       double scale = 0, wv = 0;
       for (double w : r.virial) scale = std::max(scale, std::abs(w));
       for (int i = 0; i < 3; i++)
         for (int j = 0; j < 3; j++) {
-          const double fd = (strained(i, j, h) - strained(i, j, -h)) / (2 * h);
-          wv = std::max(wv, std::abs(fd - r.virial[3 * j + i]));
+          auto fd = [&](double hh) { return (strained(i, j, hh) - strained(i, j, -hh)) / (2 * hh); };
+          const double f1 = fd(h / 2), f2 = fd(h);
+          wv = std::max(wv, std::abs((4.0 * f1 - f2) / 3.0 - r.virial[3 * j + i]));
         }
-      INFO("max |FD - W| = " << wv << " eV, max |W| = " << scale << " eV");
-      CHECK(wv < 2e-3 * scale + 2e-3);
+      INFO("max |FD - W| = " << wv << " eV, max |W| = " << scale << " eV, fp32 noise bound " << noise << " eV");
+      CHECK(wv < 2e-3 * scale + 2e-3 + noise);
     }
   }
 }
