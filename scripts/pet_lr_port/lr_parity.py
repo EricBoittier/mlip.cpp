@@ -80,6 +80,10 @@ def main():
     z = np.load(a.ref64)
     c = from_cpp(a.cpp, z)
     runs = {p.split("/")[-1].replace(".npz", ""): from_ref(p, z) for p in a.runs}
+    for r in runs.values():  # the same frames for all (a shorter mlip.cpp run: his maxima over those frames only)
+        for k in r:
+            if k in c and len(c[k]) == len(r[k]):
+                r[k] = np.where(np.isnan(c["E"]), np.nan, r[k])
     nerr = int(np.isnan(c["E"]).sum())
     print(f"== {a.label or a.cpp}: {len(c['E'])} frames ({nerr} failed); max over frames vs JAX fp64")
     print(f"  {'':22s} " + " ".join(f"{k:>11s}" for k in KEYS if k in c))

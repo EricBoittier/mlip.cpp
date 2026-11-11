@@ -14,8 +14,8 @@ unset NVIDIA_TF32_OVERRIDE
 W=/scratch/boittier/pet_lr_port; cd $W
 P="/scratch/boittier/ipsum/env/bin/python -I scripts/ref_petlr.py"
 export PYTHONUNBUFFERED=1 XLA_PYTHON_CLIENT_MEM_FRACTION=0.8
-for p in lr_species lr_both lr_fermi_cold; do
-  for s in ion cluster; do
+for p in ${PRESETS:-lr_species lr_both lr_fermi_cold}; do
+  for s in ${FAMS:-ion cluster}; do
     JAX_PLATFORMS=cpu $P seeded/$p frames/set_$s.extxyz ref/seeded/${p}_${s}_cpu32.npz --max 40 > ref/seeded/${p}_${s}_cpu32.log 2>&1
     JAX_PLATFORMS=cpu XLA_FLAGS="--xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1" \
       $P seeded/$p frames/set_$s.extxyz ref/seeded/${p}_${s}_cpu32_v2.npz --max 40 > ref/seeded/${p}_${s}_cpu32_v2.log 2>&1
