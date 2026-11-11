@@ -403,7 +403,8 @@ class IrisLR(_AuxMixin, nn.Module):
         def potentials(qq):
             phi = 0.5 * EV_A * (K @ qq)
             if self.sigma is not None:
-                er = torch.erfc(r / (math.sqrt(2.0) * self.sigma)) / torch.where(padding_mask, torch.ones_like(r), r) * keep
+                # erfc as 1 - erf (ggml has erf only; 1e-16 absolute in fp64, ~6e-8 in fp32 on a term ~1e-6 at 5 A)
+                er = (-torch.erf(r / (math.sqrt(2.0) * self.sigma)) + 1.0) / torch.where(padding_mask, torch.ones_like(r), r) * keep
                 phi = phi - 0.5 * EV_A * (er * gather_atoms(qq)).sum(dim=1)
             return phi
 

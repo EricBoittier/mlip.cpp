@@ -172,8 +172,6 @@ def main():
         from check_lr64 import load_lr
         lr = IrisLR(cfg).eval()
         load_lr(lr, flat)
-        if lr.sigma is not None:
-            raise ValueError("--lr: Gaussian charges (erf) need the FX erf mapping: not yet exported")
         if lr.ref in ("fermi", "both"):
             sgraph, sweights = export_checked(export_torch_model, IrisScoresGraph(model, lr).eval(), inputs, output_path=None,
                                                   input_names=names, input_dtypes=dtypes, dynamic_shapes=shapes,

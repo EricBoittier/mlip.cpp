@@ -14,7 +14,7 @@ P="/scratch/boittier/ipsum/env/bin/python -I scripts/ref_trunk.py"
 export PYTHONUNBUFFERED=1 XLA_PYTHON_CLIENT_MEM_FRACTION=0.8
 for CK in finetune/readout-pol scaling/readout-4m; do
   C=/work/cosmo/langer/kuma/argos/checkpoints/omol-4m/$CK/RMSE_F; T=$(echo $CK | tr / _); mkdir -p ref/$T
-  for s in mol cluster bulk; do
+  for s in ${FAMS:-mol cluster bulk}; do
     if [ "$MODE" = cpu ]; then
       # sequential: three JAX CPU processes at once exhaust a MIG slice's memory
       JAX_PLATFORMS=cpu $P $C frames/set_$s.extxyz ref/$T/${s}_cpu32_v1.npz --kpad 16 --bucket powers_of_2 > ref/$T/${s}_cpu32_v1.log 2>&1

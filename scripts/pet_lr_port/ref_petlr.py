@@ -84,6 +84,12 @@ def main():
                 d0[0] = atoms.info["dipole_origin"] if "dipole_origin" in atoms.info else atoms.get_center_of_mass()
                 inputs["dipole_origin"] = jnp.asarray(d0)
             batch = {**batch, "positions": jnp.asarray(pos), "cell": jnp.asarray(cell), "inputs": inputs}
+        if model.num_neighbors_adaptive is None:
+            # hard cutoff (his multivalent / biotrimers trunks): every pair within the cutoff, through pack_edges'
+            # pair_cutoffs path (truncate_edges needs a neighbour target); as ref_trunk.py
+            sr = dict(batch["sr"]) if "sr" in batch else batch
+            pc = jnp.full(np.asarray(sr["centers"]).shape, model.cutoff, fdt)
+            batch = {**batch, "sr": {**sr, "pair_cutoffs": pc}} if "sr" in batch else {**batch, "pair_cutoffs": pc}
         res, out, state = run(batch)
         n = len(atoms)
         NA, NS = batch["atom_mask"].shape[0], batch["structure_mask"].shape[0]

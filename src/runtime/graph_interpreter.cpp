@@ -413,6 +413,9 @@ ggml_tensor *GraphInterpreter::build_node(ggml_context *ctx,
     return build_unary(ctx, node, GGML_UNARY_OP_RELU);
   } else if (node.op == "UNARY_GELU") {
     return build_unary(ctx, node, GGML_UNARY_OP_GELU);
+  } else if (node.op == "UNARY_ERF") { // torch.erf (iris PET-LR Gaussian charges)
+    if (node.inputs.empty()) throw std::runtime_error("UNARY_ERF requires an input");
+    return ggml_plato_erf(ctx, resolve_input(ctx, node.inputs[0]));
   } else if (node.op == "UNARY_TANH") {
     return build_unary(ctx, node, GGML_UNARY_OP_TANH);
   } else if (node.op == "UNARY_EXP") {

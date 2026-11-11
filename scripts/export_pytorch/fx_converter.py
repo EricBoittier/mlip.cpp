@@ -120,6 +120,8 @@ ATEN_TO_GGML = {
     "aten.relu": "UNARY_RELU",
     "aten.gelu.default": "UNARY_GELU",
     "aten.gelu": "UNARY_GELU",
+    "aten.erf.default": "UNARY_ERF",  # iris PET-LR Gaussian charges (ggml_plato_erf: forward, backward, JVP)
+    "aten.erf": "UNARY_ERF",
     "aten.tanh.default": "UNARY_TANH",
     "aten.tanh": "UNARY_TANH",
     "aten.sigmoid.default": "UNARY_SIGMOID",
