@@ -276,11 +276,25 @@ class IrisLR(_AuxMixin, nn.Module):
         d = cfg["d_node"]
         dh = d if cfg.get("d_lr") is None else cfg["d_lr"]
         dm = cfg["d_feedforward"] if cfg.get("d_lr") is None else cfg["d_lr"]
-        self.ref = cfg.get("charge_reference", "species")
-        if cfg.get("charge_allocation") != "flows" or not cfg.get("physical_charges") or cfg.get("num_charges", 1) != 1:
+        # conserving_charges (his feat/conserving-charges a98c2f6, iris.pet.charges there): the per-component Fermi
+        # level ("fermi") or the residual allocation ("residual"), then ONE edge transfer, then the polarisation passes.
+        # One component per structure only (his sample prep raises on more without fragment labels; mlip.cpp too), so
+        # the component Fermi level is the structure's: the same maths as the flows fermi reference below
+        self.conserving = bool(cfg.get("conserving_charges"))
+        if self.conserving:
+            if cfg.get("charge_allocation", "fermi") not in ("fermi", "residual"):
+                raise ValueError("conserving_charges: charge_allocation fermi or residual")
+            if not cfg.get("physical_charges") or cfg.get("num_charges", 1) != 1 or cfg.get("induced_dipoles"):
+                raise ValueError("IrisLR conserving_charges: physical charges, num_charges=1, no induced dipoles only")
+            self.ref = "fermi" if cfg.get("charge_allocation", "fermi") == "fermi" else "residual"
+            cfg = {**cfg, "transfer_passes": 0}
+        else:
+            self.ref = cfg.get("charge_reference", "species")
+        if not self.conserving and (cfg.get("charge_allocation") != "flows" or not cfg.get("physical_charges")
+                                    or cfg.get("num_charges", 1) != 1):
             raise ValueError("IrisLR: physical charges, charge_allocation=flows and num_charges=1 only")
         # species_weighted / species_fill: his branch feat/long-range-transfer (3ed96b0, iris.pet.charges)
-        if self.ref not in ("fermi", "species", "both", "species_weighted", "species_fill"):
+        if self.ref not in ("fermi", "species", "both", "species_weighted", "species_fill", "residual", "qeq"):
             raise ValueError(f"IrisLR: charge_reference {self.ref!r} not yet ported")
         # long_range_transfer (feat/long-range-transfer): per transfer pass a drive a_i moved through the Coulomb kernel of
         # Gaussian charges (width smearing) over the whole structure, dq = G a - a (G 1)
@@ -300,6 +314,25 @@ class IrisLR(_AuxMixin, nn.Module):
         if self.ref == "species_fill":  # one score and one softplus prefactor per species
             self.species_score = nn.Parameter(torch.zeros(cfg["max_atomic_number"] + 1))
             self.species_scale = nn.Parameter(torch.zeros(cfg["max_atomic_number"] + 1))
+        if self.ref == "qeq":  # iris.pet.charges.qeq_reference (a2658e3): per-species hardness, electronegativity head
+            if cfg.get("smearing") is None:
+                raise ValueError("charge_reference='qeq' needs smearing")
+            self.qeq_hardness = nn.Parameter(torch.zeros(cfg["max_atomic_number"] + 1))
+            self.electronegativity = nn.Linear(d, 1)
+            self.qeq_maxiter, self.qeq_tol = 20, 1e-5
+        if self.ref == "residual":  # iris.pet.charges.residual_charges (conserving-charges branch)
+            self.see_charge = bool(cfg.get("weights_see_charge"))
+            self.free_charge = nn.Linear(d, 1)
+            if self.see_charge:  # Q_c through a Gaussian basis, one centre per integer of the charge-state range
+                self.allocation_hidden = nn.Linear(d + self.m_max - self.m_min + 1, dh)
+                self.allocation_weight = nn.Linear(dh, 1)
+            else:
+                self.allocation_weight = nn.Linear(d, 1)
+        if self.conserving:  # iris.pet.charges.transfers: one transfer, a_i, a_j, rbf (+ q0_i, q0_j)
+            self.see_q0 = bool(cfg.get("transfers_see_charges"))
+            self.transfer_embed = nn.Linear(d, dh)
+            self.transfer_mlp = _flax_mlp((2 * dh + self.num_rbf + (2 if self.see_q0 else 0), dh, 1))
+            self.transfer_gate = nn.Parameter(torch.zeros(()))
         self.weighted = self.ref == "species_fill"
         self.fermi = self.ref in ("fermi", "both", "species_fill")
         self.transfer_passes = int(cfg.get("transfer_passes", 1))
@@ -363,6 +396,44 @@ class IrisLR(_AuxMixin, nn.Module):
         """species_fill: the prefactor c_Z = softplus(species_scale)[Z] (the Fermi level's weights); else None."""
         return softplus(self.species_scale)[species] if self.weighted else None
 
+    def qeq(self, node, species, total_charge, potentials):
+        """iris.pet.charges.qeq_reference (a2658e3) on one structure: q = Q / n + P z, z the jax.scipy cg solution
+        (x0 = 0, maxiter 20, tol 1e-5 relative, atol 0, Jacobi preconditioner P (1 / (J + self)) P) of
+        P A P z = -P (A Q / n + chi), A x = J x + K x, K x = 2 phi(x) + self x (Gaussian self-energy); the gradient as
+        his jax.lax.custom_linear_solve: the cotangent of z solved by the same truncated cg (lambda), then
+        lambda . (b - A z*) differentiated at z* fixed. Returns (q, the stop-gradient stationarity residual
+        P (A q + chi)). Eager torch (a data-dependent iteration count): the fp64 reference, not traced."""
+        self_energy = EV_A * math.sqrt(2.0 / math.pi) / self.sigma
+        hard = softplus(self.qeq_hardness)[species]
+        chi = self.electronegativity(node)[:, 0]
+        n = chi.shape[0]
+        project = lambda x: x - x.sum() / n
+        apply = lambda x, J=hard: J * x + (2.0 * potentials(x) + self_energy * x)
+        uniform = (total_charge / n) + torch.zeros_like(chi)
+        b = -project(apply(uniform) + chi)
+        with torch.no_grad():
+            Jd = hard.detach()
+            A0 = lambda x: project(apply(project(x), Jd))
+            inv_d = 1.0 / (Jd + self_energy)
+            M0 = lambda r: project(inv_d * r)
+            z_val = jax_cg(A0, b.detach(), M0, self.qeq_maxiter, self.qeq_tol)
+
+        class _Solve(torch.autograd.Function):  # value 0; backward: the cg solve of the cotangent
+            @staticmethod
+            def forward(ctx, r):
+                return torch.zeros_like(r)
+
+            @staticmethod
+            def backward(ctx, g):
+                with torch.no_grad():
+                    return jax_cg(A0, g, M0, self.qeq_maxiter, self.qeq_tol)
+
+        r = b - project(apply(project(z_val)))
+        z = z_val + _Solve.apply(r)
+        q = uniform + project(z)
+        resid = project(apply(q) + chi).detach()
+        return q, resid
+
     def forward(self, node, species, positions, neighbor_index, padding_mask, reverse_neighbor_index, edge_vectors,
                 env, total_charge, mu_bisect, gapped, m_round, top, bottom, dipole_origin, ewald=None):
         """Per-atom LR energy [n] and the charges. Inputs beyond the trunk's: neighbor_index [n, k] (atom index of
@@ -388,6 +459,27 @@ class IrisLR(_AuxMixin, nn.Module):
         def flow_sum(t):  # sum_j 0.5 (t_ij - t_ji) w_ij
             t_rev = t.reshape(n * k)[rev_flat].reshape(n, k)
             return (0.5 * (t - t_rev) * weight).sum(dim=1)
+
+        if ewald is None:
+            # --- open-boundary potentials (jax-pme: prefactor * 1/2 sum_{j != i} q_j / r_ij) ---
+            # one-sided broadcasts only (ggml binary ops repeat the second operand into the first)
+            D = positions[None, :, :].expand(n, n, 3) - positions[:, None, :]
+            D2 = (D * D).sum(dim=-1)
+            R = torch.sqrt(D2 + 1e-15)
+            # the self term out: D2 is exactly 0 on the diagonal only (bitwise the (1 - I) / (R + I) of before, and
+            # traceable: no eye of a dynamic size)
+            K = torch.where(D2 <= 0.0, torch.zeros_like(R), torch.ones_like(R) / R)  # no reciprocal op in the converter
+            coulomb = lambda qq: 0.5 * EV_A * (K @ qq)
+        else:
+            coulomb = ewald_potentials(positions, ewald)
+
+        def potentials(qq):
+            phi = coulomb(qq)
+            if self.sigma is not None:
+                # erfc as 1 - erf (ggml has erf only; 1e-16 absolute in fp64, ~6e-8 in fp32 on a term ~1e-6 at 5 A)
+                er = (-torch.erf(r / (math.sqrt(2.0) * self.sigma)) + 1.0) / torch.where(padding_mask, torch.ones_like(r), r) * keep
+                phi = phi - 0.5 * EV_A * (er * gather_atoms(qq)).sum(dim=1)
+            return phi
 
         # --- reference ---
         aux = {}
@@ -415,6 +507,25 @@ class IrisLR(_AuxMixin, nn.Module):
             if self.ref == "both":
                 c = self.species_charge[species]
                 q = q + c - c.sum() / torch.ones_like(c).sum()  # / n as a tensor (a symbolic size traced as a species DIV)
+        elif self.ref == "qeq":
+            q, resid = self.qeq(node, species, total_charge, potentials)
+            # his qeq_residual [S] = sqrt(sum_i resid_i^2) (eV), as a per-atom column that sums to it
+            aux["qeq_residual"] = torch.sqrt((resid * resid).sum())
+            aux["residual_atoms"] = resid * resid / torch.clamp(aux["qeq_residual"], min=1e-30)
+        elif self.ref == "residual":  # q0 = p + w (Q - sum p) / max(sum w, 1e-6); residual |Q - sum p|
+            p_free = self.free_charge(node)[:, 0]
+            if self.see_charge:
+                basis = torch.cat([torch.exp(-2.0 * (total_charge.reshape(1) - float(m)) ** 2)
+                                   for m in range(self.m_min, self.m_max + 1)])  # [n_states], one structure
+                xw = torch.cat([node, basis[None, :].expand(n, basis.shape[0])], dim=-1)
+                wq = softplus(self.allocation_weight(torch.nn.functional.silu(self.allocation_hidden(xw)))[:, 0])
+            else:
+                wq = softplus(self.allocation_weight(node)[:, 0])
+            deficit = total_charge - p_free.sum()
+            q = p_free + wq / torch.clamp(wq.sum(), min=1e-6) * deficit
+            # his per-atom residual |deficit| / atoms_c, summed per structure (one component): |deficit|; as a per-atom
+            # column (graph output 7) that sums to it
+            aux["residual_atoms"] = torch.abs(deficit) / torch.ones_like(p_free).sum() + torch.zeros_like(p_free)
         elif self.ref == "species_weighted":  # q0 = c_Z - w_Z (sum_j c_Z_j - Q) / sum_j w_Z_j
             c = self.species_charge[species]
             wz = softplus(self.species_weight)[species]
@@ -423,6 +534,14 @@ class IrisLR(_AuxMixin, nn.Module):
             c = self.species_charge[species]
             q = c - (c.sum() - total_charge) / torch.ones_like(c).sum()  # / n as a tensor, as above
         aux["charges_base"] = q
+        if self.conserving:  # the one transfer of iris.pet.charges.transfers (conserving-charges branch)
+            aux["charges_pass1"] = q
+            a = self.transfer_embed(node)
+            parts = [a[:, None, :].expand(n, k, a.shape[1]), gather_atoms(a), rbf]
+            if self.see_q0:
+                parts += [q[:, None, None].expand(n, k, 1), gather_atoms(q)[..., None]]
+            t = self.transfer_mlp(torch.cat(parts, dim=-1))[..., 0] * self.transfer_gate
+            q = q + flow_sum(t)
         # --- transfer passes: edge MLP on node embeddings, charges and SR potentials ---
         if self.sigma is None:
             kern = keep / torch.where(padding_mask, torch.ones_like(r), r)
@@ -459,31 +578,11 @@ class IrisLR(_AuxMixin, nn.Module):
             q = q + step
             moved = moved + step
         aux["transfers"] = moved
-        if ewald is None:
-            # --- open-boundary potentials (jax-pme: prefactor * 1/2 sum_{j != i} q_j / r_ij) ---
-            # one-sided broadcasts only (ggml binary ops repeat the second operand into the first)
-            D = positions[None, :, :].expand(n, n, 3) - positions[:, None, :]
-            D2 = (D * D).sum(dim=-1)
-            R = torch.sqrt(D2 + 1e-15)
-            # the self term out: D2 is exactly 0 on the diagonal only (bitwise the (1 - I) / (R + I) of before, and
-            # traceable: no eye of a dynamic size)
-            K = torch.where(D2 <= 0.0, torch.zeros_like(R), torch.ones_like(R) / R)  # no reciprocal op in the converter
-            coulomb = lambda qq: 0.5 * EV_A * (K @ qq)
-        else:
-            coulomb = ewald_potentials(positions, ewald)
-
-        def potentials(qq):
-            phi = coulomb(qq)
-            if self.sigma is not None:
-                # erfc as 1 - erf (ggml has erf only; 1e-16 absolute in fp64, ~6e-8 in fp32 on a term ~1e-6 at 5 A)
-                er = (-torch.erf(r / (math.sqrt(2.0) * self.sigma)) + 1.0) / torch.where(padding_mask, torch.ones_like(r), r) * keep
-                phi = phi - 0.5 * EV_A * (er * gather_atoms(qq)).sum(dim=1)
-            return phi
-
         phi = potentials(q)
         extra = torch.zeros_like(q)
         if self.passes > 1:
-            aux["charges_pass1"] = q
+            if not self.conserving:
+                aux["charges_pass1"] = q
             delta = torch.zeros_like(q)
             for p in range(1, self.passes):
                 kk = 1 if self.shared else p
@@ -518,6 +617,27 @@ class IrisLR(_AuxMixin, nn.Module):
             energy = energy + self.MLP_2(h)[:, 0] * self.lr_scale
         self._aux = aux
         return energy
+
+
+def jax_cg(A, b, M, maxiter, tol, atol=0.0):
+    """jax.scipy.sparse.linalg.cg's _cg_solve (x0 = 0): the same recurrences and stopping rule (|r|^2 > max(tol^2
+    |b|^2, atol^2) and k < maxiter, |r|^2 from r itself with a preconditioner)."""
+    x = torch.zeros_like(b)
+    atol2 = max(tol * tol * float((b * b).sum()), atol * atol)
+    r = b - A(x)
+    z = M(r)
+    p, gamma, k = z, (r * z).sum(), 0
+    while float((r * r).sum()) > atol2 and k < maxiter:
+        Ap = A(p)
+        alpha = gamma / (p * Ap).sum()
+        x = x + alpha * p
+        r = r - alpha * Ap
+        z = M(r)
+        gamma_ = (r * z).sum()
+        p = z + (gamma_ / gamma) * p
+        gamma, k = gamma_, k + 1
+    jax_cg.last_iterations = k
+    return x
 
 
 def ewald_potentials(positions, e):
@@ -636,7 +756,7 @@ class IrisPETLRGraph(IrisTrunk):
         mu = aux.get("fermi_level")
         mu_col = (zero + mu) if mu is not None else zero
         s_col = aux["scores"] if "scores" in aux else zero
-        dens = aux["density_atoms"] if "density_atoms" in aux else (
+        dens = aux["residual_atoms"] if "residual_atoms" in aux else aux["density_atoms"] if "density_atoms" in aux else (
             self.lr.density(s_col - mu) if mu is not None else zero)
         dip = (positions - dipole_origin[None, :]) * q[:, None]
         return torch.cat([(e_sr + e_lr)[:, None], q[:, None], dip, mu_col[:, None], s_col[:, None], dens[:, None]],
@@ -669,7 +789,7 @@ class IrisPETLRGraphPBC(IrisPETLRGraph):
         mu = aux.get("fermi_level")
         mu_col = (zero + mu) if mu is not None else zero
         s_col = aux["scores"] if "scores" in aux else zero
-        dens = aux["density_atoms"] if "density_atoms" in aux else (
+        dens = aux["residual_atoms"] if "residual_atoms" in aux else aux["density_atoms"] if "density_atoms" in aux else (
             self.lr.density(s_col - mu) if mu is not None else zero)
         dip = (positions - dipole_origin[None, :]) * q[:, None]
         return torch.cat([(e_sr + e_lr)[:, None], q[:, None], dip, mu_col[:, None], s_col[:, None], dens[:, None]],

@@ -182,6 +182,7 @@ public:
     double smearing = 0;            // 0: 2 wavelength
     double slab_margin = 2.0;
     bool long_range_transfer = false; // his feat/long-range-transfer: refused on a slab (his ToSample raises)
+    bool conserving_charges = false;  // his feat/conserving-charges: one component per structure (else raises)
     std::string graph_open, graph_pbc; // the two GIR graphs (same weights); interp_ holds one at a time
     bool pbc_loaded = false;
     bool freeze_ewald = false;      // his calculator's per-run Ewald parameters (ModelOptions::iris_freeze_ewald)

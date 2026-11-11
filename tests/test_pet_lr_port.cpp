@@ -36,7 +36,12 @@ std::vector<std::pair<std::string, std::string>> lr_ggufs() {
           // his branch feat/long-range-transfer (3ed96b0): make_seeded.py lrt_weighted / lrt_fill
           {"species_weighted (2 shared passes)", resource("petlr_tiny_weighted.gguf")},
           {"species_fill (weighted Fermi level)", resource("petlr_tiny_fill.gguf")},
-          {"species_fill + long-range transfer", resource("petlr_tiny_lrt.gguf")}};
+          {"species_fill + long-range transfer", resource("petlr_tiny_lrt.gguf")},
+          // his branch feat/conserving-charges (a98c2f6): make_seeded.py cc_fermi / cc_residual (one component per
+          // structure: more raise, as his sample prep without fragment labels)
+          {"conserving fermi (2 shared passes, hardness)", resource("petlr_tiny_ccfermi.gguf")},
+          {"conserving residual (Q_c basis, q0 transfer, 3 unshared softplus passes)",
+           resource("petlr_tiny_ccresidual.gguf")}};
 }
 
 // 24 water molecules in a 9.0 A cube, a fixed jittered lattice (deterministic)
@@ -254,6 +259,14 @@ TEST_CASE("pet_lr_port: iris PET-LR on atoms without neighbours keeps the Coulom
     // Na+ and Cl- 8 A apart: no edge within the 5 A cutoff. The tiny models put |q| 0.01-0.17 e on them (F ~ 1e-5 -
     // 7e-3 eV/A), the gapped one rounds both to 0 (no force: nothing to require)
     const bool gapped = label.rfind("fermi gapped", 0) == 0;
+    if (label.rfind("conserving", 0) == 0) { // two components: raises (his sample prep without fragment labels)
+      const std::vector<float> x2 = {0, 0, 0, 8.0f, 0.3f, -0.2f};
+      const std::vector<int32_t> z2 = {11, 17};
+      PredictOptions p0;
+      p0.charge = 0, p0.spin_multiplicity = 1;
+      CHECK_THROWS(m.predict(2, x2.data(), z2.data(), nullptr, nullptr, p0));
+      continue;
+    }
     // (FD floor of fp32 energies here ~1e-5 eV/A: the Gaussian-charge model's 1.4e-5 eV/A sits at it)
     iris_check(m, {0, 0, 0, 8.0f, 0.3f, -0.2f}, {11, 17}, 0, 2e-5, gapped ? -1.0 : 5e-6);
   }

@@ -33,6 +33,8 @@ from torch_grid import open_geometry  # noqa: E402
 def build(params, ckpt):
     (_, cfg), = yaml.safe_load(open(f"{ckpt}/model/model.yaml")).items()
     cfg = {**PETLR_DEFAULTS, **cfg}
+    if cfg.get("fixed_neighbors") is not None:  # his older fixed-neighbour mode (KnnToSample): the hard cutoff
+        cfg["num_neighbors_adaptive"] = None
     flat = dict(np.load(params))
     sr = {k[len("params/sr/"):].replace("/", "."): v for k, v in flat.items() if k.startswith("params/sr/")}
     trunk = IrisTrunk(cfg)

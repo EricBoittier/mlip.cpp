@@ -63,6 +63,9 @@ PRESETS.update({
                          conductance_init=-6.0, _damp={"pol_conductance": 0.2}),
     "tiny_both": dict(_TLR, charge_reference="both", conductance_form="layerscale", polarisation_passes=2,
                       polarisation_shared=True, hardness=False, smearing=1.0, readout_charges=True),
+    # QEq (iris.pet.charges.qeq_reference, a2658e3: cg + custom_linear_solve), Gaussian charges, 2 shared passes
+    "tiny_qeq": dict(_TLR, charge_reference="qeq", smearing=1.0, polarisation_passes=2, polarisation_shared=True,
+                     hardness=False, transfer_passes=1),
 })
 
 # his branch feat/long-range-transfer (3ed96b0; env kuma /scratch/boittier/ipsum/envs/iris-long-range-transfer): no
@@ -81,6 +84,25 @@ PRESETS.update({
     "lrt_fill": dict(_LRT, charge_reference="species_fill", transfer_passes=1, polarisation_passes=1),
     "lrt_fill_cold": dict(_LRT, charge_reference="species_fill", charge_temperature=0.02, transfer_passes=1,
                           polarisation_passes=1),
+})
+
+# his branch feat/conserving-charges (a98c2f6; env kuma /scratch/boittier/ipsum/envs/iris-conserving-charges; the
+# water-screening branch bb5a5ea carries the same model code): conserving_charges (per-component Fermi level, or the
+# residual allocation, plus one edge transfer, then the polarisation passes). That PETLR has no `conditioning` list
+# (system_conditioning only) and needs fixed neighbour lists (fixed_neighbors: his KnnToSample, hard cutoff); the tiny
+# trunk otherwise
+_CC = dict({k: v for k, v in _TINY.items() if k != "conditioning"}, system_conditioning=False, fixed_neighbors=63,
+           lr=True, physical_charges=True, num_charges=1, conserving_charges=True, inputs=["charge"])
+PRESETS.update({
+    # per-component Fermi level (T 0.1), 2 shared layerscale passes with hardness
+    "cc_fermi": dict(_CC, charge_allocation="fermi", polarisation_passes=2, hardness=True),
+    # residual allocation, both information-flow switches on (Q_c basis into the weights, q0 into the transfer),
+    # 3 unshared softplus passes, no hardness
+    "cc_residual": dict(_CC, charge_allocation="residual", weights_see_charge=True, transfers_see_charges=True,
+                        charge_head_init=0.3, polarisation_passes=3, polarisation_shared=False,
+                        conductance_form="softplus", hardness=False),
+    # residual allocation, plain heads, one pass
+    "cc_residual_plain": dict(_CC, charge_allocation="residual", polarisation_passes=1),
 })
 
 

@@ -140,6 +140,8 @@ def main():
 
     (name, cfg), = yaml.safe_load(open(f"{a.ckpt}/model/model.yaml")).items()
     cfg = {**PETLR_DEFAULTS, **cfg}
+    if cfg.get("fixed_neighbors") is not None:  # his older fixed-neighbour mode (KnnToSample): the hard cutoff
+        cfg["num_neighbors_adaptive"] = None
     if cfg.get("backbone"):
         raise ValueError(f"custom backbone {cfg['backbone']!r}: not yet supported")
     if cfg.get("direct_forces") or cfg.get("direct_stress"):
@@ -278,6 +280,8 @@ def main():
         w.add_int32("pet.iris_lr.fermi_iterations", 40)
         w.add_float32("pet.iris_lr.fermi_eps", 1e-6)
         w.add_string("pet.iris_lr.dipole_origin", "center_of_mass")
+        if lr.conserving:  # one component per structure (his sample prep raises on more without fragment labels)
+            w.add_int32("pet.iris_lr.conserving_charges", 1)
         if lr.lrt:  # his ToSample refuses slabs with the long-range transfer; mlip.cpp too
             w.add_int32("pet.iris_lr.long_range_transfer", 1)
         if graph_scores is not None:
@@ -294,7 +298,8 @@ def main():
     # to_sample.max_neighbors); mlip.cpp raises there too for iris GGUFs (0: no config.yaml, no check)
     ts_all = (yaml.safe_load(open(f"{a.ckpt}/config.yaml"))["training_pipeline"]["to_sample"]
               if Path(f"{a.ckpt}/config.yaml").exists() else {})
-    w.add_int32("pet.iris.max_neighbors", int(ts_all.get("max_neighbors") or 0))
+    # (his older fixed-neighbour mode: KnnToSample keeps the nearest fixed_neighbors, so that is the overflow width)
+    w.add_int32("pet.iris.max_neighbors", int(cfg.get("fixed_neighbors") or ts_all.get("max_neighbors") or 0))
     # his XLA keeps libm-accurate transcendentals and IEEE division on the GPU: the CUDA kernels of iris graphs run
     # the precise variants (graph_model.cpp mark_precise_math; the PET-LR graphs get them regardless)
     w.add_int32("pet.precise_math", 1)

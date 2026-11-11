@@ -53,6 +53,7 @@ struct Result {
   // split-charge equilibration charges (e), pet.plato_lr.sqe models; empty otherwise
   std::vector<float> sqe_charges;
   /// iris PET-LR (pet.iris_lr): physical charges (e) per atom, dipole (e A) [3], Fermi level and metallicity
+  /// (conserving_charges with the residual allocation: `metallicity` carries his `residual`, |Q - sum_i p_i|)
   std::vector<float> charges;
   std::vector<double> dipole;
   double fermi_level = 0.0, metallicity = 0.0;

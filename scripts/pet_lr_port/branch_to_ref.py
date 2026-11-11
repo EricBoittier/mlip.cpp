@@ -20,6 +20,8 @@ if "charges" in r.files:
     out["atom/charges"] = r["charges"]
 if "metallicity" in r.files:
     out["struct/metallicity"] = np.asarray(r["metallicity"]).reshape(-1)[:S]
+elif "residual" in r.files:  # conserving_charges, residual allocation: his residual [S] (mlip.cpp's metallicity slot)
+    out["struct/metallicity"] = np.asarray(r["residual"]).reshape(-1)[:S]
 if "virial" in r.files:
     out["virial"] = np.asarray(r["virial"]).reshape(S, 3, 3)
 np.savez(sys.argv[2], **out)

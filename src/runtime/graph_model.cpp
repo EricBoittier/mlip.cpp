@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <map>
+#include <functional>
 #include <numeric>
 #include <cmath>
 #include <cstring>
@@ -56,6 +57,14 @@ void mark_precise_math(ggml_cgraph *g) {
     // local errors drop to the torch fp32 level) but moved no verdict (CUDA charges P 0.58-0.75 unchanged, median q
     // error 8.5e-7 -> 8.8e-7; job 4891425, 2026-11-11): MLIPCPP_PRECISE_SUM=1 turns it on
     static const bool psum = [] { const char *e = std::getenv("MLIPCPP_PRECISE_SUM"); return e && !std::strcmp(e, "1"); }();
+    // MUL_MAT accumulating in double (ggml-cuda-precise-mulmat.patch): a DIAGNOSTIC, off by default: MLIPCPP_PRECISE_MATMUL=1
+    // flags every F32 MUL_MAT, MLIPCPP_PRECISE_MATMUL_K=<K> only those reducing over K (e.g. 1036, the transfer MLP's
+    // first LINEAR of the 512-wide checkpoints: the CUDA charge-error candidate of 2026-11-11)
+    static const long pmm = [] {
+      const char *e = std::getenv("MLIPCPP_PRECISE_MATMUL"), *k = std::getenv("MLIPCPP_PRECISE_MATMUL_K");
+      return k && *k ? std::atol(k) : (e && !std::strcmp(e, "1") ? -1L : 0L);
+    }();
+    if (t->op == GGML_OP_MUL_MAT && pmm != 0 && (pmm < 0 || t->src[0]->ne[0] == pmm)) t->op_params[slot] = 1;
     auto on = [](const char *k) {
       if (!std::strcmp(k, "sigmoid") && !sig) return false;
       if (!std::strcmp(k, "sum") && !psum) return false;
@@ -447,11 +456,14 @@ bool GraphModel::load_from_gguf(const std::string &path) {
     iris_lr_.smearing = loader.get_float32("pet.iris_lr.smearing", 0.0f);
     iris_lr_.slab_margin = loader.get_float32("pet.iris_lr.slab_margin", 2.0f);
     iris_lr_.long_range_transfer = loader.get_int32("pet.iris_lr.long_range_transfer", 0) != 0;
+    iris_lr_.conserving_charges = loader.get_int32("pet.iris_lr.conserving_charges", 0) != 0;
     if (loader.get_int32("pet.iris_lr.halfspace", 1) != 1)
       throw std::runtime_error("pet.iris_lr.halfspace = 0: only his default halfspace k grid is ported");
-    // species_weighted / species_fill: his branch feat/long-range-transfer (3ed96b0)
+    // species_weighted / species_fill: his branch feat/long-range-transfer (3ed96b0); residual: his
+    // feat/conserving-charges (a98c2f6), conserving_charges only
     if (iris_lr_.reference != "fermi" && iris_lr_.reference != "species" && iris_lr_.reference != "both" &&
-        iris_lr_.reference != "species_weighted" && iris_lr_.reference != "species_fill")
+        iris_lr_.reference != "species_weighted" && iris_lr_.reference != "species_fill" &&
+        !(iris_lr_.reference == "residual" && iris_lr_.conserving_charges))
       throw std::runtime_error("pet.iris_lr.reference: " + iris_lr_.reference);
     if (iris_lr_.n_out != 8) throw std::runtime_error("pet.iris_lr.n_out != 8");
   }
@@ -550,7 +562,8 @@ bool GraphModel::load_from_gguf(const std::string &path) {
     iris_lr_.pbc_loaded = false;
   }
   scores_interp_ = GraphInterpreter();
-  if (iris_lr_.enabled && iris_lr_.reference != "species" && iris_lr_.reference != "species_weighted") {
+  if (iris_lr_.enabled && iris_lr_.reference != "species" && iris_lr_.reference != "species_weighted" &&
+      iris_lr_.reference != "residual") {
     const std::string sj = loader.get_string("graph_scores.json", "");
     if (sj.empty()) {
       ggml_free(temp_ctx);
@@ -1251,6 +1264,24 @@ ModelResult GraphModel::predict_single_impl(
     max_neighbors = std::max(max_neighbors, neighbor_counts[i]);
   }
   check_iris_overflow(max_neighbors);
+  if (iris_lr_.enabled && iris_lr_.conserving_charges) {
+    // his conserving-charges branch (iris.pet.sample component_charges): one Fermi level / residual correction per
+    // connected component of the mutual edge graph, Q_c from fragment labels, or the structure charge for a structure
+    // of ONE component; mlip.cpp has no fragment input, so (as his prep without labels) more components raise. Also
+    // his range check: Q outside [n m_min, n m_max]
+    std::vector<int> parent(n_atoms);
+    std::iota(parent.begin(), parent.end(), 0);
+    std::function<int(int)> root = [&](int a) { return parent[a] == a ? a : parent[a] = root(parent[a]); };
+    for (int e = 0; e < nlist.num_pairs(); e++) parent[root(nlist.centers[e])] = root(nlist.neighbors[e]);
+    int comps = 0;
+    for (int i = 0; i < n_atoms; i++) comps += root(i) == i;
+    if (comps > 1)
+      throw std::runtime_error("iris PET-LR conserving_charges: " + std::to_string(comps) +
+                               " components without fragment labels (his sample prep raises)");
+    const double Q = system.charge();
+    if (Q < double(n_atoms) * iris_lr_.m_min || Q > double(n_atoms) * iris_lr_.m_max)
+      throw std::runtime_error("iris PET-LR conserving_charges: charge outside the charge-state range");
+  }
   // A system without any edge: metatrain has no neighbour slot, so the
   // attention sees the central token alone. ggml needs at least one slot, and
   // through PET's finite -34.5 bias a padded slot still competes with the
