@@ -384,6 +384,10 @@ class IrisLR(_AuxMixin, nn.Module):
         if self.induced is not None:
             if not cfg.get("physical_charges"):
                 raise ValueError("induced_dipoles needs physical_charges")
+            # validated against his oracle on the conserving-charges branch only (cc_ind_field / cc_ind_full; one
+            # component): the flows / head branches with induced dipoles have no oracle run here
+            if not self.conserving:
+                raise ValueError("IrisLR: induced_dipoles ported with conserving_charges only (no oracle otherwise)")
             self.polarisability_gate = nn.Parameter(torch.full((), -6.0))
             self.polarisability_head = nn.Linear(d, 1)
             self.pol_init = float(cfg.get("polarisability_init", 0.0))
