@@ -46,7 +46,7 @@ def main():
     import jax.numpy as jnp
     from ase.io import read
     from marathon.io import from_dict, read_msgpack, read_yaml
-    from petjax.select import select_edges, truncate_edges
+    from petjax.select import pack_edges, select_edges, truncate_edges
     from petjax.structure import to_structure
     from petjax.utils import cast_floats, edge_displacements
 
@@ -65,6 +65,7 @@ def main():
         final_message_passing=lr.final_message_passing,
     )
     assert not lr.direct_forces and not lr.direct_stress
+    conditioning = tuple(lr.conditioning)
     params = {"params": read_msgpack(f"{a.ckpt}/model/model.msgpack")["params"]["sr"]}
     params = cast_floats(params, jnp.float64 if a.x64 else jnp.float32)
     cfg = dict(nna=lr.num_neighbors_adaptive, cutoff=lr.cutoff, cwa=lr.cutoff_width_adaptive,
@@ -72,9 +73,14 @@ def main():
 
     def forward(positions, cell, s, k_sel, cond):
         R_ij = edge_displacements(positions, s["centers"], s["others"], s["cell_shifts"], cell)
-        t, overflow = truncate_edges(
-            R_ij, s["centers"], s["others"], s["reverse"], s["pair_mask"], s["atomic_numbers"],
-            s["atom_mask"], k_sel, cfg["nna"], cfg["cutoff"], cfg["cwa"], method=cfg["method"])
+        if cfg["nna"] is None:  # hard cutoff: every pair within the cutoff, plain cutoff bump (the calculator's path)
+            t, overflow = pack_edges(
+                R_ij, s["centers"], s["others"], s["reverse"], s["pair_mask"], s["atomic_numbers"],
+                s["atom_mask"], k_sel, pair_cutoffs=jnp.full(s["centers"].shape, cfg["cutoff"], R_ij.dtype))
+        else:
+            t, overflow = truncate_edges(
+                R_ij, s["centers"], s["others"], s["reverse"], s["pair_mask"], s["atomic_numbers"],
+                s["atom_mask"], k_sel, cfg["nna"], cfg["cutoff"], cfg["cwa"], method=cfg["method"])
         e, node = trunk.apply(params, **t, return_features=True, inputs=cond,
                               atom_to_structure=jnp.zeros(s["atomic_numbers"].shape[0], jnp.int32))
         return jnp.sum(e), (e, node, t, overflow)
@@ -91,8 +97,11 @@ def main():
         # bucketed (masked) padding so compilations are reused across frames
         s = to_structure(atoms, lr.cutoff, skin=0.0, bucket_strategy=a.bucket,
                          n_atoms_bucket_strategy=a.bucket, int_dtype=np.int32, float_dtype=fdt)
-        sel = select_edges(s, cfg["nna"], cfg["cutoff"], cfg["cwa"], method=cfg["method"])
-        k_sel = -(-max(int(sel.counts.max()), 1) // a.kpad) * a.kpad
+        if cfg["nna"] is None:
+            counts = np.bincount(s["centers"][s["pair_mask"]], minlength=1)
+        else:
+            counts = select_edges(s, cfg["nna"], cfg["cutoff"], cfg["cwa"], method=cfg["method"]).counts
+        k_sel = -(-max(int(np.max(counts)), 1) // a.kpad) * a.kpad
         Np = s["positions"].shape[0]
         cond = {}
         for key in lr.conditioning:

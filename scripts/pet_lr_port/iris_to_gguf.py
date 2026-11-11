@@ -38,6 +38,15 @@ SUPPORTED = {"d_pet", "d_node", "d_head", "d_feedforward", "num_heads", "num_att
              "inputs"}
 
 
+# iris.pet.petlr.PETLR field defaults (a2658e3) for keys a model.yaml may leave out
+PETLR_DEFAULTS = dict(d_pet=128, d_node=128, d_head=128, d_feedforward=256, num_heads=8, num_attention_layers=1,
+                      num_gnn_layers=2, cutoff=5.0, cutoff_width=0.5, cutoff_width_adaptive=0.5,
+                      adaptive_cutoff_method="grid", num_neighbors_adaptive=8, attention_temperature=1.0,
+                      max_atomic_number=118, direct_forces=False, direct_stress=False, system_conditioning=False,
+                      max_charge=10, max_spin_multiplicity=10, conditioning=["charge", "spin_multiplicity"],
+                      final_message_passing=True)
+
+
 def metatrain_key(name):
     """IrisTrunk parameter name -> the metatrain PET state-dict key pet-jax's converter reads."""
     for a, b in (("neighbor_embedder.weight", "edge_embedder.weight"),):
@@ -109,6 +118,7 @@ def main():
     a = ap.parse_args()
 
     (name, cfg), = yaml.safe_load(open(f"{a.ckpt}/model/model.yaml")).items()
+    cfg = {**PETLR_DEFAULTS, **cfg}
     if cfg.get("backbone"):
         raise ValueError(f"custom backbone {cfg['backbone']!r}: not yet supported")
     if cfg.get("direct_forces") or cfg.get("direct_stress"):

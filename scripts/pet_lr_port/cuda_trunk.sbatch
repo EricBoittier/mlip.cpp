@@ -13,7 +13,9 @@
 set -uo pipefail
 unset NVIDIA_TF32_OVERRIDE MLIPCPP_TF32
 export GGML_CUDA_NO_TF32=1
-module load gcc/13.2.0 cuda/12.4.1 cmake/3.27.9 || exit 1
+module load gcc/13.2.0 cmake/3.27.9 && module load nvhpc/24.7-mpi && module load cuda/12.5.1 || exit 1
+# ggml (Muon Newton-Schulz) needs cuBLAS >= 12.5 (cublasGemmGroupedBatchedEx); host compiler stays gcc 13
+export CC=$(which gcc) CXX=$(which g++) CUDAHOSTCXX=$(which g++); module list 2>&1 | tail -3; gcc --version | head -1
 which nvcc || { echo "no nvcc after module load"; exit 1; }
 export CUDAToolkit_ROOT=$(dirname $(dirname $(which nvcc)))
 W=/scratch/boittier/pet_lr_port/cuda; D=$W/deps
