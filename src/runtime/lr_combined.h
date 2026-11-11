@@ -245,6 +245,14 @@ struct LrcSpec {
   // term through the links' gradient with the radius chain).
   bool states = false;
   double states_eps = 1e-3, states_cap = 16, states_cap_lo = 8;
+  // neutral receivers (pet.plato_lr.lrc_cond_receiver = "neutral"; absent key or "all" = Q_loc_a = sum_b R_ab Q0_b, bit
+  // for bit): a super-node takes its linked partners' charge in proportion to how charged it is itself,
+  //   Q_loc_a = Q0_a + h(|Q0_a|) sum_{b != a} R_ab Q0_b,   h = smootherstep((|Q0_a| - receiver_lo) / (receiver_hi - receiver_lo))
+  // (defaults 0.3, 0.7 e), so a near-neutral molecule beside a cation keeps its own (~0) row instead of a fraction of
+  // the cation's charge, and charged-charged links (ion pairs) are unchanged. A fixed function of the predicted charges,
+  // not a learned gate; the forces carry h' through Q0_a. Also in each lrc_states state (R binary there).
+  bool receiver_neutral = false;
+  double receiver_lo = 0.3, receiver_hi = 0.7;
   // the backbone's cutoff (pet.cutoff, pet.num_neighbors_adaptive, pet.cutoff_width_adaptive, pet.adaptive_cutoff_method;
   // read from the model's GGUF, not written by to_gguf)
   double bb_cutoff = 0, bb_nadapt = 0, bb_width = 0.5;

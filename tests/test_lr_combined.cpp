@@ -3026,3 +3026,68 @@ TEST_CASE("lrc diagnostics: Q_loc dump", "[.qloc_dump]") {
   }
   std::fclose(f);
 }
+
+TEST_CASE("lrc neutral receivers: Q_loc rule, conditioning forces and blend rows exact (h' included), mixture FD",
+          "[lrc][states][receiver]") {
+  SqeSpec S = sqe_spec();
+  S.lr_R = 10.0, S.lr_t = 2.0;
+  for (double Q : {0.0, 1.0}) {
+    LrcSpec L = links_spec();
+    L.receiver_neutral = true, L.receiver_lo = 0.05, L.receiver_hi = 0.95; // a wide ramp: every super-node on its slope
+    const int n = 8;
+    const LrcCondition c0 = lrc_condition(L, S, n, ZB, XB.data(), Q, 10, 1);
+    REQUIRE(c0.cl.s >= 2);
+    // the rule itself: Q_loc_a = Q0_a + h(|Q0_a|) sum_{b != a} R_ab Q0_b
+    double hmin = 1, hmax = 0;
+    for (int a = 0; a < c0.cl.s; a++) {
+      double t = 0;
+      for (int b = 0; b < c0.cl.s; b++)
+        if (b != a) t += c0.cl.R[size_t(a) * c0.cl.s + b] * c0.Q0[b];
+      const double u = (std::abs(c0.Q0[a]) - 0.05) / 0.9, h = u <= 0 ? 0 : u >= 1 ? 1 : u * u * u * (u * (6 * u - 15) + 10);
+      hmin = std::min(hmin, h), hmax = std::max(hmax, h);
+      CHECK(c0.Qloc[a] == Approx(c0.Q0[a] + h * t).margin(1e-12));
+    }
+    INFO("Q " << Q << ": h in [" << hmin << ", " << hmax << "]");
+    CHECK(hmax > 0);
+    CHECK(hmin < 1);
+    auto fS = [&](const std::vector<double> &x) {
+      const LrcCondition c = lrc_condition(L, S, n, ZB, x.data(), Q, 10, 1);
+      double v = 0;
+      for (int a = 0; a < c.cl.s; a++) v += (0.7 - 0.4 * a) * c.Qloc[a];
+      return v;
+    };
+    std::vector<double> G(c0.cl.s, 0.0), F(3 * n, 0.0);
+    for (int a = 0; a < c0.cl.s; a++) G[a] = c0.dS[a] != 0 ? (0.7 - 0.4 * a) / c0.dS[a] : 0.0;
+    lrc_condition_forces(L, S, c0, n, ZB, XB.data(), G, F.data());
+    const std::vector<double> rows = lrc_blend_rows(L, S, c0, n, ZB, XB.data());
+    const std::vector<double> rows_q0 = lrc_blend_rows_q0(L, c0, n, XB.data(), lrc_q0_rows(L, S, c0, n, ZB, XB.data()));
+    double err = 0, fm = 0, rq = 0;
+    for (size_t k = 0; k < XB.size(); k++) {
+      const double num = -fd(fS, XB, k, 1e-5);
+      fm = std::max(fm, std::abs(num)), err = std::max(err, std::abs(num - F[k]));
+    }
+    for (size_t k = 0; k < rows.size(); k++) rq = std::max(rq, std::abs(rows[k] - rows_q0[k]));
+    INFO("conditioning forces: max |F| " << fm << ", error " << err << "; rows vs q0 rows " << rq);
+    for (int a = 0; a < c0.cl.s; a++) REQUIRE(c0.dS[a] != 0);
+    CHECK(fm > 1e-4);
+    CHECK(err < 1e-8 * std::max(1.0, fm));
+    CHECK(rq < 1e-12 * std::max(1.0, fm));
+    // the full toy mixture (states + receivers) against central differences
+    LrcSpec Ls = states_spec();
+    Ls.receiver_neutral = true, Ls.receiver_lo = 0.05, Ls.receiver_hi = 0.95;
+    ToyMix T{Ls, S, 10, ZB2, Q};
+    for (double d2 : {5.6, 6.3}) {
+      const std::vector<double> x = two_fragments(d2);
+      std::vector<double> Fm;
+      T(x, &Fm);
+      auto E = [&](const std::vector<double> &y) { return T(y); };
+      double e2 = 0, f2 = 0;
+      for (size_t k = 0; k < x.size(); k++) {
+        const double num = -fd(E, x, k, 1e-5);
+        f2 = std::max(f2, std::abs(num)), e2 = std::max(e2, std::abs(num - Fm[k]));
+      }
+      INFO("mixture d2 " << d2 << ": max |F| " << f2 << ", error " << e2);
+      CHECK(e2 < 1e-7 * std::max(1.0, f2));
+    }
+  }
+}

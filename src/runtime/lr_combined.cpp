@@ -329,6 +329,16 @@ LrcSpec LrcSpec::from_gguf(const GGUFLoader &G, const SqeSpec &S) {
       if (!L.graph) throw std::runtime_error("lrc_links backbone: needs the graph q0 mode");
       L.links_check();
     }
+    {
+      const std::string rm = G.get_string("pet.plato_lr.lrc_cond_receiver", "all");
+      if (rm != "all" && rm != "neutral") throw std::runtime_error("lrc: lrc_cond_receiver must be all or neutral");
+      L.receiver_neutral = rm == "neutral";
+      if (L.receiver_neutral) {
+        scalar("receiver_lo", L.receiver_lo), scalar("receiver_hi", L.receiver_hi);
+        if (!(L.receiver_lo >= 0 && L.receiver_hi > L.receiver_lo))
+          throw std::runtime_error("lrc_cond_receiver neutral: needs 0 <= lrc_receiver_lo < lrc_receiver_hi");
+      }
+    }
     // backbone link states (absent key or "none": conditioning-only links, bit for bit)
     const std::string sm = G.get_string("pet.plato_lr.lrc_states", "none");
     if (sm != "none" && sm != "mix") throw std::runtime_error("lrc: lrc_states must be none or mix");
@@ -426,6 +436,10 @@ void LrcSpec::to_gguf(gguf_context *g) const {
   if (links_backbone) { // absent key = window (earlier GGUFs unchanged)
     gguf_set_val_str(g, "pet.plato_lr.lrc_links", "backbone");
     scalar("link_a", link_a), scalar("link_b", link_b);
+  }
+  if (receiver_neutral) { // absent key = all (earlier GGUFs unchanged)
+    gguf_set_val_str(g, "pet.plato_lr.lrc_cond_receiver", "neutral");
+    scalar("receiver_lo", receiver_lo), scalar("receiver_hi", receiver_hi);
   }
   if (states) { // absent key = none (earlier GGUFs unchanged)
     gguf_set_val_str(g, "pet.plato_lr.lrc_states", "mix");
@@ -1312,6 +1326,47 @@ bool LrcCondition::needs_cond_forces() const {
 }
 
 namespace {
+// receiver weight h(|Q0_a|) and dh/dQ0_a (1, 0 without the neutral-receiver rule)
+inline void receiver(const LrcSpec &L, double q0, double &h, double &dh) {
+  if (!L.receiver_neutral) {
+    h = 1.0, dh = 0.0;
+    return;
+  }
+  const double w = L.receiver_hi - L.receiver_lo, u = (std::abs(q0) - L.receiver_lo) / w;
+  h = sstep(u), dh = dsstep(u) / w * (q0 >= 0 ? 1.0 : -1.0);
+}
+// Q_loc of every super-node from R and Q0 (with the neutral-receiver rule when set)
+void local_charges(const LrcSpec &L, const LrcClusters &cl, const std::vector<double> &Q0, std::vector<double> &Qloc) {
+  const int s = cl.s;
+  Qloc.assign(s, 0.0);
+  for (int a = 0; a < s; a++) {
+    if (!L.receiver_neutral) {
+      for (int b = 0; b < s; b++) Qloc[a] += cl.R[size_t(a) * s + b] * Q0[b];
+      continue;
+    }
+    double t = 0, h, dh;
+    for (int b = 0; b < s; b++)
+      if (b != a) t += cl.R[size_t(a) * s + b] * Q0[b];
+    receiver(L, Q0[a], h, dh);
+    Qloc[a] = Q0[a] + h * t;
+  }
+}
+// dQloc_a / dQ0_b (s x s) and the R weights W_ab (dQloc_a / dR_ab = h_a Q0_b, b != a)
+void local_charge_jac(const LrcSpec &L, const LrcClusters &cl, const std::vector<double> &Q0, std::vector<double> &J,
+                      std::vector<double> &RW) {
+  const int s = cl.s;
+  J.assign(size_t(s) * s, 0.0), RW.assign(size_t(s) * s, 0.0);
+  for (int a = 0; a < s; a++) {
+    double t = 0, h, dh;
+    for (int b = 0; b < s; b++)
+      if (b != a) t += cl.R[size_t(a) * s + b] * Q0[b];
+    receiver(L, Q0[a], h, dh);
+    for (int b = 0; b < s; b++) {
+      J[size_t(a) * s + b] = b == a ? (L.receiver_neutral ? 1.0 + dh * t : cl.R[size_t(a) * s + a]) : h * cl.R[size_t(a) * s + b];
+      if (b != a) RW[size_t(a) * s + b] = h * Q0[b];
+    }
+  }
+}
 // the blend S, dS / dQloc, floor k per super-node from c.Qloc, and the rows / blend per atom
 void condition_rows(const LrcSpec &L, LrcCondition &c, int n, int max_charge) {
   const int s = c.cl.s;
@@ -1350,8 +1405,7 @@ LrcCondition lrc_condition(const LrcSpec &L, const SqeSpec &S, int n, const int3
   } else { // (a single periodic cluster still meets its images: the charges are needed)
     c.q0 = lrc_q0(L, S, n, Z, x, Q, spin, cell);
     for (int i = 0; i < n; i++) c.Q0[c.cl.sn[i]] += c.q0.q0[i];
-    for (int a = 0; a < s; a++)
-      for (int b = 0; b < s; b++) c.Qloc[a] += c.cl.R[size_t(a) * s + b] * c.Q0[b];
+    local_charges(L, c.cl, c.Q0, c.Qloc);
     if (L.cond_global) c.Qloc.assign(s, Q); // global conditioning: no position dependence (dS = 0)
   }
   condition_rows(L, c, n, max_charge);
@@ -1365,13 +1419,25 @@ void lrc_condition_forces(const LrcSpec &L, const SqeSpec &S, const LrcCondition
   std::vector<double> g(3 * size_t(n), 0.0), W(size_t(s) * s, 0.0), cq(n, 0.0);
   std::vector<double> gs(s);
   for (int a = 0; a < s; a++) gs[a] = G[a] * c.dS[a]; // dE/dQloc_a
-  for (int a = 0; a < s; a++)
-    for (int b = 0; b < s; b++)
-      if (a != b) W[size_t(a) * s + b] = gs[a] * c.Q0[b];
-  lrc_clusters_vjp(L, c.cl, n, x, W, g.data(), vir);
-  for (int i = 0; i < n; i++) {
-    const int b = c.cl.sn[i];
-    for (int a = 0; a < s; a++) cq[i] += gs[a] * c.cl.R[size_t(a) * s + b];
+  if (!L.receiver_neutral) {
+    for (int a = 0; a < s; a++)
+      for (int b = 0; b < s; b++)
+        if (a != b) W[size_t(a) * s + b] = gs[a] * c.Q0[b];
+    lrc_clusters_vjp(L, c.cl, n, x, W, g.data(), vir);
+    for (int i = 0; i < n; i++) {
+      const int b = c.cl.sn[i];
+      for (int a = 0; a < s; a++) cq[i] += gs[a] * c.cl.R[size_t(a) * s + b];
+    }
+  } else { // neutral receivers: dQloc_a = J_ab dQ0_b + RW_ab dR_ab
+    std::vector<double> J, RW;
+    local_charge_jac(L, c.cl, c.Q0, J, RW);
+    for (int a = 0; a < s; a++)
+      for (int b = 0; b < s; b++) W[size_t(a) * s + b] = gs[a] * RW[size_t(a) * s + b];
+    lrc_clusters_vjp(L, c.cl, n, x, W, g.data(), vir);
+    for (int i = 0; i < n; i++) {
+      const int b = c.cl.sn[i];
+      for (int a = 0; a < s; a++) cq[i] += gs[a] * J[size_t(a) * s + b];
+    }
   }
   lrc_q0_vjp(L, S, n, Z, x, c.q0, cq.data(), g.data(), vir);
   for (size_t k = 0; k < g.size(); k++) F[k] -= g[k];
@@ -1415,16 +1481,18 @@ std::vector<double> lrc_blend_rows_q0(const LrcSpec &L, const LrcCondition &c, i
   for (int a = 0; a < s; a++) {
     if (c.dS[a] == 0) continue;
     double *r = rows.data() + size_t(a) * 3 * n;
-    // dQloc_a/dx = sum_b R_ab dQ0_b/dx + sum_{b != a} Q0_b dR_ab/dx
+    // dQloc_a/dx = sum_b J_ab dQ0_b/dx + sum_{b != a} RW_ab dR_ab/dx (J = R, RW = Q0 without the receiver rule)
+    std::vector<double> J, RW;
+    local_charge_jac(L, c.cl, c.Q0, J, RW);
     for (int b = 0; b < s; b++) {
-      const double R = c.cl.R[size_t(a) * s + b];
+      const double R = J[size_t(a) * s + b];
       if (R == 0) continue;
       const double *qb = q0rows.data() + size_t(b) * 3 * n;
       for (int k = 0; k < 3 * n; k++) r[k] += R * qb[k];
     }
     std::vector<double> W(size_t(s) * s, 0.0);
     for (int b = 0; b < s; b++)
-      if (b != a) W[size_t(a) * s + b] = c.Q0[b];
+      if (b != a) W[size_t(a) * s + b] = RW[size_t(a) * s + b];
     lrc_clusters_vjp(L, c.cl, n, x, W, r, nullptr);
     for (int k = 0; k < 3 * n; k++) r[k] *= c.dS[a];
   }
@@ -1694,9 +1762,7 @@ LrcCondition lrc_state_condition(const LrcSpec &L, const LrcCondition &c, const 
         cl.R[size_t(nodes[qa]) * s + nodes[qb]] = lab[qa] == lab[qb] ? 1.0 : 0.0;
   }
   const int n = static_cast<int>(cl.sn.size());
-  h.Qloc.assign(s, 0.0);
-  for (int a = 0; a < s; a++)
-    for (int b = 0; b < s; b++) h.Qloc[a] += cl.R[size_t(a) * s + b] * h.Q0[b];
+  local_charges(L, cl, h.Q0, h.Qloc);
   if (L.cond_global) h.Qloc.assign(s, Q);
   condition_rows(L, h, n, max_charge);
   return h;
