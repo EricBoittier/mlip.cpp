@@ -418,7 +418,8 @@ TEST_CASE("pet_lr_interp: precise SUM / SUM_ROWS on the GPU backend (flagged ops
 TEST_CASE("pet_lr_interp: precise MUL_MAT (double accumulation) on the GPU backend, K = 1036 (flagged ops)",
           "[pet_lr_port]") {
   // ggml-cuda-precise-mulmat.patch: an F32 MUL_MAT flagged precise (op_params[last] = 1; graph_model.cpp under
-  // MLIPCPP_PRECISE_MATMUL / MLIPCPP_PRECISE_MATMUL_K, opt-in) sums the K products in double and rounds once. K = 1036
+  // MLIPCPP_PRECISE_MATMUL / MLIPCPP_PRECISE_MATMUL_K; K = 1036 by default) sums the K products in double and rounds
+  // once (kernel: MLIPCPP_PRECISE_MATMUL_KERNEL, default tiled; naive / chunk / dot2 selectable). K = 1036
   // is the transfer MLP's first LINEAR (2 * 512 + 8 + 4 inputs), where the default cuBLAS / mmf GEMM's float
   // reduction carried the CUDA charge excess. Checked: flagged = the host double sum rounded, on every element, for
   // a plain product, a broadcast batch (src0 shared across ne2) and a transposed (non-contiguous) src1 view; the

@@ -1,11 +1,11 @@
 --- a/src/ggml-cuda/ggml-cuda.cu
 +++ b/src/ggml-cuda/ggml-cuda.cu
-@@ -2276,10 +2276,126 @@
+@@ -2276,10 +2276,127 @@
      *(float *) ((char *) dst + i0 * sizeof(float) + i1 * nbd1 + i2 * nbd2 + i3 * nbd3) = (float) s;
  }
  
-+// mlip.cpp: TILED variants of the precise F32 MUL_MAT (opt-in, MLIPCPP_PRECISE_MATMUL_KERNEL; the default stays
-+// mul_mat_f32_f64acc above). A 32 x 32 output tile per block (256 threads, 4 outputs each), the operands staged
++// mlip.cpp: TILED variants of the precise F32 MUL_MAT (MLIPCPP_PRECISE_MATMUL_KERNEL; DEFAULT "tiled" since
++// 2026-11-11, "naive" selects mul_mat_f32_f64acc above). A 32 x 32 output tile per block (256 threads, 4 outputs each), the operands staged
 +// through shared memory in K-slices of 32, so the global loads coalesce along k. Modes:
 +//   0 "tiled": the SAME per-element sum as mul_mat_f32_f64acc (k = 0 .. K-1 in order into one double, products
 +//     exact in double): bit-identical results, only the memory traffic differs;
@@ -88,15 +88,16 @@
 +    }
 +}
 +
-+// MLIPCPP_PRECISE_MATMUL_KERNEL: unset / "naive" -> -1 (mul_mat_f32_f64acc), "tiled" 0, "chunk" 1, "dot2" 2
++// MLIPCPP_PRECISE_MATMUL_KERNEL: "naive" -> -1 (mul_mat_f32_f64acc), unset / "tiled" 0 (the DEFAULT: the same
++// per-element double sum as naive, bit-identical, cheaper memory traffic), "chunk" 1, "dot2" 2; anything else -> 0
 +static int mlipcpp_precise_mm_kernel() {
 +    static const int mode = [] {
 +        const char * e = getenv("MLIPCPP_PRECISE_MATMUL_KERNEL");
-+        if (!e) return -1;
-+        if (!strcmp(e, "tiled")) return 0;
++        if (!e || !*e) return 0;
++        if (!strcmp(e, "naive")) return -1;
 +        if (!strcmp(e, "chunk")) return 1;
 +        if (!strcmp(e, "dot2")) return 2;
-+        return -1;
++        return 0;
 +    }();
 +    return mode;
 +}

@@ -71,10 +71,11 @@ void mark_precise_math(ggml_cgraph *g) {
     // cuBLAS fp32 GEMM carried the CUDA charge excess: q P 0.58-0.75 -> 0.03-0.17). Overrides:
     // MLIPCPP_PRECISE_MATMUL_K=<K> flags those reducing over K instead, MLIPCPP_PRECISE_MATMUL_K=0 turns it OFF (the
     // plain cuBLAS / ggml kernels, as before); MLIPCPP_PRECISE_MATMUL=1 (with _K unset) flags every F32 MUL_MAT.
-    // The kernel of a flagged product (ggml-cuda-precise-mulmat-kernels.patch, opt-in, read in ggml-cuda):
-    // MLIPCPP_PRECISE_MATMUL_KERNEL unset = the one-thread-per-output double sum; =tiled the SAME per-element sum
-    // through shared-memory tiles (bit-identical E / q); =chunk fp32 32-term chunks summed in double; =dot2
-    // compensated fp32 (Ogita-Rump-Oishi). The default kernel stays the user's call
+    // The kernel of a flagged product (ggml-cuda-precise-mulmat-kernels.patch, read in ggml-cuda):
+    // MLIPCPP_PRECISE_MATMUL_KERNEL unset / =tiled (DEFAULT, user decision 2026-11-11) the per-element double sum
+    // (k in order) through 32 x 32 shared-memory tiles; =naive the SAME sum one thread per output (the earlier
+    // default: bit-identical E / q, +34 % vs +10 % over the flag off on readout-pol bulk_60, MIG slice); =chunk fp32
+    // 32-term chunks summed in double; =dot2 compensated fp32 (Ogita-Rump-Oishi); unrecognised values -> tiled
     static const long pmm = [] {
       const char *e = std::getenv("MLIPCPP_PRECISE_MATMUL"), *k = std::getenv("MLIPCPP_PRECISE_MATMUL_K");
       return k && *k ? std::atol(k) : (e && !std::strcmp(e, "1") ? -1L : 1036L);

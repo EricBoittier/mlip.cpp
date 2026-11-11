@@ -14,6 +14,8 @@
 # kernel and with the flag off, the charge families (readout-pol / control / readout x bulk / slab 60) per kernel;
 # and test_pet_lr_port with MLIPCPP_PRECISE_SQRT=1 (does the slab virial FD failure reproduce on a MIG slice).
 # KV_PART=build|all. Evaluation only; FP32, no TF32.
+# NOTE 2026-11-11: the default kernel is now tiled; naive is selected explicitly below. Jobs submitted before that
+# (4894263, 4894720) ran on trees where unset = naive.
 set -uo pipefail
 unset NVIDIA_TF32_OVERRIDE MLIPCPP_TF32 MLIPCPP_PRECISE_SIGMOID MLIPCPP_PRECISE_MATH_SKIP MLIPCPP_PRECISE_SUM \
   MLIPCPP_PRECISE_MATMUL MLIPCPP_PRECISE_MATMUL_K MLIPCPP_PRECISE_SQRT MLIPCPP_ENERGY_DOUBLE MLIPCPP_PRECISE_MATMUL_KERNEL
@@ -31,7 +33,7 @@ cmake --build $BD -j 5 > $C/build_kv.log 2>&1; echo "build rc=$?"; grep -m10 -E 
 nvidia-smi --query-gpu=name,power.limit,clocks.max.sm --format=csv
 [ "${KV_PART:-all}" = build ] && exit 0
 for kv in naive tiled chunk dot2; do
-  if [ $kv = naive ]; then unset MLIPCPP_PRECISE_MATMUL_KERNEL; else export MLIPCPP_PRECISE_MATMUL_KERNEL=$kv; fi
+  export MLIPCPP_PRECISE_MATMUL_KERNEL=$kv
   echo "== op test $kv"; $BD/tests/test_pet_lr_interp "*MUL_MAT*" -s 2>&1 | grep -A4 "flagged =" | head -6
 done
 unset MLIPCPP_PRECISE_MATMUL_KERNEL
@@ -39,7 +41,7 @@ S=$C/out/speed_kv_mig; mkdir -p $S
 for mode in off naive tiled chunk dot2; do
   unset MLIPCPP_PRECISE_MATMUL_K MLIPCPP_PRECISE_MATMUL_KERNEL
   [ $mode = off ] && export MLIPCPP_PRECISE_MATMUL_K=0
-  case $mode in tiled|chunk|dot2) export MLIPCPP_PRECISE_MATMUL_KERNEL=$mode;; esac
+  case $mode in naive|tiled|chunk|dot2) export MLIPCPP_PRECISE_MATMUL_KERNEL=$mode;; esac
   for fam in bulk_60 mol_chunked; do
     fr=$F/set_$fam.extxyz; g=$W/gguf/readout-pol_lr_nobase.gguf; [ $fam = bulk_60 ] && g=$W/gguf_pbc/readout-pol_lr_nobase.gguf
     $B/mlipcpp-eval $g $fr $S/${fam}_$mode.json --backend cuda --repeat 5 > /dev/null 2>&1; echo "speed $mode $fam rc=$?"

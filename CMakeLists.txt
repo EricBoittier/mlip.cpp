@@ -309,8 +309,8 @@ else()
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-precise-mulmat.patch"
         # and SQRT as __fsqrt_rn under the same flag (the iris trunks' edge lengths)
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-precise-sqrt.patch"
-        # and the precise MUL_MAT's opt-in tiled kernels (MLIPCPP_PRECISE_MATMUL_KERNEL=tiled|chunk|dot2; default:
-        # the one-thread-per-output kernel above, unchanged)
+        # and the precise MUL_MAT's tiled kernels (MLIPCPP_PRECISE_MATMUL_KERNEL=tiled (default)|naive|chunk|dot2;
+        # naive = the one-thread-per-output kernel above, same per-element sum as tiled)
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-precise-mulmat-kernels.patch"
     )
     # the source cache is keyed by the ggml tag and the patches' contents:
