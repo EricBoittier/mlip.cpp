@@ -185,7 +185,7 @@ def main():
     # charge_layer WITH the LR branch is validated for the LR side his les-water ladder runs use (the pre-flows physical
     # charge head: no charge_allocation key; oracle ref_les_lr.py on iris explore/alessandro-strict-local 1d412cf);
     # with the flows / conserving allocations no code of his combines the two, so that stays refused
-    if cfg.get("charge_layer") is not None and cfg.get("lr") and a.lr and "charge_allocation" in cfg \
+    if cfg.get("charge_layer") is not None and cfg.get("lr") and a.lr and cfg.get("charge_allocation") is not None \
             and not a.allow_charge_layer:
         raise ValueError("charge_layer with a charge_allocation LR branch: ported (the chosen layer's node features feed "
                          "the LR branch) but no oracle (no branch of his combines charge_layer with the flows / "

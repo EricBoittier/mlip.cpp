@@ -2237,8 +2237,11 @@ ModelResult GraphModel::predict_single_impl(
     const bool fermi = iris_lr_.reference == "fermi";
     std::vector<double> c(n_atoms), w(n_atoms);
     const float *x = system.positions();
+    double ctr[3] = {0, 0, 0}; // c is used about the centroid (the force is origin-free; less fp32 cancellation)
+    for (int i = 0; i < n_atoms; i++)
+      for (int k = 0; k < 3; k++) ctr[k] += double(x[3 * i + k]) / n_atoms;
     for (int i = 0; i < n_atoms; i++) {
-      c[i] = field_E[0] * x[3 * i] + field_E[1] * x[3 * i + 1] + field_E[2] * x[3 * i + 2];
+      c[i] = field_E[0] * (x[3 * i] - ctr[0]) + field_E[1] * (x[3 * i + 1] - ctr[1]) + field_E[2] * (x[3 * i + 2] - ctr[2]);
       w[i] = fermi ? double(aux[size_t(i) * C + 7]) : 1.0; // f'(s - mu) (column 7) or 1
     }
     // -d(loss)/dr of the current pass: the edge-vector scatter plus the explicit positions term

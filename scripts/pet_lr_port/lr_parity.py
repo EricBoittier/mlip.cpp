@@ -69,8 +69,10 @@ def from_cpp(path, z):
     return per_frame(get, z)
 
 
-def from_ref(path, z):
+def from_ref(path, z, conservative=False):
     r = np.load(path)
+    if conservative and "forces_conservative" in r.files:
+        r = type("Z", (dict,), {"files": property(lambda self: list(self.keys()))})({**dict(r), "forces": r["forces_conservative"]})
 
     def get(f, A):
         g = dict(E=r["atom/energy"][A].sum(), F=r["forces"][A], W=r["virial"][f] if "virial" in r.files else None)
@@ -98,10 +100,15 @@ def main():
                     help="skip frames where an atom has more than MAX_NEIGHBORS neighbours within CUTOFF: his "
                          "calculator raises there (Calculator.calculate, overflow), his oracle (predict on the "
                          "calculator's batch) silently keeps the nearest MAX_NEIGHBORS; hard-cutoff models in dense cells")
+    ap.add_argument("--conservative", action="store_true",
+                    help="compare forces with his forces minus his field force E . Z0 (forces_conservative; field refs)")
     a = ap.parse_args()
     z = np.load(a.ref64)
+    if a.conservative:
+        z = {**dict(z), "forces": z["forces_conservative"]}
+        z = type("Z", (dict,), {"files": property(lambda self: list(self.keys()))})(z)
     c = from_cpp(a.cpp, z)
-    runs = {p.split("/")[-1].replace(".npz", ""): from_ref(p, z) for p in a.runs}
+    runs = {p.split("/")[-1].replace(".npz", ""): from_ref(p, z, a.conservative) for p in a.runs}
     if a.overflow:
         from ase.io import read
         from ase.neighborlist import neighbor_list

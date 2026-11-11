@@ -333,15 +333,17 @@ class IrisLR(_AuxMixin, nn.Module):
         if self.conserving:
             if cfg.get("charge_allocation", "fermi") not in ("fermi", "residual"):
                 raise ValueError("conserving_charges: charge_allocation fermi or residual")
-            if not cfg.get("physical_charges") or cfg.get("num_charges", 1) != 1 or cfg.get("induced_dipoles"):
-                raise ValueError("IrisLR conserving_charges: physical charges, num_charges=1, no induced dipoles only")
+            if not cfg.get("physical_charges") or cfg.get("num_charges", 1) != 1:
+                raise ValueError("IrisLR conserving_charges: physical charges, num_charges=1 only")
             self.ref = "fermi" if cfg.get("charge_allocation", "fermi") == "fermi" else "residual"
             cfg = {**cfg, "transfer_passes": 0}
-        elif "charge_allocation" not in cfg and cfg.get("physical_charges") and cfg.get("num_charges", 1) == 1:
+        elif cfg.get("charge_allocation") is None and cfg.get("physical_charges") and cfg.get("num_charges", 1) == 1:
             # the charge HEAD of his pre-flows physical branch (iris before 2d61e0c; the les-water ladder runs, iris
             # explore/alessandro-strict-local 1d412cf): q = MLP(h) * charge_scale (a learned scalar, or the constant
             # charge_scale_init), point charges, then the polarisation passes; no reference, no transfer
-            for key in ("remove_sr_cutoff", "readout_phi0", "polarisation_descent", "smearing"):
+            # (charge_allocation None is his main branch's default too, a2658e3: the same head path there)
+            for key in ("remove_sr_cutoff", "readout_phi0", "readout_charges", "polarisation_descent", "smearing",
+                        "long_range_transfer", "induced_dipoles", "hellmann_feynman_forces"):
                 if cfg.get(key):
                     raise ValueError(f"IrisLR head charges: {key} not ported")
             self.ref = "head"
@@ -368,6 +370,11 @@ class IrisLR(_AuxMixin, nn.Module):
         # frozen Fermi level (his frozen_fermi_level, the Born charges' tapped charges): mu (fermi) or the residual
         # correction (residual) out of the gradient; never exported (the field-force oracle check only)
         self.frozen = False
+        # induced dipoles: NOT ported. His path needs jax-pme EwaldDipole (lab-cosmo/jax-pme#38); its branch head 2a8d052
+        # predates the pair layout his pinned jax-pme (1c26495) merged, and his a98c2f6 batching fails on it
+        # (_flatten_jaxpme unpack): no oracle without rebasing that PR ourselves
+        if cfg.get("induced_dipoles"):
+            raise ValueError("IrisLR: induced_dipoles not ported (no oracle: jax-pme#38 is incompatible with his pin)")
         self.lrt = bool(cfg.get("long_range_transfer"))
         if self.lrt and cfg.get("smearing") is None:
             raise ValueError("long_range_transfer needs smearing")

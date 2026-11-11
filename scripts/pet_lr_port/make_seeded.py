@@ -172,6 +172,7 @@ def main():
     # {leaf name: s}: an ELEMENTWISE factor in [1 - s, 1 + s] on those leaves (a constant-initialised per-species leaf,
     # e.g. species_weight, otherwise stays uniform under the per-leaf factor and its species dependence is untested)
     jitter = cfg.pop("_jitter", {})
+    setv = cfg.pop("_set", {})  # {leaf name: value}: set those scalar leaves after the randomisation
     lr_on = bool(cfg["lr"])
     model = PETLR(**cfg)
     key = jax.random.PRNGKey(a.seed)
@@ -185,6 +186,14 @@ def main():
             x = 0.1 * jax.random.normal(k1, x.shape, x.dtype)
         out.append(x * (1.0 + a.scale * jax.random.uniform(k2, (), x.dtype, -1.0, 1.0)))
     params = jax.tree.unflatten(tree, out)
+    if setv:
+        from flax.traverse_util import flatten_dict, unflatten_dict
+        flat = flatten_dict(params)
+        for path in flat:
+            if str(path[-1]) in setv:
+                flat[path] = jnp.full_like(flat[path], setv[str(path[-1])])
+                print("set:", "/".join(map(str, path)), setv[str(path[-1])])
+        params = unflatten_dict(flat)
     if jitter:
         from flax.traverse_util import flatten_dict, unflatten_dict
         flat = flatten_dict(params)
