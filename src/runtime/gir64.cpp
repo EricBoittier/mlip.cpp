@@ -12,6 +12,7 @@
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
+#include <chrono>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -238,13 +239,34 @@ void reduce_to(const std::vector<int64_t> &os, const std::vector<int64_t> &s, co
 template <class T>
 void gemm(int64_t m, int64_t n, int64_t k, const T *A, bool ta, const T *B, bool tb, T *C, bool parallel) {
   if (!ta && !tb) {
+    // four rows of C per pass over B (each B element loaded once for four FMAs), B in column blocks of 256
+    const int64_t mb = (m + 3) / 4;
 #pragma omp parallel for schedule(static) if (parallel && m * n * k > 65536)
-    for (int64_t i = 0; i < m; i++) {
-      T *c = C + i * n;
-      for (int64_t p = 0; p < k; p++) {
-        const T a = A[i * k + p];
-        const T *b = B + p * n;
-        for (int64_t j = 0; j < n; j++) c[j] += a * b[j];
+    for (int64_t ib = 0; ib < mb; ib++) {
+      const int64_t i = 4 * ib;
+      if (i + 4 <= m) {
+        T *c0 = C + i * n, *c1 = c0 + n, *c2 = c1 + n, *c3 = c2 + n;
+        const T *a0 = A + i * k, *a1 = a0 + k, *a2 = a1 + k, *a3 = a2 + k;
+        for (int64_t j0 = 0; j0 < n; j0 += 256) {
+          const int64_t j1 = std::min(n, j0 + 256);
+          for (int64_t p = 0; p < k; p++) {
+            const T x0 = a0[p], x1 = a1[p], x2 = a2[p], x3 = a3[p];
+            const T *b = B + p * n;
+            for (int64_t j = j0; j < j1; j++) {
+              const T bj = b[j];
+              c0[j] += x0 * bj, c1[j] += x1 * bj, c2[j] += x2 * bj, c3[j] += x3 * bj;
+            }
+          }
+        }
+      } else {
+        for (int64_t r = i; r < m; r++) {
+          T *c = C + r * n;
+          for (int64_t p = 0; p < k; p++) {
+            const T a = A[r * k + p];
+            const T *b = B + p * n;
+            for (int64_t j = 0; j < n; j++) c[j] += a * b[j];
+          }
+        }
       }
     }
   } else if (!ta && tb && m >= 16) {
@@ -902,10 +924,14 @@ template <class T> void Executor<T>::forward(bool keep_all) {
     last_use[out_index_] = int(g_.nodes.size());
   }
   static const bool trace = std::getenv("MLIPCPP_FP64_TRACE") != nullptr;
+  static const bool prof = std::getenv("MLIPCPP_FP64_PROFILE") != nullptr; // seconds per op type, to stderr
+  std::map<std::string, double> tsum;
   for (size_t k = 0; k < g_.nodes.size(); k++) {
     const GIRNode &n = g_.nodes[k];
     try {
+      const auto t0 = std::chrono::steady_clock::now();
       Tensor<T> v = eval(k);
+      if (prof) tsum[n.op] += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
       // the result's shape must be the traced one (a size-1 rank difference of a pass-through is a reshape)
       if (!n.output_shape.empty()) {
         const std::vector<int64_t> s = resolve(n.output_shape);
@@ -930,6 +956,14 @@ template <class T> void Executor<T>::forward(bool keep_all) {
           const int j = index_.at(std::stoi(r.substr(5)));
           if (last_use[j] == int(k)) vals_[j] = Tensor<T>{};
         }
+  }
+  if (prof) {
+    double tot = 0;
+    for (const auto &[op, t] : tsum) tot += t;
+    std::fprintf(stderr, "fp64 forward %.3f s:", tot);
+    for (const auto &[op, t] : tsum)
+      if (t > 0.02 * tot) std::fprintf(stderr, " %s %.3f", op.c_str(), t);
+    std::fprintf(stderr, "\n");
   }
 }
 
@@ -984,9 +1018,32 @@ template <class T> void Executor<T>::backward(const std::vector<T> &cot, bool wa
     if (v.empty()) v.assign(size_t(n), T(0.0));
     return v.data();
   };
+  static const bool prof = std::getenv("MLIPCPP_FP64_PROFILE") != nullptr;
+  std::map<std::string, double> tsum;
+  struct Report {
+    std::map<std::string, double> &t;
+    bool on;
+    ~Report() {
+      if (!on) return;
+      double tot = 0;
+      for (const auto &[op, x] : t) tot += x;
+      std::fprintf(stderr, "fp64 backward %.3f s:", tot);
+      for (const auto &[op, x] : t)
+        if (x > 0.02 * tot) std::fprintf(stderr, " %s %.3f", op.c_str(), x);
+      std::fprintf(stderr, "\n");
+    }
+  } report{tsum, prof};
   for (size_t kk = N; kk-- > 0;) {
     if (adj[kk].empty()) continue;
     const GIRNode &n = g_.nodes[kk];
+    const auto t0 = std::chrono::steady_clock::now();
+    struct Tick {
+      std::map<std::string, double> &t;
+      const std::string &op;
+      std::chrono::steady_clock::time_point t0;
+      bool on;
+      ~Tick() { if (on) t[op] += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); }
+    } tick{tsum, n.op, t0, prof};
     const NodeInfo &I = info_[kk];
     std::vector<T> gv = std::move(adj[kk]);
     adj[kk].clear();
