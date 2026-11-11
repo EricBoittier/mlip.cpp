@@ -53,7 +53,12 @@ std::vector<std::pair<std::string, std::string>> lr_ggufs() {
           {"qeq (cg + custom_linear_solve, Gaussian charges, 2 shared passes)", resource("petlr_tiny_qeq.gguf")},
           // his branch feat/threshold-reference (101575d): make_seeded.py thr (threshold reference: no Fermi level,
           // species weights jittered per species, 1 transfer, 2 shared passes with hardness)
-          {"threshold (1 transfer, 2 shared passes, hardness)", resource("petlr_tiny_thr.gguf")}};
+          {"threshold (1 transfer, 2 shared passes, hardness)", resource("petlr_tiny_thr.gguf")},
+          // feat/conserving-charges with the field input (make_seeded.py cc_fermi_field; zero field here: the
+          // energy-gradient path, dipole_flow and the zf columns) and the les-water ladder with its LR head
+          // (les_ladder_lr_c0: charge_layer 0, 3 unshared passes)
+          {"conserving fermi + field input (zero field)", resource("petlr_tiny_ccfield.gguf")},
+          {"les ladder + LR head (charge_layer 0)", resource("petlr_les_ladder_lr.gguf")}};
 }
 
 // 24 water molecules in a 9.0 A cube, a fixed jittered lattice (deterministic)
@@ -249,6 +254,9 @@ TEST_CASE("pet_lr_port: iris QEq host cg = jax.scipy cg (recurrences, stopping r
 }
 
 namespace {
+// models whose charges do not sum to the total charge by construction (his pre-flows charge head)
+bool no_charge_sum(const std::string &path) { return path.find("ladder_lr") != std::string::npos; }
+
 double iris_energy(Predictor &m, const std::vector<float> &x, const std::vector<int32_t> &Z, int Q,
                    const PredictOptions &base) {
   PredictOptions po = base;
@@ -261,7 +269,7 @@ double iris_energy(Predictor &m, const std::vector<float> &x, const std::vector<
 // seeded models are rough, forces up to 1e5 eV/A on close contacts); tolerance ftol + 1e-3 max|F|; charges sum to Q;
 // the dipole is sum_i q_i (r_i - r0); max|F| > fmin (not trivially zero)
 double iris_check(Predictor &m, const std::vector<float> &x, const std::vector<int32_t> &Z, int Q, double ftol,
-                  double fmin = 0.05) {
+                  double fmin = 0.05, bool charge_sum = true) {
   PredictOptions po;
   po.compute_forces = true;
   po.charge = Q;
@@ -275,7 +283,8 @@ double iris_check(Predictor &m, const std::vector<float> &x, const std::vector<i
     qs += r.charges[i];
     for (int a = 0; a < 3; a++) D[a] += r.charges[i] * (x[3 * i + a] - po.dipole_origin[a]);
   }
-  CHECK(std::fabs(qs - Q) < 2e-4);
+  // (the pre-flows charge head has no total-charge constraint: his LR head adds none, by design)
+  if (charge_sum) CHECK(std::fabs(qs - Q) < 2e-4);
   for (int a = 0; a < 3; a++) CHECK(std::fabs(D[a] - r.dipole[a]) < 2e-4 * std::max(1.0, std::fabs(D[a])));
   auto fd = [&](size_t k, double h) {
     std::vector<float> xp = x, xm = x;
@@ -314,9 +323,9 @@ TEST_CASE("pet_lr_port: iris PET-LR forces = -dE/dx (FD), charge sum, dipole; ev
     INFO("model: " << label << " (" << path << ")");
     ModelOptions mo;
     Predictor m(path, mo);
-    const double ga = iris_check(m, a, {8, 1, 1, 1, 8, 1, 1}, 1, 5e-3);
-    const double gb = iris_check(m, b, {8, 1, 1, 8, 1, 1, 8, 1, 1}, 0, 5e-3);
-    const double gc = iris_check(m, c, {11, 8, 1, 1, 17, 8, 1, 1}, 0, 5e-3);
+    const double ga = iris_check(m, a, {8, 1, 1, 1, 8, 1, 1}, 1, 5e-3, 0.05, !no_charge_sum(path));
+    const double gb = iris_check(m, b, {8, 1, 1, 8, 1, 1, 8, 1, 1}, 0, 5e-3, 0.05, !no_charge_sum(path));
+    const double gc = iris_check(m, c, {11, 8, 1, 1, 17, 8, 1, 1}, 0, 5e-3, 0.05, !no_charge_sum(path));
     if (label.rfind("fermi gapped", 0) == 0) { // the gapped branch (metallicity ~ 0) must be what the FD test saw
       INFO("metallicity: " << ga << " " << gb << " " << gc);
       CHECK(std::min({ga, gb, gc}) < 1e-6);
@@ -341,7 +350,7 @@ TEST_CASE("pet_lr_port: iris PET-LR on atoms without neighbours keeps the Coulom
       continue;
     }
     // (FD floor of fp32 energies here ~1e-5 eV/A: the Gaussian-charge model's 1.4e-5 eV/A sits at it)
-    iris_check(m, {0, 0, 0, 8.0f, 0.3f, -0.2f}, {11, 17}, 0, 2e-5, gapped ? -1.0 : 5e-6);
+    iris_check(m, {0, 0, 0, 8.0f, 0.3f, -0.2f}, {11, 17}, 0, 2e-5, gapped ? -1.0 : 5e-6, !no_charge_sum(path));
   }
 }
 
@@ -425,7 +434,7 @@ TEST_CASE("pet_lr_port: iris PET-LR in a 3-D cell and a slab: forces = -dE/dx an
       REQUIRE(r.virial.size() == 9);
       double qs = 0;
       for (float q : r.charges) qs += q;
-      CHECK(std::fabs(qs) < 2e-4);
+      if (!no_charge_sum(path)) CHECK(std::fabs(qs) < 2e-4);
       auto energy = [&](const std::vector<float> &y, const float *cc) {
         PredictOptions p = po;
         p.compute_forces = false, p.compute_stress = false;
