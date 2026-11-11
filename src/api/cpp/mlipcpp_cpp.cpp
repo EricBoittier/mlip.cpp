@@ -186,6 +186,7 @@ struct Predictor::Impl {
     }
     result.latent_charges = std::move(internal_result.latent_charges);
     result.sqe_charges = std::move(internal_result.sqe_charges);
+    result.virial = std::move(internal_result.virial);
     return result;
   }
 

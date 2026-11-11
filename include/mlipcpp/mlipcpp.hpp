@@ -52,6 +52,8 @@ struct Result {
   std::vector<float> latent_charges;
   // split-charge equilibration charges (e), pet.plato_lr.sqe models; empty otherwise
   std::vector<float> sqe_charges;
+  // periodic graph models: the full virial dE/d(strain) [9], row-major, eV, before symmetrisation; empty otherwise
+  std::vector<double> virial;
 
   bool has_forces() const { return !forces.empty(); }
   bool has_stress() const { return !stress.empty(); }

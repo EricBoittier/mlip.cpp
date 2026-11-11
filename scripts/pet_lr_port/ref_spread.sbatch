@@ -16,11 +16,11 @@ for CK in finetune/readout-pol scaling/readout-4m; do
   C=/work/cosmo/langer/kuma/argos/checkpoints/omol-4m/$CK/RMSE_F; T=$(echo $CK | tr / _); mkdir -p ref/$T
   for s in mol cluster bulk; do
     if [ "$MODE" = cpu ]; then
-      JAX_PLATFORMS=cpu $P $C frames/set_$s.extxyz ref/$T/${s}_cpu32_v1.npz --kpad 16 --bucket powers_of_2 > ref/$T/${s}_cpu32_v1.log 2>&1 &
-      JAX_PLATFORMS=cpu XLA_FLAGS="--xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1" taskset -c 0 \
-        $P $C frames/set_$s.extxyz ref/$T/${s}_cpu32_v2.npz > ref/$T/${s}_cpu32_v2.log 2>&1 &
-      JAX_PLATFORMS=cpu $P $C frames/set_$s.extxyz ref/$T/${s}_cpu32_v3.npz --kpad 24 --bucket multiples_of_32 > ref/$T/${s}_cpu32_v3.log 2>&1 &
-      wait
+      # sequential: three JAX CPU processes at once exhaust a MIG slice's memory
+      JAX_PLATFORMS=cpu $P $C frames/set_$s.extxyz ref/$T/${s}_cpu32_v1.npz --kpad 16 --bucket powers_of_2 > ref/$T/${s}_cpu32_v1.log 2>&1
+      JAX_PLATFORMS=cpu XLA_FLAGS="--xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1" \
+        $P $C frames/set_$s.extxyz ref/$T/${s}_cpu32_v2.npz > ref/$T/${s}_cpu32_v2.log 2>&1
+      JAX_PLATFORMS=cpu $P $C frames/set_$s.extxyz ref/$T/${s}_cpu32_v3.npz --kpad 24 --bucket multiples_of_32 > ref/$T/${s}_cpu32_v3.log 2>&1
     else
       $P $C frames/set_$s.extxyz ref/$T/${s}_gpu32_$VAR.npz $GPUARGS > ref/$T/${s}_gpu32_$VAR.log 2>&1; echo "$CK $s rc=$?"
     fi

@@ -12,6 +12,9 @@ struct ModelResult {
   float energy = 0.0f;
   std::vector<float> forces; // [n_atoms * 3], flattened
   std::vector<float> stress; // [6] in Voigt notation (xx, yy, zz, yz, xz, xy)
+  // periodic graph models: the full virial dE/d(strain) [9], row-major, eV, before symmetrisation (the backbone
+  // and its adaptive-cutoff chain; the Voigt stress is sym(virial) / V plus any long-range terms); empty otherwise
+  std::vector<double> virial;
 
   std::vector<float> nc_forces; // [n_atoms * 3], direct force head
   // Plato-PET-LR with LES: the latent charges per atom (e: model units times charge_unit,

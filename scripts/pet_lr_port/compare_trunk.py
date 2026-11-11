@@ -55,12 +55,13 @@ def load_cpp(path, vols=None):
         if "stress" in f and vols is not None and np.isfinite(vols[k]):
             s = np.asarray(f["stress"], dtype=np.float64)  # Voigt xx yy zz yz xz xy, eV/A^3
             V = np.array([[s[0], s[5], s[4]], [s[5], s[1], s[3]], [s[4], s[3], s[2]]]) * vols[k]
-        out.append(dict(E=float(f["energy"]), F=np.asarray(f["forces"], dtype=np.float64).reshape(n, 3), V=V))
+        full = np.asarray(f["virial"], dtype=np.float64).reshape(3, 3) if "virial" in f else None
+        out.append(dict(E=float(f["energy"]), F=np.asarray(f["forces"], dtype=np.float64).reshape(n, 3), V=V, W=full))
     return out
 
 
 def metrics(a, b):
-    e_rel, e_atom, f_rel, f_abs, f_sq, n_f, v_rel, v_anti = [], [], [], [], 0.0, 0, [], []
+    e_rel, e_atom, f_rel, f_abs, f_sq, n_f, v_rel, v_anti, w_rel = [], [], [], [], 0.0, 0, [], [], []
     for x, y in zip(a, b):
         n = len(y["F"])
         e_rel.append(abs(x["E"] - y["E"]) / max(abs(y["E"]), 1e-300))
@@ -75,11 +76,15 @@ def metrics(a, b):
             sx, sy = 0.5 * (x["V"] + x["V"].T), 0.5 * (y["V"] + y["V"].T)
             v_rel.append(np.abs(sx - sy).max() / max(np.abs(sy).max(), 1e-300))
             v_anti.append(np.abs(y["V"] - y["V"].T).max() / 2 / max(np.abs(sy).max(), 1e-300))
+            if x.get("W") is not None:  # mlip.cpp's full virial against the oracle's, unsymmetrised
+                w_rel.append(np.abs(x["W"] - y["V"]).max() / max(np.abs(y["V"]).max(), 1e-300))
     r = dict(n=len(a), E_rel=max(e_rel), E_rel_median=float(np.median(e_rel)), E_atom=max(e_atom),
              F_rel=max(f_rel), F_rel_median=float(np.median(f_rel)), F_abs=max(f_abs),
              F_rms=(f_sq / n_f) ** 0.5)
     if v_rel:
         r.update(V_rel=max(v_rel), V_rel_median=float(np.median(v_rel)), V_antisym_ref=max(v_anti))
+        if w_rel:
+            r.update(W_full_rel=max(w_rel), W_full_rel_median=float(np.median(w_rel)))
     return r
 
 

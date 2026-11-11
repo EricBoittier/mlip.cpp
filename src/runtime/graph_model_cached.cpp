@@ -870,12 +870,17 @@ ModelResult GraphModel::predict_cached(const AtomicSystem &system, bool compute_
     // (C[k, s] + C[reverse]) / 2 (each pair cutoff is the mean of two radii)
     std::vector<double> F(3 * size_t(n), 0.0), chain(C.empty() ? 0 : 3 * E, 0.0);
     std::vector<std::array<double, 6>> virial(periodic ? n : 0, std::array<double, 6>{});
+    // the full (unsymmetrised) virial per atom, accumulated separately so the Voigt sums stay bit-identical
+    std::vector<std::array<double, 9>> virial9(periodic ? n : 0, std::array<double, 9>{});
     auto add_virial = [&](int i, const double r[3], const double gr[3]) {
       auto &w = virial[i];
       w[0] += r[0] * gr[0], w[1] += r[1] * gr[1], w[2] += r[2] * gr[2];
       w[3] += 0.5 * (r[1] * gr[2] + r[2] * gr[1]);
       w[4] += 0.5 * (r[0] * gr[2] + r[2] * gr[0]);
       w[5] += 0.5 * (r[0] * gr[1] + r[1] * gr[0]);
+      auto &f = virial9[i];
+      for (int a = 0; a < 3; a++)
+        for (int b = 0; b < 3; b++) f[3 * a + b] += r[a] * gr[b];
     };
 #pragma omp parallel for num_threads(nt) schedule(static)
     for (int k = 0; k < n; k++) {
@@ -909,6 +914,7 @@ ModelResult GraphModel::predict_cached(const AtomicSystem &system, bool compute_
         }
     }
     std::array<double, 6> w_plato{};
+    std::array<double, 9> w9_plato{};
     if (g.grad_pos) { // Plato-PET-LR: -dE/dx and dE/d strain of the long-range ops
       std::vector<float> gp(3 * size_t(n));
       ggml_backend_tensor_get(g.grad_pos, gp.data(), 0, gp.size() * sizeof(float));
@@ -918,6 +924,7 @@ ModelResult GraphModel::predict_cached(const AtomicSystem &system, bool compute_
       float q[9];
       ggml_backend_tensor_get(g.grad_eps, q, 0, sizeof q);
       w_plato = {q[0], q[4], q[8], 0.5 * (q[5] + q[7]), 0.5 * (q[2] + q[6]), 0.5 * (q[1] + q[3])};
+      for (int c = 0; c < 9; c++) w9_plato[c] = q[c];
     }
     result.forces.resize(3 * size_t(n));
     for (size_t k = 0; k < F.size(); k++) result.forces[k] = static_cast<float>(energy_scale_ * F[k]);
@@ -928,6 +935,11 @@ ModelResult GraphModel::predict_cached(const AtomicSystem &system, bool compute_
       for (const auto &v : virial)
         for (int c = 0; c < 6; c++) w[c] += v[c];
       set_stress(*cell, energy_scale_, w, result);
+      std::array<double, 9> w9 = w9_plato;
+      for (const auto &v : virial9)
+        for (int c = 0; c < 9; c++) w9[c] += v[c];
+      result.virial.assign(w9.begin(), w9.end());
+      for (auto &x : result.virial) x *= energy_scale_;
     }
   }
   if (no_edges && forces_requested) { // energy independent of the positions
@@ -1052,6 +1064,7 @@ ModelResult GraphModel::predict_cached_device(const AtomicSystem &system, bool c
     std::vector<double> F(3 * size_t(n));
     download(F.data(), st.f_cons, F.size());
     std::array<double, 6> w_plato{};
+    std::array<double, 9> w9_plato{};
     if (g.grad_pos) { // Plato-PET-LR: -dE/dx and dE/d strain of the long-range ops
       std::vector<float> gp(3 * size_t(n));
       ggml_backend_tensor_get(g.grad_pos, gp.data(), 0, gp.size() * sizeof(float));
@@ -1061,6 +1074,7 @@ ModelResult GraphModel::predict_cached_device(const AtomicSystem &system, bool c
       float q[9];
       ggml_backend_tensor_get(g.grad_eps, q, 0, sizeof q);
       w_plato = {q[0], q[4], q[8], 0.5 * (q[5] + q[7]), 0.5 * (q[2] + q[6]), 0.5 * (q[1] + q[3])};
+      for (int c = 0; c < 9; c++) w9_plato[c] = q[c];
     }
     result.forces.assign(F.begin(), F.end());
     result.has_forces = true;

@@ -420,6 +420,18 @@ bool GraphModel::load_from_gguf(const std::string &path) {
     throw std::runtime_error("Plato-PET-LR GGUFs are forces-mode exports");
   conditioning_.max_charge = loader.get_int32("pet.max_charge", 10);
   conditioning_.max_spin_multiplicity = loader.get_int32("pet.max_spin_multiplicity", 10);
+  if (const std::string keys = loader.get_string("pet.conditioning_keys", ""); !keys.empty()) {
+    conditioning_.use_charge = conditioning_.use_spin = false;
+    size_t a = 0;
+    while (a <= keys.size()) {
+      const size_t b = std::min(keys.find(',', a), keys.size());
+      const std::string k = keys.substr(a, b - a);
+      if (k == "charge") conditioning_.use_charge = true;
+      else if (k == "spin_multiplicity") conditioning_.use_spin = true;
+      else throw std::runtime_error("pet.conditioning_keys: unknown key '" + k + "'");
+      a = b + 1;
+    }
+  }
   state_dict_names_ = json::parse(loader.get_string("train.state_dict_names", "{}"))
                           .get<std::map<std::string, std::string>>();
 
@@ -1768,6 +1780,9 @@ ModelResult GraphModel::predict_single_impl(
 
         if (vol > 1e-10f) {
           result.stress.assign(6, 0.0f);
+          // the full virial W_ab = sum_edges r_a dE/dr_b (row-major, eV, double): PET is not exactly rotation
+          // invariant, so W has an antisymmetric part that the Voigt stress drops (parity outputs)
+          result.virial.assign(9, 0.0);
           for (int ca = 0; ca < n_atoms; ca++) {
             for (int slot = 0; slot < max_neighbors; slot++) {
               int flat_idx = ca * max_neighbors + slot;
@@ -1787,6 +1802,9 @@ ModelResult GraphModel::predict_single_impl(
               result.stress[3] += 0.5f * (ey * gz + ez * gy); // yz
               result.stress[4] += 0.5f * (ex * gz + ez * gx); // xz
               result.stress[5] += 0.5f * (ex * gy + ey * gx); // xy
+              const double e3[3] = {ex, ey, ez}, g3[3] = {gx, gy, gz};
+              for (int a = 0; a < 3; a++)
+                for (int b = 0; b < 3; b++) result.virial[3 * a + b] += e3[a] * g3[b];
             }
           }
           for (int e = 0; e < static_cast<int>(chain_grad.size()); e++) {
@@ -1798,6 +1816,8 @@ ModelResult GraphModel::predict_single_impl(
             result.stress[3] += static_cast<float>(0.5 * (r[1] * g[2] + r[2] * g[1]));
             result.stress[4] += static_cast<float>(0.5 * (r[0] * g[2] + r[2] * g[0]));
             result.stress[5] += static_cast<float>(0.5 * (r[0] * g[1] + r[1] * g[0]));
+            for (int a = 0; a < 3; a++)
+              for (int b = 0; b < 3; b++) result.virial[3 * a + b] += double(r[a]) * double(g[b]);
           }
 
           if (!plato_geps.empty()) { // row-major dE/d eps
@@ -1806,10 +1826,12 @@ ModelResult GraphModel::predict_single_impl(
             result.stress[3] += 0.5f * (q[5] + q[7]);
             result.stress[4] += 0.5f * (q[2] + q[6]);
             result.stress[5] += 0.5f * (q[1] + q[3]);
+            for (int i = 0; i < 9; i++) result.virial[i] += q[i];
           }
           for (int i = 0; i < 6; i++) {
             result.stress[i] *= energy_scale_ / vol;
           }
+          for (auto &w : result.virial) w *= energy_scale_;
           result.has_stress = true;
         }
       }
