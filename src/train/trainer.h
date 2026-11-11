@@ -310,6 +310,8 @@ public:
   /// lrc_states: free the shared compute buffer (graphs are built per batch for Plato models, none is cached) so that
   /// the frozen charge pass, which allocates its own, has the device memory; the next graph allocates it again
   void release_compute_buffer();
+  /// lrc_states: one structure whose copies are spread over consecutive part batches (Batch::part_*), run as one
+  StepStats run_parts(const std::vector<const Batch *> &parts, double energy_scale, bool backward);
   int64_t vs_structs = 0, vs_evals = 0, vs_fix3 = 0, vs_real_atoms = 0, vs_packed_atoms = 0, vs_max = 0;
   std::vector<double> sqe_grad;
   double sqe_abs_energy = 0;
@@ -440,6 +442,7 @@ private:
     runtime::LrcClusters cl;
     runtime::LrcStates st;
     std::vector<double> q0rows; // dQ0_b/dx per super-node (lazy; shared by every copy's blend rows)
+    std::vector<int> copy;      // per entry of sys: its index in st.copies
   };
   std::vector<VsStruct> vs_;
   std::vector<int> vs_sys_a0_;                  // first atom of every system

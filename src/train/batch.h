@@ -107,6 +107,13 @@ struct Batch {
   std::vector<uint8_t> vs_active;
   int structures() const { return n_primary ? n_primary : n_real_systems; }
   int copies() const { return n_real_systems - structures(); }
+  // lrc_states, a part of a split structure (one structure whose copies do not fit one micro-batch): every system is a
+  // copy of the same structure (vs_copy: its index in LrcStates::copies), there are no loss rows (no atom weights, no
+  // force mask); the parts of a group are consecutive in a worker's list and run together (Worker::run_parts), which
+  // combines the copies and takes the loss once. part_group -1: an ordinary batch.
+  int part_group = -1, part_count = 0, part_index = 0;
+  std::vector<int32_t> vs_copy;
+  float part_energy_target = 0.0f; // the structure's energy target (scaled, per atom)
 };
 
 /// lrc_states: the edge-drop groups of each backbone evaluation of a structure (positions as packed, float, rotated);
@@ -132,6 +139,16 @@ struct Tiling {
   /// Smallest grid point >= x: lo, then x*ratio rounded up to a multiple of 8.
   static int bucket(int x, int lo, double ratio);
 };
+
+/// lrc_states: a part batch of structure `id` holding its copies `copies` (indices into its LrcStates copies, in the
+/// planner's order); group bookkeeping as Batch::part_*. Positions rotated by R (null: none).
+Batch make_part_batch(const MemmapSplit &split, const NeighborCache &nl, int64_t id, const float *R,
+                      const std::vector<int> &copies, const std::map<int, int> &species_to_index,
+                      const TargetScaling &scaling, float cutoff, const StatePlanner &planner);
+/// lrc_states: whether a structure with `c` copies of n atoms and m neighbours is split into parts (budget: the
+/// micro-batch attention budget; MLIPCPP_VS_SPLIT_COPIES=k > 0 forces parts of at most k copies, for tests), and the
+/// copies per part
+int part_copies(int c, int n, int m, double budget);
 
 /// Pack `ids` of `split`. `rotations` is empty (no augmentation) or holds one
 /// 3x3 row-major matrix per structure, applied to edge vectors and forces.

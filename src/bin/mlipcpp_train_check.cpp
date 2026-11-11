@@ -216,6 +216,59 @@ int main(int argc, char **argv) {
       fmt::print("states-fd tail loss: L {:.6g}, |g| {:.6g};{} -> {}\n", L0, gn, line, best < 2e-2 ? "PASS" : "FAIL");
       ok = ok && best < 2e-2;
     }
+    // split structures (Worker::run_parts): every multi-state structure of the first n as one-copy parts against the
+    // same structure in one batch: same loss and gradient (fp32 graphs: to accumulation order)
+    for (int64_t id : ids) {
+      const Batch whole = make_batch(split, nl, {id}, {}, worker.model().species_to_index(), sc, worker.model().cutoff(), 0,
+                                     0, 0, &planner);
+      if (whole.n_real_systems < 2) continue; // (only structures with >= 2 copies are ever split)
+      const int V = whole.n_real_systems;
+      std::vector<Batch> parts;
+      for (int v = 0; v < V; v++) {
+        parts.push_back(make_part_batch(split, nl, id, nullptr, {v}, worker.model().species_to_index(), sc,
+                                        worker.model().cutoff(), planner));
+        parts.back().part_group = 0, parts.back().part_count = V, parts.back().part_index = v;
+        parts.back().energy_norm = whole.energy_norm, parts.back().force_norm = whole.force_norm;
+      }
+      std::vector<const Batch *> pp;
+      for (const Batch &x : parts) pp.push_back(&x);
+      worker.zero_grads();
+      const StepStats sa = worker.run(whole, sc.energy_scale, true);
+      const std::vector<float> ga = worker.get_grads();
+      worker.zero_grads();
+      const StepStats sb = worker.run_parts(pp, sc.energy_scale, true);
+      const std::vector<float> gb = worker.get_grads();
+      worker.zero_grads();
+      double dg = 0, gm = 0;
+      bool finite = std::isfinite(sb.loss);
+      for (size_t q = 0; q < ga.size(); q++) {
+        finite = finite && std::isfinite(gb[q]);
+        dg = std::max(dg, double(std::abs(ga[q] - gb[q]))), gm = std::max(gm, double(std::abs(ga[q])));
+      }
+      const double dl = std::abs(sa.loss - sb.loss) / std::max(1e-30, std::abs(sa.loss));
+      const bool pass = finite && dl < 1e-6 && dg <= 1e-5 * gm;
+      fmt::print("states-fd parts: id {} ({} copies): loss {:.10g} vs {:.10g} (rel {:.2e}), max |dg| {:.3e} of {:.3e} (rel "
+                 "{:.2e}) -> {}\n", id, V, sa.loss, sb.loss, dl, dg, gm, dg / std::max(1e-30, gm), pass ? "PASS" : "FAIL");
+      ok = ok && pass;
+    }
+    { // the fp32 floor of the comparison above, in the existing path: one batch {a, b} vs a and b alone, summed
+      const int64_t a = ids.front(), c = ids.back();
+      auto grads_of = [&](const std::vector<int64_t> &g_ids) {
+        Batch bb = make_batch(split, nl, g_ids, {}, worker.model().species_to_index(), sc, worker.model().cutoff(), 0, 0, 0,
+                              &planner);
+        bb.energy_norm = 1.0f, bb.force_norm = 1.0f / (3.0f * split.n_atoms(a));
+        worker.zero_grads();
+        worker.run(bb, sc.energy_scale, true);
+        return worker.get_grads();
+      };
+      const std::vector<float> gab = grads_of({a, c}), ga1 = grads_of({a}), gb1 = grads_of({c});
+      double dg = 0, gm = 0;
+      for (size_t q = 0; q < gab.size(); q++)
+        dg = std::max(dg, double(std::abs(gab[q] - ga1[q] - gb1[q]))), gm = std::max(gm, double(std::abs(gab[q])));
+      worker.zero_grads();
+      fmt::print("states-fd floor: one batch of ids {} and {} vs each alone, summed: max |dg| {:.3e} of {:.3e} (rel {:.2e})\n",
+                 a, c, dg, gm, dg / std::max(1e-30, gm));
+    }
     ok = check("energy + force loss") && ok;
     const Worker::Conservative keep = worker.conservative;
     worker.conservative.energy = 0, worker.conservative.nc_force = 0;
