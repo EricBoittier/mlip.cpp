@@ -475,10 +475,11 @@ bool GraphModel::load_from_gguf(const std::string &path) {
     // feat/conserving-charges (a98c2f6), conserving_charges only
     if (iris_lr_.reference != "fermi" && iris_lr_.reference != "species" && iris_lr_.reference != "both" &&
         iris_lr_.reference != "species_weighted" && iris_lr_.reference != "species_fill" &&
-        iris_lr_.reference != "qeq" && iris_lr_.reference != "threshold" &&
+        iris_lr_.reference != "qeq" && iris_lr_.reference != "threshold" && iris_lr_.reference != "head" &&
         !(iris_lr_.reference == "residual" && iris_lr_.conserving_charges))
       throw std::runtime_error("pet.iris_lr.reference: " + iris_lr_.reference);
-    // threshold: his feat/threshold-reference (101575d): no Fermi level, no scores graph
+    // threshold: his feat/threshold-reference (101575d): no Fermi level, no scores graph; head: the pre-flows physical
+    // charge head (his les-water ladder runs, explore/alessandro-strict-local 1d412cf), no reference at all
     iris_lr_.columns.clear();
     {
       std::stringstream cs(loader.get_string("pet.iris_lr.columns", ""));
@@ -605,7 +606,7 @@ bool GraphModel::load_from_gguf(const std::string &path) {
   }
   scores_interp_ = GraphInterpreter();
   if (iris_lr_.enabled && iris_lr_.reference != "species" && iris_lr_.reference != "species_weighted" &&
-      iris_lr_.reference != "residual" && iris_lr_.reference != "threshold") {
+      iris_lr_.reference != "residual" && iris_lr_.reference != "threshold" && iris_lr_.reference != "head") {
     const std::string sj = loader.get_string("graph_scores.json", "");
     if (sj.empty()) {
       ggml_free(temp_ctx);

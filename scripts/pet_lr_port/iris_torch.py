@@ -337,14 +337,24 @@ class IrisLR(_AuxMixin, nn.Module):
                 raise ValueError("IrisLR conserving_charges: physical charges, num_charges=1, no induced dipoles only")
             self.ref = "fermi" if cfg.get("charge_allocation", "fermi") == "fermi" else "residual"
             cfg = {**cfg, "transfer_passes": 0}
+        elif "charge_allocation" not in cfg and cfg.get("physical_charges") and cfg.get("num_charges", 1) == 1:
+            # the charge HEAD of his pre-flows physical branch (iris before 2d61e0c; the les-water ladder runs, iris
+            # explore/alessandro-strict-local 1d412cf): q = MLP(h) * charge_scale (a learned scalar, or the constant
+            # charge_scale_init), point charges, then the polarisation passes; no reference, no transfer
+            for key in ("remove_sr_cutoff", "readout_phi0", "polarisation_descent", "smearing"):
+                if cfg.get(key):
+                    raise ValueError(f"IrisLR head charges: {key} not ported")
+            self.ref = "head"
+            cfg = {**cfg, "transfer_passes": 0}
         else:
             self.ref = cfg.get("charge_reference", "species")
-        if not self.conserving and (cfg.get("charge_allocation") != "flows" or not cfg.get("physical_charges")
-                                    or cfg.get("num_charges", 1) != 1):
+        if not self.conserving and self.ref != "head" and (
+                cfg.get("charge_allocation") != "flows" or not cfg.get("physical_charges")
+                or cfg.get("num_charges", 1) != 1):
             raise ValueError("IrisLR: physical charges, charge_allocation=flows and num_charges=1 only")
         # species_weighted / species_fill: his branch feat/long-range-transfer (3ed96b0, iris.pet.charges)
         if self.ref not in ("fermi", "species", "both", "species_weighted", "species_fill", "residual", "qeq",
-                            "threshold"):
+                            "threshold", "head"):
             raise ValueError(f"IrisLR: charge_reference {self.ref!r} not yet ported")
         # long_range_transfer (feat/long-range-transfer): per transfer pass a drive a_i moved through the Coulomb kernel of
         # Gaussian charges (width smearing) over the whole structure, dq = G a - a (G 1)
@@ -369,6 +379,13 @@ class IrisLR(_AuxMixin, nn.Module):
             self.score = nn.Linear(d, 1)
         if self.ref in ("species", "both", "species_weighted", "threshold"):
             self.species_charge = nn.Parameter(torch.zeros(cfg["max_atomic_number"] + 1))
+        if self.ref == "head":  # masked MLP((d_hidden, d_hidden, 1)) (flax auto-name MLP_0), x charge_scale
+            self.MLP_0 = _flax_mlp((d, dh, dh, 1))
+            self.learn_scale = bool(cfg.get("learn_charge_scale", True))
+            if self.learn_scale:
+                self.charge_scale = nn.Parameter(torch.ones(()))
+            else:
+                self.charge_scale_const = float(cfg.get("charge_scale_init", 1.0))
         if self.ref == "threshold":  # his feat/threshold-reference (101575d): a learned threshold per species
             self.species_threshold = nn.Parameter(torch.zeros(cfg["max_atomic_number"] + 1))
         if self.ref in ("species_weighted", "threshold"):  # softplus per species, the share of the excess
@@ -412,6 +429,7 @@ class IrisLR(_AuxMixin, nn.Module):
         self.cscale = float(cfg.get("conductance_scale", 1.0))
         self.cinit = float(cfg.get("conductance_init", -4.0))
         self.hard = bool(cfg.get("hardness", True))
+        self.hardness_init = float(cfg.get("hardness_init", 2.0))  # (the head branch's parameter; 2.0 elsewhere)
         for k in range(1, (self.passes if not self.shared else min(self.passes, 2))):
             sx = "" if k == 1 else f"_{k}"
             setattr(self, f"pol_embed{sx}", nn.Linear(d, dh))
@@ -640,6 +658,9 @@ class IrisLR(_AuxMixin, nn.Module):
             # his per-atom residual |deficit| / atoms_c, summed per structure (one component): |deficit|; as a per-atom
             # column (graph output 7) that sums to it
             aux["residual_atoms"] = torch.abs(deficit) / torch.ones_like(p_free).sum() + torch.zeros_like(p_free)
+        elif self.ref == "head":
+            scale = self.charge_scale if self.learn_scale else self.charge_scale_const
+            q = self.MLP_0(node)[:, 0] * scale
         elif self.ref == "threshold":
             # iris.pet.charges.threshold_reference (101575d): q = c_Z + f(s_i - theta_Z), spread by the softplus
             # species weights to sum to Q: q0 = q - w (sum q - Q) / max(sum w, 1e-12); the residual R = sum q - Q
@@ -735,7 +756,7 @@ class IrisLR(_AuxMixin, nn.Module):
                     drives = drives + drive
                 step = flow_sum(drive)
                 if self.hard:
-                    zh = getattr(self, f"hardness_head{sx}")(node)[:, 0] + 2.0
+                    zh = getattr(self, f"hardness_head{sx}")(node)[:, 0] + self.hardness_init
                     eta = softplus(zh)
                     extra = extra + 0.5 * eta * step * step
                 delta = delta + step

@@ -128,6 +128,8 @@ def main():
             else:
                 out.setdefault(k, []).append(v.reshape(-1)[:1])
         ptr.append(ptr[-1] + n)
+        if field_forces is not None:  # one compile per frame shape (his tap machinery): free them, else the host OOMs
+            jax.clear_caches()
         if f % 10 == 0:
             print(f"{f}/{len(frames)} n={n} {time.time() - t0:.1f}s", flush=True)
     np.savez(a.out, atom_ptr=np.array(ptr), error=np.array(err), **{k: np.concatenate(v) for k, v in out.items()})

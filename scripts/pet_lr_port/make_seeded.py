@@ -143,6 +143,15 @@ PRESETS.update({
     # the ladder's charge_layer 0 variant, no gates
     "les_ladder_c0": dict(_LES, num_gnn_layers=2, backbone="backbones.LayeredBackbone", per_layer_readout=True,
                           charge_layer=0),
+    # WITH that branch's LR side (the pre-flows physical charge head; his configs.py PETLR_PHYSICAL: one physical
+    # charge, constant charge_scale 0.1, lr_scale_init 1): the charge_layer oracle. As his ladder runs (charges from
+    # layer 1, gated heads, one pass), and charge_layer 0 with a learned scale and 2 unshared passes with hardness
+    "les_ladder_lr": dict(_LES, num_gnn_layers=2, backbone="backbones.LayeredBackbone", per_layer_readout=True,
+                          learn_layer_gates=True, charge_layer=1, lr=True, physical_charges=True, num_charges=1,
+                          lr_scale_init=1.0, learn_charge_scale=False, charge_scale_init=0.1),
+    "les_ladder_lr_c0": dict(_LES, num_gnn_layers=2, backbone="backbones.LayeredBackbone", per_layer_readout=True,
+                             charge_layer=0, lr=True, physical_charges=True, num_charges=1, lr_scale_init=1.0,
+                             polarisation_passes=3, polarisation_shared=False, hardness=True),
 })
 
 def main():

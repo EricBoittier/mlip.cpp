@@ -182,10 +182,14 @@ def main():
     if cfg.get("fixed_neighbors") is not None:  # his older fixed-neighbour mode (KnnToSample): the hard cutoff
         cfg["num_neighbors_adaptive"] = None
     # his les-water backbones (NoFinalCombineBackbone / LayeredBackbone; iris_torch.backbone_kind raises on others)
-    if cfg.get("charge_layer") is not None and cfg.get("lr") and a.lr and not a.allow_charge_layer:
-        raise ValueError("charge_layer with the LR branch: ported (the chosen layer's node features feed the LR branch) "
-                         "but not validated against an oracle (his les-water branch's LR side is not the ported flows "
-                         "allocation); --allow-charge-layer to export anyway")
+    # charge_layer WITH the LR branch is validated for the LR side his les-water ladder runs use (the pre-flows physical
+    # charge head: no charge_allocation key; oracle ref_les_lr.py on iris explore/alessandro-strict-local 1d412cf);
+    # with the flows / conserving allocations no code of his combines the two, so that stays refused
+    if cfg.get("charge_layer") is not None and cfg.get("lr") and a.lr and "charge_allocation" in cfg \
+            and not a.allow_charge_layer:
+        raise ValueError("charge_layer with a charge_allocation LR branch: ported (the chosen layer's node features feed "
+                         "the LR branch) but no oracle (no branch of his combines charge_layer with the flows / "
+                         "conserving allocations); --allow-charge-layer to export anyway")
     if cfg.get("charge_layer") is not None and not cfg.get("lr"):
         cfg["charge_layer"] = None  # (charge_layer only picks the LR branch's node features: no effect trunk-only)
     if cfg.get("direct_forces") or cfg.get("direct_stress"):
