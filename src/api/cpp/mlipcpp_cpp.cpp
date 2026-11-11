@@ -158,6 +158,7 @@ struct Predictor::Impl {
 
       graph_model->set_iris_freeze_ewald(options.iris_freeze_ewald);
       if (options.iris_max_neighbors >= 0) graph_model->set_iris_max_neighbors(options.iris_max_neighbors);
+      graph_model->set_iris_qeq_solver(options.iris_qeq_maxiter, options.iris_qeq_tol);
       model_type_str = "PET-Graph";
       nc_forces = graph_model->nc_forces();
       model = std::move(graph_model);

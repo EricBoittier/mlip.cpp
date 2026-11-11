@@ -41,7 +41,10 @@ std::vector<std::pair<std::string, std::string>> lr_ggufs() {
           // structure: more raise, as his sample prep without fragment labels)
           {"conserving fermi (2 shared passes, hardness)", resource("petlr_tiny_ccfermi.gguf")},
           {"conserving residual (Q_c basis, q0 transfer, 3 unshared softplus passes)",
-           resource("petlr_tiny_ccresidual.gguf")}};
+           resource("petlr_tiny_ccresidual.gguf")},
+          // his QEq (a2658e3 qeq_reference: cg + custom_linear_solve; make_seeded.py tiny_qeq, 2 shared passes):
+          // mlip.cpp's three-stage evaluation (host cg, cotangent cg, second backward)
+          {"qeq (cg + custom_linear_solve, Gaussian charges, 2 shared passes)", resource("petlr_tiny_qeq.gguf")}};
 }
 
 // 24 water molecules in a 9.0 A cube, a fixed jittered lattice (deterministic)
@@ -175,6 +178,46 @@ TEST_CASE("pet_lr_port: iris fermi_level with weights (species_fill): sum_i w_i 
   CHECK_FALSE(fermi_host(g, 2.0 + 1e-3, c, &wg).gapped);
 }
 
+TEST_CASE("pet_lr_port: iris QEq host cg = jax.scipy cg (recurrences, stopping rule, truncation)", "[pet_lr_port]") {
+  using namespace mlipcpp::runtime::iris;
+  // a fixed SPD matrix (diagonally dominant, n = 6) with a Jacobi preconditioner
+  const int n = 6;
+  double A[n][n];
+  for (int i = 0; i < n; i++)
+    for (int j = 0; j < n; j++) A[i][j] = i == j ? 4.0 + i : 1.0 / (1.0 + std::abs(i - j));
+  auto mv = [&](const std::vector<double> &x) {
+    std::vector<double> y(n, 0.0);
+    for (int i = 0; i < n; i++)
+      for (int j = 0; j < n; j++) y[i] += A[i][j] * x[j];
+    return y;
+  };
+  auto jac = [&](const std::vector<double> &r) {
+    std::vector<double> z(n);
+    for (int i = 0; i < n; i++) z[i] = r[i] / A[i][i];
+    return z;
+  };
+  const std::vector<double> b = {1.0, -2.0, 0.5, 3.0, -1.0, 0.25};
+  const CGResult full = cg_host(mv, b, jac, 100, 1e-14);
+  const std::vector<double> Ax = mv(full.x);
+  double err = 0;
+  for (int i = 0; i < n; i++) err = std::max(err, std::fabs(Ax[i] - b[i]));
+  CHECK(err < 1e-12);
+  CHECK(full.iterations <= n + 1); // finite termination (+ roundoff)
+  CHECK(full.final_ratio < 1.0);
+  // truncation: maxiter binds, the iterate is the k-step Krylov one (not converged)
+  const CGResult two = cg_host(mv, b, jac, 2, 1e-14);
+  CHECK(two.iterations == 2);
+  CHECK(two.final_ratio > 1.0);
+  // the relative tolerance stops early (his tol 1e-5): |r| <= 1e-5 |b|
+  const CGResult tol = cg_host(mv, b, jac, 100, 1e-5);
+  CHECK(tol.iterations <= full.iterations);
+  CHECK(tol.final_ratio <= 1.0);
+  // zero right-hand side (a single atom: P b = 0): no iteration, x = 0, no NaN
+  const CGResult zero = cg_host(mv, std::vector<double>(n, 0.0), jac, 20, 1e-5);
+  CHECK(zero.iterations == 0);
+  for (double x : zero.x) CHECK(x == 0.0);
+}
+
 namespace {
 double iris_energy(Predictor &m, const std::vector<float> &x, const std::vector<int32_t> &Z, int Q,
                    const PredictOptions &base) {
@@ -270,6 +313,43 @@ TEST_CASE("pet_lr_port: iris PET-LR on atoms without neighbours keeps the Coulom
     // (FD floor of fp32 energies here ~1e-5 eV/A: the Gaussian-charge model's 1.4e-5 eV/A sits at it)
     iris_check(m, {0, 0, 0, 8.0f, 0.3f, -0.2f}, {11, 17}, 0, 2e-5, gapped ? -1.0 : 5e-6);
   }
+}
+
+TEST_CASE("pet_lr_port: iris QEq three-stage evaluation: both cg solves run; his tol 1e-5 = a converged solve here",
+          "[pet_lr_port]") {
+  // water trimer (9 atoms): with his settings (maxiter 20, tol 1e-5) the cg stops below the tolerance; a converged
+  // solve (tol 1e-7, near the fp32 floor of the operator; tol 0 would iterate on roundoff and diverge) gives the same
+  // energy, charges and forces to fp32
+  // noise, so the FD test above (which differentiates the energy of the solved charges) checks the implicit gradient
+  const std::vector<float> x = {0, 0, 0, 0.96f, 0, 0, -0.24f, 0.93f, 0, 2.8f, 0.3f, 0.2f, 3.3f, 1.1f, 0.3f,
+                                3.2f, -0.4f, 0.7f, 1.2f, 2.6f, -0.3f, 0.5f, 3.2f, -0.5f, 1.9f, 3.1f, 0.2f};
+  const std::vector<int32_t> Z = {8, 1, 1, 8, 1, 1, 8, 1, 1};
+  PredictOptions po;
+  po.compute_forces = true, po.charge = 0, po.spin_multiplicity = 1;
+  ModelOptions his, conv;
+  conv.iris_qeq_maxiter = 100, conv.iris_qeq_tol = 1e-7;
+  Predictor a(resource("petlr_tiny_qeq.gguf"), his), b(resource("petlr_tiny_qeq.gguf"), conv);
+  const auto ra = a.predict(9, x.data(), Z.data(), nullptr, nullptr, po);
+  const auto rb = b.predict(9, x.data(), Z.data(), nullptr, nullptr, po);
+  double fmax = 0, df = 0, dq = 0;
+  for (size_t k = 0; k < ra.forces.size(); k++)
+    fmax = std::max(fmax, double(std::fabs(ra.forces[k]))), df = std::max(df, double(std::fabs(ra.forces[k] - rb.forces[k])));
+  for (size_t i = 0; i < ra.charges.size(); i++) dq = std::max(dq, double(std::fabs(ra.charges[i] - rb.charges[i])));
+  INFO("E " << ra.energy << " vs " << rb.energy << ", max|dF| " << df << " (max|F| " << fmax << "), max|dq| " << dq
+            << ", |P (A q + chi)| " << ra.metallicity);
+  CHECK(std::fabs(ra.energy - rb.energy) < 1e-5 * std::fabs(ra.energy) + 1e-5);
+  CHECK(df < 1e-4 * fmax + 1e-4);
+  CHECK(dq < 1e-5);
+  CHECK(ra.metallicity < 1e-4); // the stationarity residual (his qeq_residual, eV) of the solved charges
+  // truncated (maxiter 2 < the 8 iterations n - 1 needs here): the charges move, and the solve is reported unconverged
+  ModelOptions trunc;
+  trunc.iris_qeq_maxiter = 2;
+  Predictor c(resource("petlr_tiny_qeq.gguf"), trunc);
+  const auto rc = c.predict(9, x.data(), Z.data(), nullptr, nullptr, po);
+  double dqt = 0;
+  for (size_t i = 0; i < ra.charges.size(); i++) dqt = std::max(dqt, double(std::fabs(ra.charges[i] - rc.charges[i])));
+  CHECK(dqt > 1e-3);
+  CHECK(rc.metallicity > 1e-3);
 }
 
 // ---- periodic cells (his jax-pme tiled Ewald at the calculator's frozen parameters; graph_pbc.json) ----

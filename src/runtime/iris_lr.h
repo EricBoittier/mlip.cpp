@@ -92,6 +92,49 @@ inline FermiHost fermi_host(const std::vector<double> &s, double Q, const FermiC
   return h;
 }
 
+/// jax.scipy.sparse.linalg.cg (jax 0.10.2 _cg_solve, x0 = 0) on the host in double, as his QEq
+/// (iris.pet.charges.qeq_reference, a2658e3) calls it: the same recurrences and stopping rule (iterate while
+/// |r|^2 > max(tol^2 |b|^2, atol^2) and k < maxiter; |r|^2 from r itself), with the preconditioner M. `A` and `M`
+/// map a vector to a vector. Transliterated from scripts/pet_lr_port/iris_torch.py jax_cg (= his JAX fp64).
+struct CGResult {
+  std::vector<double> x;
+  int iterations = 0;
+  double final_ratio = 0; // |r|^2 / max(tol^2 |b|^2, atol^2) at the stop (< 1: converged; 0 / 0 -> 0)
+};
+
+template <class ApplyA, class ApplyM>
+inline CGResult cg_host(const ApplyA &A, const std::vector<double> &b, const ApplyM &M, int maxiter, double tol,
+                        double atol = 0.0) {
+  const size_t n = b.size();
+  auto dot = [n](const std::vector<double> &u, const std::vector<double> &v) {
+    double s = 0;
+    for (size_t i = 0; i < n; i++) s += u[i] * v[i];
+    return s;
+  };
+  CGResult res;
+  res.x.assign(n, 0.0);
+  const double atol2 = std::max(tol * tol * dot(b, b), atol * atol);
+  std::vector<double> r = b; // b - A x0, x0 = 0 (A 0 = 0)
+  std::vector<double> z = M(r);
+  std::vector<double> p = z;
+  double gamma = dot(r, z);
+  int k = 0;
+  while (dot(r, r) > atol2 && k < maxiter) {
+    const std::vector<double> Ap = A(p);
+    const double alpha = gamma / dot(p, Ap);
+    for (size_t i = 0; i < n; i++) res.x[i] += alpha * p[i], r[i] -= alpha * Ap[i];
+    z = M(r);
+    const double gamma_new = dot(r, z);
+    const double beta = gamma_new / gamma;
+    for (size_t i = 0; i < n; i++) p[i] = z[i] + beta * p[i];
+    gamma = gamma_new, k++;
+  }
+  res.iterations = k;
+  const double rr = dot(r, r);
+  res.final_ratio = atol2 > 0 ? rr / atol2 : (rr > 0 ? INFINITY : 0.0);
+  return res;
+}
+
 /// His calculator's frozen Ewald parameters (iris.pet.calculator.Calculator._freeze, a2658e3, and jax-pme
 /// batched_mixed to_lr / shrink_2d_cell, 1c26495), per structure as his oracle runs them: for a slab (two periodic
 /// directions) the effective cell with the non-periodic vector shrunk to the slab thickness + margin + 1.5 L_max,

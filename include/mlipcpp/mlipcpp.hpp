@@ -84,6 +84,10 @@ struct ModelOptions {
   /// does. -1 (default): the GGUF's pet.iris.max_neighbors (his to_sample.max_neighbors; absent in GGUFs written
   /// before 2026-11-11: no check); 0: no check (every neighbour kept, the behaviour of non-iris models).
   int iris_max_neighbors = -1;
+  /// iris QEq models only (charge_reference qeq): override the GGUF's cg settings (his maxiter 20, tol 1e-5);
+  /// -1: the GGUF's. A converged solve (tol 0, large maxiter) makes the forces -dE/dx of the energy (FD tests)
+  int iris_qeq_maxiter = -1;
+  double iris_qeq_tol = -1.0;
 };
 
 /**

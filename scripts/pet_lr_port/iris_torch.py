@@ -417,6 +417,9 @@ class IrisLR(_AuxMixin, nn.Module):
             inv_d = 1.0 / (Jd + self_energy)
             M0 = lambda r: project(inv_d * r)
             z_val = jax_cg(A0, b.detach(), M0, self.qeq_maxiter, self.qeq_tol)
+            self._qeq_fwd_iterations = jax_cg.last_iterations
+
+        outer = self
 
         class _Solve(torch.autograd.Function):  # value 0; backward: the cg solve of the cotangent
             @staticmethod
@@ -426,16 +429,45 @@ class IrisLR(_AuxMixin, nn.Module):
             @staticmethod
             def backward(ctx, g):
                 with torch.no_grad():
-                    return jax_cg(A0, g, M0, self.qeq_maxiter, self.qeq_tol)
+                    lam = jax_cg(A0, g, M0, self.qeq_maxiter, self.qeq_tol)
+                    outer._qeq_bwd_iterations = jax_cg.last_iterations
+                    return lam
 
         r = b - project(apply(project(z_val)))
         z = z_val + _Solve.apply(r)
         q = uniform + project(z)
         resid = project(apply(q) + chi).detach()
+        self._qeq_iterations = (self._qeq_fwd_iterations, None)
         return q, resid
 
+    def qeq_traced(self, node, species, total_charge, potentials, z, lam):
+        """The graph form of `qeq` (mlip.cpp's three-stage evaluation): z [n] (the host cg solution, a gradient leaf)
+        and lam [n] (the host cg solution of the cotangent of z, 0 in the first pass) are inputs. Returns (q, the
+        stationarity residual P (A q + chi), lam * r per atom with r = b - P A P z): the loss sum E + sum lam r has
+        the derivative of his custom_linear_solve at fixed (z, lam), and d(sum E)/dz with lam = 0 is the cotangent."""
+        self_energy = EV_A * math.sqrt(2.0 / math.pi) / self.sigma
+        hard = softplus(self.qeq_hardness)[species]
+        chi = self.electronegativity(node)[:, 0]
+        nt = torch.ones_like(chi).sum()  # n as a tensor (a symbolic size would be traced as an op on species)
+        project = lambda x: x - x.sum() / nt
+        apply = lambda x: hard * x + (2.0 * potentials(x) + self_energy * x)
+        uniform = total_charge / nt + torch.zeros_like(chi)
+        b = -project(apply(uniform) + chi)
+        pz = project(z)
+        r = b - project(apply(pz))
+        q = uniform + pz
+        resid = project(apply(q) + chi)
+        return q, resid, lam * r
+
+    def qeq_apply(self, species, potentials, x):
+        """The host cg's operator pieces: (apply(x) = J x + 2 phi(x) + self x, the Jacobi diagonal J + self)."""
+        self_energy = EV_A * math.sqrt(2.0 / math.pi) / self.sigma
+        hard = softplus(self.qeq_hardness)[species]
+        return hard * x + (2.0 * potentials(x) + self_energy * x), hard + self_energy
+
     def forward(self, node, species, positions, neighbor_index, padding_mask, reverse_neighbor_index, edge_vectors,
-                env, total_charge, mu_bisect, gapped, m_round, top, bottom, dipole_origin, ewald=None):
+                env, total_charge, mu_bisect, gapped, m_round, top, bottom, dipole_origin, ewald=None, qeq_z=None,
+                qeq_lambda=None, qeq_apply_x=None):
         """Per-atom LR energy [n] and the charges. Inputs beyond the trunk's: neighbor_index [n, k] (atom index of
         each slot), positions [n, 3], total_charge [1], the host's frozen-score bisection mu_bisect [1] and gapped
         decision (gapped [1] in {0, 1}, m_round [n] rounded occupations, top / bottom [n] indicator weights of the
@@ -481,6 +513,8 @@ class IrisLR(_AuxMixin, nn.Module):
                 phi = phi - 0.5 * EV_A * (er * gather_atoms(qq)).sum(dim=1)
             return phi
 
+        if qeq_apply_x is not None:  # the host cg's operator graph (IrisQEqApplyGraph): no charges, no energy
+            return self.qeq_apply(species, potentials, qeq_apply_x)
         # --- reference ---
         aux = {}
         if self.fermi:
@@ -507,6 +541,11 @@ class IrisLR(_AuxMixin, nn.Module):
             if self.ref == "both":
                 c = self.species_charge[species]
                 q = q + c - c.sum() / torch.ones_like(c).sum()  # / n as a tensor (a symbolic size traced as a species DIV)
+        elif self.ref == "qeq" and qeq_z is not None:  # the graph form (mlip.cpp): z, lam from the host
+            q, resid, adj = self.qeq_traced(node, species, total_charge, potentials, qeq_z, qeq_lambda)
+            aux["qeq_adjoint"] = adj
+            aux["qeq_residual"] = torch.sqrt((resid * resid).sum())
+            aux["residual_atoms"] = resid * resid / torch.clamp(aux["qeq_residual"], min=1e-30)
         elif self.ref == "qeq":
             q, resid = self.qeq(node, species, total_charge, potentials)
             # his qeq_residual [S] = sqrt(sum_i resid_i^2) (eV), as a per-atom column that sums to it
@@ -742,20 +781,28 @@ class IrisPETLRGraph(IrisTrunk):
         self.n_cond = 2 if trunk.conditioning else 0
 
     def forward(self, species, neighbor_species, edge_vectors, *args):
+        return self._forward(species, neighbor_species, edge_vectors, args, None)
+
+    def _forward(self, species, neighbor_species, edge_vectors, args, ew):
         trunk_args = args[:3 + self.n_cond]
+        lr_args = args[3 + self.n_cond:]
         (neighbor_index, positions, total_charge, mu_bisect, gapped, m_round, top, bottom,
-         dipole_origin) = args[3 + self.n_cond:]
+         dipole_origin) = lr_args[:9]
+        # QEq: the host cg's solution z and the cotangent solution lam (QEQ_INPUTS, after dipole_origin)
+        qz, qlam = lr_args[9:11] if self.lr.ref == "qeq" else (None, None)
         e_sr = IrisTrunk.forward(self, species, neighbor_species, edge_vectors, *trunk_args) * self.energy_scale
         node, env = self._aux["node"], self._aux["env"]
         padding_mask, reverse = args[0], args[1]
         e_lr = self.lr(node, species, positions, neighbor_index, padding_mask, reverse, edge_vectors, env,
-                       total_charge, mu_bisect, gapped, m_round, top, bottom, dipole_origin)
+                       total_charge, mu_bisect, gapped, m_round, top, bottom, dipole_origin, ewald=ew, qeq_z=qz,
+                       qeq_lambda=qlam)
         aux = self.lr._aux
         q = aux["charges"]
         zero = torch.zeros_like(q)
         mu = aux.get("fermi_level")
         mu_col = (zero + mu) if mu is not None else zero
-        s_col = aux["scores"] if "scores" in aux else zero
+        # QEq: column 6 is lam_i r_i, the adjoint term mlip.cpp adds to the loss (not an output)
+        s_col = aux["scores"] if "scores" in aux else aux["qeq_adjoint"] if "qeq_adjoint" in aux else zero
         dens = aux["residual_atoms"] if "residual_atoms" in aux else aux["density_atoms"] if "density_atoms" in aux else (
             self.lr.density(s_col - mu) if mu is not None else zero)
         dip = (positions - dipole_origin[None, :]) * q[:, None]
@@ -774,26 +821,7 @@ class IrisPETLRGraphPBC(IrisPETLRGraph):
 
     def forward(self, species, neighbor_species, edge_vectors, *args):
         ew = dict(zip(self.EWALD, args[-len(self.EWALD):]))
-        args = args[:-len(self.EWALD)]
-        trunk_args = args[:3 + self.n_cond]
-        (neighbor_index, positions, total_charge, mu_bisect, gapped, m_round, top, bottom,
-         dipole_origin) = args[3 + self.n_cond:]
-        e_sr = IrisTrunk.forward(self, species, neighbor_species, edge_vectors, *trunk_args) * self.energy_scale
-        node, env = self._aux["node"], self._aux["env"]
-        padding_mask, reverse = args[0], args[1]
-        e_lr = self.lr(node, species, positions, neighbor_index, padding_mask, reverse, edge_vectors, env,
-                       total_charge, mu_bisect, gapped, m_round, top, bottom, dipole_origin, ewald=ew)
-        aux = self.lr._aux
-        q = aux["charges"]
-        zero = torch.zeros_like(q)
-        mu = aux.get("fermi_level")
-        mu_col = (zero + mu) if mu is not None else zero
-        s_col = aux["scores"] if "scores" in aux else zero
-        dens = aux["residual_atoms"] if "residual_atoms" in aux else aux["density_atoms"] if "density_atoms" in aux else (
-            self.lr.density(s_col - mu) if mu is not None else zero)
-        dip = (positions - dipole_origin[None, :]) * q[:, None]
-        return torch.cat([(e_sr + e_lr)[:, None], q[:, None], dip, mu_col[:, None], s_col[:, None], dens[:, None]],
-                         dim=-1)
+        return self._forward(species, neighbor_species, edge_vectors, args[:-len(self.EWALD)], ew)
 
 
 class IrisScoresGraph(IrisTrunk):
@@ -806,7 +834,32 @@ class IrisScoresGraph(IrisTrunk):
 
     def forward(self, species, neighbor_species, edge_vectors, *args):
         IrisTrunk.forward(self, species, neighbor_species, edge_vectors, *args)
+        if self.lr.ref == "qeq":  # QEq: the electronegativity chi [n] (the host cg's right-hand side)
+            return self.lr.electronegativity(self._aux["node"])[:, 0]
         s = self.lr.scores(self._aux["node"], species)
         w = self.lr.weights(species)
         # species_fill: [n, 2] = (s, c) (the host bisection's weights); else s [n]
         return s if w is None else torch.cat([s[:, None], w[:, None]], dim=-1)
+
+
+class IrisQEqApplyGraph(nn.Module):
+    """The operator of the host cg of QEq (mlip.cpp's three-stage evaluation, iris.pet.charges.qeq_reference): no
+    trunk. Inputs species, edge_vectors, padding_mask, reverse_neighbor_index, neighbor_index, positions, qeq_x [n]
+    (+ the EWALD inputs of IrisPETLRGraphPBC when `periodic`); output [n, 2] = (apply(x) = J x + 2 phi(x) + self x,
+    the Jacobi diagonal J + self). The host projects (P x = x - mean x) and runs the cg in double."""
+
+    INPUTS = ("species", "edge_vectors", "padding_mask", "reverse_neighbor_index", "neighbor_index", "positions",
+              "qeq_x")
+
+    def __init__(self, lr, periodic=False):
+        super().__init__()
+        self.lr = lr
+        self.periodic = periodic
+
+    def forward(self, species, edge_vectors, padding_mask, reverse, neighbor_index, positions, x, *ewald):
+        ew = dict(zip(IrisPETLRGraphPBC.EWALD, ewald)) if self.periodic else None
+        env = torch.zeros_like(edge_vectors[..., 0])
+        z1 = torch.zeros_like(x[:1])
+        a, d = self.lr(None, species, positions, neighbor_index, padding_mask, reverse, edge_vectors, env, z1, z1, z1,
+                       x, x, x, torch.zeros_like(positions[0]), ewald=ew, qeq_apply_x=x)
+        return torch.cat([a[:, None], d[:, None]], dim=-1)

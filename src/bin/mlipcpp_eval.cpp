@@ -58,7 +58,8 @@ int main(int argc, char *argv[]) {
     return 1;
   }
   std::optional<int> charge, spin;
-  int repeat = 0, max_nb = -1;
+  int repeat = 0, max_nb = -1, qeq_maxiter = -1;
+  double qeq_tol = -1.0;
   bool freeze = false;
   std::string backend = "cpu";
   for (int i = 4; i + 1 < argc; i++) {
@@ -69,6 +70,8 @@ int main(int argc, char *argv[]) {
     else if (a == "--repeat") repeat = std::stoi(argv[++i]);
     else if (a == "--iris-freeze-ewald") freeze = std::stoi(argv[++i]) != 0;
     else if (a == "--iris-max-neighbors") max_nb = std::stoi(argv[++i]);
+    else if (a == "--iris-qeq-maxiter") qeq_maxiter = std::stoi(argv[++i]); // iris QEq: override his cg settings
+    else if (a == "--iris-qeq-tol") qeq_tol = std::stod(argv[++i]);
     else {
       std::cerr << "unknown option " << a << "\n";
       return 1;
@@ -78,6 +81,7 @@ int main(int argc, char *argv[]) {
     ModelOptions mo;
     mo.backend = parse(backend);
     mo.iris_freeze_ewald = freeze, mo.iris_max_neighbors = max_nb;
+    mo.iris_qeq_maxiter = qeq_maxiter, mo.iris_qeq_tol = qeq_tol;
     Predictor model(argv[1], mo);
     std::ifstream in(argv[2]);
     if (!in) throw std::runtime_error(std::string("cannot read ") + argv[2]);

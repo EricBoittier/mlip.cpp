@@ -29,7 +29,8 @@ import yaml
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
 from petjax_convert import PETJAX_CONVERT, load_petjax_convert  # noqa: E402
-from iris_torch import IrisLR, IrisPETLRGraph, IrisPETLRGraphPBC, IrisScoresGraph, IrisTrunk  # noqa: E402
+from iris_torch import (IrisLR, IrisPETLRGraph, IrisPETLRGraphPBC, IrisQEqApplyGraph, IrisScoresGraph,  # noqa: E402
+                        IrisTrunk)
 
 SUPPORTED = {"d_pet", "d_node", "d_head", "d_feedforward", "num_heads", "num_attention_layers", "num_gnn_layers",
              "cutoff", "cutoff_width", "cutoff_width_adaptive", "adaptive_cutoff_method", "num_neighbors_adaptive",
@@ -168,13 +169,15 @@ def main():
               "charge_index": "i32", "spin_index": "i32", "neighbor_index": "i32"}
     energy_scale = float(np.asarray(sr["energy_scale"]).reshape(()))
     graph_scores = graph_pbc = None
+    graph_qeq = {}  # QEq: the host cg's operator graphs (open / pbc)
     if a.lr:
         if not cfg.get("lr"):
             raise ValueError("--lr: the checkpoint has no LR branch (lr: false)")
         from check_lr64 import load_lr
         lr = IrisLR(cfg).eval()
         load_lr(lr, flat)
-        if lr.fermi:
+        qeq = lr.ref == "qeq"
+        if lr.fermi or qeq:  # QEq: the scores graph returns chi
             sgraph, sweights = export_checked(export_torch_model, IrisScoresGraph(model, lr).eval(), inputs, output_path=None,
                                                   input_names=names, input_dtypes=dtypes, dynamic_shapes=shapes,
                                                   strict=False)
@@ -187,11 +190,16 @@ def main():
         extra = (torch.zeros(n, a.max_neighbors, dtype=torch.long), torch.randn(n, 3, generator=g),
                  torch.zeros(1), torch.zeros(1), torch.zeros(1), torch.zeros(n), torch.zeros(n), torch.zeros(n),
                  torch.zeros(3))
+        trunk_inputs, trunk_shapes = inputs, shapes
         inputs = inputs + extra
         names = names + ["neighbor_index", "positions", "total_charge", "mu_bisect", "gapped", "m_round", "top",
                          "bottom", "dipole_origin"]
         shapes = shapes[:3] + (shapes[3] + (dict(nk), {0: atom}, None, None, None, {0: atom}, {0: atom}, {0: atom},
                                             None),)
+        if qeq:  # the host cg's solution z (a gradient input) and the cotangent solution lam
+            inputs = inputs + (torch.zeros(n), torch.zeros(n))
+            names = names + ["qeq_z", "qeq_lambda"]
+            shapes = shapes[:3] + (shapes[3] + ({0: atom}, {0: atom}),)
         model_export = export
         # the periodic graph (his jax-pme Ewald), same parameters
         kl, K = 13, 17
@@ -207,6 +215,17 @@ def main():
             export_torch_model, export_pbc, inputs + ew_in, output_path=None,
             input_names=names + list(IrisPETLRGraphPBC.EWALD), input_dtypes=pdtypes,
             dynamic_shapes=shapes[:3] + (shapes[3] + ew_shapes,), strict=False)
+        if qeq:  # the operator graphs: no trunk (species, geometry, x)
+            ti, ts = trunk_inputs, trunk_shapes
+            ap_in = (ti[0], ti[2], ti[3], ti[4], extra[0], extra[1], torch.randn(n, generator=g))
+            ap_shapes = (ts[0], ts[2], ts[3][0], ts[3][1], dict(nk), {0: atom}, {0: atom})
+            for key, periodic in (("graph_qeq_apply.json", False), ("graph_qeq_apply_pbc.json", True)):
+                gq, wq = export_checked(
+                    export_torch_model, IrisQEqApplyGraph(lr, periodic).eval(), ap_in + (ew_in if periodic else ()),
+                    output_path=None, input_names=list(IrisQEqApplyGraph.INPUTS) + (
+                        list(IrisPETLRGraphPBC.EWALD) if periodic else []), input_dtypes=pdtypes,
+                    dynamic_shapes=ap_shapes + ((ew_shapes,) if periodic else ()), strict=False)
+                graph_qeq[key] = (gq, wq)
     else:
         model_export = model
     graph, weights = export_checked(
@@ -240,6 +259,14 @@ def main():
             if nd["op"] in ("ADD", "SUB", "MUL", "DIV", "POW", "MATMUL") and \
                     {"input:lr_index", "input:species", "input:neighbor_index"} & set(nd["inputs"]):
                 raise ValueError(f"periodic graph node {nd['id']} {nd['op']} {nd['inputs']}: integer operand")
+    for key, (gq, wq) in graph_qeq.items():  # the operator graphs read the full graph's weights (lr.*)
+        qrefs = {x[7:] for nd in gq.to_dict()["nodes"] for x in nd["inputs"] if x.startswith("weight:")}
+        if qrefs - set(weights):
+            raise ValueError(f"{key} reads weights the full graph does not write: {sorted(qrefs - set(weights))[:5]}")
+        for nd in gq.to_dict()["nodes"]:
+            if nd["op"] in ("ADD", "SUB", "MUL", "DIV", "POW", "MATMUL") and \
+                    {"input:lr_index", "input:species", "input:neighbor_index"} & set(nd["inputs"]):
+                raise ValueError(f"{key} node {nd['id']} {nd['op']} {nd['inputs']}: integer operand")
     if graph_scores is not None:
         sweights = {(k.lower() if k.lower() in weights and k not in weights else k): v for k, v in sweights.items()}
         missing = set(sweights) - set(weights)
@@ -286,6 +313,11 @@ def main():
             w.add_int32("pet.iris_lr.long_range_transfer", 1)
         if graph_scores is not None:
             w.add_string("graph_scores.json", json.dumps(graph_scores.to_dict()))
+        if lr.ref == "qeq":  # his qeq_reference cg settings (maxiter 20, tol 1e-5 relative, atol 0)
+            w.add_int32("pet.iris_lr.qeq_maxiter", int(lr.qeq_maxiter))
+            w.add_float32("pet.iris_lr.qeq_tol", float(lr.qeq_tol))
+            for key, (gq, _) in graph_qeq.items():
+                w.add_string(key, json.dumps(gq.to_dict()))
         if graph_pbc is not None:  # his calculator's Ewald settings (Calculator.from_checkpoint: the sampler's)
             w.add_string("graph_pbc.json", json.dumps(graph_pbc.to_dict()))
             ts = (yaml.safe_load(open(f"{a.ckpt}/config.yaml"))["training_pipeline"]["to_sample"]

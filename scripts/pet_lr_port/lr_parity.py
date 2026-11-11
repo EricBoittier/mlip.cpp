@@ -12,7 +12,7 @@ import json
 
 import numpy as np
 
-KEYS = ("E", "F", "W", "q", "q_rel", "mu", "dipole", "dipole_abs", "metallicity")
+KEYS = ("E", "F", "W", "q", "q_rel", "mu", "dipole", "dipole_abs", "metallicity", "qeq_residual")
 
 
 def per_frame(get, z):
@@ -41,6 +41,8 @@ def per_frame(get, z):
             out["mu"].append(abs(g["mu"] - z["int/fermi_level"][A][0]))
         if "struct/metallicity" in z.files:  # (ref_branch.py refs: metallicity without the Fermi level)
             out["metallicity"].append(abs(g["metallicity"] - z["struct/metallicity"][f]))
+        if "struct/qeq_residual" in z.files:  # QEq: his |P (A q + chi)| (eV); mlip.cpp reports it as `metallicity`
+            out["qeq_residual"].append(abs(g["qeq_residual"] - z["struct/qeq_residual"][f]))
     return {k: np.asarray(v, float) for k, v in out.items() if len(v)}
 
 
@@ -56,7 +58,7 @@ def from_cpp(path, z):
         return dict(E=x["energy"], F=np.asarray(x["forces"]).reshape(-1, 3), q=np.asarray(x.get("charges", [])),
                     W=np.asarray(x["virial"]).reshape(3, 3) if "virial" in x else None,
                     dipole=np.asarray(x.get("dipole", [np.nan] * 3)), mu=x.get("fermi_level", np.nan),
-                    metallicity=x.get("metallicity", np.nan))
+                    metallicity=x.get("metallicity", np.nan), qeq_residual=x.get("metallicity", np.nan))
     return per_frame(get, z)
 
 
@@ -71,6 +73,8 @@ def from_ref(path, z):
             g.update(mu=r["int/fermi_level"][A][0])
         if "struct/metallicity" in r.files:
             g.update(metallicity=r["struct/metallicity"][f])
+        if "struct/qeq_residual" in r.files:
+            g.update(qeq_residual=r["struct/qeq_residual"][f])
         return g
     return per_frame(get, z)
 
@@ -109,9 +113,9 @@ def main():
         print(f"  {'JAX ' + n:22s} " + " ".join(f"{np.nanmax(r[k]):11.2e}" if k in r else f"{'-':>11s}"
                                              for k in KEYS if k in c))
     for k in KEYS:
-        if k not in c:
+        if k not in c or np.all(np.isnan(c[k])):  # (e.g. the dipole on periodic cells: none reported)
             continue
-        his = [np.nanmax(r[k]) for r in runs.values() if k in r]
+        his = [np.nanmax(r[k]) for r in runs.values() if k in r and not np.all(np.isnan(r[k]))]
         if not his:
             continue
         mx = np.nanmax(c[k])

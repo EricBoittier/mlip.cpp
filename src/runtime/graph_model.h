@@ -183,6 +183,12 @@ public:
     double slab_margin = 2.0;
     bool long_range_transfer = false; // his feat/long-range-transfer: refused on a slab (his ToSample raises)
     bool conserving_charges = false;  // his feat/conserving-charges: one component per structure (else raises)
+    // QEq (reference "qeq", his qeq_reference, a2658e3): the host cg's settings and its operator graphs
+    // (graph_qeq_apply{,_pbc}.json: [n, 2] = (J x + 2 phi(x) + self x, J + self)); the scores graph returns chi
+    int qeq_maxiter = 20;
+    double qeq_tol = 1e-5;
+    std::string graph_qeq_open, graph_qeq_pbc;
+    int qeq_loaded = -1; // which operator graph qeq_interp_ holds (0 open, 1 pbc, -1 none)
     std::string graph_open, graph_pbc; // the two GIR graphs (same weights); interp_ holds one at a time
     bool pbc_loaded = false;
     bool freeze_ewald = false;      // his calculator's per-run Ewald parameters (ModelOptions::iris_freeze_ewald)
@@ -202,6 +208,17 @@ public:
   void set_iris_max_neighbors(int m) { iris_max_neighbors_ = m; }
   /// iris PET-LR: freeze the Ewald parameters per run (see ModelOptions::iris_freeze_ewald); resets the frozen set
   void set_iris_freeze_ewald(bool on) { iris_lr_.freeze_ewald = on; iris_lr_.frozen = {}; }
+  /// iris QEq: override the GGUF's cg settings (maxiter < 0 / tol < 0: keep the GGUF's); tests run converged solves
+  void set_iris_qeq_solver(int maxiter, double tol) {
+    if (maxiter >= 0) iris_lr_.qeq_maxiter = maxiter;
+    if (tol >= 0) iris_lr_.qeq_tol = tol;
+  }
+  /// iris QEq: the last call's cg iteration counts (forward, cotangent; -1: not run) and |r|^2 / atol^2 at the stop
+  struct QEqStats {
+    int forward_iterations = -1, cotangent_iterations = -1;
+    double forward_ratio = 0, cotangent_ratio = 0;
+  };
+  const QEqStats &iris_qeq_stats() const { return iris_qeq_stats_; }
   /// the frozen Ewald parameters (iris::EwaldFrozen::to_vec; empty before the first periodic call)
   const std::vector<double> &iris_frozen_ewald() const { return iris_lr_.frozen.params; }
   /// Plato-PET-LR components (GGUF pet.plato_lr.*; enabled false: a plain PET)
@@ -249,7 +266,9 @@ public:
   /// raises his calculator's overflow error when an atom's selected neighbours exceed pet.iris.max_neighbors
   void check_iris_overflow(int max_selected) const;
 private:
-  GraphInterpreter scores_interp_; // iris PET-LR: trunk + score head (fermi / both references)
+  GraphInterpreter scores_interp_; // iris PET-LR: trunk + score head (fermi / both references; QEq: chi)
+  GraphInterpreter qeq_interp_;    // iris QEq: the host cg's operator graph (no trunk)
+  QEqStats iris_qeq_stats_;
   PetPlatoLRSpec plato_lr_;
   std::vector<PetPlatoLRStructure> plato_st_; // the cached path's structure (set before fit_cached_graph)
   float plato_charge_unit_ = 0.0f;             // plato_les_charge_unit (read on first use)

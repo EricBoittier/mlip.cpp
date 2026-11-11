@@ -463,9 +463,11 @@ bool GraphModel::load_from_gguf(const std::string &path) {
     // feat/conserving-charges (a98c2f6), conserving_charges only
     if (iris_lr_.reference != "fermi" && iris_lr_.reference != "species" && iris_lr_.reference != "both" &&
         iris_lr_.reference != "species_weighted" && iris_lr_.reference != "species_fill" &&
-        !(iris_lr_.reference == "residual" && iris_lr_.conserving_charges))
+        iris_lr_.reference != "qeq" && !(iris_lr_.reference == "residual" && iris_lr_.conserving_charges))
       throw std::runtime_error("pet.iris_lr.reference: " + iris_lr_.reference);
     if (iris_lr_.n_out != 8) throw std::runtime_error("pet.iris_lr.n_out != 8");
+    iris_lr_.qeq_maxiter = loader.get_int32("pet.iris_lr.qeq_maxiter", 20);
+    iris_lr_.qeq_tol = loader.get_float32("pet.iris_lr.qeq_tol", 1e-5f);
   }
   param_names_ = json::parse(loader.get_string("train.param_names", "[]"))
                      .get<std::vector<std::string>>();
@@ -560,6 +562,16 @@ bool GraphModel::load_from_gguf(const std::string &path) {
     iris_lr_.graph_open = graph_json;
     iris_lr_.graph_pbc = loader.get_string("graph_pbc.json", "");
     iris_lr_.pbc_loaded = false;
+  }
+  qeq_interp_ = GraphInterpreter();
+  if (iris_lr_.enabled && iris_lr_.reference == "qeq") {
+    iris_lr_.graph_qeq_open = loader.get_string("graph_qeq_apply.json", "");
+    iris_lr_.graph_qeq_pbc = loader.get_string("graph_qeq_apply_pbc.json", "");
+    iris_lr_.qeq_loaded = -1;
+    if (iris_lr_.graph_qeq_open.empty()) {
+      ggml_free(temp_ctx);
+      throw std::runtime_error("pet.iris_lr: the qeq reference needs graph_qeq_apply.json");
+    }
   }
   scores_interp_ = GraphInterpreter();
   if (iris_lr_.enabled && iris_lr_.reference != "species" && iris_lr_.reference != "species_weighted" &&
@@ -672,6 +684,7 @@ bool GraphModel::load_from_gguf(const std::string &path) {
       ggml_backend_tensor_set(weight, temp->data, 0, ggml_nbytes(weight));
       interp_.set_weight(name, weight);
       if (scores_interp_.has_graph()) scores_interp_.set_weight(name, weight);
+      if (iris_lr_.enabled && iris_lr_.reference == "qeq") qeq_interp_.set_weight(name, weight);
     }
   }
 
@@ -681,6 +694,7 @@ bool GraphModel::load_from_gguf(const std::string &path) {
   compute_backend_ = backend_provider_->primary();
   interp_.set_backend(compute_backend_);
   scores_interp_.set_backend(compute_backend_);
+  qeq_interp_.set_backend(compute_backend_);
   if (!compute_backend_) {
     throw std::runtime_error("Failed to get compute backend");
   }
@@ -1306,6 +1320,22 @@ ModelResult GraphModel::predict_single_impl(
   interp_.set_dimension("max_neighbors", max_neighbors);
   interp_.set_dimension("n_edges", n_atoms * max_neighbors);
   interp_.set_dimension("max_neighbors_plus_one", max_neighbors + 1);
+  const bool iris_qeq = iris_lr_.enabled && iris_lr_.reference == "qeq";
+  if (iris_qeq) {
+    const Cell *c = system.cell();
+    const bool pbc = c && (c->periodic[0] || c->periodic[1] || c->periodic[2]);
+    if (pbc && iris_lr_.graph_qeq_pbc.empty())
+      throw std::runtime_error("iris QEq: periodic structure but the GGUF has no graph_qeq_apply_pbc.json");
+    if (iris_lr_.qeq_loaded != int(pbc)) {
+      qeq_interp_.load_graph(pbc ? iris_lr_.graph_qeq_pbc : iris_lr_.graph_qeq_open);
+      iris_lr_.qeq_loaded = int(pbc);
+    }
+    qeq_interp_.set_dimension("n_atoms", n_atoms);
+    qeq_interp_.set_dimension("max_neighbors", max_neighbors);
+    qeq_interp_.set_dimension("n_edges", n_atoms * max_neighbors);
+    qeq_interp_.set_dimension("max_neighbors_plus_one", max_neighbors + 1);
+  }
+  iris_qeq_stats_ = {};
   if (iris_lr_.enabled && scores_interp_.has_graph()) {
     scores_interp_.set_dimension("n_atoms", n_atoms);
     scores_interp_.set_dimension("max_neighbors", max_neighbors);
@@ -1428,6 +1458,9 @@ ModelResult GraphModel::predict_single_impl(
   ggml_tensor *iris_nbr = nullptr, *iris_pos = nullptr, *iris_Q = nullptr, *iris_mu = nullptr,
               *iris_gapped = nullptr, *iris_mround = nullptr, *iris_top = nullptr, *iris_bottom = nullptr,
               *iris_r0 = nullptr;
+  // iris QEq: the host cg's solution z (a gradient input: d(sum E)/dz is the cotangent), the cotangent's solution
+  // lambda (0 in the first pass) and the operator graph's argument x
+  ggml_tensor *qeq_z = nullptr, *qeq_lambda = nullptr, *qeq_x = nullptr;
   // periodic cells: his jax-pme Ewald (graph_pbc.json): the real-space list at rc + skin in [n, n_lr] slots, the
   // halfspace k vectors, the volume; lattice shifts S @ cell, k vectors and volume are gradient inputs (virial)
   ggml_tensor *ew_index = nullptr, *ew_shift = nullptr, *ew_keep = nullptr, *ew_kvec = nullptr, *ew_vol = nullptr,
@@ -1537,6 +1570,10 @@ ModelResult GraphModel::predict_single_impl(
       }
       interp_.set_dimension("n_lr", kl);
       interp_.set_dimension("n_kvec", int64_t(es.k_grid.size()));
+      if (iris_lr_.reference == "qeq") {
+        qeq_interp_.set_dimension("n_lr", kl);
+        qeq_interp_.set_dimension("n_kvec", int64_t(es.k_grid.size()));
+      }
     }
   }
   if (iris_lr_.enabled) {
@@ -1551,6 +1588,12 @@ ModelResult GraphModel::predict_single_impl(
     iris_top = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, n_atoms), "top");
     iris_bottom = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, n_atoms), "bottom");
     iris_r0 = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, 3), "dipole_origin");
+    if (iris_qeq) {
+      qeq_z = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, n_atoms), "qeq_z");
+      qeq_lambda = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, n_atoms), "qeq_lambda");
+      qeq_x = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, n_atoms), "qeq_x");
+      if (compute_forces) ggml_set_param(qeq_z);
+    }
     if (iris_pbc) {
       const int64_t kl = int64_t(ew_keep_d.size()) / n_atoms, K = int64_t(ew_kvec_d.size()) / 3;
       ew_index = mk(ggml_new_tensor_2d(input_ctx, GGML_TYPE_I32, kl, n_atoms), "lr_index");
@@ -1780,6 +1823,17 @@ ModelResult GraphModel::predict_single_impl(
       for (ggml_tensor *t : {ew_index, ew_shift, ew_keep, ew_kvec, ew_vol, ew_smear, ew_cut, ew_slab, ew_normal, ew_basis})
         interp_.set_input(ggml_get_name(t), t);
     }
+    if (iris_qeq) {
+      for (ggml_tensor *t : {qeq_z, qeq_lambda, qeq_x})
+        ggml_backend_tensor_set(t, zeros.data(), 0, zeros.size() * sizeof(float));
+      interp_.set_input("qeq_z", qeq_z);
+      interp_.set_input("qeq_lambda", qeq_lambda);
+      for (const auto &in : qeq_interp_.graph().inputs) { // the operator graph: geometry, species, x (by name)
+        ggml_tensor *t = ggml_get_tensor(input_ctx, in.name.c_str());
+        if (!t) throw std::runtime_error("iris QEq operator graph: no input " + in.name);
+        qeq_interp_.set_input(in.name, t);
+      }
+    }
     // the scores graph reads the trunk's inputs, by name
     if (scores_interp_.has_graph())
       for (const auto &in : scores_interp_.graph().inputs) {
@@ -1835,12 +1889,18 @@ ModelResult GraphModel::predict_single_impl(
   interp_.set_input_gradients(false);
   if (p3m_ && !lr_charges)
     throw std::runtime_error("Missing PET-LR charge application");
-  ggml_tensor *iris_scores = nullptr, *iris_aux = nullptr;
+  ggml_tensor *iris_scores = nullptr, *iris_aux = nullptr, *qeq_apply = nullptr, *qeq_adjoint = nullptr;
   if (iris_lr_.enabled && output) {
     if (scores_interp_.has_graph()) {
       iris_scores = scores_interp_.build(compute_ctx);
       if (!iris_scores) throw std::runtime_error("iris PET-LR: scores graph failed to build");
       ggml_set_output(iris_scores);
+    }
+    if (iris_qeq) {
+      qeq_apply = qeq_interp_.build(compute_ctx);
+      if (!qeq_apply || ggml_nelements(qeq_apply) != 2 * int64_t(n_atoms))
+        throw std::runtime_error("iris QEq: operator graph failed to build");
+      ggml_set_output(qeq_apply);
     }
     // output [n, n_out]: column 0 is the energy (the only column differentiated), the rest is read back
     if (output->ne[0] != iris_lr_.n_out || output->ne[1] != n_atoms)
@@ -1848,6 +1908,9 @@ ModelResult GraphModel::predict_single_impl(
     iris_aux = ggml_cont(compute_ctx, output);
     ggml_set_output(iris_aux);
     output = ggml_cont(compute_ctx, ggml_view_2d(compute_ctx, iris_aux, 1, n_atoms, iris_aux->nb[1], 0));
+    if (iris_qeq) // column 6: lambda_i r_i, r = b - P A P z (the adjoint term of his custom_linear_solve)
+      qeq_adjoint = ggml_cont(compute_ctx, ggml_view_2d(compute_ctx, iris_aux, 1, n_atoms, iris_aux->nb[1],
+                                                        6 * sizeof(float)));
   }
   if (!output) {
     throw std::runtime_error("Failed to build computation graph");
@@ -1874,6 +1937,9 @@ ModelResult GraphModel::predict_single_impl(
                                          : ggml_sum(compute_ctx, output);
     // Seed the backbone with the native solver's charge adjoint in a second
     // backward evaluation. Potentials are independent inputs to the readout.
+    // iris QEq: + sum_i lambda_i r_i (0 with lambda = 0, the first pass); its derivative at fixed (z, lambda) is
+    // the implicit term of his custom_linear_solve (second pass)
+    if (qeq_adjoint) total_energy = ggml_add(compute_ctx, total_energy, ggml_sum(compute_ctx, qeq_adjoint));
     if (lr_charge_adjoint)
       total_energy =
           ggml_add(compute_ctx, total_energy,
@@ -1902,6 +1968,7 @@ ModelResult GraphModel::predict_single_impl(
     ggml_tensor *grad = ggml_graph_get_grad(cgraph, edge_vectors_t);
     ggml_tensor *pos_grad = iris_pos ? ggml_graph_get_grad(cgraph, iris_pos) : nullptr;
     if (pos_grad) ggml_set_output(pos_grad);
+    if (ggml_tensor *g = qeq_z ? ggml_graph_get_grad(cgraph, qeq_z) : nullptr) ggml_set_output(g);
     for (ggml_tensor *t : {ew_shift, ew_kvec, ew_vol, ew_normal, ew_basis})
       if (ggml_tensor *g = t ? ggml_graph_get_grad(cgraph, t) : nullptr) ggml_set_output(g);
     if (grad) {
@@ -1943,6 +2010,7 @@ ModelResult GraphModel::predict_single_impl(
 
   interp_.init_constants();
   if (iris_scores) scores_interp_.init_constants();
+  if (qeq_apply) qeq_interp_.init_constants();
   if (plato && plato->needs_neighbor_index()) {
     std::vector<int32_t> nbr(neighbor_atoms_vec.begin(), neighbor_atoms_vec.end());
     for (auto &j : nbr) j = std::max(j, 0);
@@ -1970,6 +2038,41 @@ ModelResult GraphModel::predict_single_impl(
                                  ggml_nbytes(lr_charge_adjoint));
   }
   profile.mark("p3m_forward");
+  // iris QEq, his qeq_reference (a2658e3) as jax.scipy cg + custom_linear_solve, in three stages: (1) the host cg
+  // (double; the operator J x + 2 phi(x) + self x from the operator graph, projected P x = x - mean x, Jacobi
+  // preconditioner P (x / (J + self))) on b = -P (A Q / n + chi) -> z; (2) the graph with z (a gradient leaf) and
+  // lambda = 0 -> energy, charges and the cotangent zbar = d(sum E)/dz; (3) the same cg on zbar -> lambda (its own
+  // iteration count), then the backward of sum E + sum lambda (b - P A P z) at fixed (z, lambda) -> forces / virial
+  ggml_cgraph *qeq_graph = nullptr;
+  std::vector<double> qeq_diag;
+  auto qeq_project = [](std::vector<double> v) {
+    double m = 0;
+    for (double x : v) m += x;
+    m /= double(std::max<size_t>(v.size(), 1));
+    for (double &x : v) x -= m;
+    return v;
+  };
+  auto qeq_operator = [&](const std::vector<double> &x, std::vector<double> *diag) {
+    std::vector<float> xf(x.begin(), x.end()), o(2 * size_t(n_atoms));
+    ggml_backend_tensor_set(qeq_x, xf.data(), 0, xf.size() * sizeof(float));
+    if (backend_provider_->compute(qeq_graph) != GGML_STATUS_SUCCESS)
+      throw std::runtime_error("iris QEq: operator graph failed");
+    ggml_backend_tensor_get(qeq_apply, o.data(), 0, o.size() * sizeof(float));
+    std::vector<double> a(n_atoms);
+    for (int i = 0; i < n_atoms; i++) a[i] = o[2 * size_t(i)];
+    if (diag) {
+      diag->resize(n_atoms);
+      for (int i = 0; i < n_atoms; i++) (*diag)[i] = o[2 * size_t(i) + 1];
+    }
+    return a;
+  };
+  auto qeq_A = [&](const std::vector<double> &v) { return qeq_project(qeq_operator(qeq_project(v), nullptr)); };
+  auto qeq_M = [&](const std::vector<double> &r) {
+    std::vector<double> v(r.size());
+    for (size_t i = 0; i < r.size(); i++) v[i] = r[i] / qeq_diag[i];
+    return qeq_project(v);
+  };
+  static const bool qeq_log = [] { const char *e = std::getenv("MLIPCPP_QEQ_LOG"); return e && *e == '1'; }();
   if (iris_lr_.enabled) {
     // two-pass mu: the scores graph forward, the bisection on the host (his stop_gradient), then the full graph
     if (iris_scores) {
@@ -1978,28 +2081,45 @@ ModelResult GraphModel::predict_single_impl(
       if (precise_math()) mark_precise_math(sg);
       if (backend_provider_->compute(sg) != GGML_STATUS_SUCCESS)
         throw std::runtime_error("iris PET-LR: scores graph failed");
-      // species_fill: the scores graph returns [n, 2] = (s, c), c the Fermi level's weights
-      const bool weighted = iris_lr_.reference == "species_fill";
-      const int sc = weighted ? 2 : 1;
-      if (ggml_nelements(iris_scores) != int64_t(sc) * n_atoms)
-        throw std::runtime_error("iris PET-LR: scores graph output size");
-      std::vector<float> sf(size_t(sc) * n_atoms);
-      ggml_backend_tensor_get(iris_scores, sf.data(), 0, sf.size() * sizeof(float));
-      std::vector<double> sd(n_atoms), wd(weighted ? n_atoms : 0);
-      for (int i = 0; i < n_atoms; i++) {
-        sd[i] = sf[size_t(i) * sc];
-        if (weighted) wd[i] = sf[size_t(i) * sc + 1];
+      if (iris_qeq) { // stage 1: chi from the scores graph, then the host cg
+        if (ggml_nelements(iris_scores) != n_atoms) throw std::runtime_error("iris QEq: scores graph output size");
+        std::vector<float> chi(n_atoms);
+        ggml_backend_tensor_get(iris_scores, chi.data(), 0, chi.size() * sizeof(float));
+        qeq_graph = ggml_new_graph_custom(compute_ctx, 32768, false);
+        ggml_build_forward_expand(qeq_graph, qeq_apply);
+        if (precise_math()) mark_precise_math(qeq_graph);
+        const std::vector<double> uniform(n_atoms, double(float(system.charge())) / n_atoms);
+        std::vector<double> b = qeq_operator(uniform, &qeq_diag);
+        for (int i = 0; i < n_atoms; i++) b[i] = -(b[i] + chi[i]);
+        b = qeq_project(b);
+        const iris::CGResult z = iris::cg_host(qeq_A, b, qeq_M, iris_lr_.qeq_maxiter, iris_lr_.qeq_tol);
+        iris_qeq_stats_.forward_iterations = z.iterations, iris_qeq_stats_.forward_ratio = z.final_ratio;
+        const std::vector<float> zf(z.x.begin(), z.x.end());
+        ggml_backend_tensor_set(qeq_z, zf.data(), 0, zf.size() * sizeof(float));
+      } else {
+        // species_fill: the scores graph returns [n, 2] = (s, c), c the Fermi level's weights
+        const bool weighted = iris_lr_.reference == "species_fill";
+        const int sc = weighted ? 2 : 1;
+        if (ggml_nelements(iris_scores) != int64_t(sc) * n_atoms)
+          throw std::runtime_error("iris PET-LR: scores graph output size");
+        std::vector<float> sf(size_t(sc) * n_atoms);
+        ggml_backend_tensor_get(iris_scores, sf.data(), 0, sf.size() * sizeof(float));
+        std::vector<double> sd(n_atoms), wd(weighted ? n_atoms : 0);
+        for (int i = 0; i < n_atoms; i++) {
+          sd[i] = sf[size_t(i) * sc];
+          if (weighted) wd[i] = sf[size_t(i) * sc + 1];
+        }
+        iris::FermiConfig fc;
+        fc.m_min = iris_lr_.m_min, fc.m_max = iris_lr_.m_max, fc.temperature = iris_lr_.temperature;
+        fc.iterations = iris_lr_.iterations, fc.eps = iris_lr_.eps;
+        const iris::FermiHost h = iris::fermi_host(sd, double(system.charge()), fc, weighted ? &wd : nullptr);
+        const float mu = float(h.mu), gap = h.gapped ? 1.f : 0.f;
+        ggml_backend_tensor_set(iris_mu, &mu, 0, sizeof(float));
+        ggml_backend_tensor_set(iris_gapped, &gap, 0, sizeof(float));
+        ggml_backend_tensor_set(iris_mround, h.m_round.data(), 0, n_atoms * sizeof(float));
+        ggml_backend_tensor_set(iris_top, h.top.data(), 0, n_atoms * sizeof(float));
+        ggml_backend_tensor_set(iris_bottom, h.bottom.data(), 0, n_atoms * sizeof(float));
       }
-      iris::FermiConfig fc;
-      fc.m_min = iris_lr_.m_min, fc.m_max = iris_lr_.m_max, fc.temperature = iris_lr_.temperature;
-      fc.iterations = iris_lr_.iterations, fc.eps = iris_lr_.eps;
-      const iris::FermiHost h = iris::fermi_host(sd, double(system.charge()), fc, weighted ? &wd : nullptr);
-      const float mu = float(h.mu), gap = h.gapped ? 1.f : 0.f;
-      ggml_backend_tensor_set(iris_mu, &mu, 0, sizeof(float));
-      ggml_backend_tensor_set(iris_gapped, &gap, 0, sizeof(float));
-      ggml_backend_tensor_set(iris_mround, h.m_round.data(), 0, n_atoms * sizeof(float));
-      ggml_backend_tensor_set(iris_top, h.top.data(), 0, n_atoms * sizeof(float));
-      ggml_backend_tensor_set(iris_bottom, h.bottom.data(), 0, n_atoms * sizeof(float));
     }
     profile.mark("iris_scores");
   }
@@ -2013,6 +2133,25 @@ ModelResult GraphModel::predict_single_impl(
   }
 
   profile.mark("forward_backward");
+  if (qeq_graph && backward && compute_forces) { // stage 3: lambda = cg(zbar), then the backward again
+    ggml_tensor *gz = ggml_graph_get_grad(cgraph, qeq_z);
+    if (!gz) throw std::runtime_error("iris QEq: no gradient for z");
+    std::vector<float> zb(n_atoms);
+    ggml_backend_tensor_get(gz, zb.data(), 0, zb.size() * sizeof(float));
+    const iris::CGResult lam = iris::cg_host(qeq_A, std::vector<double>(zb.begin(), zb.end()), qeq_M,
+                                             iris_lr_.qeq_maxiter, iris_lr_.qeq_tol);
+    iris_qeq_stats_.cotangent_iterations = lam.iterations, iris_qeq_stats_.cotangent_ratio = lam.final_ratio;
+    const std::vector<float> lf(lam.x.begin(), lam.x.end());
+    ggml_backend_tensor_set(qeq_lambda, lf.data(), 0, lf.size() * sizeof(float));
+    ggml_graph_reset(cgraph);
+    if (backend_provider_->compute(cgraph) != GGML_STATUS_SUCCESS)
+      throw std::runtime_error("iris QEq: the second backward failed");
+    profile.mark("qeq_backward");
+  }
+  if (qeq_graph && qeq_log)
+    std::fprintf(stderr, "[mlipcpp iris qeq] n %d cg iterations forward %d (|r|^2/atol^2 %.3g) cotangent %d (%.3g)\n",
+                 n_atoms, iris_qeq_stats_.forward_iterations, iris_qeq_stats_.forward_ratio,
+                 iris_qeq_stats_.cotangent_iterations, iris_qeq_stats_.cotangent_ratio);
   if (lr_potentials && compute_forces) {
     std::vector<float> adjoint(charge_values.size());
     ggml_backend_tensor_get(ggml_graph_get_grad(cgraph, lr_potentials),

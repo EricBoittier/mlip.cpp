@@ -374,3 +374,71 @@ TEST_CASE("pet_lr_interp: precise SUM / SUM_ROWS on the GPU backend (flagged ops
   ggml_free(ctx);
   ggml_backend_free(gpu);
 }
+
+TEST_CASE("pet_lr_interp: precise MUL_MAT (double accumulation) on the GPU backend, K = 1036 (flagged ops)",
+          "[pet_lr_port]") {
+  // ggml-cuda-precise-mulmat.patch: an F32 MUL_MAT flagged precise (op_params[last] = 1; graph_model.cpp under
+  // MLIPCPP_PRECISE_MATMUL / MLIPCPP_PRECISE_MATMUL_K, opt-in) sums the K products in double and rounds once. K = 1036
+  // is the transfer MLP's first LINEAR (2 * 512 + 8 + 4 inputs), where the default cuBLAS / mmf GEMM's float
+  // reduction carried the CUDA charge excess. Checked: flagged = the host double sum rounded, on every element, for
+  // a plain product, a broadcast batch (src0 shared across ne2) and a transposed (non-contiguous) src1 view; the
+  // default kernel is recorded, not required
+  ggml_backend_t gpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+  if (!gpu) {
+    SUCCEED("no GPU backend");
+    return;
+  }
+  const int K = 1036, M = 64, N = 40, B = 3;
+  auto val = [](int a, int b, double s) {
+    return float((((a * 7 + b) % 3) - 1) * (1.0 + 1e2 * std::fabs(std::sin(s * a + 0.11 * b))) + 1e-3 * std::cos(a + 2.0 * b));
+  };
+  std::vector<float> w(size_t(K) * M), x(size_t(K) * N * B), xt(size_t(N) * K);
+  for (int m = 0; m < M; m++)
+    for (int k = 0; k < K; k++) w[size_t(m) * K + k] = val(k, m, 0.37);
+  for (int b = 0; b < B; b++)
+    for (int n = 0; n < N; n++)
+      for (int k = 0; k < K; k++) x[(size_t(b) * N + n) * K + k] = val(k + 13 * b, n, 0.71);
+  for (int n = 0; n < N; n++) // xt [K, N] row-major: element (k, n) at k * N + n; viewed transposed as [K, N]
+    for (int k = 0; k < K; k++) xt[size_t(k) * N + n] = x[size_t(n) * K + k];
+  ggml_context *ctx = ggml_init({16 * 1024 * 1024, nullptr, true});
+  ggml_tensor *tw = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, M);
+  ggml_tensor *tx = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, N, B);
+  ggml_tensor *txt = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, N, K);
+  ggml_tensor *txv = ggml_transpose(ctx, txt); // [K, N], nb[0] = N * 4: non-contiguous
+  ggml_tensor *outs[4] = {ggml_mul_mat(ctx, tw, tx), ggml_mul_mat(ctx, tw, txv), ggml_mul_mat(ctx, tw, tx),
+                          ggml_mul_mat(ctx, tw, txv)};
+  constexpr int slot = GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1;
+  outs[0]->op_params[slot] = 1, outs[1]->op_params[slot] = 1; // outs[2, 3]: the default kernels, for the record
+  ggml_cgraph *g = ggml_new_graph(ctx);
+  for (int i = 0; i < 4; i++) ggml_set_output(outs[i]), ggml_build_forward_expand(g, outs[i]);
+  ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, gpu);
+  ggml_backend_tensor_set(tw, w.data(), 0, w.size() * 4);
+  ggml_backend_tensor_set(tx, x.data(), 0, x.size() * 4);
+  ggml_backend_tensor_set(txt, xt.data(), 0, xt.size() * 4);
+  REQUIRE(ggml_backend_graph_compute(gpu, g) == GGML_STATUS_SUCCESS);
+  std::vector<float> o0(size_t(M) * N * B), o1(size_t(M) * N), o2(o0.size()), o3(o1.size());
+  ggml_backend_tensor_get(outs[0], o0.data(), 0, o0.size() * 4);
+  ggml_backend_tensor_get(outs[1], o1.data(), 0, o1.size() * 4);
+  ggml_backend_tensor_get(outs[2], o2.data(), 0, o2.size() * 4);
+  ggml_backend_tensor_get(outs[3], o3.data(), 0, o3.size() * 4);
+  int exact = 0, exact_t = 0, exact_fast = 0, exact_fast_t = 0;
+  double worst_fast = 0;
+  for (int b = 0; b < B; b++)
+    for (int n = 0; n < N; n++)
+      for (int m = 0; m < M; m++) {
+        double s = 0;
+        for (int k = 0; k < K; k++) s += double(w[size_t(m) * K + k]) * double(x[(size_t(b) * N + n) * K + k]);
+        const size_t i = (size_t(b) * N + n) * M + m; // dst [M, N, B]
+        exact += o0[i] == float(s), exact_fast += o2[i] == float(s);
+        worst_fast = std::max(worst_fast, std::fabs(double(o2[i]) - s) / std::max(std::fabs(s), 1e-30));
+        if (b == 0) exact_t += o1[i] == float(s), exact_fast_t += o3[i] == float(s);
+      }
+  INFO("flagged = host double sum rounded: " << exact << "/" << M * N * B << " (batched), " << exact_t << "/" << M * N
+       << " (transposed src1); default kernel " << exact_fast << "/" << M * N * B << ", " << exact_fast_t << "/" << M * N
+       << ", worst relative error " << worst_fast);
+  CHECK(exact == M * N * B);
+  CHECK(exact_t == M * N);
+  ggml_backend_buffer_free(buf);
+  ggml_free(ctx);
+  ggml_backend_free(gpu);
+}
