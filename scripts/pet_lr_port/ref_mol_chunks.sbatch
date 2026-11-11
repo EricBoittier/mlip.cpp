@@ -16,10 +16,14 @@ W=/scratch/boittier/pet_lr_port; cd $W
 PY="/scratch/boittier/ipsum/env/bin/python -I"
 export PYTHONUNBUFFERED=1 JAX_PLATFORMS=cpu
 mkdir -p frames/mol_chunks
+# split the text (ase.io.write rounds positions to 1e-8 A: the 2026-11-11 run's chunks did, so its references belong
+# to frames/set_mol_chunked.extxyz = cat of the chunks, not to set_mol.extxyz)
 $PY -c "
-from ase.io import read, write
-a = read('frames/set_mol.extxyz', ':')
-for i in range(0, len(a), 40): write(f'frames/mol_chunks/c{i // 40}.extxyz', a[i:i + 40])
+lines = open('frames/set_mol.extxyz').read().splitlines(True)
+frames, i = [], 0
+while i < len(lines):
+    n = int(lines[i]); frames.append(''.join(lines[i:i + n + 2])); i += n + 2
+for c in range(0, len(frames), 40): open(f'frames/mol_chunks/c{c // 40}.extxyz', 'w').write(''.join(frames[c:c + 40]))
 "
 for CK in ${CKS:-finetune/readout-pol finetune/control finetune/readout scaling/readout-1m scaling/readout-2m scaling/readout-4m}; do
   C=/work/cosmo/langer/kuma/argos/checkpoints/omol-4m/$CK/RMSE_F
