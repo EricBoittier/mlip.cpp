@@ -35,7 +35,9 @@ namespace {
 /// Precise transcendentals on CUDA (cmake/patches/ggml-cuda-precise-unary.patch): ggml-cuda builds with
 /// -use_fast_math, whose __logf keeps only an absolute accuracy of 2^-21.4 near 1, so log(1 + u) (the log1p of
 /// softplus) loses all relative accuracy at small u, and whose __sinf / __cosf degrade outside [-pi, pi] (the
-/// Ewald structure factors). Flags every LOG / SIN / COS / EXP node of `g` (forward and backward) for the
+/// Ewald structure factors), and whose __expf in SIGMOID loses accuracy with |x| (the Fermi occupations at small T),
+/// with 2-ulp approximate division (DIV: __fdiv_rn when flagged, ggml-cuda-precise-sigmoid-div.patch). Flags every
+/// LOG / SIN / COS / EXP / SIGMOID / DIV node of `g` (forward and backward) for the
 /// double-precision kernels; the CPU backend's kernels are already accurate and ignore the flag. Other models
 /// never call this (their CUDA kernels stay the fast ones, bit for bit). MLIPCPP_PRECISE_MATH=0 turns it off.
 void mark_precise_math(ggml_cgraph *g) {
@@ -44,8 +46,10 @@ void mark_precise_math(ggml_cgraph *g) {
   constexpr int slot = GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1;
   for (int i = 0; i < ggml_graph_n_nodes(g); i++) {
     ggml_tensor *t = ggml_graph_node(g, i);
-    const bool unary_exp = t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == GGML_UNARY_OP_EXP;
-    if (t->op == GGML_OP_LOG || t->op == GGML_OP_SIN || t->op == GGML_OP_COS || unary_exp) t->op_params[slot] = 1;
+    const bool unary = t->op == GGML_OP_UNARY && (ggml_get_unary_op(t) == GGML_UNARY_OP_EXP ||
+                                                  ggml_get_unary_op(t) == GGML_UNARY_OP_SIGMOID);
+    if (t->op == GGML_OP_LOG || t->op == GGML_OP_SIN || t->op == GGML_OP_COS || t->op == GGML_OP_DIV || unary)
+      t->op_params[slot] = 1;
   }
 }
 } // namespace

@@ -277,3 +277,51 @@ TEST_CASE("pet_lr_interp: precise LOG / SIN / COS / EXP on the GPU backend (flag
   ggml_free(ctx);
   ggml_backend_free(gpu);
 }
+
+// ggml-cuda-precise-sigmoid-div.patch: SIGMOID (the Fermi occupations, arguments (s - mu) / T up to ~50 at T = 0.02)
+// in double and DIV as IEEE round-to-nearest (__fdiv_rn) when flagged; the default kernels keep __expf (error growing
+// with |x|) and the 2-ulp approximate division of -use_fast_math. Found by the per-node fp64 oracle
+// (compare_node_grads_iris.py): CUDA's sigmoid of the occupation 4-10x the local error of a correctly rounded fp32 op.
+TEST_CASE("pet_lr_interp: precise SIGMOID / DIV on the GPU backend (flagged ops)", "[pet_lr_port]") {
+  ggml_backend_t gpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+  if (!gpu) {
+    SUCCEED("no GPU backend");
+    return;
+  }
+  const int n = 256;
+  std::vector<float> x(n), y(n);
+  for (int i = 0; i < n; i++) {
+    x[i] = float(-60.0 + 120.0 * i / (n - 1) + 1e-3 * std::sin(7.0 * i)); // sigmoid(x) and x / y
+    y[i] = float(0.0173 + 0.37 * std::fabs(std::cos(3.0 * i)));
+  }
+  ggml_context *ctx = ggml_init({16 * 1024 * 1024, nullptr, true});
+  ggml_tensor *tx = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n), *ty = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+  ggml_tensor *outs[4] = {ggml_sigmoid(ctx, tx), ggml_div(ctx, tx, ty), ggml_sigmoid(ctx, tx), ggml_div(ctx, tx, ty)};
+  constexpr int slot = GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1;
+  for (int k = 0; k < 2; k++) outs[k]->op_params[slot] = 1; // outs[2, 3]: the default (fast) kernels, for the record
+  ggml_cgraph *g = ggml_new_graph(ctx);
+  for (ggml_tensor *o : outs) ggml_set_output(o), ggml_build_forward_expand(g, o);
+  ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, gpu);
+  ggml_backend_tensor_set(tx, x.data(), 0, n * 4);
+  ggml_backend_tensor_set(ty, y.data(), 0, n * 4);
+  REQUIRE(ggml_backend_graph_compute(gpu, g) == GGML_STATUS_SUCCESS);
+  std::vector<float> r[4];
+  for (int k = 0; k < 4; k++) r[k].resize(n), ggml_backend_tensor_get(outs[k], r[k].data(), 0, n * 4);
+  double rs = 0, rs_fast = 0, rd = 0, rd_fast = 0;
+  int div_exact = 0;
+  for (int i = 0; i < n; i++) {
+    const double S = 1.0 / (1.0 + std::exp(-double(x[i])));
+    rs = std::max(rs, std::fabs(r[0][i] - S) / S), rs_fast = std::max(rs_fast, std::fabs(r[2][i] - S) / S);
+    const double D = double(x[i]) / double(y[i]);
+    rd = std::max(rd, std::fabs(r[1][i] - D) / std::fabs(D)), rd_fast = std::max(rd_fast, std::fabs(r[3][i] - D) / std::fabs(D));
+    div_exact += r[1][i] == x[i] / y[i]; // the CPU's (correctly rounded) fp32 division
+  }
+  INFO("sigmoid relative: flagged " << rs << ", default " << rs_fast << "; division relative: flagged " << rd
+                                    << ", default " << rd_fast << "; flagged = CPU fp32 division on " << div_exact << "/" << n);
+  CHECK(rs < 1.2e-7);
+  CHECK(rd < 6.1e-8);
+  CHECK(div_exact == n);
+  ggml_backend_buffer_free(buf);
+  ggml_free(ctx);
+  ggml_backend_free(gpu);
+}

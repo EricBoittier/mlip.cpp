@@ -301,6 +301,8 @@ else()
         # (op_params[last] = 1, set for iris PET-LR graphs: runtime/iris_lr.h mark_precise_math);
         # default: the -use_fast_math kernels, unchanged
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-precise-unary.patch"
+        # and SIGMOID in double / DIV as __fdiv_rn under the same flag (the Fermi occupations of iris PET-LR)
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-precise-sigmoid-div.patch"
     )
     # the source cache is keyed by the ggml tag and the patches' contents:
     # CPM's default key hashes the arguments, i.e. the patch paths, so every
