@@ -53,8 +53,12 @@ PRESETS.update({
     "tiny_trunk": dict(_TINY),
     "tiny_fermi": dict(_TLR, charge_reference="fermi", polarisation_passes=1, readout_charges=True, transfer_passes=1),
     "tiny_cold": dict(_TLR, charge_reference="fermi", charge_temperature=0.02, polarisation_passes=1),
+    # damped (2026-11-11, 4th session): conductance_init -6 and the conductance heads' last layer x 0.2 keep the
+    # charges O(1) (undamped: 3 passes amplified them to ~100 e and max|F| 1e4-1e5 eV/A, which made the FD tolerance
+    # of the C++ test weak) and put softplus in its log1p regime (z ~ -6: the CUDA __logf defect's reproducer)
     "tiny_species": dict(_TLR, charge_reference="species", conductance_form="softplus", polarisation_passes=3,
-                         polarisation_shared=False, hardness=True, readout_charges=True, transfer_passes=2),
+                         polarisation_shared=False, hardness=True, readout_charges=True, transfer_passes=2,
+                         conductance_init=-6.0, _damp={"pol_conductance": 0.2}),
     "tiny_both": dict(_TLR, charge_reference="both", conductance_form="layerscale", polarisation_passes=2,
                       polarisation_shared=True, hardness=False, smearing=1.0, readout_charges=True),
 })
@@ -72,6 +76,7 @@ def main():
 
     from iris.pet.petlr import PETLR
     cfg = {"lr": False, **PRESETS[a.preset]}
+    damp = cfg.pop("_damp", {})  # {path substring: factor} on the last Dense of matching heads, after the randomisation
     lr_on = bool(cfg["lr"])
     model = PETLR(**cfg)
     key = jax.random.PRNGKey(a.seed)
@@ -85,6 +90,24 @@ def main():
             x = 0.1 * jax.random.normal(k1, x.shape, x.dtype)
         out.append(x * (1.0 + a.scale * jax.random.uniform(k2, (), x.dtype, -1.0, 1.0)))
     params = jax.tree.unflatten(tree, out)
+    if damp:
+        from flax.traverse_util import flatten_dict, unflatten_dict
+        flat = flatten_dict(params)
+        last = {}
+        for path in flat:  # the last Dense_k of each matching module
+            name = "/".join(map(str, path))
+            for sub, f in damp.items():
+                if sub in name and any(str(p).startswith("Dense_") for p in path):
+                    mod = path[:[str(p).startswith("Dense_") for p in path].index(True)]
+                    k = max(int(str(p)[6:]) for q in flat for p in q[len(mod):len(mod) + 1]
+                            if q[:len(mod)] == mod and str(p).startswith("Dense_"))
+                    last[mod + (f"Dense_{k}",)] = f
+        for path in list(flat):
+            for mod, f in last.items():
+                if path[:len(mod)] == mod:
+                    flat[path] = flat[path] * f
+        print("damped:", sorted("/".join(map(str, m)) + f" x{f}" for m, f in last.items()))
+        params = unflatten_dict(flat)
     d = Path(a.out) / "model"
     d.mkdir(parents=True, exist_ok=True)
     write_msgpack(d / "model.msgpack", jax.tree.map(lambda v: jnp.asarray(v), params))

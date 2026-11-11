@@ -341,7 +341,7 @@ class IrisLR(_AuxMixin, nn.Module):
         return bound * torch.tanh(self.score(node)[:, 0] / bound)
 
     def forward(self, node, species, positions, neighbor_index, padding_mask, reverse_neighbor_index, edge_vectors,
-                env, total_charge, mu_bisect, gapped, m_round, top, bottom, dipole_origin):
+                env, total_charge, mu_bisect, gapped, m_round, top, bottom, dipole_origin, ewald=None):
         """Per-atom LR energy [n] and the charges. Inputs beyond the trunk's: neighbor_index [n, k] (atom index of
         each slot), positions [n, 3], total_charge [1], the host's frozen-score bisection mu_bisect [1] and gapped
         decision (gapped [1] in {0, 1}, m_round [n] rounded occupations, top / bottom [n] indicator weights of the
@@ -404,17 +404,21 @@ class IrisLR(_AuxMixin, nn.Module):
             q = q + step
             moved = moved + step
         aux["transfers"] = moved
-        # --- open-boundary potentials (jax-pme: prefactor * 1/2 sum_{j != i} q_j / r_ij) ---
-        # one-sided broadcasts only (ggml binary ops repeat the second operand into the first)
-        D = positions[None, :, :].expand(n, n, 3) - positions[:, None, :]
-        D2 = (D * D).sum(dim=-1)
-        R = torch.sqrt(D2 + 1e-15)
-        # the self term out: D2 is exactly 0 on the diagonal only (bitwise the (1 - I) / (R + I) of before, and
-        # traceable: no eye of a dynamic size)
-        K = torch.where(D2 <= 0.0, torch.zeros_like(R), torch.ones_like(R) / R)  # no reciprocal op in the converter
+        if ewald is None:
+            # --- open-boundary potentials (jax-pme: prefactor * 1/2 sum_{j != i} q_j / r_ij) ---
+            # one-sided broadcasts only (ggml binary ops repeat the second operand into the first)
+            D = positions[None, :, :].expand(n, n, 3) - positions[:, None, :]
+            D2 = (D * D).sum(dim=-1)
+            R = torch.sqrt(D2 + 1e-15)
+            # the self term out: D2 is exactly 0 on the diagonal only (bitwise the (1 - I) / (R + I) of before, and
+            # traceable: no eye of a dynamic size)
+            K = torch.where(D2 <= 0.0, torch.zeros_like(R), torch.ones_like(R) / R)  # no reciprocal op in the converter
+            coulomb = lambda qq: 0.5 * EV_A * (K @ qq)
+        else:
+            coulomb = ewald_potentials(positions, ewald)
 
         def potentials(qq):
-            phi = 0.5 * EV_A * (K @ qq)
+            phi = coulomb(qq)
             if self.sigma is not None:
                 # erfc as 1 - erf (ggml has erf only; 1e-16 absolute in fp64, ~6e-8 in fp32 on a term ~1e-6 at 5 A)
                 er = (-torch.erf(r / (math.sqrt(2.0) * self.sigma)) + 1.0) / torch.where(padding_mask, torch.ones_like(r), r) * keep
@@ -459,6 +463,52 @@ class IrisLR(_AuxMixin, nn.Module):
             energy = energy + self.MLP_2(h)[:, 0] * self.lr_scale
         self._aux = aux
         return energy
+
+
+def ewald_potentials(positions, e):
+    """jax-pme batched_tiled `Ewald(prefactor=eV_A).potentials` (1c26495) as iris calls it (`iris.pet.long_range`):
+    half the physical potential of point charges in a 3-D periodic cell or a 2-D slab, at his calculator's frozen
+    parameters. Returns q -> phi [n]. `e` holds (all tensors; the derivative inputs of the virial marked *):
+      lr_index [n, kl] long   atom j of each real-space slot (FULL list at rc + skin: each pair both ways, so
+                              0.5 sum over slots = his half list summed both ways), padded slots any index
+      lr_shift [n, kl, 3] *   the slot's lattice shift S @ cell (A)
+      lr_keep  [n, kl]        1 real slot, 0 padded
+      kvec     [K, 3]   *     k-vectors (halfspace grid n @ 2 pi cell^-T, k = 0 excluded), his `generate_ewald_kvectors`
+      volume   [1]      *     |det cell| (the effective cell for a slab)
+      smearing [1], cutoff [1] (rc; slots at r >= rc are masked, as his `_masked`)
+      slab [1] (1 for a slab), slab_normal [3], slab_basis [1] (|cell[k] . n|, the effective cell's)
+    Real space: sr(r) = 1/r - erf(r / (s sqrt 2)) / r; k space: sum_k W_k Re(exp(-i k r_i) S_k), W = 2 G / V with
+    G = 4 pi exp(-s^2 k^2 / 2) / k^2 (halfspace g = 2; the k = 0 term is 0 for Coulomb); corrections: self
+    -q sqrt(2 / pi) / s, background -2 pi s^2 Q / V, slab (Yeh-Berkowitz) 4 pi (z M - (M2 + Q z^2) / 2 - Q b^2 / 12) / V;
+    (k space + corrections) / 2; everything times the prefactor."""
+    n, kl = e["lr_index"].shape
+    pos_j = positions[e["lr_index"].reshape(n * kl)].reshape(n, kl, 3)
+    D = pos_j - positions[:, None, :] + e["lr_shift"]
+    D2 = (D * D).sum(dim=-1)
+    pad = e["lr_keep"] <= 0.0
+    r = torch.sqrt(torch.where(pad, torch.ones_like(D2), D2))
+    keep = torch.where(r >= e["cutoff"], torch.zeros_like(r), e["lr_keep"])
+    inv_s = 1.0 / (math.sqrt(2.0) * e["smearing"])
+    v_sr = (-torch.erf(r * inv_s) + 1.0) / r * keep  # 1/r - erf/r as (1 - erf) / r (ggml has erf only)
+    kvec, V, s = e["kvec"], e["volume"], e["smearing"]
+    k2 = (kvec * kvec).sum(dim=-1)
+    W = 2.0 * (4.0 * math.pi) * torch.exp(-0.5 * (s * s) * k2) / k2 / V
+    theta = positions @ kvec.T  # [n, K]
+    c, sn = torch.cos(theta), torch.sin(theta)
+    zn = positions @ e["slab_normal"]  # [n]
+
+    def phi(qq):
+        q_j = qq[e["lr_index"].reshape(n * kl)].reshape(n, kl)
+        rs = 0.5 * (v_sr * q_j).sum(dim=1)
+        Sr, Si = qq @ c, qq @ sn  # [K]
+        ks = c @ (W * Sr) + sn @ (W * Si)
+        Q = qq.sum()
+        corr = -qq * (math.sqrt(2.0 / math.pi) / s) - 2.0 * (math.pi * s * s) * Q / V
+        M, M2 = (qq * zn).sum(), (qq * zn * zn).sum()
+        b = e["slab_basis"]
+        slab = 4.0 * math.pi * (zn * M - 0.5 * (M2 + Q * zn * zn) - Q / 12.0 * b * b) / V
+        return EV_A * (rs + 0.5 * (ks + corr + e["slab"] * slab))
+    return phi
 
 
 def bisect_fermi(lr, s, total, iterations=40, eps=1e-6):

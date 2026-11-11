@@ -30,6 +30,26 @@
 
 using json = nlohmann::json;
 
+
+namespace {
+/// Precise transcendentals on CUDA (cmake/patches/ggml-cuda-precise-unary.patch): ggml-cuda builds with
+/// -use_fast_math, whose __logf keeps only an absolute accuracy of 2^-21.4 near 1, so log(1 + u) (the log1p of
+/// softplus) loses all relative accuracy at small u, and whose __sinf / __cosf degrade outside [-pi, pi] (the
+/// Ewald structure factors). Flags every LOG / SIN / COS / EXP node of `g` (forward and backward) for the
+/// double-precision kernels; the CPU backend's kernels are already accurate and ignore the flag. Other models
+/// never call this (their CUDA kernels stay the fast ones, bit for bit). MLIPCPP_PRECISE_MATH=0 turns it off.
+void mark_precise_math(ggml_cgraph *g) {
+  static const bool off = [] { const char *e = std::getenv("MLIPCPP_PRECISE_MATH"); return e && !std::strcmp(e, "0"); }();
+  if (off || !g) return;
+  constexpr int slot = GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1;
+  for (int i = 0; i < ggml_graph_n_nodes(g); i++) {
+    ggml_tensor *t = ggml_graph_node(g, i);
+    const bool unary_exp = t->op == GGML_OP_UNARY && ggml_get_unary_op(t) == GGML_UNARY_OP_EXP;
+    if (t->op == GGML_OP_LOG || t->op == GGML_OP_SIN || t->op == GGML_OP_COS || unary_exp) t->op_params[slot] = 1;
+  }
+}
+} // namespace
+
 namespace mlipcpp::runtime {
 
 namespace {
@@ -1663,6 +1683,8 @@ ModelResult GraphModel::predict_single_impl(
     if (nc_output) ggml_build_forward_expand(cgraph, nc_output);
   }
 
+  if (iris_lr_.enabled) mark_precise_math(cgraph);
+
   ggml_cgraph *charge_graph = nullptr;
   if (lr_charges) {
     charge_graph = ggml_new_graph_custom(compute_ctx, 32768, false);
@@ -1710,6 +1732,7 @@ ModelResult GraphModel::predict_single_impl(
     if (iris_scores) {
       ggml_cgraph *sg = ggml_new_graph_custom(compute_ctx, 32768, false);
       ggml_build_forward_expand(sg, iris_scores);
+      mark_precise_math(sg);
       if (backend_provider_->compute(sg) != GGML_STATUS_SUCCESS)
         throw std::runtime_error("iris PET-LR: scores graph failed");
       std::vector<float> sf(n_atoms);

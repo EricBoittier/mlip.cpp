@@ -297,6 +297,10 @@ else()
         # energy of a half spectrum with its gradient w.r.t. the spectrum and the cell metric
         # (GGML_OP_PLATO_PME / _BACK); CPU + CUDA
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-plato-pme.patch"
+        # CUDA LOG / SIN / COS / EXP in double precision when the op carries the precise flag
+        # (op_params[last] = 1, set for iris PET-LR graphs: runtime/iris_lr.h mark_precise_math);
+        # default: the -use_fast_math kernels, unchanged
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-precise-unary.patch"
     )
     # the source cache is keyed by the ggml tag and the patches' contents:
     # CPM's default key hashes the arguments, i.e. the patch paths, so every

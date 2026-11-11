@@ -1,0 +1,71 @@
+diff --git a/src/ggml-cuda/unary.cu b/src/ggml-cuda/unary.cu
+--- a/src/ggml-cuda/unary.cu	2026-11-11 05:37:14.966901559 +0100
++++ b/src/ggml-cuda/unary.cu	2026-11-11 05:37:14.995901845 +0100
+@@ -81,6 +81,29 @@
+     return logf(x);
+ }
+ 
++// precise variants (mlip.cpp): ggml-cuda builds with -use_fast_math, under which expf / logf / sinf / cosf are the
++// __expf / __logf / __sinf / __cosf intrinsics: __logf keeps only an ABSOLUTE accuracy of 2^-21.4 near 1 (so log(1 + u)
++// for small u loses all relative accuracy), __sinf / __cosf degrade outside [-pi, pi]. A graph that needs the libm
++// accuracy (the CPU backend's) sets op_params[GGML_CUDA_PRECISE_SLOT] = 1 on the op; the double-precision functions
++// are not touched by -use_fast_math. Default (flag 0): the fast kernels, bit for bit as before.
++#define GGML_CUDA_PRECISE_SLOT (GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1)
++
++static __device__ __forceinline__ float op_exp_precise(float x) {
++    return (float) exp((double) x);
++}
++
++static __device__ __forceinline__ float op_sin_precise(float x) {
++    return (float) sin((double) x);
++}
++
++static __device__ __forceinline__ float op_cos_precise(float x) {
++    return (float) cos((double) x);
++}
++
++static __device__ __forceinline__ float op_log_precise(float x) {
++    return (float) log((double) x);
++}
++
+ static __device__ __forceinline__ float op_expm1(float x) {
+     return expm1f(x);
+ }
+@@ -199,6 +222,10 @@
+ }
+ 
+ void ggml_cuda_op_exp(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    if (dst->op_params[GGML_CUDA_PRECISE_SLOT] == 1) {
++        ggml_cuda_op_unary<op_exp_precise>(ctx, dst);
++        return;
++    }
+     ggml_cuda_op_unary<op_exp>(ctx, dst);
+ }
+ 
+@@ -211,14 +238,26 @@
+ }
+ 
+ void ggml_cuda_op_sin(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    if (dst->op_params[GGML_CUDA_PRECISE_SLOT] == 1) {
++        ggml_cuda_op_unary<op_sin_precise>(ctx, dst);
++        return;
++    }
+     ggml_cuda_op_unary<op_sin>(ctx, dst);
+ }
+ 
+ void ggml_cuda_op_cos(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    if (dst->op_params[GGML_CUDA_PRECISE_SLOT] == 1) {
++        ggml_cuda_op_unary<op_cos_precise>(ctx, dst);
++        return;
++    }
+     ggml_cuda_op_unary<op_cos>(ctx, dst);
+ }
+ 
+ void ggml_cuda_op_log(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    if (dst->op_params[GGML_CUDA_PRECISE_SLOT] == 1) {
++        ggml_cuda_op_unary<op_log_precise>(ctx, dst);
++        return;
++    }
+     ggml_cuda_op_unary<op_log>(ctx, dst);
+ }
+ 
