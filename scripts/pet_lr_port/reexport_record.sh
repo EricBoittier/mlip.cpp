@@ -6,6 +6,7 @@
 # layout); `--install` then moves the old ones to gguf/pre_v6/ and installs the new ones.
 # Run from ~/data/plato-lr-scratch/pet_lr_port.  usage: reexport_record.sh [--install]
 set -uo pipefail
+INSTALL=${1:-}  # (captured here: the check loop's `set --` overwrites $1)
 S=$(cd $(dirname $0) && pwd); PY=${PY:-$HOME/miniforge3/envs/b4ff/bin/python}
 E=${E:-$HOME/src/mlip.cpp-petlrport/build-cpu/bin/mlipcpp-eval}; T=$HOME/src/mlip.cpp-petlrport/tests/resources
 O=gguf_v6; mkdir -p $O/pbc $O/tests out/reexport
@@ -54,7 +55,7 @@ for j in "${JOBS[@]}"; do
     fr=frames/set_$f.extxyz; [ -f $fr ] || fr=out/nodegrad/$f.extxyz
     if [ $kind = lr ] && [ $oldpbc = 0 ] && [[ $f == bulk* || $f == slab* ]]; then outs="$outs $f:n/a(old GGUF open-only)"; continue; fi
     a=out/reexport/a.json b=out/reexport/b.json
-    $E $old $fr $a > /dev/null 2>&1; ra=$?; $E $new $fr $b > /dev/null 2>&1; rb=$?
+    rm -f $a $b; $E $old $fr $a > /dev/null 2>&1; ra=$?; $E $new $fr $b > /dev/null 2>&1; rb=$?
     # bit-identical, or identical apart from frames the NEW file raises on (the max_neighbors overflow check)
     same=$($PY -c "
 import json; x = json.load(open('$a'))['frames']; y = json.load(open('$b'))['frames']
@@ -68,8 +69,10 @@ print('DIFFER' if bad or len(x) != len(y) else 'bit-identical' + (f'+{len(ov)}ov
   echo "$old -> $new | gguf: $d | outputs:$outs"
   [[ $d == IDENTICAL* ]] || fail=1
 done
-echo "fail=$fail"
-if [ "${1:-}" = "--install" ] && [ $fail = 0 ]; then
+echo "fail=$fail"  # (1 also when only graph.json changed: see the gguf column)
+# fail stays 1 for the files whose graph.json legitimately changed (direct trunks, open-only LR exports): install when
+# every OUTPUT check passed (bit-identical / overflow raises / n/a), as done on 2026-11-11 from out/reexport_check2.txt
+if [ "$INSTALL" = "--install" ] && ! grep -q "DIFFER" out/reexport_check2.txt 2>/dev/null; then
   mkdir -p gguf/pre_v6/pbc
   for j in "${JOBS[@]}"; do set -- $j; [[ $1 == gguf/* ]] && cp -n $1 gguf/pre_v6/${1#gguf/} && cp $2 $1; [[ $1 == $T/* ]] && cp $2 $1; done
   echo installed
