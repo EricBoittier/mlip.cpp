@@ -16,6 +16,11 @@ S = len(ap) - 1
 e = np.zeros(ap[-1])
 e[ap[:-1]] = np.asarray(r["energy"]).reshape(-1)[:S]
 out = {"atom_ptr": ap, "atom/energy": e, "forces": r["forces"], "struct/dipole": np.full((S, 3), np.nan)}
+if "field_forces" in r.files:  # under a field: his forces = -dE/dr + E . Z0; `forces` here is the conservative part
+    out["forces"] = r["forces"] - r["field_forces"]
+    out["field_forces"] = r["field_forces"]
+if "dipole_flow" in r.files and np.asarray(r["dipole_flow"]).size == 3 * S:  # [S, 3] (older refs: x only)
+    out["struct/dipole_flow"] = np.asarray(r["dipole_flow"]).reshape(S, 3)
 if "charges" in r.files:
     out["atom/charges"] = r["charges"]
 if "metallicity" in r.files:

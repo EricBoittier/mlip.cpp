@@ -66,6 +66,11 @@ def main():
     for f in range(nf):
         if err[f] or frames[f].pbc.any():
             continue
+        if cfg.get("fixed_neighbors") is not None:  # his KnnToSample keeps the nearest fixed_neighbors (mlip.cpp raises)
+            from ase.neighborlist import neighbor_list
+            if np.bincount(neighbor_list("i", frames[f], float(cfg["cutoff"]))).max() > int(cfg["fixed_neighbors"]):
+                print(f"frame {f}: overflows fixed_neighbors {cfg['fixed_neighbors']}, skipped", flush=True)
+                continue
         Z, spin = info[f]
         at = frames[f]
         Q = float(at.info.get("charge", 0))
@@ -97,6 +102,9 @@ def main():
         add("field force E.Z0 max|d| / max|E.Z0|", np.abs(Ff - Fh).max() / np.abs(Fh).max())
         add("share max|E.Z0| / max|F|", np.abs(Fh).max() / np.abs(z["forces"][A]).max())
         lr.frozen = False
+        if rows["forces -dE/dr  max|dF|/max|F|"][-1] > 1e-8:
+            print(f"frame {f} (n {len(Z)}): F {rows['forces -dE/dr  max|dF|/max|F|'][-1]:.2e}, q "
+                  f"{rows['charges max|dq|'][-1]:.2e}", flush=True)
     print(f"torch fp64 vs his JAX fp64 under a field ({a.ref}), {len(next(iter(rows.values())))} open frames: max / median")
     for k, v in rows.items():
         print(f"  {k:40s} {max(v):.3g} / {np.median(v):.3g}")

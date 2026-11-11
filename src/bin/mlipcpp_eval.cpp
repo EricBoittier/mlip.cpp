@@ -6,6 +6,10 @@
  *
  *   mlipcpp-eval MODEL.gguf IN.xyz OUT.json [--backend cpu|cuda|...] [--charge Q] [--spin S] [--repeat N]
  *                [--iris-freeze-ewald 0|1] [--iris-max-neighbors N] [--no-forces]
+ * iris PET-LR on CUDA: the F32 MUL_MATs reducing over K = 1036 (the 512-wide checkpoints' transfer-MLP first LINEAR)
+ * accumulate in double by default; MLIPCPP_PRECISE_MATMUL_K=0 turns that off, =<K> moves it to another K,
+ * MLIPCPP_PRECISE_MATMUL=1 (with _K unset) flags every F32 MUL_MAT; MLIPCPP_PRECISE_SUM / _SIGMOID / _SQRT=1 are
+ * opt-in (see runtime/graph_model.cpp mark_precise_math). CPU results are unaffected by all of these.
  * (iris models: --iris-freeze-ewald 1 freezes the Ewald parameters over the frames of the file as his calculator does
  * over a run; --iris-max-neighbors overrides the GGUF's overflow limit, 0 = no check)
  *

@@ -64,12 +64,14 @@ void mark_precise_math(ggml_cgraph *g) {
     // 2026-11-11): the E verdicts there track the shared fp32 input-rounding bias, not op accuracy. Default: the user's
     // call; MLIPCPP_PRECISE_SQRT=1 turns it on
     static const bool psqrt = [] { const char *e = std::getenv("MLIPCPP_PRECISE_SQRT"); return e && !std::strcmp(e, "1"); }();
-    // MUL_MAT accumulating in double (ggml-cuda-precise-mulmat.patch): a DIAGNOSTIC, off by default: MLIPCPP_PRECISE_MATMUL=1
-    // flags every F32 MUL_MAT, MLIPCPP_PRECISE_MATMUL_K=<K> only those reducing over K (e.g. 1036, the transfer MLP's
-    // first LINEAR of the 512-wide checkpoints: the CUDA charge-error candidate of 2026-11-11)
+    // MUL_MAT accumulating in double (ggml-cuda-precise-mulmat.patch). DEFAULT (user decision 2026-11-11): the F32
+    // MUL_MATs reducing over K = 1036 (the transfer MLP's first LINEAR of the 512-wide PET-LR checkpoints, whose
+    // cuBLAS fp32 GEMM carried the CUDA charge excess: q P 0.58-0.75 -> 0.03-0.17). Overrides:
+    // MLIPCPP_PRECISE_MATMUL_K=<K> flags those reducing over K instead, MLIPCPP_PRECISE_MATMUL_K=0 turns it OFF (the
+    // plain cuBLAS / ggml kernels, as before); MLIPCPP_PRECISE_MATMUL=1 (with _K unset) flags every F32 MUL_MAT
     static const long pmm = [] {
       const char *e = std::getenv("MLIPCPP_PRECISE_MATMUL"), *k = std::getenv("MLIPCPP_PRECISE_MATMUL_K");
-      return k && *k ? std::atol(k) : (e && !std::strcmp(e, "1") ? -1L : 0L);
+      return k && *k ? std::atol(k) : (e && !std::strcmp(e, "1") ? -1L : 1036L);
     }();
     if (t->op == GGML_OP_MUL_MAT && pmm != 0 && (pmm < 0 || t->src[0]->ne[0] == pmm)) t->op_params[slot] = 1;
     auto on = [](const char *k) {
@@ -490,7 +492,8 @@ bool GraphModel::load_from_gguf(const std::string &path) {
         if (c == std::string::npos) throw std::runtime_error("pet.iris_lr.columns: " + item);
         const std::string name = item.substr(0, c);
         const int width = std::stoi(item.substr(c + 1));
-        if ((name != "charge_residual" || width != 1) && (name != "dipole_flow" || width != 3))
+        if ((name != "charge_residual" || width != 1) && (name != "dipole_flow" || width != 3) &&
+            (name != "zf_q0" || width != 1) && (name != "zf_x" || width != 1))
           throw std::runtime_error("pet.iris_lr.columns: unknown column " + item);
         iris_lr_.columns.emplace_back(name, width);
         width_sum += width;
@@ -1488,10 +1491,12 @@ ModelResult GraphModel::predict_single_impl(
   // iris PET-LR (pet.iris_lr): the LR branch's own inputs; positions are a gradient input
   ggml_tensor *iris_nbr = nullptr, *iris_pos = nullptr, *iris_Q = nullptr, *iris_mu = nullptr,
               *iris_gapped = nullptr, *iris_mround = nullptr, *iris_top = nullptr, *iris_bottom = nullptr,
-              *iris_r0 = nullptr, *iris_field = nullptr;
+              *iris_r0 = nullptr, *iris_field = nullptr, *zf_w = nullptr, *zf_a = nullptr;
   // iris QEq: the host cg's solution z (a gradient input: d(sum E)/dz is the cotangent), the cotangent's solution
   // lambda (0 in the first pass) and the operator graph's argument x
   ggml_tensor *qeq_z = nullptr, *qeq_lambda = nullptr, *qeq_x = nullptr;
+  bool field_on = false;                   // a nonzero field on a field model (his E . Z0 in the forces)
+  std::array<double, 3> field_E{0, 0, 0};
   // periodic cells: his jax-pme Ewald (graph_pbc.json): the real-space list at rc + skin in [n, n_lr] slots, the
   // halfspace k vectors, the volume; lattice shifts S @ cell, k vectors and volume are gradient inputs (virial)
   ggml_tensor *ew_index = nullptr, *ew_shift = nullptr, *ew_keep = nullptr, *ew_kvec = nullptr, *ew_vol = nullptr,
@@ -1620,6 +1625,14 @@ ModelResult GraphModel::predict_single_impl(
     iris_bottom = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, n_atoms), "bottom");
     iris_r0 = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, 3), "dipole_origin");
     if (iris_lr_.field) iris_field = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, 3), "field");
+    // the field force E . Z0 (open structures): the loss is zf_w sum E + sum_i zf_a_i X_i (X the zf_x column);
+    // (1, 0) is the energy, (0, a) the gradients of the frozen pass-1 charges the force needs
+    const bool has_zf = std::any_of(iris_lr_.columns.begin(), iris_lr_.columns.end(),
+                                    [](const auto &c) { return c.first == "zf_x"; });
+    if (iris_lr_.field && compute_forces && has_zf) {
+      zf_w = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, 1), "zf_w");
+      zf_a = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, n_atoms), "zf_a");
+    }
     if (iris_qeq) {
       qeq_z = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, n_atoms), "qeq_z");
       qeq_lambda = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, n_atoms), "qeq_lambda");
@@ -1849,9 +1862,28 @@ ModelResult GraphModel::predict_single_impl(
       // his forces under a field are -dE/dr PLUS E . Z0 (the exact Born charges of the pass-1 charges at a frozen
       // Fermi level, iris.pet.predict._field_forces), which is not the gradient of anything this graph outputs: not
       // ported (it needs two more backward passes of the pass-1 charges), so forces under a nonzero field raise
-      if (compute_forces && (E[0] != 0 || E[1] != 0 || E[2] != 0))
-        throw std::runtime_error("iris PET-LR: forces under a nonzero field need the field force E . Z0 (not ported); "
-                                 "energies, charges and dipoles only (mlipcpp-eval --no-forces)");
+      // MLIPCPP_FIELD_CONSERVATIVE_ONLY=1 (a diagnostic): return -dE/dr alone, NOT his forces (parity of the field
+      // energy's gradient against his forces minus his field_forces)
+      static const bool cons_only = [] {
+        const char *e = std::getenv("MLIPCPP_FIELD_CONSERVATIVE_ONLY");
+        return e && !std::strcmp(e, "1");
+      }();
+      field_on = E[0] != 0 || E[1] != 0 || E[2] != 0;
+      field_E = E;
+      // his E . Z0 by two extra backward passes is exact on OPEN structures with a hard cutoff (his conserving
+      // models: fixed neighbour lists); periodic cells need his unfolded per-gather levers (iris.pet.bec): refused
+      if (compute_forces && !cons_only && field_on && (iris_pbc || have_adaptive))
+        throw std::runtime_error("iris PET-LR: the field force E . Z0 is ported for open structures (hard cutoff) "
+                                 "only; periodic cells: energies, charges and dipoles only (mlipcpp-eval --no-forces)");
+      if (compute_forces && !cons_only && field_on && !zf_w)
+        throw std::runtime_error("iris PET-LR: this GGUF has no zf_q0 / zf_x columns for the field force; re-export it");
+      if (cons_only) field_on = false;
+      if (zf_w) {
+        const float one = 1.f;
+        std::vector<float> zeros_a(n_atoms, 0.f);
+        ggml_backend_tensor_set(zf_w, &one, 0, sizeof(float));
+        ggml_backend_tensor_set(zf_a, zeros_a.data(), 0, zeros_a.size() * sizeof(float));
+      }
       const float Ef[3] = {float(E[0]), float(E[1]), float(E[2])};
       ggml_backend_tensor_set(iris_field, Ef, 0, sizeof(Ef));
       interp_.set_input("field", iris_field);
@@ -1984,6 +2016,17 @@ ModelResult GraphModel::predict_single_impl(
     // iris QEq: + sum_i lambda_i r_i (0 with lambda = 0, the first pass); its derivative at fixed (z, lambda) is
     // the implicit term of his custom_linear_solve (second pass)
     if (qeq_adjoint) total_energy = ggml_add(compute_ctx, total_energy, ggml_sum(compute_ctx, qeq_adjoint));
+    if (zf_w) { // the field force's passes (zf_w, zf_a set per pass; (1, 0) = the energy alone)
+      int cx = 8;
+      for (const auto &[name, width] : iris_lr_.columns) {
+        if (name == "zf_x") break;
+        cx += width;
+      }
+      ggml_tensor *X = ggml_cont(compute_ctx, ggml_view_2d(compute_ctx, iris_aux, 1, n_atoms, iris_aux->nb[1],
+                                                          size_t(cx) * sizeof(float)));
+      total_energy = ggml_add(compute_ctx, ggml_mul(compute_ctx, total_energy, zf_w),
+                              ggml_sum(compute_ctx, ggml_mul(compute_ctx, X, ggml_reshape_2d(compute_ctx, zf_a, 1, n_atoms))));
+    }
     if (lr_charge_adjoint)
       total_energy =
           ggml_add(compute_ctx, total_energy,
@@ -2177,6 +2220,74 @@ ModelResult GraphModel::predict_single_impl(
   }
 
   profile.mark("forward_backward");
+  // his field force E . Z0 = E q0_i + d_i G - c_i d_i Q0 (c_j = E . r_j fixed, G = sum c_j q0_j, Q0 = sum q0_j, q0 the
+  // pass-1 charges at a frozen Fermi level; scripts/pet_lr_port/check_field64.py = his iris.pet.predict._field_forces
+  // to 1e-13): two more backward passes of sum_j a_j X_j (fermi: X = s, a = c f' or f'; residual: X = p, a = c or 1),
+  // then the energy pass again for the forces below
+  std::vector<double> field_force;
+  if (field_on && zf_w && compute_forces) {
+    const int C = iris_lr_.n_out;
+    std::vector<float> aux(size_t(n_atoms) * C);
+    ggml_backend_tensor_get(iris_aux, aux.data(), 0, aux.size() * sizeof(float));
+    int cq = 8, cx = 8;
+    for (int k = 0, col = 8; k < int(iris_lr_.columns.size()); col += iris_lr_.columns[k].second, k++) {
+      if (iris_lr_.columns[k].first == "zf_q0") cq = col;
+      if (iris_lr_.columns[k].first == "zf_x") cx = col;
+    }
+    const bool fermi = iris_lr_.reference == "fermi";
+    std::vector<double> c(n_atoms), w(n_atoms);
+    const float *x = system.positions();
+    for (int i = 0; i < n_atoms; i++) {
+      c[i] = field_E[0] * x[3 * i] + field_E[1] * x[3 * i + 1] + field_E[2] * x[3 * i + 2];
+      w[i] = fermi ? double(aux[size_t(i) * C + 7]) : 1.0; // f'(s - mu) (column 7) or 1
+    }
+    // -d(loss)/dr of the current pass: the edge-vector scatter plus the explicit positions term
+    auto pass_forces = [&](const std::vector<float> &a) {
+      const float zero = 0.f;
+      ggml_backend_tensor_set(zf_w, &zero, 0, sizeof(float));
+      ggml_backend_tensor_set(zf_a, a.data(), 0, a.size() * sizeof(float));
+      ggml_graph_reset(cgraph);
+      if (backend_provider_->compute(cgraph) != GGML_STATUS_SUCCESS)
+        throw std::runtime_error("iris PET-LR: the field-force pass failed");
+      std::vector<double> F(3 * size_t(n_atoms), 0.0);
+      if (ggml_tensor *g = ggml_graph_get_grad(cgraph, edge_vectors_t)) {
+        std::vector<float> gd(ggml_nelements(g));
+        ggml_backend_tensor_get(g, gd.data(), 0, ggml_nbytes(g));
+        for (int ca = 0; ca < n_atoms; ca++)
+          for (int slot = 0; slot < max_neighbors; slot++) {
+            const int flat = ca * max_neighbors + slot, na = neighbor_atoms_vec[flat];
+            if (pm_data[flat] > 0.5f || na < 0) continue;
+            for (int k = 0; k < 3; k++) {
+              F[3 * ca + k] += gd[3 * slot + 3 * max_neighbors * ca + k];
+              F[3 * na + k] -= gd[3 * slot + 3 * max_neighbors * ca + k];
+            }
+          }
+      }
+      if (ggml_tensor *g = ggml_graph_get_grad(cgraph, iris_pos)) {
+        std::vector<float> gp(3 * size_t(n_atoms));
+        ggml_backend_tensor_get(g, gp.data(), 0, gp.size() * sizeof(float));
+        for (int i = 0; i < 3 * n_atoms; i++) F[i] -= gp[i];
+      }
+      return F;
+    };
+    std::vector<float> a(n_atoms);
+    for (int i = 0; i < n_atoms; i++) a[i] = float(c[i] * w[i]);
+    const std::vector<double> FG = pass_forces(a); // -dG/dr
+    for (int i = 0; i < n_atoms; i++) a[i] = float(w[i]);
+    const std::vector<double> FQ = pass_forces(a); // -dQ0/dr
+    field_force.assign(3 * size_t(n_atoms), 0.0);
+    for (int i = 0; i < n_atoms; i++)
+      for (int k = 0; k < 3; k++)
+        field_force[3 * i + k] = field_E[k] * aux[size_t(i) * C + cq] - FG[3 * i + k] + c[i] * FQ[3 * i + k];
+    const float one = 1.f;
+    std::vector<float> zeros_a(n_atoms, 0.f);
+    ggml_backend_tensor_set(zf_w, &one, 0, sizeof(float));
+    ggml_backend_tensor_set(zf_a, zeros_a.data(), 0, zeros_a.size() * sizeof(float));
+    ggml_graph_reset(cgraph);
+    if (backend_provider_->compute(cgraph) != GGML_STATUS_SUCCESS)
+      throw std::runtime_error("iris PET-LR: the energy pass after the field force failed");
+    profile.mark("field_force");
+  }
   if (qeq_graph && backward && compute_forces) { // stage 3: lambda = cg(zbar), then the backward again
     ggml_tensor *gz = ggml_graph_get_grad(cgraph, qeq_z);
     if (!gz) throw std::runtime_error("iris QEq: no gradient for z");
@@ -2499,6 +2610,8 @@ ModelResult GraphModel::predict_single_impl(
       for (int i = 0; i < n_atoms * 3; i++) {
         result.forces[i] *= energy_scale_;
       }
+      // his field force E . Z0 (not part of the energy; iris graphs have energy_scale_ 1)
+      for (size_t i = 0; i < field_force.size(); i++) result.forces[i] += float(field_force[i]);
 
       result.has_forces = true;
 
@@ -2610,6 +2723,10 @@ ModelResult GraphModel::predict_single_impl(
     // extra columns: structure sums (in double) of per-atom terms
     int col = 8;
     for (const auto &[name, width] : iris_lr_.columns) {
+      if (name.rfind("zf_", 0) == 0) { // per-atom inputs of the field force, not outputs
+        col += width;
+        continue;
+      }
       std::vector<double> sum(width, 0.0);
       for (int i = 0; i < n_atoms; i++)
         for (int a = 0; a < width; a++) sum[a] += aux[size_t(i) * C + col + a];

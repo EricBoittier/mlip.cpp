@@ -12,7 +12,8 @@ import json
 
 import numpy as np
 
-KEYS = ("E", "F", "W", "q", "q_rel", "mu", "dipole", "dipole_abs", "metallicity", "qeq_residual", "charge_residual")
+KEYS = ("E", "F", "W", "q", "q_rel", "mu", "dipole", "dipole_abs", "metallicity", "qeq_residual", "charge_residual",
+        "dipole_flow")
 
 
 def per_frame(get, z):
@@ -27,7 +28,7 @@ def per_frame(get, z):
             continue
         e = z["atom/energy"][A]
         out["E"].append(abs(g["E"] - e.sum()) / np.abs(e).sum())
-        out["F"].append(np.abs(g["F"] - z["forces"][A]).max() / np.abs(z["forces"][A]).max())
+        out["F"].append(np.abs(g["F"] - z["forces"][A]).max() / np.abs(z["forces"][A]).max() if g["F"].size else np.nan)
         if "virial" in z.files and np.all(np.isfinite(z["virial"][f])) and g.get("W") is not None:
             out["W"].append(np.abs(g["W"] - z["virial"][f]).max() / np.abs(z["virial"][f]).max())
         periodic = "virial" in z.files and np.all(np.isfinite(z["virial"][f]))
@@ -43,6 +44,9 @@ def per_frame(get, z):
             out["metallicity"].append(abs(g["metallicity"] - z["struct/metallicity"][f]))
         if "struct/qeq_residual" in z.files:  # QEq: his |P (A q + chi)| (eV); mlip.cpp reports it as `metallicity`
             out["qeq_residual"].append(abs(g["qeq_residual"] - z["struct/qeq_residual"][f]))
+        if "struct/dipole_flow" in z.files:  # conserving charges: the flow dipole [S, 3] (e A), max|d| / max|D|
+            D = z["struct/dipole_flow"][f]
+            out["dipole_flow"].append(np.abs(np.asarray(g["dipole_flow"]) - D).max() / max(np.abs(D).max(), 1e-12))
         if "struct/charge_residual" in z.files:  # threshold reference: his charge_residual [S] (signed, e)
             out["charge_residual"].append(abs(g["charge_residual"] - z["struct/charge_residual"][f]))
     return {k: np.asarray(v, float) for k, v in out.items() if len(v)}
@@ -61,7 +65,7 @@ def from_cpp(path, z):
                     W=np.asarray(x["virial"]).reshape(3, 3) if "virial" in x else None,
                     dipole=np.asarray(x.get("dipole", [np.nan] * 3)), mu=x.get("fermi_level", np.nan),
                     metallicity=x.get("metallicity", np.nan), qeq_residual=x.get("metallicity", np.nan),
-                    charge_residual=x.get("charge_residual", np.nan))
+                    charge_residual=x.get("charge_residual", np.nan), dipole_flow=x.get("dipole_flow", [np.nan] * 3))
     return per_frame(get, z)
 
 
@@ -80,6 +84,8 @@ def from_ref(path, z):
             g.update(qeq_residual=r["struct/qeq_residual"][f])
         if "struct/charge_residual" in r.files:
             g.update(charge_residual=r["struct/charge_residual"][f])
+        if "struct/dipole_flow" in r.files:
+            g.update(dipole_flow=r["struct/dipole_flow"][f])
         return g
     return per_frame(get, z)
 

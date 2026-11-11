@@ -460,6 +460,11 @@ class IrisLR(_AuxMixin, nn.Module):
             out.append(("charge_residual", 1))
         if self.conserving:
             out.append(("dipole_flow", 3))
+        if self.field:
+            # his field force E . Z0 (mlip.cpp, open structures): the pass-1 charges q0 and X, the quantity whose
+            # gradient times a host weight is that of q0 at a frozen Fermi level (fermi: the scores s, weight f'(s - mu)
+            # from column 7; residual: the free charges p, weight 1). Per atom, NOT summed by the host
+            out += [("zf_q0", 1), ("zf_x", 1)]
         return out
 
     # -- charge states (iris.pet.charges) --
@@ -645,6 +650,7 @@ class IrisLR(_AuxMixin, nn.Module):
             aux["residual_atoms"] = resid * resid / torch.clamp(aux["qeq_residual"], min=1e-30)
         elif self.ref == "residual":  # q0 = p + w (Q - sum p) / max(sum w, 1e-6); residual |Q - sum p|
             p_free = self.free_charge(node)[:, 0]
+            aux["free_atoms"] = p_free
             if self.see_charge:
                 basis = torch.cat([torch.exp(-2.0 * (total_charge.reshape(1) - float(m)) ** 2)
                                    for m in range(self.m_min, self.m_max + 1)])  # [n_states], one structure
@@ -685,6 +691,8 @@ class IrisLR(_AuxMixin, nn.Module):
         aux["charges_base"] = q
         if self.conserving:  # the one transfer of iris.pet.charges.transfers (conserving-charges branch)
             aux["charges_pass1"] = q
+            aux["zf_q0_atoms"] = q
+            aux["zf_x_atoms"] = aux["scores"] if self.ref == "fermi" else aux["free_atoms"]
             a = self.transfer_embed(node)
             parts = [a[:, None, :].expand(n, k, a.shape[1]), gather_atoms(a), rbf]
             if self.see_q0:
