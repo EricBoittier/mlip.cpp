@@ -55,12 +55,26 @@ PRESETS.update({
     "tiny_cold": dict(_TLR, charge_reference="fermi", charge_temperature=0.02, polarisation_passes=1),
     # damped (2026-11-11, 4th session): conductance_init -6 and the conductance heads' last layer x 0.2 keep the
     # charges O(1) (undamped: 3 passes amplified them to ~100 e and max|F| 1e4-1e5 eV/A, which made the FD tolerance
-    # of the C++ test weak) and put softplus in its log1p regime (z ~ -6: the CUDA __logf defect's reproducer)
+    # of the C++ test weak) and put softplus in its log1p regime (z ~ -6). NOT a reproducer of the CUDA __logf defect
+    # (fast-math tiny_species is inside his floor too, E 0.30x): the seeded lr_species preset is (5.1x), and
+    # test_pet_lr_interp checks the flagged log op on the GPU directly
     "tiny_species": dict(_TLR, charge_reference="species", conductance_form="softplus", polarisation_passes=3,
                          polarisation_shared=False, hardness=True, readout_charges=True, transfer_passes=2,
                          conductance_init=-6.0, _damp={"pol_conductance": 0.2}),
     "tiny_both": dict(_TLR, charge_reference="both", conductance_form="layerscale", polarisation_passes=2,
                       polarisation_shared=True, hardness=False, smearing=1.0, readout_charges=True),
+})
+
+# his branch feat/long-range-transfer (3ed96b0; env kuma /scratch/boittier/ipsum/envs/iris-long-range-transfer): no
+# readout_charges there; species_fill / species_weighted references and the long-range transfer passes (Gaussian
+# Coulomb kernel of width `smearing`)
+_LRT = {k: v for k, v in _TLR.items()}
+PRESETS.update({
+    "lrt_species_fill": dict(_LRT, charge_reference="species_fill", long_range_transfer=True, smearing=1.0,
+                             transfer_passes=1, polarisation_passes=1),
+    "lrt_species_weighted": dict(_LRT, charge_reference="species_weighted", long_range_transfer=True, smearing=1.0,
+                                 transfer_passes=2, polarisation_passes=2, polarisation_shared=False,
+                                 conductance_form="softplus", hardness=True),
 })
 
 

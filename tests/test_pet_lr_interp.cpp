@@ -223,3 +223,57 @@ TEST_CASE("pet_lr_interp: GIR numbers with an explicit exponent sign (1e+30, 2.5
   REQUIRE(std::abs(r.out[0] - 1.0) < 1e-5);
   REQUIRE(std::abs(r.out[1] + 250.0) < 1e-3);
 }
+
+// ggml-cuda-precise-unary.patch: LOG / SIN / COS / EXP flagged precise (op_params[last] = 1, set for iris PET-LR
+// graphs by graph_model.cpp) run in double precision on CUDA; the default fast-math kernels keep __logf, whose error
+// is ABSOLUTE (2^-21.4) near 1: log(1 + u) at small u (the log1p of softplus) had relative errors up to ~1 and made
+// the seeded species preset 5x his floor on CUDA. On the GPU backend (skipped without one): flagged log(1 + u),
+// sin / cos at |x| ~ 100 and exp agree with libm in double to fp32 rounding.
+#include <ggml.h>
+TEST_CASE("pet_lr_interp: precise LOG / SIN / COS / EXP on the GPU backend (flagged ops)", "[pet_lr_port]") {
+  ggml_backend_t gpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+  if (!gpu) {
+    SUCCEED("no GPU backend");
+    return;
+  }
+  const int n = 64;
+  std::vector<float> w(n), a(n), e(n);
+  for (int i = 0; i < n; i++) {
+    w[i] = float(1.0 + std::pow(10.0, -7.0 + 6.0 * i / (n - 1))); // 1 + u, u in [1e-7, 1e-1]
+    a[i] = float(-120.0 + 240.0 * i / (n - 1));
+    e[i] = float(-30.0 + 40.0 * i / (n - 1));
+  }
+  ggml_context *ctx = ggml_init({16 * 1024 * 1024, nullptr, true});
+  ggml_tensor *tw = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n), *ta = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n),
+              *te = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+  ggml_tensor *outs[5] = {ggml_log(ctx, tw), ggml_sin(ctx, ta), ggml_cos(ctx, ta), ggml_exp(ctx, te), ggml_log(ctx, tw)};
+  constexpr int slot = GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1;
+  for (int k = 0; k < 4; k++) outs[k]->op_params[slot] = 1; // outs[4]: the default (fast) log, for the record
+  ggml_cgraph *g = ggml_new_graph(ctx);
+  for (ggml_tensor *o : outs) ggml_set_output(o), ggml_build_forward_expand(g, o);
+  ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, gpu);
+  ggml_backend_tensor_set(tw, w.data(), 0, n * 4);
+  ggml_backend_tensor_set(ta, a.data(), 0, n * 4);
+  ggml_backend_tensor_set(te, e.data(), 0, n * 4);
+  REQUIRE(ggml_backend_graph_compute(gpu, g) == GGML_STATUS_SUCCESS);
+  std::vector<float> r[5];
+  for (int k = 0; k < 5; k++) r[k].resize(n), ggml_backend_tensor_get(outs[k], r[k].data(), 0, n * 4);
+  double rl = 0, rl_fast = 0, as = 0, ac = 0, re = 0;
+  for (int i = 0; i < n; i++) {
+    const double L = std::log(double(w[i]));
+    rl = std::max(rl, std::fabs(r[0][i] - L) / L);
+    rl_fast = std::max(rl_fast, std::fabs(r[4][i] - L) / L);
+    as = std::max(as, std::fabs(r[1][i] - std::sin(double(a[i]))));
+    ac = std::max(ac, std::fabs(r[2][i] - std::cos(double(a[i]))));
+    re = std::max(re, std::fabs(r[3][i] - std::exp(double(e[i]))) / std::exp(double(e[i])));
+  }
+  INFO("log(1 + u) relative: flagged " << rl << ", default " << rl_fast << "; sin " << as << ", cos " << ac
+                                       << " (absolute); exp relative " << re);
+  CHECK(rl < 1.2e-7);
+  CHECK(as < 1.2e-7);
+  CHECK(ac < 1.2e-7);
+  CHECK(re < 1.2e-7);
+  ggml_backend_buffer_free(buf);
+  ggml_free(ctx);
+  ggml_backend_free(gpu);
+}

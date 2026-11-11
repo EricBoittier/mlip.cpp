@@ -76,10 +76,24 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cpp"); ap.add_argument("ref64"); ap.add_argument("runs", nargs="*")
     ap.add_argument("--label", default="")
+    ap.add_argument("--overflow", nargs=3, metavar=("FRAMES", "CUTOFF", "MAX_NEIGHBORS"),
+                    help="skip frames where an atom has more than MAX_NEIGHBORS neighbours within CUTOFF: his "
+                         "calculator raises there (Calculator.calculate, overflow), his oracle (predict on the "
+                         "calculator's batch) silently keeps the nearest MAX_NEIGHBORS; hard-cutoff models in dense cells")
     a = ap.parse_args()
     z = np.load(a.ref64)
     c = from_cpp(a.cpp, z)
     runs = {p.split("/")[-1].replace(".npz", ""): from_ref(p, z) for p in a.runs}
+    if a.overflow:
+        from ase.io import read
+        from ase.neighborlist import neighbor_list
+        fr = read(a.overflow[0], ":")
+        over = [f for f in range(len(c["E"])) if f < len(fr) and
+                np.bincount(neighbor_list("i", fr[f], float(a.overflow[1])), minlength=len(fr[f])).max()
+                > int(a.overflow[2])]
+        for k in c:
+            c[k][over] = np.nan
+        print(f"  (skipped {len(over)} overflow frames: {over})")
     for r in runs.values():  # the same frames for all (a shorter mlip.cpp run: his maxima over those frames only)
         for k in r:
             if k in c and len(c[k]) == len(r[k]):
