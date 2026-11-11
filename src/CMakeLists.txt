@@ -40,6 +40,8 @@ set(MLIPCPP_RUNTIME_SOURCES
     runtime/frag_charges.cpp
     runtime/sqe.cpp
     runtime/lr_combined.cpp
+    runtime/gir64.cpp
+    runtime/iris_fp64.cpp
 )
 
 # Utilities
