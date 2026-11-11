@@ -37,11 +37,15 @@ def build(params, ckpt):
         cfg["num_neighbors_adaptive"] = None
     flat = dict(np.load(params))
     sr = {k[len("params/sr/"):].replace("/", "."): v for k, v in flat.items() if k.startswith("params/sr/")}
+    if cfg.get("charge_layer") is not None and not cfg.get("lr"):
+        cfg["charge_layer"] = None  # as iris_to_gguf.py: no effect trunk-only
     trunk = IrisTrunk(cfg)
     fill(trunk, sr, cfg, load_petjax_convert(PETJAX_CONVERT))
+    scale = float(np.asarray(sr["energy_scale"]).reshape(()))
+    if not cfg.get("lr"):  # a trunk-only model (e.g. the les-water presets): no LR branch
+        return cfg, trunk.double().eval(), None, scale
     lr = IrisLR(cfg)
     load_lr(lr, flat)
-    scale = float(np.asarray(sr["energy_scale"]).reshape(()))
     return cfg, trunk.double().eval(), lr.double().eval(), scale
 
 

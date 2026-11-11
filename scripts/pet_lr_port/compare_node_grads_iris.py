@@ -82,7 +82,7 @@ def read_dump(path, frame=0):
 def export_program(params, ckpt, kind, n_atoms=7, max_neighbors=11):
     from export_pytorch.export_pet_gguf import add_conditioning_inputs, example_export_args
     cfg, trunk, lr, scale = cg.build(params, ckpt)
-    trunk, lr = copy.deepcopy(trunk).float(), copy.deepcopy(lr).float()
+    trunk, lr = copy.deepcopy(trunk).float(), (None if lr is None else copy.deepcopy(lr).float())
     inputs, names, shapes = example_export_args(n_atoms, max_neighbors, cfg["cutoff"], forces=True)
     if trunk.conditioning:
         inputs, names, shapes = add_conditioning_inputs(inputs, names, shapes, n_atoms)
@@ -266,7 +266,12 @@ def local_errors(gm, rec64, cpp, exact, bad):
         if not pure or not isinstance(y64, torch.Tensor):
             continue
         c = e[1].reshape(tuple(y64.shape)).astype(np.float64)
-        fwd[n.name] = (rel(c, y64.detach().numpy()), rel(y32.detach().double().numpy(), y64.detach().numpy()))
+        # first-order energy budget of this op's local rounding: sum (local error) * dE/d(node) (fp64 gradient),
+        # signed, for mlip.cpp and the torch fp32 replay (a systematic shift shows here, not in a max-relative error)
+        g64 = ref.grad.detach().numpy() if ref.grad is not None else None
+        bc = float(((c - y64.detach().numpy()) * g64).sum()) if g64 is not None else np.nan
+        b32 = float(((y32.detach().double().numpy() - y64.detach().numpy()) * g64).sum()) if g64 is not None else np.nan
+        fwd[n.name] = (rel(c, y64.detach().numpy()), rel(y32.detach().double().numpy(), y64.detach().numpy()), bc, b32)
 
     # backward local: dE/d(v) = sum over consumers c of VJP_c(mlip.cpp values; seed mlip.cpp's dE/dc)
     for v_name, cons in consumers.items():
@@ -404,6 +409,7 @@ def analyse(ep, names, dumps, kind, frame):
             summ[lab] = dict(E=abs(y[:, 0].sum() - y64[:, 0].sum()) / np.abs(y64[:, 0]).sum(),
                              q=np.abs(y[:, 1] - y64[:, 1]).max())
     out["summary"] = summ
+    out["norm"] = float(np.abs(y64[:, 0] if y64.ndim > 1 else y64).sum())
     return out
 
 
@@ -415,6 +421,8 @@ def main():
     ap.add_argument("--frames", default="0", help="comma list / a-b range of structure indices in the dumps")
     ap.add_argument("--top", type=int, default=20)
     ap.add_argument("--table", action="store_true", help="print the per-node global table of every frame")
+    ap.add_argument("--budget", action="store_true",
+                    help="signed first-order energy budget per op (local error x dE/d node, / sum|E_i|), mean over frames")
     a = ap.parse_args()
     frames = []
     for tok in a.frames.split(","):
@@ -427,6 +435,7 @@ def main():
     labs = list(paths)
     ep, names = export_program(a.params, a.ckpt, a.kind)
     agg = {lab: {"fwd": {}, "bwd": {}} for lab in labs}
+    budget = {}
     glob_ = {}
     for f in frames:
         dumps = {lab: read_dump(p, f) for lab, p in paths.items()}
@@ -458,11 +467,35 @@ def main():
                 print(f"  {nm:28s} " + " ".join(fmt(r, 'v_' + l) for l in labs + ["t32"]) + " | " +
                       " ".join(fmt(r, 'g_' + l) for l in labs + ["t32"]))
         for lab in labs:
+            for nm, t in res["local"][lab][0].items():
+                if len(t) > 2 and np.isfinite(t[2]):
+                    budget.setdefault(nm, {}).setdefault(lab, []).append(t[2] / res["norm"])
+                    budget[nm].setdefault("t32@" + lab, []).append(t[3] / res["norm"])
+        for lab in labs:
             fwd, bwd = res["local"][lab]
             for key, tab in (("fwd", fwd), ("bwd", bwd)):
                 for nm, t in tab.items():
                     agg[lab][key].setdefault(nm, []).append(t)
     nf = len(frames)
+    if a.budget:
+        print(f"\nSIGNED ENERGY BUDGET per op: sum(local error x dE/d node) / sum|E_i fp64|, mean over {nf} structures"
+              " (t32 = the torch fp32 replay on that dump's inputs); total = the sum over ops")
+        for lab in labs:
+            tot = sum(np.mean(d[lab]) for d in budget.values() if lab in d)
+            tt = sum(np.mean(d["t32@" + lab]) for d in budget.values() if "t32@" + lab in d)
+            print(f"  total {lab}: {tot:+.2e} (t32 {tt:+.2e})")
+        key = (lambda nm: abs(np.mean(budget[nm][labs[1]]) - np.mean(budget[nm][labs[0]]))) if len(labs) > 1 else \
+            (lambda nm: abs(np.mean(budget[nm][labs[0]])))
+        rows_b = sorted([nm for nm in budget if all(l in budget[nm] for l in labs)], key=key, reverse=True)[:a.top]
+        print(f"  {'node':28s} " + " ".join(f"{l:>10s} {'t32':>10s}" for l in labs) +
+              (f" {labs[1] + '-' + labs[0]:>12s} P>0" if len(labs) > 1 else ""))
+        for nm in rows_b:
+            d = budget[nm]
+            line = f"  {nm:28s} " + " ".join(f"{np.mean(d[l]):+10.2e} {np.mean(d['t32@' + l]):+10.2e}" for l in labs)
+            if len(labs) > 1:
+                df = np.asarray(d[labs[1]]) - np.asarray(d[labs[0]])
+                line += f" {df.mean():+12.2e} {np.mean(df > 0):.2f}"
+            print(line)
     print(f"\nGLOBAL error vs fp64 at the graph inputs / outputs (median over {nf} structures):")
     for nm in [x for x in glob_ if x.startswith(("edge_vectors", "cutoff_values", "positions"))] + \
             [x for x in glob_][-3:]:

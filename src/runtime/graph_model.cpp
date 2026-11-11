@@ -38,9 +38,9 @@ namespace {
 /// softplus) loses all relative accuracy at small u, and whose __sinf / __cosf degrade outside [-pi, pi] (the
 /// Ewald structure factors), and whose __expf in SIGMOID loses accuracy with |x| (the Fermi occupations at small T),
 /// with 2-ulp approximate division (DIV: __fdiv_rn when flagged, ggml-cuda-precise-sigmoid-div.patch). Flags every
-/// LOG / SIN / COS / EXP / SIGMOID / DIV node of `g` (forward and backward) for the
+/// LOG / SIN / COS / EXP / SIGMOID / DIV / SQRT node of `g` (forward and backward) for the
 /// double-precision kernels, and (opt-in, MLIPCPP_PRECISE_SUM=1) every SUM / SUM_ROWS for double accumulation
-/// (ggml-cuda-precise-sum.patch); the CPU backend's kernels are already accurate and ignore the flag. Other models
+/// (ggml-cuda-precise-sum.patch) and (opt-in, MLIPCPP_PRECISE_SQRT=1) every SQRT as __fsqrt_rn; the CPU backend's kernels are already accurate and ignore the flag. Other models
 /// never call this (their CUDA kernels stay the fast ones, bit for bit). MLIPCPP_PRECISE_MATH=0 turns it off.
 void mark_precise_math(ggml_cgraph *g) {
   if (!g) return;
@@ -57,6 +57,13 @@ void mark_precise_math(ggml_cgraph *g) {
     // local errors drop to the torch fp32 level) but moved no verdict (CUDA charges P 0.58-0.75 unchanged, median q
     // error 8.5e-7 -> 8.8e-7; job 4891425, 2026-11-11): MLIPCPP_PRECISE_SUM=1 turns it on
     static const bool psum = [] { const char *e = std::getenv("MLIPCPP_PRECISE_SUM"); return e && !std::strcmp(e, "1"); }();
+    // SQRT as __fsqrt_rn (ggml-cuda-precise-sqrt.patch) is NOT flagged by default either: the op is correctly rounded
+    // with it (GPU op test 4096 / 4096 = CPU sqrtf; the fast-math default 3352 / 4096) and it takes the les-water
+    // ladder presets' CUDA E into his range (mol_z18 P vs his gpu32 0.70 -> 0.57, 0.72 -> 0.53; maxima 1.05-1.15x ->
+    // 0.99-1.05x), but readout-pol cluster E P moved 0.68 -> 0.74 and lr_both ion E max 1.04x -> 1.11x (job 4893238,
+    // 2026-11-11): the E verdicts there track the shared fp32 input-rounding bias, not op accuracy. Default: the user's
+    // call; MLIPCPP_PRECISE_SQRT=1 turns it on
+    static const bool psqrt = [] { const char *e = std::getenv("MLIPCPP_PRECISE_SQRT"); return e && !std::strcmp(e, "1"); }();
     // MUL_MAT accumulating in double (ggml-cuda-precise-mulmat.patch): a DIAGNOSTIC, off by default: MLIPCPP_PRECISE_MATMUL=1
     // flags every F32 MUL_MAT, MLIPCPP_PRECISE_MATMUL_K=<K> only those reducing over K (e.g. 1036, the transfer MLP's
     // first LINEAR of the 512-wide checkpoints: the CUDA charge-error candidate of 2026-11-11)
@@ -68,6 +75,7 @@ void mark_precise_math(ggml_cgraph *g) {
     auto on = [](const char *k) {
       if (!std::strcmp(k, "sigmoid") && !sig) return false;
       if (!std::strcmp(k, "sum") && !psum) return false;
+      if (!std::strcmp(k, "sqrt") && !psqrt) return false;
       return skip.find(k) == std::string::npos;
     };
     const bool is_unary = t->op == GGML_OP_UNARY;
@@ -75,7 +83,10 @@ void mark_precise_math(ggml_cgraph *g) {
                                     (ggml_get_unary_op(t) == GGML_UNARY_OP_SIGMOID && on("sigmoid")));
     // SUM / SUM_ROWS: double accumulation (ggml-cuda-precise-sum.patch), as ggml-cpu (ggml_float) does
     const bool sum = (t->op == GGML_OP_SUM || t->op == GGML_OP_SUM_ROWS) && on("sum");
-    if (sum || (t->op == GGML_OP_LOG && on("log")) || (t->op == GGML_OP_SIN && on("sin")) ||
+    // SQRT as __fsqrt_rn (ggml-cuda-precise-sqrt.patch, opt-in above): -use_fast_math's approximate sqrt of the edge
+    // lengths carried a systematic CUDA-only energy shift on the les-water ladder presets (signed energy budget)
+    const bool sqrt_ = t->op == GGML_OP_SQRT && on("sqrt");
+    if (sum || sqrt_ || (t->op == GGML_OP_LOG && on("log")) || (t->op == GGML_OP_SIN && on("sin")) ||
         (t->op == GGML_OP_COS && on("cos")) || (t->op == GGML_OP_DIV && on("div")) || unary)
       t->op_params[slot] = 1;
   }

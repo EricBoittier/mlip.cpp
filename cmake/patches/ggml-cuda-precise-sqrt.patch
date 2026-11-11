@@ -1,0 +1,28 @@
+diff -ru a/src/ggml-cuda/unary.cu b/src/ggml-cuda/unary.cu
+--- a/src/ggml-cuda/unary.cu	2026-11-11 10:53:30.501211000 +0100
++++ b/src/ggml-cuda/unary.cu	2026-11-11 10:53:30.522419000 +0100
+@@ -104,6 +104,13 @@
+     return (float) log((double) x);
+ }
+ 
++// SQRT: under -use_fast_math (-prec-sqrt=false) sqrtf is the approximate square root; __fsqrt_rn is IEEE
++// round-to-nearest whatever the flags (the CPU backend's sqrtf). Used when the op carries the precise flag: the edge
++// lengths of the iris trunks, where the approximate one carried a systematic energy shift (les-water ladder presets)
++static __device__ __forceinline__ float op_sqrt_precise(float x) {
++    return __fsqrt_rn(x);
++}
++
+ // sigmoid of the Fermi occupations (T = 0.02-0.1: arguments ~10-50): __expf's error grows with |x|
+ static __device__ __forceinline__ float op_sigmoid_precise(float x) {
+     return (float) (1.0 / (1.0 + exp(-(double) x)));
+@@ -243,6 +250,10 @@
+ }
+ 
+ void ggml_cuda_op_sqrt(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    if (dst->op_params[GGML_CUDA_PRECISE_SLOT] == 1) {
++        ggml_cuda_op_unary<op_sqrt_precise>(ctx, dst);
++        return;
++    }
+     ggml_cuda_op_unary<op_sqrt>(ctx, dst);
+ }
+ 

@@ -307,6 +307,8 @@ else()
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-precise-sum.patch"
         # and F32 MUL_MAT accumulating in double under the same flag (diagnostic: MLIPCPP_PRECISE_MATMUL[_K])
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-precise-mulmat.patch"
+        # and SQRT as __fsqrt_rn under the same flag (the iris trunks' edge lengths)
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-precise-sqrt.patch"
     )
     # the source cache is keyed by the ggml tag and the patches' contents:
     # CPM's default key hashes the arguments, i.e. the patch paths, so every

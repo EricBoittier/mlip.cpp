@@ -326,6 +326,46 @@ TEST_CASE("pet_lr_interp: precise SIGMOID / DIV on the GPU backend (flagged ops)
   ggml_backend_free(gpu);
 }
 
+// ggml-cuda-precise-sqrt.patch: SQRT as IEEE round-to-nearest (__fsqrt_rn) when flagged; the default kernel is the
+// approximate square root of -use_fast_math (-prec-sqrt=false). Found by the signed energy budget of the per-node fp64
+// oracle (compare_node_grads_iris.py --budget): the edge-length SQRT of the les-water ladder presets carried a
+// systematic CUDA-only energy shift (7x the CPU's signed contribution).
+TEST_CASE("pet_lr_interp: precise SQRT on the GPU backend (flagged op)", "[pet_lr_port]") {
+  ggml_backend_t gpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+  if (!gpu) {
+    SUCCEED("no GPU backend");
+    return;
+  }
+  const int n = 4096;
+  std::vector<float> x(n);
+  for (int i = 0; i < n; i++) x[i] = float(0.25 + 36.0 * i / (n - 1) + 1e-4 * std::sin(13.0 * i)); // r^2 in [0.25, 36]
+  ggml_context *ctx = ggml_init({16 * 1024 * 1024, nullptr, true});
+  ggml_tensor *tx = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+  ggml_tensor *outs[2] = {ggml_sqrt(ctx, tx), ggml_sqrt(ctx, tx)};
+  constexpr int slot = GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1;
+  outs[0]->op_params[slot] = 1; // outs[1]: the default (fast) kernel, for the record
+  ggml_cgraph *g = ggml_new_graph(ctx);
+  for (ggml_tensor *o : outs) ggml_set_output(o), ggml_build_forward_expand(g, o);
+  ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, gpu);
+  ggml_backend_tensor_set(tx, x.data(), 0, n * 4);
+  REQUIRE(ggml_backend_graph_compute(gpu, g) == GGML_STATUS_SUCCESS);
+  std::vector<float> r[2];
+  for (int k = 0; k < 2; k++) r[k].resize(n), ggml_backend_tensor_get(outs[k], r[k].data(), 0, n * 4);
+  int exact = 0, exact_fast = 0;
+  double bias_fast = 0;
+  for (int i = 0; i < n; i++) {
+    const float c = std::sqrt(x[i]); // the CPU's correctly rounded fp32 sqrt
+    exact += r[0][i] == c, exact_fast += r[1][i] == c;
+    bias_fast += (double(r[1][i]) - std::sqrt(double(x[i]))) / std::sqrt(double(x[i]));
+  }
+  INFO("flagged = CPU sqrtf on " << exact << "/" << n << "; default on " << exact_fast << "/" << n
+                                 << " (mean relative error of the default " << bias_fast / n << ")");
+  CHECK(exact == n);
+  ggml_backend_buffer_free(buf);
+  ggml_free(ctx);
+  ggml_backend_free(gpu);
+}
+
 // ggml-cuda-precise-sum.patch: SUM / SUM_ROWS accumulate in double when flagged (ggml-cpu always does: ggml_float in
 // ggml_vec_sum_f32); the default CUDA kernels accumulate in float (cub / the warp-tree reduce_rows). Candidate from the
 // per-node fp64 oracle: the Ewald / Coulomb potential sums of the charge path at 2.5-7x the local error of a torch fp32
