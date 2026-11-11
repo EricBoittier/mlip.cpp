@@ -2645,3 +2645,43 @@ TEST_CASE("lrc links backbone: unsupported settings throw; key absent keeps the 
   CHECK(!Lw.links_backbone);
   CHECK(lrc_clusters(Lw, 8, XB.data()).rad.empty());
 }
+
+// ---- PET's bump cutoff in fp32: 0.5 (1 + tanh y) vs the identical sigmoid(2 y) (pet.cutoff_bump_stable) ----------------
+TEST_CASE("pet stable bump: no fp32 staircase in the attention bias near the pair cutoff; elsewhere unchanged",
+          "[pet][gguf]") {
+  const char *path = std::getenv("MLIPCPP_TEST_PET_GGUF"); // PET-OMol-S (bump cutoff, adaptive grid radii)
+  if (!path || !*path || !std::filesystem::exists(path)) SKIP("MLIPCPP_TEST_PET_GGUF not set");
+  auto load = [&](bool stable) {
+    setenv("MLIPCPP_PET_STABLE_BUMP", stable ? "1" : "0", 1);
+    auto m = std::make_unique<mlipcpp::runtime::GraphModel>();
+    m->set_backend_preference(mlipcpp::BackendPreference::CPU);
+    REQUIRE(m->load_from_gguf(path));
+    unsetenv("MLIPCPP_PET_STABLE_BUMP");
+    return m;
+  };
+  auto off = load(false), on = load(true);
+  const int32_t Z[2] = {3, 11};
+  auto e2 = [&](mlipcpp::runtime::GraphModel &m, double d) {
+    const float x[6] = {0, 0, 0, float(d), 0, 0};
+    mlipcpp::AtomicSystem s(2, x, Z, nullptr);
+    s.set_charge(2), s.set_spin_multiplicity(1);
+    return double(m.predict(s, false).energy);
+  };
+  // Li+...Na+ (Q = +2): pair cutoff 7.8127 A; in fp32 the factor 0.5 (1 + tanh y) underflows to 0 at about 7.795 A
+  // (the attention bias jumps from -17.3 to log 1e-15 = -34.5), sigmoid(2 y) is still 2.6e-8 there
+  double jump_off = 0, jump_on = 0;
+  for (double d = 7.7900; d < 7.8000; d += 2e-4) {
+    jump_off = std::max(jump_off, std::abs(e2(*off, d + 2e-4) - e2(*off, d)));
+    jump_on = std::max(jump_on, std::abs(e2(*on, d + 2e-4) - e2(*on, d)));
+  }
+  INFO("largest 0.0002 A energy step on 7.79-7.80 A: off " << jump_off << " eV, stable " << jump_on << " eV");
+  CHECK(jump_off > 0.05);  // the staircase (+121 meV at the underflow)
+  CHECK(jump_on < 0.015);  // smooth: |dE/dd| <= ~60 eV/A x 0.0002 A
+  // far inside the cutoff (no factor in the tail) and a water molecule: the same energies to fp32 noise
+  CHECK(std::abs(e2(*off, 5.0) - e2(*on, 5.0)) < 2e-4);
+  const int32_t Zw[3] = {8, 1, 1};
+  const float xw[9] = {0, 0, 0, 0.757f, 0.586f, 0, -0.757f, 0.586f, 0};
+  mlipcpp::AtomicSystem w(3, xw, Zw, nullptr);
+  w.set_charge(0), w.set_spin_multiplicity(1);
+  CHECK(std::abs(double(off->predict(w, false).energy) - double(on->predict(w, false).energy)) < 2e-4);
+}

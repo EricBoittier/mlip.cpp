@@ -392,6 +392,10 @@ bool GraphModel::load_from_gguf(const std::string &path) {
   num_neighbors_adaptive_ = loader.get_float32("pet.num_neighbors_adaptive", 0.0f);
   cutoff_width_adaptive_ = loader.get_float32("pet.cutoff_width_adaptive", cutoff_width_);
   adaptive_cutoff_method_ = loader.get_string("pet.adaptive_cutoff_method", "grid");
+  // stable bump (graph_interpreter.h: stable_bump): GGUF pet.cutoff_bump_stable (absent = 0), MLIPCPP_PET_STABLE_BUMP=0|1
+  // overrides; default off, bit-identical
+  interp_.stable_bump = loader.get_int32("pet.cutoff_bump_stable", 0) != 0;
+  if (const char *e = std::getenv("MLIPCPP_PET_STABLE_BUMP"); e && *e) interp_.stable_bump = *e != '0';
   num_heads_ = loader.get_int32("pet.num_heads", 0);
   conditioning_.enabled = loader.get_int32("pet.system_conditioning", 0) != 0;
   plato_lr_ = PetPlatoLRSpec::from_gguf(loader);

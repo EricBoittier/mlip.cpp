@@ -51,6 +51,13 @@ public:
   // fragment-constrained charges); returns the tensor that replaces it. Unset: none.
   std::function<ggml_tensor *(ggml_context *, const GIRNode &, ggml_tensor *)> post_node;
 
+  // PET's bump cutoff factor 0.5 (1 + tanh(y)) (GIR: MUL scalar 0.5 of ADD scalar 1 of UNARY_TANH) built as the
+  // identical sigmoid(2 y). In fp32, 1 + tanh(y) cancels for y < -8.7, so the factor near 0 takes only multiples of
+  // 2^-25 and log(factor), the attention bias, is a staircase (energy steps of 7-121 meV on Li+...Na+ for PET-OMol-S,
+  // flat energy under 15-56 eV/A forces). sigmoid(2 y) keeps full relative precision down to the bias clamp (1e-15).
+  // Off by default (bit-identical); GraphModel sets it from pet.cutoff_bump_stable / MLIPCPP_PET_STABLE_BUMP.
+  bool stable_bump = false;
+
   // The output of node `target_id` rebuilt with every reference `from` (e.g. "input:charge_index")
   // replaced by `to`, through the nodes that depend on it (the others keep their built outputs).
   // For use inside post_node / custom_op while building; the built outputs are left unchanged.
