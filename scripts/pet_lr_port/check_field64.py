@@ -52,9 +52,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("params"); ap.add_argument("ckpt"); ap.add_argument("ref"); ap.add_argument("frames")
     ap.add_argument("--max", type=int, default=0)
+    ap.add_argument("--flip-alpha", action="store_true", help="induced dipoles: the gate at -50 (alpha ~ 0): the check "
+                    "must then FAIL, i.e. it sees the dipole terms")
     a = ap.parse_args()
     torch.set_default_dtype(torch.float64)
     cfg, trunk, lr, scale = build(a.params, a.ckpt)
+    if a.flip_alpha:
+        with torch.no_grad():
+            lr.polarisability_gate.fill_(-50.0)
     z = np.load(a.ref)
     ap_ = z["atom_ptr"]
     err = z["error"] if "error" in z.files else np.zeros(len(ap_) - 1)

@@ -268,6 +268,8 @@ def main():
             input_names=names + list(IrisPETLRGraphPBC.EWALD), input_dtypes=pdtypes,
             dynamic_shapes=shapes[:3] + (shapes[3] + ew_shapes,), strict=False)
         graph_multi = {}
+        # (induced dipoles on several components: exported, but UNVALIDATED: no oracle run of his fragment labels with
+        # induced dipoles; the dipole terms are structure-wide and per atom, only q0 follows the components)
         if lr.conserving:  # several components: per-component Fermi level / residual (IrisPETLRGraphMulti), own graphs
             C = 2
             n_comp = torch.export.Dim("n_comp", min=1, max=100000)

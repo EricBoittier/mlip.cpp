@@ -18,6 +18,7 @@
 # (c) test_pet_lr_port (build_kv: the slab virial FD with two Richardson step pairs) default and MLIPCPP_PRECISE_SQRT=1,
 #     and the [.slab_fd_scan] step scan of the conserving residual preset, flag off / on;
 # (d) induced dipoles on CUDA if exported (gguf_extra/cc_ind_*.gguf) -> out/ind_cuda; (e) periodic E . Z0 on CUDA.
+# PART=a runs (a) only (submitted afterany:4894059: the same binary), PART=bcde the rest (build_kv only: independent).
 # Evaluation only; FP32, no TF32.
 set -uo pipefail
 unset NVIDIA_TF32_OVERRIDE MLIPCPP_TF32 MLIPCPP_PRECISE_SIGMOID MLIPCPP_PRECISE_MATH_SKIP MLIPCPP_PRECISE_SUM \
@@ -27,6 +28,8 @@ module load gcc/13.2.0 cmake/3.27.9 && module load nvhpc/24.7-mpi && module load
 export CC=$(which gcc) CXX=$(which g++) CUDAHOSTCXX=$(which g++)
 C=/scratch/boittier/pet_lr_port/cuda; W=$C; F=/scratch/boittier/pet_lr_port/frames; BD=$C/build_kv; B=$BD/bin
 nvidia-smi --query-gpu=name,power.limit,clocks.max.sm --format=csv
+PART=${PART:-all}
+if [ $PART = a ] || [ $PART = all ]; then
 # (a)
 O=$C/out/pbc/mm_explicit_h100; mkdir -p $O
 for g in readout-pol control readout; do for s in bulk slab; do
