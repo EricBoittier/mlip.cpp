@@ -3970,6 +3970,17 @@ TEST_CASE("lrc pbc: cluster diagnostics of periodic frames", "[.pbc_diag]") {
     for (double r : cl.rad) rmin = std::min(rmin, r), rmax = std::max(rmax, r);
     std::fprintf(out, "], \"rad_min\": %.4f, \"rad_max\": %.4f", cl.rad.empty() ? 0.0 : rmin, rmax);
     const LrcStates st = lrc_states(L, cl);
+    std::fprintf(out, ", \"E_lr\": %.6f",
+                 lrc_energy(L, m.plato_lr().sqe, c, n, sys.atomic_numbers(), x.data(), double(sys.charge()), false).energy);
+    if (std::getenv("MLIPCPP_DIAG_FULL")) { // per-atom super-node and the weak links (i, j, A, image displacement)
+      std::fprintf(out, ", \"sn\": [");
+      for (int i = 0; i < n; i++) std::fprintf(out, "%s%d", i ? ", " : "", cl.sn[i]);
+      std::fprintf(out, "], \"weak\": [");
+      for (size_t w = 0; w < cl.weak.size(); w++)
+        std::fprintf(out, "%s[%d, %d, %.4g, %.4f, %.4f, %.4f]", w ? ", " : "", cl.weak[w].i, cl.weak[w].j, cl.weak[w].A,
+                     cl.weak[w].d[0], cl.weak[w].d[1], cl.weak[w].d[2]);
+      std::fprintf(out, "]");
+    }
     std::fprintf(out, ", \"states\": %d, \"copies\": %zu, \"M\": %.4f, \"lambda\": %.4f, \"fix3_comps\": %d}\n",
                  int(st.active), st.active ? st.copies.size() : size_t(1), st.M, st.lambda, st.fix3_comps);
     std::fflush(out);
