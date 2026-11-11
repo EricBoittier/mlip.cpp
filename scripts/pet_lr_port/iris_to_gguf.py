@@ -278,6 +278,8 @@ def main():
         w.add_int32("pet.iris_lr.fermi_iterations", 40)
         w.add_float32("pet.iris_lr.fermi_eps", 1e-6)
         w.add_string("pet.iris_lr.dipole_origin", "center_of_mass")
+        if lr.lrt:  # his ToSample refuses slabs with the long-range transfer; mlip.cpp too
+            w.add_int32("pet.iris_lr.long_range_transfer", 1)
         if graph_scores is not None:
             w.add_string("graph_scores.json", json.dumps(graph_scores.to_dict()))
         if graph_pbc is not None:  # his calculator's Ewald settings (Calculator.from_checkpoint: the sampler's)

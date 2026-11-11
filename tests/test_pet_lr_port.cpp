@@ -35,7 +35,8 @@ std::vector<std::pair<std::string, std::string>> lr_ggufs() {
           {"both (Gaussian charges, 2 shared passes)", resource("petlr_tiny_both.gguf")},
           // his branch feat/long-range-transfer (3ed96b0): make_seeded.py lrt_weighted / lrt_fill
           {"species_weighted (2 shared passes)", resource("petlr_tiny_weighted.gguf")},
-          {"species_fill (weighted Fermi level)", resource("petlr_tiny_fill.gguf")}};
+          {"species_fill (weighted Fermi level)", resource("petlr_tiny_fill.gguf")},
+          {"species_fill + long-range transfer", resource("petlr_tiny_lrt.gguf")}};
 }
 
 // 24 water molecules in a 9.0 A cube, a fixed jittered lattice (deterministic)
@@ -276,6 +277,13 @@ TEST_CASE("pet_lr_port: iris PET-LR in a 3-D cell and a slab: forces = -dE/dx an
       std::copy(cell, cell + 9, c);
       if (slab) c[8] = 22.0f;
       const bool pbc[3] = {true, true, !slab};
+      // the long-range transfer: refused on periodic structures (his ToSample raises on a slab; the 3-D virial is open)
+      if (label.find("long-range transfer") != std::string::npos) {
+        PredictOptions p0;
+        p0.charge = 0, p0.spin_multiplicity = 1;
+        CHECK_THROWS(m.predict(n, x.data(), Z.data(), c, pbc, p0));
+        continue;
+      }
       PredictOptions po;
       po.compute_forces = true, po.compute_stress = true;
       po.charge = 0, po.spin_multiplicity = 1;
@@ -382,6 +390,7 @@ TEST_CASE("pet_lr_port: slab virial chain rule (normal / basis): W = dE/d eps at
   const bool pbc[3] = {true, true, false};
   for (const auto &[label, path] : lr_ggufs()) {
     INFO("model: " << label << ", slab (pbc T T F, 22 A vacuum vector)");
+    if (label.find("long-range transfer") != std::string::npos) continue; // refused on a slab (his ToSample)
     ModelOptions mo;
     mo.iris_freeze_ewald = true;
     Predictor m(path, mo);

@@ -46,15 +46,24 @@ for j in "${JOBS[@]}"; do
   set -- $j; old=$1 new=$2 kind=$3
   [ -f $old ] || { echo "MISSING old $old"; continue; }
   d=$($PY $S/gguf_diff.py $old $new --allow-new $ALLOW 2>&1 | grep -v "^new key" | tr '\n' ';')
-  fams="ion_40"; [ $kind = lr ] && fams="ion_40 bulk_60_3 slab_60_3"
+  fams="ion_40 cluster_40"; [ $kind = lr ] && fams="ion_40 cluster_40 bulk_60_3 slab_60_3"
+  # an old open-only LR GGUF (no graph_pbc.json, exported before the periodic graph) has no periodic result of record
+  oldpbc=$($PY -c "import sys; sys.path.insert(0, '$S'); import gguf_diff as g; print(int('graph_pbc.json' in g.read('$old')[1]))")
   outs=""
   for f in $fams; do
     fr=frames/set_$f.extxyz; [ -f $fr ] || fr=out/nodegrad/$f.extxyz
+    if [ $kind = lr ] && [ $oldpbc = 0 ] && [[ $f == bulk* || $f == slab* ]]; then outs="$outs $f:n/a(old GGUF open-only)"; continue; fi
     a=out/reexport/a.json b=out/reexport/b.json
     $E $old $fr $a > /dev/null 2>&1; ra=$?; $E $new $fr $b > /dev/null 2>&1; rb=$?
-    same=$($PY -c "import json,sys; x=json.load(open('$a'))['frames']; y=json.load(open('$b'))['frames']; print('bit-identical' if x==y else 'DIFFER')" 2>&1)
+    # bit-identical, or identical apart from frames the NEW file raises on (the max_neighbors overflow check)
+    same=$($PY -c "
+import json; x = json.load(open('$a'))['frames']; y = json.load(open('$b'))['frames']
+ov = [i for i, (u, v) in enumerate(zip(x, y)) if u != v and 'max_neighbors' in v.get('error', '') and 'error' not in u]
+bad = [i for i, (u, v) in enumerate(zip(x, y)) if u != v and i not in ov]
+nerr = sum('error' in v for v in y)
+print('DIFFER' if bad or len(x) != len(y) else 'bit-identical' + (f'+{len(ov)}overflow' if ov else '') + (f'[{nerr}/{len(y)}err]' if nerr else ''))" 2>&1)
     outs="$outs $f:$same(rc $ra/$rb)"
-    [ "$same" = bit-identical ] || fail=1
+    [[ "$same" == bit-identical* ]] || fail=1
   done
   echo "$old -> $new | gguf: $d | outputs:$outs"
   [[ $d == IDENTICAL* ]] || fail=1

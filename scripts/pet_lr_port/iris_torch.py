@@ -282,8 +282,11 @@ class IrisLR(_AuxMixin, nn.Module):
         # species_weighted / species_fill: his branch feat/long-range-transfer (3ed96b0, iris.pet.charges)
         if self.ref not in ("fermi", "species", "both", "species_weighted", "species_fill"):
             raise ValueError(f"IrisLR: charge_reference {self.ref!r} not yet ported")
-        if cfg.get("long_range_transfer"):
-            raise ValueError("IrisLR: long_range_transfer not yet ported")
+        # long_range_transfer (feat/long-range-transfer): per transfer pass a drive a_i moved through the Coulomb kernel of
+        # Gaussian charges (width smearing) over the whole structure, dq = G a - a (G 1)
+        self.lrt = bool(cfg.get("long_range_transfer"))
+        if self.lrt and cfg.get("smearing") is None:
+            raise ValueError("long_range_transfer needs smearing")
         self.m_min, self.m_max, self.T = cfg.get("charge_state_min", -3), cfg.get("charge_state_max", 3), \
             cfg.get("charge_temperature", 0.1)
         self.cutoff, self.width, self.num_rbf = float(cfg["cutoff"]), float(cfg["cutoff_width"]), 8
@@ -304,6 +307,10 @@ class IrisLR(_AuxMixin, nn.Module):
             setattr(self, f"transfer_embed_{k}", nn.Linear(d, dh))
             setattr(self, f"transfer_mlp_{k}", _flax_mlp((2 * dh + self.num_rbf + 4, dh, 1)))
             setattr(self, f"transfer_gate_{k}", nn.Parameter(torch.zeros(())))
+            if self.lrt:  # iris.pet.charges.long_range_drive
+                setattr(self, f"long_range_embed_{k}", nn.Linear(d, dh))
+                setattr(self, f"long_range_mlp_{k}", _flax_mlp((dh + 2, dh, 1)))
+                setattr(self, f"long_range_gate_{k}", nn.Parameter(torch.zeros(())))
         self.passes = int(cfg.get("polarisation_passes", 1))
         self.shared = bool(cfg.get("polarisation_shared", True))
         self.form = cfg.get("conductance_form", "layerscale")
@@ -422,6 +429,19 @@ class IrisLR(_AuxMixin, nn.Module):
         else:
             kern = torch.erf(r / (math.sqrt(2.0) * self.sigma)) / torch.where(padding_mask, torch.ones_like(r), r) * keep
         kernel_sr = weight * kern
+        if self.lrt:
+            # the long-range transfer kernel G (his flow_potential: jax-pme RawPotential, prefactor 1, potentials x 2):
+            # open: erf(r / (sqrt 2 sigma)) / r over all pairs i != j; periodic: the reciprocal-space sum alone (k = 0
+            # out, no self / background / slab terms), at the batch's Ewald smearing (the calculator's lr_k2 argument)
+            if ewald is None:
+                Dl = positions[None, :, :].expand(n, n, 3) - positions[:, None, :]
+                D2l = (Dl * Dl).sum(dim=-1)
+                Rl = torch.sqrt(D2l + 1e-15)
+                Gl = torch.where(D2l <= 0.0, torch.zeros_like(Rl), torch.erf(Rl / (math.sqrt(2.0) * self.sigma)) / Rl)
+                conv = lambda x: Gl @ x
+            else:
+                conv = ewald_reciprocal(positions, ewald)
+            ones_g = conv(torch.ones_like(q))
         moved = torch.zeros_like(q)
         for p in range(1, self.transfer_passes + 1):
             phi_sr = (kernel_sr * gather_atoms(q)).sum(dim=1)
@@ -431,6 +451,11 @@ class IrisLR(_AuxMixin, nn.Module):
                              phi_sr[:, None, None].expand(n, k, 1), gather_atoms(phi_sr)[..., None]], dim=-1)
             t = getattr(self, f"transfer_mlp_{p}")(xin)[..., 0] * getattr(self, f"transfer_gate_{p}")
             step = flow_sum(t)
+            if self.lrt:
+                h = getattr(self, f"long_range_embed_{p}")(node)
+                xl = torch.cat([h, q[:, None], phi_sr[:, None]], dim=-1)
+                al = getattr(self, f"long_range_mlp_{p}")(xl)[:, 0] * getattr(self, f"long_range_gate_{p}")
+                step = step + (conv(al) - al * ones_g)
             q = q + step
             moved = moved + step
         aux["transfers"] = moved
@@ -540,6 +565,17 @@ def ewald_potentials(positions, e):
         slab = 4.0 * math.pi * (zn * M - 0.5 * (M2 + Q * zn * zn) - Q / 12.0 * b * b) / V
         return EV_A * (rs + 0.5 * (ks + corr + e["slab"] * slab))
     return phi
+
+
+def ewald_reciprocal(positions, e):
+    """The k-space sum of `ewald_potentials` alone, prefactor 1 and the 1/2 removed: x -> sum_k W_k Re(exp(-i k r_i)
+    S_k(x)) [n] (his long-range transfer kernel on a periodic structure, iris.pet.charges.flow_potential)."""
+    kvec, V, s = e["kvec"], e["volume"], e["smearing"]
+    k2 = (kvec * kvec).sum(dim=-1)
+    W = 2.0 * (4.0 * math.pi) * torch.exp(-0.5 * (s * s) * k2) / k2 / V
+    theta = positions @ kvec.transpose(0, 1)
+    c, sn = torch.cos(theta), torch.sin(theta)
+    return lambda x: c @ (W * (c.transpose(0, 1) @ x)) + sn @ (W * (sn.transpose(0, 1) @ x))
 
 
 def bisect_fermi(lr, s, total, iterations=40, eps=1e-6, w=None):
