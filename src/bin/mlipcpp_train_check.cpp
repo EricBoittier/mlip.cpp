@@ -6,6 +6,7 @@
 //                       [--conservative 1 --energy-weight W --force-weight W --nc-force-weight W]
 #include "train/crash.h"
 #include "train/trainer.h"
+#include "train/tail_loss.h"
 
 #include <cstdlib>
 #include <fmt/core.h>
@@ -78,7 +79,17 @@ int main(int argc, char **argv) {
   worker.loss.huber = huber, worker.loss.delta_e = de, worker.loss.delta_f = df;
   if (qcorr.weight > 0 && !split.load_partial_charges(qtarget))
     throw std::runtime_error(data + "/train/" + qtarget + "_charge.bin: not found");
-  const TargetScaling sc = TargetScaling::fit(split);
+  // --states-fd: the model's composition and scales (the FT recipe's --model-baselines), so that the trainer's energies
+  // are comparable with inference (the host long-range energy is in eV; a refitted energy scale would rescale only the
+  // backbone part)
+  TargetScaling sc;
+  if (states_fd) {
+    for (auto [Z, c] : worker.model().composition_energies()) sc.composition[Z] = c;
+    for (auto [Z, f] : worker.model().nc_force_scales()) sc.force_scale[Z] = f;
+    sc.energy_scale = worker.model().energy_scale();
+  } else {
+    sc = TargetScaling::fit(split);
+  }
   const AdaptiveCutoff adaptive = adaptive_cutoff(worker.model());
   NeighborCache nl = NeighborCache::load_or_build(
       split, worker.model().cutoff(), cache_path(cache_dir, split, worker.model().cutoff(), adaptive), 8, adaptive);
@@ -124,7 +135,71 @@ int main(int argc, char **argv) {
       fmt::print("states-fd {}: L {:.6g}, |g| {:.6g};{} -> {}\n", what, s0.loss, gn, line, best < 2e-2 ? "PASS" : "FAIL");
       return best < 2e-2;
     };
-    bool ok = check("energy + force loss");
+    bool ok = true;
+    // the tail-loss path (energies() and run_tail: FORWARD / BACKWARD graphs, copies through the weighted energy rows)
+    // on the first 7 structures (tdata: the Li+...Na+ series), pairs (k, 6): energy differences against the split's
+    // labels (inference energies for tdata/exact*) and the run_tail gradient against FD along g / |g|
+    if (n >= 7) {
+      std::vector<int64_t> tids(7);
+      std::iota(tids.begin(), tids.end(), first);
+      const Batch bt = make_batch(split, nl, tids, {}, worker.model().species_to_index(), sc, worker.model().cutoff(), 0, 0, 0,
+                                  &planner);
+      fmt::print("states-fd tail: {} structures, {} copies\n", bt.structures(), bt.copies());
+      const std::vector<double> Et = worker.energies(bt, sc.energy_scale);
+      double emax = 0;
+      std::vector<TailPair> pairs;
+      for (int k = 0; k < 6; k++) {
+        const double dl = double(split.energy(tids[k])) - double(split.energy(tids[6]));
+        emax = std::max(emax, std::abs((Et[k] - Et[6]) - dl));
+        fmt::print("  tail k {}: dE trainer {:.6f}, labels {:.6f} eV\n", k, Et[k] - Et[6], dl);
+        TailPair tp;
+        tp.k = k, tp.l = 6, tp.de_dft = dl + 0.05 * (k - 2.5), tp.de_ref = 0.3, tp.d = 5.0;
+        pairs.push_back(tp);
+      }
+      fmt::print("states-fd tail: max |dE(trainer energies()) - dE(labels)| {:.3e} eV (labels = inference: parity)\n", emax);
+      {
+        std::vector<SystemError> se;
+        worker.system_errors = &se;
+        worker.run(bt, sc.energy_scale, false);
+        worker.system_errors = nullptr;
+        for (const SystemError &r : se) fmt::print("  run_conservative on the tail batch: id {} dE {:.6f} eV\n", r.id, r.de * r.n);
+        for (int64_t id : tids) { // each structure alone
+          const Batch b1 = make_batch(split, nl, {id}, {}, worker.model().species_to_index(), sc, worker.model().cutoff(), 0, 0,
+                                      0, &planner);
+          std::vector<SystemError> s1;
+          worker.system_errors = &s1;
+          worker.run(b1, sc.energy_scale, false);
+          worker.system_errors = nullptr;
+          fmt::print("  alone: id {} copies {} dE {:.6f} eV; energies() {:.6f}\n", id, b1.copies(), s1[0].de * s1[0].n,
+                     worker.energies(b1, sc.energy_scale)[0]);
+        }
+      }
+      TailLoss tl;
+      tl.weight = 1.0;
+      worker.tail_cotangent = true;
+      worker.zero_grads();
+      const double L0 = worker.run_tail(bt, sc.energy_scale, pairs, tl, 1.0);
+      const std::vector<float> g = worker.get_grads();
+      double gn = 0;
+      for (float x : g) gn += double(x) * x;
+      gn = std::sqrt(gn);
+      double best = 1e30;
+      std::string line;
+      for (double h : {1e-2, 3e-3, 1e-3}) {
+        auto loss_at = [&](double sgn) {
+          std::vector<float> p = p0;
+          for (size_t q = 0; q < p.size(); q++) p[q] += static_cast<float>(sgn * h / gn * g[q]);
+          worker.set_params(p);
+          return tl.eval(pairs, worker.energies(bt, sc.energy_scale), nullptr);
+        };
+        const double fdv = (loss_at(+1) - loss_at(-1)) / (2 * h), rel = std::abs(fdv - gn) / gn;
+        best = std::min(best, rel), line += fmt::format(" h {:.0e}: FD {:.6g} (rel {:.2e})", h, fdv, rel);
+      }
+      worker.set_params(p0), worker.zero_grads(), worker.tail_cotangent = false;
+      fmt::print("states-fd tail loss: L {:.6g}, |g| {:.6g};{} -> {}\n", L0, gn, line, best < 2e-2 ? "PASS" : "FAIL");
+      ok = ok && best < 2e-2;
+    }
+    ok = check("energy + force loss") && ok;
     const Worker::Conservative keep = worker.conservative;
     worker.conservative.energy = 0, worker.conservative.nc_force = 0;
     ok = check("force loss alone") && ok;
