@@ -572,21 +572,20 @@ void vjp_round(const LrcSpec &L, const SqeSpec &S, int n, const int32_t *Z, cons
 }
 } // namespace
 
+// An element absent from lrc_fukui_Z (e.g. the rare gases: the Fukui fits list only the elements in their data) takes
+// phi = 0 (both channels), the value the fits start every element from (an element listed without data keeps it). It
+// used to throw, which failed every structure with such an atom once it had more than one cluster (Ar ... Xe at 9 A).
 double LrcSpec::fukui(int z) const {
   if (fukui_mode == FukuiMode::Uniform) return 1.0;
-  for (size_t k = 0; k < fukui_Z.size(); k++)
-    if (fukui_Z[k] == z) {
-      const double p = fukui_phi[k];
-      return (p > 30 ? p : std::log1p(std::exp(p))) + 1e-6;
-    }
-  throw std::runtime_error("lrc graph: no Fukui parameter for atomic number " + std::to_string(z));
+  const double p = fukui_phi_of(z);
+  return (p > 30 ? p : std::log1p(std::exp(p))) + 1e-6;
 }
 
 double LrcSpec::fukui_phi_of(int z, bool minus) const {
   const std::vector<double> &phi = minus && !fukui_phi_minus.empty() ? fukui_phi_minus : fukui_phi;
   for (size_t k = 0; k < fukui_Z.size(); k++)
     if (fukui_Z[k] == z) return phi[k];
-  throw std::runtime_error("lrc graph: no Fukui parameter for atomic number " + std::to_string(z));
+  return 0.0;
 }
 
 void LrcSpec::fukui_check() const {
@@ -607,7 +606,14 @@ void LrcSpec::fukui_check() const {
 int LrcSpec::elem(int z) const {
   for (size_t k = 0; k < fukui_Z.size(); k++)
     if (fukui_Z[k] == z) return static_cast<int>(k);
-  throw std::runtime_error("lrc graph: no combo parameters for atomic number " + std::to_string(z));
+  return -1;
+}
+// combo parameters of an element absent from lrc_fukui_Z (e.g. the rare gases): the values set_combo_keys.py gives an
+// element the fit has no data for (theta 0, eta softplus^-1(5), kappa softplus^-1(1e-3), sf_score 0, sf_scale
+// softplus^-1(1)), where it used to throw
+namespace {
+const double kEtaMissing = std::log(std::expm1(5.0)), kKappaMissing = std::log(std::expm1(1e-3)),
+             kSfScaleMissing = std::log(std::expm1(1.0));
 }
 
 void LrcSpec::combo_check() const {
@@ -1266,7 +1272,8 @@ inline void gkernel(double sigma, double r, double ke, double &k, double &dk) {
 // flow coupling kappa_ij(r) and d kappa / dr
 inline void flow_kappa(const LrcSpec &L, int ei, int ej, double r, double &kap, double &dkap) {
   const size_t E = L.fukui_Z.size();
-  const double sp = softplus(0.5 * (L.flow_kappa[size_t(ei) * E + ej] + L.flow_kappa[size_t(ej) * E + ei]));
+  const double sp = softplus(ei < 0 || ej < 0 ? kKappaMissing
+                                              : 0.5 * (L.flow_kappa[size_t(ei) * E + ej] + L.flow_kappa[size_t(ej) * E + ei]));
   double w, dw;
   if (L.flow_coulomb) gkernel(L.smear, r, 1.0, w, dw);
   else {
@@ -1307,7 +1314,8 @@ void qeq_matrix(const LrcSpec &L, int n, const int32_t *Z, const double *x, std:
   Lc.assign(size_t(n) * n, 0.0), J.resize(n);
   const double self = kKE * std::sqrt(2.0 / M_PI) / L.smear;
   for (int i = 0; i < n; i++) {
-    J[i] = softplus(L.qeq_eta[L.elem(Z[i])]);
+    const int e = L.elem(Z[i]);
+    J[i] = softplus(e < 0 ? kEtaMissing : L.qeq_eta[e]);
     Lc[size_t(i) * n + i] = J[i] + self;
     for (int j = 0; j < i; j++) {
       double k, dk;
@@ -1373,7 +1381,8 @@ LrcQ0 q0_graph(const LrcSpec &L, int n, const int32_t *Z, const double *x, doubl
       scores();
       fukui_channel(L, n, Z, x, Qp, spin, false, o.fp, o.dfp);
       for (int i = 0; i < n; i++) {
-        stair(L.fermi_K, L.fermi_T, o.score[i] - L.thr_theta[L.elem(Z[i])], o.occ[i], o.docc[i]);
+        const int e = L.elem(Z[i]);
+        stair(L.fermi_K, L.fermi_T, o.score[i] - (e < 0 ? 0.0 : L.thr_theta[e]), o.occ[i], o.docc[i]);
         o.M += o.docc[i], o.sum_p += o.occ[i], o.Fp += o.fp[i];
       }
       o.wt.resize(n);
@@ -1384,7 +1393,8 @@ LrcQ0 q0_graph(const LrcSpec &L, int n, const int32_t *Z, const double *x, doubl
       o.score.resize(n), o.fp.resize(n); // fp: c_Z
       for (int i = 0; i < n; i++) {
         const int e = L.elem(Z[i]);
-        o.score[i] = B * std::tanh(L.sf_score[e] / B), o.fp[i] = softplus(L.sf_scale[e]);
+        o.score[i] = e < 0 ? 0.0 : B * std::tanh(L.sf_score[e] / B);
+        o.fp[i] = softplus(e < 0 ? kSfScaleMissing : L.sf_scale[e]);
       }
       o.mu = solve_mu(L, o.score, &o.fp, o.r);
       for (int i = 0; i < n; i++) {

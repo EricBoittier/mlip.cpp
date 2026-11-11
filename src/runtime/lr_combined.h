@@ -181,7 +181,7 @@ struct LrcSpec {
   bool cond_neutral = false;
   bool combo() const { return q0_ref != Q0Ref::Fukui || flow_passes > 0; }
   bool needs_q_always() const { return readout; }
-  int elem(int z) const; // index into fukui_Z (throws when absent)
+  int elem(int z) const; // index into fukui_Z (-1 when absent: the combo defaults of set_combo_keys.py)
   void combo_check() const; // throws on an inconsistent combo configuration
   static LrcSpec from_gguf(const GGUFLoader &L, const SqeSpec &sqe);
   void to_gguf(gguf_context *g) const;
