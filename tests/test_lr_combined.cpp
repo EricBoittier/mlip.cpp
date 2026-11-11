@@ -10,6 +10,8 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdio>
+#include <cstring>
+#include <string>
 #include <cstdlib>
 #include <filesystem>
 
@@ -2959,4 +2961,68 @@ TEST_CASE("lrc states: blend rows from shared per-super-node q0 rows equal lrc_b
       CHECK(mag > 1e-4);
       CHECK(err < 1e-12 * std::max(1.0, mag));
     }
+}
+
+// diagnostics (hidden): per structure of MLIPCPP_QLOC_XYZ (extended XYZ with charge=), the conditioning of the model
+// MLIPCPP_QLOC_GGUF: super-nodes, Q_loc, S, dS per super-node and the fallback flag, as JSON lines on stdout
+TEST_CASE("lrc diagnostics: Q_loc dump", "[.qloc_dump]") {
+  const char *path = std::getenv("MLIPCPP_QLOC_GGUF"), *xyz = std::getenv("MLIPCPP_QLOC_XYZ");
+  if (!path || !xyz) SKIP("MLIPCPP_QLOC_GGUF / MLIPCPP_QLOC_XYZ not set");
+  mlipcpp::runtime::GraphModel m;
+  m.set_backend_preference(mlipcpp::BackendPreference::CPU);
+  REQUIRE(m.load_from_gguf(path));
+  const LrcSpec &L = m.plato_lr().lrc;
+  const SqeSpec &S = m.plato_lr().sqe;
+  std::FILE *f = std::fopen(xyz, "r");
+  REQUIRE(f);
+  static const std::map<std::string, int> el = {{"H", 1}, {"Li", 3}, {"B", 5}, {"C", 6}, {"N", 7}, {"O", 8}, {"F", 9},
+      {"Na", 11}, {"Mg", 12}, {"Al", 13}, {"Si", 14}, {"P", 15}, {"S", 16}, {"Cl", 17}, {"K", 19}, {"Ca", 20}, {"Br", 35},
+      {"I", 53}};
+  char line[4096];
+  int idx = 0;
+  while (std::fgets(line, sizeof line, f)) {
+    const int n = std::atoi(line);
+    if (n <= 0) break;
+    REQUIRE(std::fgets(line, sizeof line, f));
+    const char *q = std::strstr(line, "charge=");
+    const int Q = q ? std::atoi(q + 7) : 0;
+    std::vector<int32_t> Z(n);
+    std::vector<double> x(3 * size_t(n));
+    for (int i = 0; i < n; i++) {
+      REQUIRE(std::fgets(line, sizeof line, f));
+      char sym[8];
+      std::sscanf(line, "%7s %lf %lf %lf", sym, &x[3 * i], &x[3 * i + 1], &x[3 * i + 2]);
+      auto it = el.find(sym);
+      Z[i] = it != el.end() ? it->second : 0;
+      if (!Z[i]) { // atomic number by symbol table of the model's species? fall back to periodic order via a scan
+        static const char *tab[] = {"", "H", "He", "Li", "Be", "B", "C", "N", "O", "F", "Ne", "Na", "Mg", "Al", "Si", "P", "S", "Cl", "Ar", "K", "Ca", "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu", "Zn", "Ga", "Ge", "As", "Se", "Br", "Kr", "Rb", "Sr", "Y", "Zr", "Nb", "Mo", "Tc", "Ru", "Rh", "Pd", "Ag", "Cd", "In", "Sn", "Sb", "Te", "I", "Xe", "Cs", "Ba", "La", "Ce", "Pr", "Nd", "Pm", "Sm", "Eu", "Gd", "Tb", "Dy", "Ho", "Er", "Tm", "Yb", "Lu", "Hf", "Ta", "W", "Re", "Os", "Ir", "Pt", "Au", "Hg", "Tl", "Pb", "Bi"};
+        for (int k = 1; k < int(sizeof tab / sizeof tab[0]); k++)
+          if (std::string(tab[k]) == sym) Z[i] = k;
+      }
+    }
+    const LrcCondition c = lrc_condition(L, S, n, Z.data(), x.data(), double(Q), 10, 1);
+    std::printf("{\"i\": %d, \"Q\": %d, \"s\": %d, \"weak\": %zu, \"superedges\": %zu, \"fallback\": %d, \"Qloc\": [", idx, Q,
+                c.cl.s, c.cl.weak.size(), c.cl.se.size(), int(c.cl.fallback));
+    for (int a = 0; a < c.cl.s; a++) std::printf("%s%.5f", a ? ", " : "", c.Qloc[a]);
+    std::printf("], \"Q0\": [");
+    for (int a = 0; a < c.cl.s; a++) std::printf("%s%.5f", a ? ", " : "", c.Q0[a]);
+    std::printf("], \"dS\": [");
+    for (int a = 0; a < c.cl.s; a++) std::printf("%s%.5f", a ? ", " : "", c.dS[a]);
+    std::printf("], \"size\": [");
+    std::vector<int> sz(c.cl.s, 0);
+    for (int i = 0; i < n; i++) sz[c.cl.sn[i]]++;
+    for (int a = 0; a < c.cl.s; a++) std::printf("%s%d", a ? ", " : "", sz[a]);
+    std::printf("]");
+    { // the 3b states of the same clusters (eps 1e-3, cap 8 -> 16)
+      LrcSpec L2 = L;
+      L2.states = true, L2.states_eps = 1e-3, L2.states_cap = 16, L2.states_cap_lo = 8;
+      const LrcStates st = lrc_states(L2, c.cl);
+      std::printf(", \"copies\": %zu, \"lambda\": %.4f, \"M\": %.2f, \"fix3_comps\": %d, \"comps\": %zu", st.copies.size(), st.lambda,
+                  st.M, st.fix3_comps, st.comps.size());
+    }
+    std::printf("}\n");
+    std::fflush(stdout);
+    idx++;
+  }
+  std::fclose(f);
 }

@@ -844,7 +844,8 @@ ModelResult GraphModel::predict_single_lrc(const AtomicSystem &system, bool comp
           std::vector<double> Fv(3 * size_t(n), 0.0);
           if (rv.forces.size() == Fv.size())
             for (size_t k = 0; k < Fv.size(); k++) Fv[k] = double(rv.forces[k]);
-          if (hc.needs_cond_forces()) {
+          static const bool no_cf = [] { const char *e = std::getenv("MLIPCPP_LRC_NO_CONDF"); return e && *e == '1'; }();
+          if (hc.needs_cond_forces() && !no_cf) {
             if (lrc_blend_grad_.size() != static_cast<size_t>(n)) throw std::runtime_error("lrc_states: no dE/dS");
             std::vector<double> G(hc.cl.s, 0.0);
             for (int i = 0; i < n; i++) G[hc.cl.sn[i]] += lrc_blend_grad_[i];
@@ -863,8 +864,10 @@ ModelResult GraphModel::predict_single_lrc(const AtomicSystem &system, bool comp
       r.atomic_energies.assign(Ea.begin(), Ea.end());
       if (!Fnc.empty()) r.nc_forces.assign(Fnc.begin(), Fnc.end());
       if (parameter_gradients) parameter_gradients->assign(pg.begin(), pg.end());
-      const LrcEnergy le = lrc_energy(L, sq, cond, n, system.atomic_numbers(), x.data(), double(system.charge()),
-                                      compute_forces);
+      LrcEnergy le = lrc_energy(L, sq, cond, n, system.atomic_numbers(), x.data(), double(system.charge()),
+                                compute_forces);
+      static const bool no_lr = [] { const char *e = std::getenv("MLIPCPP_LRC_NO_LR"); return e && *e == '1'; }();
+      if (no_lr) le.energy = 0, std::fill(le.forces.begin(), le.forces.end(), 0.0);
       r.energy = static_cast<float>(Eref + Emix + le.energy);
       r.sqe_charges.assign(le.q.begin(), le.q.end());
       if (compute_forces) {
@@ -889,8 +892,10 @@ ModelResult GraphModel::predict_single_lrc(const AtomicSystem &system, bool comp
   const std::vector<double> blend_grad = lrc_blend_grad_;
   // one open cluster or a bulk cell: the plain model (lrc_intra: the long range still acts inside)
   if (cond.cl.s == 1 && !cond.cl.images() && !L.intra) return r;
-  const LrcEnergy le = lrc_energy(L, sq, cond, n, system.atomic_numbers(), x.data(), double(system.charge()),
-                                  compute_forces);
+  LrcEnergy le = lrc_energy(L, sq, cond, n, system.atomic_numbers(), x.data(), double(system.charge()), compute_forces);
+  // MLIPCPP_LRC_NO_LR=1: drop the long-range energy and forces (diagnostics only: ablations on fixed weights)
+  static const bool no_lr = [] { const char *e = std::getenv("MLIPCPP_LRC_NO_LR"); return e && *e == '1'; }();
+  if (no_lr) le.energy = 0, std::fill(le.forces.begin(), le.forces.end(), 0.0);
   r.energy = static_cast<float>(double(r.energy) + le.energy);
   r.sqe_charges.assign(le.q.begin(), le.q.end());
   if (!compute_forces || r.forces.size() != le.forces.size()) return r;
@@ -898,7 +903,10 @@ ModelResult GraphModel::predict_single_lrc(const AtomicSystem &system, bool comp
   vir.resize(9, 0.0);
   // dE/dS from the graph, also for a structure without any edge (a backward pass for the blend alone there); the
   // central differences in S (h = 0.05) only on request: their truncation error was ~3 eV/A on bare ions (E04)
-  if (cond.needs_cond_forces() && !fd_ds) {
+  // MLIPCPP_LRC_NO_CONDF=1: drop the conditioning forces (diagnostics only: force attribution on fixed weights)
+  static const bool no_cf = [] { const char *e = std::getenv("MLIPCPP_LRC_NO_CONDF"); return e && *e == '1'; }();
+  if (no_cf) {
+  } else if (cond.needs_cond_forces() && !fd_ds) {
     if (blend_grad.size() != static_cast<size_t>(n)) throw std::runtime_error("lrc: no dE/dS from the graph");
     std::vector<double> G(cond.cl.s, 0.0);
     for (int i = 0; i < n; i++) G[cond.cl.sn[i]] += blend_grad[i];
