@@ -26,6 +26,12 @@ std::string trunk_gguf() {
   const char *e = std::getenv("MLIPCPP_PETLR_GGUF");
   return e && *e ? e : resource("petlr_tiny_trunk.gguf");
 }
+// the trunk GGUFs of the virial / force tests: the tiny trunk, and his les-water backbones (make_seeded.py les_local3:
+// NoFinalCombineBackbone, 3 layers, comb_norms eps 1e-6; les_ladder: LayeredBackbone, 2 layers, 3 gated energy heads)
+std::vector<std::string> trunk_ggufs() {
+  if (const char *e = std::getenv("MLIPCPP_PETLR_GGUF"); e && *e) return {e};
+  return {resource("petlr_tiny_trunk.gguf"), resource("petlr_les_local3.gguf"), resource("petlr_les_ladder.gguf")};
+}
 // the LR GGUFs: (label, path); every IrisLR reference / pass type of the tiny presets
 std::vector<std::pair<std::string, std::string>> lr_ggufs() {
   if (const char *e = std::getenv("MLIPCPP_PETLR_LR_GGUF"); e && *e) return {{"env", e}};
@@ -68,7 +74,8 @@ void water_box(std::vector<float> &x, std::vector<int32_t> &Z, float cell[9]) {
 } // namespace
 
 TEST_CASE("pet_lr_port: full virial = dE/d eps (non-symmetric deformation), Voigt = sym / V", "[pet_lr_port]") {
-  const std::string path = trunk_gguf();
+  for (const std::string &path : trunk_ggufs()) {
+  INFO("model: " << path);
   ModelOptions mo;
   Predictor model(path, mo);
   std::vector<float> x;
@@ -108,6 +115,26 @@ TEST_CASE("pet_lr_port: full virial = dE/d eps (non-symmetric deformation), Voig
   for (int k = 0; k < 6; k++) {
     const double sym = 0.5 * (r.virial[3 * va[k] + vb[k]] + r.virial[3 * vb[k] + va[k]]) / V;
     CHECK(std::abs(sym - r.stress[k]) < 1e-5 * scale / V + 1e-7);
+  }
+  // open structure (H3O+ ... H2O): forces = -dE/dx by central differences
+  const std::vector<float> xo = {0, 0, 0, 0.98f, 0.1f, 0, -0.35f, 0.92f, 0.05f, -0.33f, -0.5f, 0.8f,
+                                 2.55f, 0.2f, 0.1f, 3.1f, 0.95f, 0.2f, 3.05f, -0.55f, -0.1f};
+  const std::vector<int32_t> Zo = {8, 1, 1, 1, 8, 1, 1};
+  PredictOptions pf;
+  pf.compute_forces = true;
+  const Result ro = model.predict(7, xo.data(), Zo.data(), nullptr, nullptr, pf);
+  pf.compute_forces = false;
+  double fw = 0, fm = 0;
+  for (size_t k = 0; k < xo.size(); k++) {
+    std::vector<float> xp = xo, xm = xo;
+    xp[k] += 4e-3f, xm[k] -= 4e-3f;
+    const double fd = -(double(model.predict(7, xp.data(), Zo.data(), nullptr, nullptr, pf).energy) -
+                        double(model.predict(7, xm.data(), Zo.data(), nullptr, nullptr, pf).energy)) /
+                      (double(xp[k]) - double(xm[k]));
+    fw = std::max(fw, std::abs(fd - ro.forces[k])), fm = std::max(fm, double(std::abs(ro.forces[k])));
+  }
+  INFO("open: max |F_FD - F| = " << fw << ", max |F| = " << fm);
+  CHECK(fw < 2e-3 * fm + 5e-3);
   }
 }
 

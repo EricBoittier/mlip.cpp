@@ -105,12 +105,35 @@ PRESETS.update({
     "cc_residual_plain": dict(_CC, charge_allocation="residual", polarisation_passes=1),
 })
 
+# his les-water backbones (ipsum-work play/les-water/backbones.py; iris branch explore/alessandro-strict-local-20261012-v1
+# 1d412cf carries the same trunk() and NoFinalCombineBackbone, and the PET per_layer_readout / learn_layer_gates /
+# feature_layer (charge_layer) of iris 38c91c4): NoFinalCombineBackbone (no combine after the last GNN layer) and
+# LayeredBackbone (the standard trunk returning per-layer features: entry l before layer l's combine, the last entry
+# after the final combine, L + 1 energy heads); both build the comb_norms with flax's default LayerNorm eps 1e-6
+# (pet-jax's Backbone: 1e-5). Trunk-only (lr: False; that branch's LR side predates the ported flows allocation).
+# Run in the main env with PYTHONPATH=<that worktree>:<a dir holding his backbones.py> (kuma ref_les.sbatch). No
+# conditioning (that PET has no `conditioning` list)
+_LES = dict({k: v for k, v in _TINY.items() if k not in ("conditioning", "final_message_passing")},
+            system_conditioning=False)
+PRESETS.update({
+    # his configs.py local_backbone at two and three layers (1 resp. 2 intermediate comb_norms at eps 1e-6)
+    "les_local2": dict(_LES, num_gnn_layers=2, backbone="backbones.NoFinalCombineBackbone"),
+    "les_local3": dict(_LES, num_gnn_layers=3, backbone="backbones.NoFinalCombineBackbone"),
+    # his ladder (layered, two layers, per_layer_readout; charges from layer 1's features) with the layer gates on
+    "les_ladder": dict(_LES, num_gnn_layers=2, backbone="backbones.LayeredBackbone", per_layer_readout=True,
+                       learn_layer_gates=True, charge_layer=1),
+    # the ladder's charge_layer 0 variant, no gates
+    "les_ladder_c0": dict(_LES, num_gnn_layers=2, backbone="backbones.LayeredBackbone", per_layer_readout=True,
+                          charge_layer=0),
+})
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("out"); ap.add_argument("--preset", required=True, choices=sorted(PRESETS))
     ap.add_argument("--seed", type=int, default=0); ap.add_argument("--scale", type=float, default=0.5)
-    ap.add_argument("--config", help="a training config.yaml to copy (Calculator.from_checkpoint reads its sampler)")
+    ap.add_argument("--config", default=str(Path(__file__).resolve().parent / "presets" / "seeded_config.yaml"),
+                    help="a training config.yaml to copy (Calculator.from_checkpoint reads its sampler; default the "
+                         "seeded presets' presets/seeded_config.yaml, num_k 1024, max_neighbors 59; '' for none)")
     a = ap.parse_args()
     import jax
     import jax.numpy as jnp
@@ -155,7 +178,7 @@ def main():
     write_msgpack(d / "model.msgpack", jax.tree.map(lambda v: jnp.asarray(v), params))
     write_yaml(d / "model.yaml", {"iris.pet.petlr.PETLR": cfg})
     write_yaml(d / "baseline.yaml", {})
-    if a.config:
+    if a.config and Path(a.config).exists():
         import shutil
         shutil.copy(a.config, Path(a.out) / "config.yaml")
     print(a.preset, cfg, sum(x.size for x in out), "parameters ->", d)

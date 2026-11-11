@@ -54,7 +54,17 @@ def main():
 
     lr = from_dict(read_yaml(f"{a.ckpt}/model/model.yaml"))
     fdt = np.float64 if a.x64 else np.float32
-    trunk = PET(
+    if hasattr(lr, "backbone"):  # his les-water branch (backbone / per_layer_readout / charge_layer): PET's own fields
+        import dataclasses
+        fields = {f.name for f in dataclasses.fields(PET)} - {"parent", "name"}
+        kw = {f: getattr(lr, f) for f in fields if hasattr(lr, f)}
+        if "feature_layer" in fields:
+            kw["feature_layer"] = getattr(lr, "charge_layer", None)
+        trunk = PET(**kw)
+        lr_conditioning = tuple(getattr(lr, "conditioning", ("charge", "spin_multiplicity"))) \
+            if lr.system_conditioning else ()
+    else:
+      trunk = PET(
         d_pet=lr.d_pet, d_node=lr.d_node, d_head=lr.d_head, d_feedforward=lr.d_feedforward,
         num_heads=lr.num_heads, num_attention_layers=lr.num_attention_layers,
         num_gnn_layers=lr.num_gnn_layers, cutoff=lr.cutoff, cutoff_width=lr.cutoff_width,
@@ -63,9 +73,9 @@ def main():
         system_conditioning=lr.system_conditioning, max_charge=lr.max_charge,
         max_spin_multiplicity=lr.max_spin_multiplicity, conditioning=tuple(lr.conditioning),
         final_message_passing=lr.final_message_passing,
-    )
+      )
     assert not lr.direct_forces and not lr.direct_stress
-    conditioning = tuple(lr.conditioning)
+    conditioning = lr_conditioning if hasattr(lr, "backbone") else tuple(lr.conditioning)
     params = {"params": read_msgpack(f"{a.ckpt}/model/model.msgpack")["params"]["sr"]}
     params = cast_floats(params, jnp.float64 if a.x64 else jnp.float32)
     cfg = dict(nna=lr.num_neighbors_adaptive, cutoff=lr.cutoff, cwa=lr.cutoff_width_adaptive,
@@ -104,7 +114,7 @@ def main():
         k_sel = -(-max(int(np.max(counts)), 1) // a.kpad) * a.kpad
         Np = s["positions"].shape[0]
         cond = {}
-        for key in lr.conditioning:
+        for key in conditioning:
             default = 0 if key == "charge" else 1
             cond[key] = jnp.asarray([int(atoms.info.get(key, default))], dtype=jnp.int32)
         js = {kk: jnp.asarray(v) for kk, v in s.items()}
@@ -131,7 +141,7 @@ def main():
                 matmul_precision=str(jax.config.jax_default_matmul_precision),
                 device=str(jax.devices()[0]), jax=jax.__version__, host=platform.node(),
                 overflow=overflow_any, kpad=a.kpad, bucket=a.bucket,
-                xla_flags=__import__('os').environ.get('XLA_FLAGS', ''), conditioning=list(lr.conditioning), **cfg)
+                xla_flags=__import__('os').environ.get('XLA_FLAGS', ''), conditioning=list(conditioning), **cfg)
     np.savez(a.out, atom_ptr=np.asarray(atom_ptr), pair_ptr=np.asarray(pair_ptr),
              meta=json.dumps(meta), **res)
     print(json.dumps(meta), f"{time.time() - t0:.1f}s")

@@ -133,6 +133,16 @@ def _mlp2(d_in, d_hidden):
     return nn.Sequential(nn.Linear(d_in, d_hidden), nn.SiLU(), nn.Linear(d_hidden, d_hidden), nn.SiLU())
 
 
+def backbone_kind(name):
+    """None (pet-jax's Backbone), 'nofinal' (NoFinalCombineBackbone) or 'layered' (LayeredBackbone), by class name."""
+    if not name or name.endswith("petjax.model.Backbone"):
+        return None
+    for cls, kind in (("NoFinalCombineBackbone", "nofinal"), ("LayeredBackbone", "layered")):
+        if name.split(".")[-1] == cls:
+            return kind
+    raise ValueError(f"custom backbone {name!r}: not supported (NoFinalCombineBackbone / LayeredBackbone only)")
+
+
 class IrisTrunk(_AuxMixin, nn.Module):
     """The iris PET trunk as an mlip.cpp pet-graph (forces mode: distances and cutoff factors in-graph)."""
 
@@ -143,18 +153,41 @@ class IrisTrunk(_AuxMixin, nn.Module):
         d, dn, dh, Z = cfg["d_pet"], cfg["d_node"], cfg["d_head"], cfg["max_atomic_number"] + 1
         L = cfg["num_gnn_layers"]
         self.final_mp = cfg.get("final_message_passing", True)
+        # his les-water backbones (ipsum-work play/les-water/backbones.py trunk(); iris explore/alessandro-strict-local
+        # 1d412cf): NoFinalCombineBackbone = no combine after the last layer; LayeredBackbone = the standard trunk
+        # returning per-layer features (entry l before layer l's combine, the last entry after the final combine). Both
+        # build the comb_norms with flax's default LayerNorm eps 1e-6 (pet-jax's Backbone 1e-5)
+        self.backbone = backbone_kind(cfg.get("backbone"))
+        comb_eps = 1e-5
+        if self.backbone == "nofinal":
+            self.final_mp, comb_eps = False, 1e-6
+        elif self.backbone == "layered":
+            self.final_mp, comb_eps = True, 1e-6
+        # iris PET (38c91c4): per_layer_readout = one Energy head per layers entry (energy_head_<l>), the energy their
+        # sum, each optionally times a learned gate (layer_gate_<l>); feature_layer (PETLR charge_layer) = which
+        # entry's node features the LR branch reads
+        self.per_layer = bool(cfg.get("per_layer_readout"))
+        self.gates = bool(cfg.get("learn_layer_gates"))
+        self.feature_layer = cfg.get("charge_layer", cfg.get("feature_layer"))
+        if (self.per_layer or self.feature_layer is not None) and self.backbone != "layered":
+            raise ValueError("per_layer_readout / charge_layer need a backbone returning layers (LayeredBackbone)")
+        self.n_heads = L + 1 if self.per_layer else 1
         self.cutoff, self.width = float(cfg["cutoff"]), float(cfg["cutoff_width"])
         self.neighbor_embedder = nn.Embedding(Z, d)  # pet-jax backbone/edge_embedder (initial messages)
         self.node_embedders = nn.ModuleList([nn.Embedding(Z, dn)])
         self.gnn_layers = nn.ModuleList([GNNLayer(cfg, i == 0) for i in range(L)])
         n_comb = L if self.final_mp else L - 1
-        self.combination_norms = nn.ModuleList([nn.LayerNorm(2 * d, eps=1e-5) for _ in range(n_comb)])
+        self.combination_norms = nn.ModuleList([nn.LayerNorm(2 * d, eps=comb_eps) for _ in range(n_comb)])
         self.combination_mlps = nn.ModuleList(
             [nn.Sequential(nn.Linear(2 * d, 2 * d), nn.SiLU(), nn.Linear(2 * d, d)) for _ in range(n_comb)])
-        self.node_energy_heads = nn.ModuleList([_mlp2(dn, dh)])
-        self.node_final_layers = nn.ModuleList([nn.Linear(dh, 1)])
-        self.edge_energy_heads = nn.ModuleList([_mlp2(d, dh)])
-        self.edge_final_layers = nn.ModuleList([nn.Linear(dh, 1)])
+        H = self.n_heads
+        self.node_energy_heads = nn.ModuleList([_mlp2(dn, dh) for _ in range(H)])
+        self.node_final_layers = nn.ModuleList([nn.Linear(dh, 1) for _ in range(H)])
+        self.edge_energy_heads = nn.ModuleList([_mlp2(d, dh) for _ in range(H)])
+        self.edge_final_layers = nn.ModuleList([nn.Linear(dh, 1) for _ in range(H)])
+        if self.per_layer and self.gates:
+            for l in range(H):
+                setattr(self, f"layer_gate_{l}", nn.Parameter(torch.ones(1)))
         self.conditioning = bool(cfg.get("system_conditioning", False))
         if self.conditioning:
             self.max_charge = int(cfg["max_charge"])
@@ -203,6 +236,7 @@ class IrisTrunk(_AuxMixin, nn.Module):
         messages = torch.where(padding_mask.unsqueeze(-1), torch.zeros_like(messages), messages)
         node = self.node_embedders[0](species)[:, None, :]
         geom = torch.cat([edge_vectors, r[..., None]], dim=-1)
+        layers = []
         L = len(self.gnn_layers)
         for i, layer in enumerate(self.gnn_layers):
             g = layer.edge_embedder(geom)
@@ -221,17 +255,32 @@ class IrisTrunk(_AuxMixin, nn.Module):
                 node = node + cond[:, None, :]
             edge = torch.where(padding_mask.unsqueeze(-1), torch.zeros_like(edge), edge)
             messages = messages + edge
+            if self.backbone == "layered":  # his trunk(): the features before this layer's combine
+                layers.append((node[:, 0, :], messages))
             if i < L - 1 or self.final_mp:
                 rev = edge.reshape(n * k, d)[reverse_neighbor_index].reshape(n, k, d)
                 rev = torch.where(padding_mask.unsqueeze(-1), torch.zeros_like(rev), rev)
                 comb = self.combination_mlps[i](self.combination_norms[i](torch.cat([edge, rev], dim=-1)))
                 messages = messages + torch.where(padding_mask.unsqueeze(-1), torch.zeros_like(comb), comb)
         node = node[:, 0, :]
-        node_e = self.node_final_layers[0](self.node_energy_heads[0](node))[:, 0]
-        edge_e = self.edge_final_layers[0](self.edge_energy_heads[0](messages))[..., 0]
-        edge_e = torch.where(padding_mask, torch.zeros_like(edge_e), edge_e)
-        energy = node_e + (edge_e * cut).sum(dim=1)
-        self._aux = dict(node=node, r=r, env=cut)  # for IrisPETLR (the trunk's own outputs, not graph outputs)
+        if self.backbone == "layered":
+            layers.append((node, messages))  # the final entry, after the last combine
+
+        def head(h, nd, msg):  # pet-jax Energy: node head + sum_j edge head x cutoff
+            node_e = self.node_final_layers[h](self.node_energy_heads[h](nd))[:, 0]
+            edge_e = self.edge_final_layers[h](self.edge_energy_heads[h](msg))[..., 0]
+            edge_e = torch.where(padding_mask, torch.zeros_like(edge_e), edge_e)
+            return node_e + (edge_e * cut).sum(dim=1)
+
+        if self.per_layer:
+            energy = 0.0
+            for h, (nd, msg) in enumerate(layers):
+                e_h = head(h, nd, msg)
+                energy = energy + (e_h * getattr(self, f"layer_gate_{h}") if self.gates else e_h)
+        else:
+            energy = head(0, node, messages)
+        feat = node if self.feature_layer is None else layers[self.feature_layer][0]
+        self._aux = dict(node=feat, r=r, env=cut)  # for IrisPETLR (the trunk's own outputs, not graph outputs)
         return energy
 
 

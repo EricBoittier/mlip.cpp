@@ -56,3 +56,4 @@ website/dist/
 website/node_modules/
 a.out.*
 !tests/resources/petlr_tiny_*.gguf
+!tests/resources/petlr_les_*.gguf

@@ -61,15 +61,40 @@ def metatrain_key(name):
     return name
 
 
+PER_LAYER_HEADS = ("node_energy_heads.", "node_final_layers.", "edge_energy_heads.", "edge_final_layers.")
+
+
+def per_layer_head(name):
+    """(head index, the name with index 0) for a per-layer energy head parameter of IrisTrunk; else None."""
+    for pre in PER_LAYER_HEADS:
+        if name.startswith(pre):
+            l, rest = name[len(pre):].split(".", 1)
+            return int(l), pre + "0." + rest
+    return None
+
+
 def fill(model, sr, cfg, conv):
-    """Load IrisTrunk from the iris `sr` leaves; return the metatrain-keyed copy for the round trip."""
+    """Load IrisTrunk from the iris `sr` leaves; return the metatrain-keyed copy for the round trip. With
+    per_layer_readout (his iris 38c91c4 PET) head l is the flax subtree energy_head_<l> (the single head's layout
+    under that scope) and layer_gate_<l> its gate: those leaves are loaded by name and left out of the metatrain round
+    trip (metatrain has no such heads); every leaf is still consumed exactly once."""
     mt, used = {}, {}
     sd = model.state_dict()
     dummy = np.zeros((2, 3), np.float32)
     for name in sd:
-        key = metatrain_key(name)
+        if name.startswith("layer_gate_"):
+            v = np.asarray(sr[name]).reshape(tuple(sd[name].shape))
+            sd[name] = torch.from_numpy(np.ascontiguousarray(v))
+            used.setdefault(name, []).append(name)
+            continue
+        plh = per_layer_head(name) if model.per_layer else None
+        key = metatrain_key(plh[1] if plh else name)
         flax = conv._scope_key(*conv._finalize_key(conv._rename_key(key), dummy)[:1], key)
         transposed = conv._finalize_key(conv._rename_key(key), dummy)[1].shape != dummy.shape
+        if plh:
+            if not flax.startswith("energy_head."):
+                raise KeyError(f"{name}: per-layer head maps to {flax}")
+            flax = f"energy_head_{plh[0]}." + flax[len("energy_head."):]
         if flax not in sr:
             raise KeyError(f"{name} ({key}) -> {flax}: not in the iris trunk")
         v = np.asarray(sr[flax])
@@ -82,7 +107,8 @@ def fill(model, sr, cfg, conv):
         if tuple(v.shape) != tuple(sd[name].shape):
             raise ValueError(f"{name} <- {flax}: {v.shape} vs {tuple(sd[name].shape)}")
         sd[name] = torch.from_numpy(np.ascontiguousarray(v))
-        mt[key] = sd[name]
+        if not plh:
+            mt[key] = sd[name]
         used.setdefault(flax, []).append(name)
     model.load_state_dict(sd)
     double = {k: v for k, v in used.items() if len(v) > 1}
@@ -104,7 +130,8 @@ def round_trip(mt, sr, cfg, conv):
             ref, v = ref[1:], v[1:]
         if v.shape != ref.shape or not np.array_equal(v, ref):
             raise ValueError(f"round trip differs at {k}")
-    lost = set(sr) - set(back) - {"energy_scale"}
+    lost = {k for k in set(sr) - set(back) - {"energy_scale"}
+            if not (k.startswith("energy_head_") or k.startswith("layer_gate_"))}  # per-layer heads: loaded by name
     if lost:
         raise ValueError(f"round trip lost {sorted(lost)}")
     return len(back)
@@ -128,6 +155,14 @@ def export_checked(export_torch_model, *a, **kw):
     return out
 
 
+def to_sample(a):
+    """His training pipeline's to_sample (CKPT_DIR/config.yaml, else --config, else {})."""
+    path = Path(f"{a.ckpt}/config.yaml")
+    if not path.exists() and a.config:
+        path = Path(a.config)
+    return yaml.safe_load(open(path))["training_pipeline"]["to_sample"] if path.exists() else {}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("params"); ap.add_argument("ckpt")
@@ -135,6 +170,8 @@ def main():
     ap.add_argument("--no-baseline", action="store_true")
     ap.add_argument("--n-atoms", type=int, default=7); ap.add_argument("--max-neighbors", type=int, default=11)
     ap.add_argument("--dump-json", help="also write the graph JSON(s) to this path prefix (inspection)")
+    ap.add_argument("--config", help="the training config.yaml (his to_sample: num_k, max_neighbors) when CKPT_DIR has "
+                    "none; the seeded presets' is scripts/pet_lr_port/presets/seeded_config.yaml")
     ap.add_argument("--lr", action="store_true",
                     help="trunk + LR branch as one graph (IrisPETLRGraph) plus the scores graph of the two-pass mu")
     a = ap.parse_args()
@@ -143,8 +180,9 @@ def main():
     cfg = {**PETLR_DEFAULTS, **cfg}
     if cfg.get("fixed_neighbors") is not None:  # his older fixed-neighbour mode (KnnToSample): the hard cutoff
         cfg["num_neighbors_adaptive"] = None
-    if cfg.get("backbone"):
-        raise ValueError(f"custom backbone {cfg['backbone']!r}: not yet supported")
+    # his les-water backbones (NoFinalCombineBackbone / LayeredBackbone; iris_torch.backbone_kind raises on others)
+    if cfg.get("charge_layer") is not None and not cfg.get("lr"):
+        cfg["charge_layer"] = None  # (charge_layer only picks the LR branch's node features: no effect trunk-only)
     if cfg.get("direct_forces") or cfg.get("direct_stress"):
         raise ValueError("direct heads: not yet supported")
     conditioning = list(cfg.get("conditioning", ["charge", "spin_multiplicity"]))
@@ -240,6 +278,14 @@ def main():
             if nd["op"] in ("ADD", "SUB", "MUL", "DIV", "POW", "MATMUL") and int_inputs & set(nd["inputs"]):
                 raise ValueError(f"node {nd['id']} {nd['op']} {nd['inputs']}: an integer input as an arithmetic operand "
                                  "(a symbolic size?)")
+    # the comb_norms' LayerNorm eps as traced: his les-water backbones build them with flax's default 1e-6, pet-jax's
+    # Backbone with 1e-5 (invisible in fp32 parity: asserted here, and the torch fp64 check flips with it)
+    want_eps = 1e-6 if model.backbone in ("nofinal", "layered") else 1e-5
+    for g_ in [graph.to_dict()] + ([graph_pbc.to_dict()] if graph_pbc is not None else []):
+        for nd in g_["nodes"]:
+            if nd["op"] == "LAYER_NORM" and any("combination_norms" in x for x in nd["inputs"]):
+                if abs(nd.get("params", {}).get("eps", -1) - want_eps) > 1e-12:
+                    raise ValueError(f"comb_norms LayerNorm {nd['name']}: eps {nd.get('params')} != {want_eps}")
     # the converter writes graph weight refs lower-cased (his flax names MLP_0 / LayerNorm_0 keep their case in
     # the state dict): store the tensors under the names the graph reads
     refs = {x[7:] for nd in graph.to_dict()["nodes"] for x in nd["inputs"] if x.startswith("weight:")}
@@ -320,16 +366,18 @@ def main():
                 w.add_string(key, json.dumps(gq.to_dict()))
         if graph_pbc is not None:  # his calculator's Ewald settings (Calculator.from_checkpoint: the sampler's)
             w.add_string("graph_pbc.json", json.dumps(graph_pbc.to_dict()))
-            ts = (yaml.safe_load(open(f"{a.ckpt}/config.yaml"))["training_pipeline"]["to_sample"]
-                  if Path(f"{a.ckpt}/config.yaml").exists() else {})
+            ts = to_sample(a)
+            if not int(ts.get("num_k") or 0):  # (the C++ side would raise on every periodic structure)
+                raise ValueError(f"{a.ckpt}: no to_sample.num_k (no config.yaml there and no --config): the periodic graph "
+                                 "would be written with pet.iris_lr.num_k = 0; pass --config (seeded presets: "
+                                 "presets/seeded_config.yaml)")
             w.add_int32("pet.iris_lr.num_k", int(ts.get("num_k") or 0))
             w.add_float32("pet.iris_lr.smearing", float(ts.get("smearing") or 0.0))  # 0: 2 wavelength
             w.add_int32("pet.iris_lr.halfspace", int(ts.get("halfspace", True)))
             w.add_float32("pet.iris_lr.slab_margin", 2.0)
     # his calculator raises when an atom has more than max_neighbors neighbours within the cutoff (training pipeline
     # to_sample.max_neighbors); mlip.cpp raises there too for iris GGUFs (0: no config.yaml, no check)
-    ts_all = (yaml.safe_load(open(f"{a.ckpt}/config.yaml"))["training_pipeline"]["to_sample"]
-              if Path(f"{a.ckpt}/config.yaml").exists() else {})
+    ts_all = to_sample(a)
     # (his older fixed-neighbour mode: KnnToSample keeps the nearest fixed_neighbors, so that is the overflow width)
     w.add_int32("pet.iris.max_neighbors", int(cfg.get("fixed_neighbors") or ts_all.get("max_neighbors") or 0))
     # his XLA keeps libm-accurate transcendentals and IEEE division on the GPU: the CUDA kernels of iris graphs run

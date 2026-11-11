@@ -1,0 +1,116 @@
+# The training config.yaml the seeded presets carry (make_seeded.py --config; copied into ckpt/seeded/tiny_*, lr_*,
+# ckpt/seeded_branch/*, ckpt/seeded_cc/*; md5 of the body a1e2fae3): his calculator / ToSample read
+# training_pipeline.to_sample (num_k 1024, max_neighbors 59). iris_to_gguf.py --config uses it when CKPT_DIR has none.
+frozen_params: []
+gradient_clip: 0
+gradient_clip_mode: value
+infra:
+  commit: 'e3fcaca pet: readout_charges, the physical charges as an input of the potential
+    readout'
+  status: ''
+initial_weights: /capstor/store/cscs/swissai/aa002/mfl/runs/play/omol-4m/runs/full/fermi/0/checkpoints/RMSE_F/model/model.msgpack
+loss: mse
+loss_weights:
+  dipole: 0.1
+  energy: 0.5
+  forces: 0.5
+  metallicity: 0.0
+lr_decay:
+  start_decay_after: 0.0
+  stop_decay_after: 2.0
+  style: linear
+max_epochs: 2.0
+max_steps: 6247476
+min_learning_rate: 1.0e-06
+model:
+  iris.pet.petlr.PETLR:
+    adaptive_cutoff_method: grid
+    attention_temperature: 1.0
+    bec_scale: 1.0
+    charge_allocation: flows
+    charge_reference: fermi
+    charge_scale_init: 1.0
+    charge_state_max: 3
+    charge_state_min: -3
+    charge_temperature: 0.1
+    conditioning: [spin_multiplicity]
+    conductance_form: layerscale
+    conductance_init: -4.0
+    conductance_scale: 1.0
+    coulomb_prefactor: null
+    cutoff: 5.0
+    cutoff_width: 0.5
+    cutoff_width_adaptive: 0.5
+    d_feedforward: 256
+    d_head: 128
+    d_lr: null
+    d_node: 512
+    d_pet: 128
+    descriptor_flows: true
+    direct_forces: false
+    direct_stress: false
+    final_message_passing: true
+    hardness: true
+    init_prefactor: 1.0
+    inputs: [charge, spin_multiplicity, dipole_origin]
+    learn_bec_scale: false
+    learn_charge_scale: true
+    lr: true
+    lr_scale_init: 0.0
+    max_atomic_number: 83
+    max_charge: 10
+    max_spin_multiplicity: 11
+    num_attention_layers: 1
+    num_charges: 1
+    num_gnn_layers: 2
+    num_heads: 8
+    num_neighbors_adaptive: 40
+    physical_charges: true
+    polarisation_passes: 2
+    polarisation_shared: true
+    qeq_hardness_init: 5.0
+    readout_charges: true
+    readout_phi0: false
+    score_init: 0.3
+    smearing: null
+    system_conditioning: true
+    transfer_init: 0.3
+    transfer_passes: 1
+n_train: 3123738
+n_valid: 50000
+num_parameters: 7555082
+optimizer: muon
+start_learning_rate: 0.0003
+training_pipeline:
+  batcher:
+    cutoffs: differentiable
+    inputs: [charge, spin_multiplicity, dipole_origin]
+    keys: [energy, forces, dipole]
+    lr:
+      BK: 16
+      BM: 8
+      n_atoms_pbc: 8
+      n_pairs: 1
+      n_pairs_nonpbc: 127489
+      n_structures_pbc: 1
+      num_k: 16
+    max_neighbors: 59
+    n_atoms: 1025
+    n_pairs: 75777
+    n_structures: 1025
+    num_batches: 1
+  rotational_augmentation: true
+  to_sample:
+    adaptive_cutoff_method: grid
+    cutoff: 5.0
+    cutoff_width_adaptive: 0.5
+    cutoffs: differentiable
+    max_neighbors: 59
+    num_k: 1024
+    num_neighbors_adaptive: 40
+    with_lr: true
+  transforms_atoms: []
+  transforms_sample: []
+valid_every: 780934
+worker_buffer_size: 2
+worker_count: 16
