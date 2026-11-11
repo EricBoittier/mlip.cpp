@@ -122,3 +122,64 @@ TEST_CASE("tail loss: pair file", "[tail]") {
   REQUIRE(t.groups[0].pairs[1].l == 1);
   REQUIRE(t.groups[0].pairs[1].de_dft == Approx(-0.3));
 }
+
+// Same-geometry charge / spin-state pair loss (mlipcpp-train --pair-data): TailLoss with dE_ref = 0 and the scale
+// fixed to --pair-scale (eV), so r = (dE_model - dE_DFT) / scale and L = W mean_p Huber_delta(r)
+namespace {
+// one geometry, three states: N (local 0), N-1 (1, the cation), N+1 (2, the anion); IP = E(N-1) - E(N),
+// EA = E(N) - E(N+1), both as k - l
+std::vector<TailPair> ipea_group() { return {{1, 0, 9.31, 0.0, 0.0}, {0, 2, 1.12, 0.0, 0.0}}; }
+} // namespace
+
+TEST_CASE("pair loss: residual in eV over the fixed scale, quadratic and linear branches", "[pair]") {
+  const auto p = ipea_group();
+  TailLoss pl{0.5, 1.0, 1.0}; // weight 0.5, scale 1 eV, delta 1
+  std::vector<double> E = {-2000.0, -2000.0 + 9.31, -2000.0 - 1.12};
+  std::vector<double> g;
+  REQUIRE(pl.eval(p, E, &g) == Approx(0.0).margin(1e-12)); // at the DFT differences, any common offset
+  for (double x : g) REQUIRE(std::abs(x) < 1e-12);
+  REQUIRE(pl.scale(p[0]) == 1.0);
+  E[1] += 0.4; // IP 0.4 eV too high: r = 0.4, L = 0.5 x mean(0.5 0.16, 0) = 0.02
+  REQUIRE(pl.residual(p[0], E) == Approx(0.4));
+  REQUIRE(pl.eval(p, E, nullptr) == Approx(0.5 * 0.5 * (0.5 * 0.16)));
+  E[1] += 57.6; // a -58 eV-class outlier (here +58): linear, |dL/dE| bounded by W delta / (scale n_pairs)
+  REQUIRE(pl.eval(p, E, &g) == Approx(0.5 * 0.5 * (58.0 - 0.5)));
+  REQUIRE(g[1] == Approx(0.5 * 1.0 / 2.0));
+  REQUIRE(g[0] == Approx(-0.5 * 1.0 / 2.0));
+  // the scale: the same loss in meV with scale 1000 meV
+  TailLoss pm{0.5, 1000.0, 1.0};
+  auto q = p;
+  for (auto &x : q) x.de_dft *= 1e3;
+  std::vector<double> Em = {1e3 * E[0], 1e3 * E[1], 1e3 * E[2]};
+  REQUIRE(pm.eval(q, Em, nullptr) == Approx(pl.eval(p, E, nullptr)));
+}
+
+TEST_CASE("pair loss: gradient matches central differences, sums to zero", "[pair]") {
+  const auto p = ipea_group();
+  std::mt19937_64 rng(11);
+  std::normal_distribution<double> nd(0.0, 0.8);
+  for (double delta : {0.25, 1.0, 1e6}) { // delta 1e6: the pure square W/2 (dE_model - dE_DFT)^2 / scale^2
+    TailLoss pl{1.7, 0.5, delta};
+    for (int trial = 0; trial < 20; trial++) {
+      std::vector<double> E = {-713.0, -713.0 + 9.31, -713.0 - 1.12};
+      for (double &x : E) x += nd(rng);
+      std::vector<double> g;
+      const double L = pl.eval(p, E, &g);
+      if (delta == 1e6) {
+        double ref = 0;
+        for (const auto &x : p) ref += 0.5 * std::pow((E[x.k] - E[x.l] - x.de_dft) / 0.5, 2);
+        REQUIRE(L == Approx(1.7 * ref / p.size()));
+      }
+      double sum = 0;
+      for (size_t k = 0; k < E.size(); k++) {
+        const double h = 1e-6;
+        auto Ep = E, Em = E;
+        Ep[k] += h, Em[k] -= h;
+        const double fd = (pl.eval(p, Ep, nullptr) - pl.eval(p, Em, nullptr)) / (2 * h);
+        REQUIRE(g[k] == Approx(fd).epsilon(1e-5).margin(1e-7));
+        sum += g[k];
+      }
+      REQUIRE(std::abs(sum) < 1e-12); // a common shift of the group (composition, offsets) has no gradient
+    }
+  }
+}

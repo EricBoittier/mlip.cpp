@@ -109,6 +109,19 @@ struct TrainOptions {
   // and no forces of the scans enter. Conservative training only. tail_weight 0: off
   std::string tail_data;
   double tail_weight = 0.0, tail_floor_mev = 2.585, tail_delta = 1.0;
+  // same-geometry charge / spin-state pairs (vertical IP / EA, spin gaps; train/tail_loss.h with the scale fixed):
+  // --pair-data DIR holds a MemmapSplit plus pairs.tsv (tail_pairs.tsv format, dE_ref ignored); every pair_every-th
+  // step adds one group (one geometry, all its states, co-batched; classes in turn) with
+  //   pair_weight * mean_p Huber_{pair_delta}((ΔE_model - ΔE_DFT) / pair_scale)   (ΔE in eV; scale pair_scale eV)
+  // and, with pair_rows_weight V > 0, the ordinary energy + force loss of its members at V x the weight of an
+  // ordinary row of the step batch (V alone, pair_weight 0: the "upweighted rows" alternative). Conservative only.
+  // --pair-val DIR (same format): the held-out pairs' ΔE errors after each epoch (no gradient)
+  std::string pair_data, pair_val, pair_val_dump; // pair_val: DIR[,DIR...]; pair_val_dump: per-pair error TSV prefix
+  double pair_weight = 0.0, pair_scale = 1.0, pair_delta = 1.0, pair_rows_weight = 0.0;
+  int pair_every = 1;
+  // --pair-grad-check N: before training, compare the pair loss's parameter gradient (run_tail's backward) with a
+  // central difference of the loss along the normalised gradient, on the first N groups of --pair-data, and stop
+  int pair_grad_check = 0;
   // checkpoint_steps > 0: also <output>.step%06d.gguf every that many steps (for per-checkpoint monitors)
   int64_t checkpoint_steps = 0;
   // fine-tuning: keep the composition and scales stored in --init instead of
@@ -302,6 +315,9 @@ public:
   /// pairs: local indices into the batch; returns the loss, the normalised residuals in `r` (optional).
   double run_tail(const Batch &b, double energy_scale, const std::vector<TailPair> &pairs, const TailLoss &tl,
                   double mult, std::vector<double> *r = nullptr);
+  /// The model energies (eV, without the composition baseline; host lrc / SQE energies included) of the batch's
+  /// real structures: one FORWARD pass, no gradient (run_tail's first half; the held-out pair errors).
+  std::vector<double> energies(const Batch &b, double energy_scale);
 
   /// Profiling: compute node by node (synchronised) and accumulate, per op
   /// ("fwd:OP" / "bwd:OP"; conservative mode "F.fwd:OP" / "F.bwd:OP" for the

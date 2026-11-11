@@ -9,7 +9,7 @@
 
 namespace mlipcpp::train {
 
-TailSet TailSet::load(const std::string &path) {
+TailSet TailSet::load(const std::string &path, bool mixed) {
   std::ifstream f(path);
   if (!f) throw std::runtime_error("--tail-data: cannot open " + path);
   TailSet t;
@@ -35,7 +35,8 @@ TailSet TailSet::load(const std::string &path) {
       local.emplace_back();
     }
     TailGroup &grp = t.groups[gi.first->second];
-    if (grp.cls != ci.first->second) throw std::runtime_error(path + ": group " + g + " has two classes");
+    if (grp.cls != ci.first->second && !mixed) throw std::runtime_error(path + ": group " + g + " has two classes");
+    p.cls = ci.first->second;
     auto &loc = local[gi.first->second];
     auto at = [&](int64_t s) {
       auto it = loc.emplace(s, int64_t(grp.ids.size()));
