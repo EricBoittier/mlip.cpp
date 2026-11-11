@@ -447,8 +447,11 @@ Result64 IrisDriver::predict(const System64 &s, bool compute_forces) {
       in["lr_keep"] = T64::from({n, kl}, keep);
       in["kvec"] = T64::from({K, 3}, kv);
       in["volume"] = T64::from({1}, {std::fabs(det)});
-      in["smearing"] = T64::from({1}, {es.smearing});
-      in["cutoff"] = T64::from({1}, {es.cutoff});
+      // his Ewald batch is pinned to float32 even in his x64 runs (iris.pet.batching, jax-pme get_batch(dtype=
+      // np.float32)): the smearing and the real-space cutoff the maths sees are float32-rounded (torch_grid.py
+      // ewald_inputs does the same and = his JAX fp64 to 1e-14; in double they move periodic outputs by ~1e-11)
+      in["smearing"] = T64::from({1}, {double(float(es.smearing))});
+      in["cutoff"] = T64::from({1}, {double(float(es.cutoff))});
       in["slab"] = T64::from({1}, {es.slab ? 1.0 : 0.0});
       in["slab_normal"] = T64::from({3}, {normal[0], normal[1], normal[2]});
       in["slab_basis"] = T64::from({1}, {basis});
@@ -553,6 +556,23 @@ Result64 IrisDriver::predict(const System64 &s, bool compute_forces) {
     }
   }
 
+  // MLIPCPP_FP64_DUMP=<file>: append this structure's graph inputs and output (JSON lines; diagnostics: the
+  // eager torch module on exactly these inputs, scripts/pet_lr_port/fp64_torch_inputs.py)
+  static const char *dump = [] { const char *e = std::getenv("MLIPCPP_FP64_DUMP"); return e && *e ? e : nullptr; }();
+  auto dump_json = [&](const T64 *outp) {
+    nlohmann::json j;
+    for (const auto &i : G.inputs) {
+      const T64 &t = in.at(i.name);
+      j["inputs"][i.name] = {{"shape", t.shape}, {"data", *t.data}};
+    }
+    if (outp) j["output"] = {{"shape", outp->shape}, {"data", *outp->data}};
+    if (FILE *fp = std::fopen(dump, "a")) {
+      const std::string sj = j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+      std::fprintf(fp, "%s\n", sj.c_str());
+      std::fclose(fp);
+    }
+  };
+
   // --- full graph ---
   Executor<double> ex(G);
   load_weights(ex);
@@ -563,6 +583,7 @@ Result64 IrisDriver::predict(const System64 &s, bool compute_forces) {
   const int C = L.enabled ? L.n_out : 1;
   if (out.numel() != int64_t(n) * C) throw std::runtime_error("fp64: graph output is not [n_atoms, n_out]");
   std::vector<double> aux(out.ptr(), out.ptr() + out.numel());
+  if (dump) dump_json(&out);
   const double escale = m.energy_scale();
 
   // gradients of <cot, output> -> per-atom -d/dr (edge scatter + explicit positions), and the raw adjoints
