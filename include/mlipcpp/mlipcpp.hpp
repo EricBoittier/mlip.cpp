@@ -62,6 +62,9 @@ struct Result {
   bool has_charge_residual = false;
   /// conserving charges: the dipole of the edge flows (e A) [3]; empty otherwise
   std::vector<double> dipole_flow;
+  /// conserving charges on several components: each atom's component and their charges Q_c; empty otherwise
+  std::vector<int> components;
+  std::vector<double> component_charges;
   // periodic graph models: the full virial dE/d(strain) [9], row-major, eV, before symmetrisation; empty otherwise
   std::vector<double> virial;
 

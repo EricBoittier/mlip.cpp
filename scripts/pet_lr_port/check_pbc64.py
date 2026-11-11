@@ -56,8 +56,12 @@ def energy(cfg, trunk, lr, scale, pos, cell, Z, spin, Q, prm, hard=False, lr_on=
         mu_b, gapped, m_round, top, bottom = bisect_fermi(lr, lr.scores(node, Zt).detach(), Q,
                                                           w=None if w is None else w.detach())
     e_lr = lr(node, Zt, pos, g["neighbor_index"], g["padding_mask"], g["reverse"], ev, env,
-              t(Q), t(mu_b), t(float(gapped)), m_round, top, bottom, torch.zeros(3, dtype=torch.float64), ewald=e)
+              t(Q), t(mu_b), t(float(gapped)), m_round, top, bottom, torch.zeros(3, dtype=torch.float64), ewald=e,
+              field=None if _FIELD[0] is None else t(_FIELD[0]))
     return (e_sr + e_lr).sum(), lr._aux
+
+
+_FIELD = [None]  # the frame's uniform field (his `field` input) for models that read one; set per frame in main
 
 
 def main():
@@ -86,12 +90,19 @@ def main():
         eps = torch.zeros(3, 3, requires_grad=True)
         pos = P0 + P0 @ eps; cell = C0 + C0 @ eps
         pos.retain_grad()
+        _FIELD[0] = np.asarray(atoms.info["field"], float) if getattr(lr, "field", False) else None
         E, aux = energy(cfg, trunk, lr, scale, pos, cell, Z, spin, Q, prm, hard=a.hard)
         gp, ge = torch.autograd.grad(E, [pos, eps])
         F = -gp.numpy()
         Fj, Ej = zf["forces"][A], zf["atom/energy"][A]
         add("energy |dE|/sum|E_i|", abs(float(E) - Ej.sum()) / np.abs(Ej).sum())
+        if "forces_conservative" in zf.files:  # under a field: -dE/dr against his forces minus his E . Z0
+            Fj = zf["forces_conservative"][A]
         add("forces max|dF|/max|F|", np.abs(F - Fj).max() / np.abs(Fj).max())
+        if "struct/dipole_flow" in zf.files and "dipole_flow_atoms" in aux:
+            D = zf["struct/dipole_flow"][f]
+            add("dipole_flow max|d|/max|D|", float(np.abs(aux["dipole_flow_atoms"].sum(0).detach().numpy() - D).max()
+                                                   / np.abs(D).max()))
         if "atom/charges" in zf.files:
             add("charges max|dq| (e)", np.abs(aux["charges"].detach().numpy() - zf["atom/charges"][A]).max())
         if atoms.pbc.any():  # slabs too: his predict's stress (the calculator reports it for 3-D cells only)

@@ -199,6 +199,10 @@ public:
     int qeq_loaded = -1; // which operator graph qeq_interp_ holds (0 open, 1 pbc, -1 none)
     std::string graph_open, graph_pbc; // the two GIR graphs (same weights); interp_ holds one at a time
     bool pbc_loaded = false;
+    // conserving charges on several components (graph_multi{,_pbc}.json, IrisPETLRGraphMulti): the connected
+    // components of the neighbour graph and mlip.cpp's R-only Q_c rule; which of the four graphs interp_ holds
+    std::string graph_multi_open, graph_multi_pbc;
+    int loaded_kind = -1; // 0 open, 1 pbc, 2 multi open, 3 multi pbc
     bool freeze_ewald = false;      // his calculator's per-run Ewald parameters (ModelOptions::iris_freeze_ewald)
     struct Frozen {                 // the frozen parameters and the system they belong to
       bool valid = false;

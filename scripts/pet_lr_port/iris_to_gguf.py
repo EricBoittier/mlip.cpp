@@ -29,8 +29,8 @@ import yaml
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
 from petjax_convert import PETJAX_CONVERT, load_petjax_convert  # noqa: E402
-from iris_torch import (IrisLR, IrisPETLRGraph, IrisPETLRGraphPBC, IrisQEqApplyGraph, IrisScoresGraph,  # noqa: E402
-                        IrisTrunk)
+from iris_torch import (IrisLR, IrisPETLRGraph, IrisPETLRGraphMulti, IrisPETLRGraphMultiPBC,  # noqa: E402
+                        IrisPETLRGraphPBC, IrisQEqApplyGraph, IrisScoresGraph, IrisTrunk)
 
 SUPPORTED = {"d_pet", "d_node", "d_head", "d_feedforward", "num_heads", "num_attention_layers", "num_gnn_layers",
              "cutoff", "cutoff_width", "cutoff_width_adaptive", "adaptive_cutoff_method", "num_neighbors_adaptive",
@@ -185,7 +185,7 @@ def main():
     # charge_layer WITH the LR branch is validated for the LR side his les-water ladder runs use (the pre-flows physical
     # charge head: no charge_allocation key; oracle ref_les_lr.py on iris explore/alessandro-strict-local 1d412cf);
     # with the flows / conserving allocations no code of his combines the two, so that stays refused
-    if cfg.get("charge_layer") is not None and cfg.get("lr") and a.lr and "charge_allocation" in cfg \
+    if cfg.get("charge_layer") is not None and cfg.get("lr") and a.lr and cfg.get("charge_allocation") is not None \
             and not a.allow_charge_layer:
         raise ValueError("charge_layer with a charge_allocation LR branch: ported (the chosen layer's node features feed "
                          "the LR branch) but no oracle (no branch of his combines charge_layer with the flows / "
@@ -224,7 +224,8 @@ def main():
         lr = IrisLR(cfg).eval()
         load_lr(lr, flat)
         qeq = lr.ref == "qeq"
-        if lr.fermi or qeq:  # QEq: the scores graph returns chi
+        # conserving residual: the scores graph returns the free charges p (the multi-component Q_c rule)
+        if lr.fermi or qeq or (lr.conserving and lr.ref == "residual"):  # QEq: the scores graph returns chi
             sgraph, sweights = export_checked(export_torch_model, IrisScoresGraph(model, lr).eval(), inputs, output_path=None,
                                                   input_names=names, input_dtypes=dtypes, dynamic_shapes=shapes,
                                                   strict=False)
@@ -266,6 +267,22 @@ def main():
             export_torch_model, export_pbc, inputs + ew_in, output_path=None,
             input_names=names + list(IrisPETLRGraphPBC.EWALD), input_dtypes=pdtypes,
             dynamic_shapes=shapes[:3] + (shapes[3] + ew_shapes,), strict=False)
+        graph_multi = {}
+        if lr.conserving:  # several components: per-component Fermi level / residual (IrisPETLRGraphMulti), own graphs
+            C = 2
+            n_comp = torch.export.Dim("n_comp", min=1, max=100000)
+            Mx = torch.zeros(n, C); Mx[: n // 2, 0] = 1.0; Mx[n // 2:, 1] = 1.0
+            mi = (Mx, torch.zeros(C), torch.zeros(C), torch.zeros(C))
+            ms = ({0: atom, 1: n_comp}, {0: n_comp}, {0: n_comp}, {0: n_comp})
+            mnames = list(IrisPETLRGraphMulti.MULTI)
+            gm, _ = export_checked(export_torch_model, IrisPETLRGraphMulti(model, lr, energy_scale).eval(), inputs + mi,
+                                   output_path=None, input_names=names + mnames, input_dtypes=dtypes,
+                                   dynamic_shapes=shapes[:3] + (shapes[3] + ms,), strict=False)
+            gmp, _ = export_checked(export_torch_model, IrisPETLRGraphMultiPBC(model, lr, energy_scale).eval(),
+                                    inputs + mi + ew_in, output_path=None,
+                                    input_names=names + mnames + list(IrisPETLRGraphPBC.EWALD), input_dtypes=pdtypes,
+                                    dynamic_shapes=shapes[:3] + (shapes[3] + ms + ew_shapes,), strict=False)
+            graph_multi = {"graph_multi.json": gm, "graph_multi_pbc.json": gmp}
         if qeq:  # the operator graphs: no trunk (species, geometry, x)
             ti, ts = trunk_inputs, trunk_shapes
             ap_in = (ti[0], ti[2], ti[3], ti[4], extra[0], extra[1], torch.randn(n, generator=g))
@@ -381,6 +398,8 @@ def main():
             w.add_float32("pet.iris_lr.qeq_tol", float(lr.qeq_tol))
             for key, (gq, _) in graph_qeq.items():
                 w.add_string(key, json.dumps(gq.to_dict()))
+        for key, gm in graph_multi.items():  # conserving charges on several components
+            w.add_string(key, json.dumps(gm.to_dict()))
         if graph_pbc is not None:  # his calculator's Ewald settings (Calculator.from_checkpoint: the sampler's)
             w.add_string("graph_pbc.json", json.dumps(graph_pbc.to_dict()))
             ts = to_sample(a)
