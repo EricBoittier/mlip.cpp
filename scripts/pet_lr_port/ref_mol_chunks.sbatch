@@ -18,7 +18,8 @@ export PYTHONUNBUFFERED=1 JAX_PLATFORMS=cpu
 mkdir -p frames/mol_chunks
 # split the text (ase.io.write rounds positions to 1e-8 A: the 2026-11-11 run's chunks did, so its references belong
 # to frames/set_mol_chunked.extxyz = cat of the chunks, not to set_mol.extxyz)
-$PY -c "
+# the chunks of record (2026-11-11 03:26, = frames/set_mol_chunked.extxyz) are kept: never re-split under existing refs
+[ -f frames/mol_chunks/c0.extxyz ] || $PY -c "
 lines = open('frames/set_mol.extxyz').read().splitlines(True)
 frames, i = [], 0
 while i < len(lines):
