@@ -1917,6 +1917,37 @@ ModelResult GraphModel::predict_single_impl(
           for (int i = 0; i < n_atoms * 3; i++) result.forces[i] -= gp[i];
         }
 
+      // MLIPCPP_FORCE_SPLIT=<file>: append this structure's force pieces (diagnostics, parity work): n, k, the
+      // slot neighbours, padding, dE/d edge_vectors [n, k, 3], dE/d cutoff_values [n, k], dE/d positions [n, 3]
+      // and the per-atom chain term of the adaptive cutoffs [n, 3], all unscaled (energy_scale written last)
+      static const char *split_path = std::getenv("MLIPCPP_FORCE_SPLIT");
+      if (split_path && *split_path) {
+        if (FILE *fp = std::fopen(split_path, "ab")) {
+          const int32_t hdr[2] = {n_atoms, max_neighbors};
+          std::fwrite(hdr, sizeof(int32_t), 2, fp);
+          std::vector<int32_t> nb(neighbor_atoms_vec.begin(), neighbor_atoms_vec.begin() + total_slots);
+          std::fwrite(nb.data(), sizeof(int32_t), total_slots, fp);
+          std::fwrite(pm_data.data(), sizeof(float), total_slots, fp);
+          std::fwrite(grad_data.data(), sizeof(float), size_t(total_slots) * 3, fp);
+          std::vector<float> cvg(total_slots, 0.0f), gpos(3 * size_t(n_atoms), 0.0f), fcut(3 * size_t(n_atoms), 0.0f);
+          if (ggml_tensor *g = cutoff_values_t ? ggml_graph_get_grad(cgraph, cutoff_values_t) : nullptr)
+            if (g->data) ggml_backend_tensor_get(g, cvg.data(), 0, ggml_nbytes(g));
+          if (ggml_tensor *g = iris_pos ? ggml_graph_get_grad(cgraph, iris_pos) : nullptr)
+            ggml_backend_tensor_get(g, gpos.data(), 0, gpos.size() * sizeof(float));
+          for (size_t e = 0; e < chain_grad.size(); e++)
+            for (int c = 0; c < 3; c++) {
+              fcut[full_nlist.centers[e] * 3 + c] += float(chain_grad[e][c]);
+              fcut[full_nlist.neighbors[e] * 3 + c] -= float(chain_grad[e][c]);
+            }
+          std::fwrite(cvg.data(), sizeof(float), total_slots, fp);
+          std::fwrite(gpos.data(), sizeof(float), gpos.size(), fp);
+          std::fwrite(fcut.data(), sizeof(float), fcut.size(), fp);
+          const float sc = energy_scale_;
+          std::fwrite(&sc, sizeof(float), 1, fp);
+          std::fclose(fp);
+        }
+      }
+
       // Apply energy scale
       for (int i = 0; i < n_atoms * 3; i++) {
         result.forces[i] *= energy_scale_;

@@ -39,6 +39,26 @@ PRESETS.update({
     "lr_fermi_cold": dict(_LR, charge_reference="fermi", charge_temperature=0.02, polarisation_passes=1),
 })
 
+# tiny models for the committed test GGUFs (tests/resources/petlr_tiny_*.gguf): a small trunk with the adaptive cutoff
+# (cutoff Jacobian) and spin-only conditioning, and one LR model per reference / pass type, so the C++ FD tests run by
+# default on every IrisLR row: fermi (T = 0.1), gapped fermi (T = 0.02), species (softplus, 3 unshared passes, hardness,
+# 2 transfer passes), both (Gaussian charges, 2 shared passes)
+_TINY = dict(d_pet=16, d_node=32, d_head=16, d_feedforward=32, num_heads=2, num_attention_layers=1, num_gnn_layers=2,
+             cutoff=5.0, cutoff_width=0.5, final_message_passing=True, num_neighbors_adaptive=8,
+             max_atomic_number=18, system_conditioning=True, conditioning=["spin_multiplicity"], max_charge=10,
+             max_spin_multiplicity=11)
+_TLR = dict(_TINY, lr=True, physical_charges=True, charge_allocation="flows", num_charges=1,
+            inputs=["charge", "spin_multiplicity", "dipole_origin"])
+PRESETS.update({
+    "tiny_trunk": dict(_TINY),
+    "tiny_fermi": dict(_TLR, charge_reference="fermi", polarisation_passes=1, readout_charges=True, transfer_passes=1),
+    "tiny_cold": dict(_TLR, charge_reference="fermi", charge_temperature=0.02, polarisation_passes=1),
+    "tiny_species": dict(_TLR, charge_reference="species", conductance_form="softplus", polarisation_passes=3,
+                         polarisation_shared=False, hardness=True, readout_charges=True, transfer_passes=2),
+    "tiny_both": dict(_TLR, charge_reference="both", conductance_form="layerscale", polarisation_passes=2,
+                      polarisation_shared=True, hardness=False, smearing=1.0, readout_charges=True),
+})
+
 
 def main():
     ap = argparse.ArgumentParser()
