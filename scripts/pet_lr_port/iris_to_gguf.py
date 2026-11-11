@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""Iris PET-LR checkpoint (ipsum/PET-LR, after M. Langer) -> mlip.cpp pet-graph GGUF, directly: no metatrain.
+
+    python iris_to_gguf.py PARAMS.npz CKPT_DIR -o OUT.gguf [--no-baseline]
+
+PARAMS.npz: the checkpoint's flat parameter tree (dump_params.py, his marathon.io reader); CKPT_DIR: model/model.yaml,
+model/baseline.yaml. Writes the trunk (`params/sr`); the LR branch is added by later phases.
+
+Weights go straight from the iris tree into `iris_torch.IrisTrunk` (a pure-torch transliteration of pet-jax's
+trunk, used only to trace the graph with mlip.cpp's FX exporter). Species tables keep iris's Z-indexed layout
+(species_map Z -> Z); the conditioning tables are laid out as the C++ side indexes them (charge c at row
+c + max_charge, multiplicity m at row m - 1).
+
+Check (bit for bit): every trunk weight is also written under its metatrain state-dict key into a plain dict, and
+pet-jax's own metatrain -> Flax converter (`petjax.convert`, c3f216c, imported from his source with jax / marathon
+stubbed) must return every `sr` leaf exactly, the three species tables in full (row 0 included); only row 0 of the
+spin table (multiplicity 0, never indexed, absent from the C++ layout) is not carried. Each leaf is consumed
+exactly once. No metatrain module is imported (asserted).
+"""
+import argparse
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+import torch
+import yaml
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
+from convert_iris import PETJAX_CONVERT, load_petjax_convert  # noqa: E402  (pure helpers, no metatrain)
+from iris_torch import IrisTrunk  # noqa: E402
+
+SUPPORTED = {"d_pet", "d_node", "d_head", "d_feedforward", "num_heads", "num_attention_layers", "num_gnn_layers",
+             "cutoff", "cutoff_width", "cutoff_width_adaptive", "adaptive_cutoff_method", "num_neighbors_adaptive",
+             "attention_temperature", "max_atomic_number", "system_conditioning", "max_charge",
+             "max_spin_multiplicity", "conditioning", "final_message_passing", "direct_forces", "direct_stress",
+             "inputs"}
+
+
+def metatrain_key(name):
+    """IrisTrunk parameter name -> the metatrain PET state-dict key pet-jax's converter reads."""
+    for a, b in (("neighbor_embedder.weight", "edge_embedder.weight"),):
+        if name == a:
+            return b
+    for a, b in (("node_energy_heads.0.", "node_heads.energy.0."), ("edge_energy_heads.0.", "edge_heads.energy.0."),
+                 ("node_final_layers.0.", "node_last_layers.energy.0.energy___0."),
+                 ("edge_final_layers.0.", "edge_last_layers.energy.0.energy___0.")):
+        if name.startswith(a):
+            return b + name[len(a):]
+    return name
+
+
+def fill(model, sr, cfg, conv):
+    """Load IrisTrunk from the iris `sr` leaves; return the metatrain-keyed copy for the round trip."""
+    mt, used = {}, {}
+    sd = model.state_dict()
+    dummy = np.zeros((2, 3), np.float32)
+    for name in sd:
+        key = metatrain_key(name)
+        flax = conv._scope_key(*conv._finalize_key(conv._rename_key(key), dummy)[:1], key)
+        transposed = conv._finalize_key(conv._rename_key(key), dummy)[1].shape != dummy.shape
+        if flax not in sr:
+            raise KeyError(f"{name} ({key}) -> {flax}: not in the iris trunk")
+        v = np.asarray(sr[flax])
+        if flax.endswith("charge_embedding.embedding"):
+            v = np.roll(v, cfg["max_charge"], axis=0)  # value-indexed -> row c + max_charge
+        elif flax.endswith("spin_multiplicity_embedding.embedding"):
+            v = v[1:]  # row m -> row m - 1
+        if transposed:
+            v = v.T
+        if tuple(v.shape) != tuple(sd[name].shape):
+            raise ValueError(f"{name} <- {flax}: {v.shape} vs {tuple(sd[name].shape)}")
+        sd[name] = torch.from_numpy(np.ascontiguousarray(v))
+        mt[key] = sd[name]
+        used.setdefault(flax, []).append(name)
+    model.load_state_dict(sd)
+    double = {k: v for k, v in used.items() if len(v) > 1}
+    missing = sorted(set(sr) - set(used) - {"energy_scale"})
+    if double or missing:
+        raise ValueError(f"leaves used twice {double} / not consumed {missing}")
+    return mt
+
+
+def round_trip(mt, sr, cfg, conv):
+    back = conv._convert_state_dict(mt)
+    n_rows = cfg["max_atomic_number"] + 1
+    conv._scatter_species_embeddings(back, list(range(n_rows)), n_rows)  # Z-indexed tables: rows map to themselves
+    if cfg["system_conditioning"]:
+        conv._layout_conditioning_tables(back, cfg["max_charge"])
+    for k, v in back.items():
+        ref, v = np.asarray(sr[k]), np.asarray(v)
+        if k.endswith("spin_multiplicity_embedding.embedding"):
+            ref, v = ref[1:], v[1:]
+        if v.shape != ref.shape or not np.array_equal(v, ref):
+            raise ValueError(f"round trip differs at {k}")
+    lost = set(sr) - set(back) - {"energy_scale"}
+    if lost:
+        raise ValueError(f"round trip lost {sorted(lost)}")
+    return len(back)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("params"); ap.add_argument("ckpt")
+    ap.add_argument("-o", "--output", required=True)
+    ap.add_argument("--no-baseline", action="store_true")
+    ap.add_argument("--n-atoms", type=int, default=7); ap.add_argument("--max-neighbors", type=int, default=11)
+    a = ap.parse_args()
+
+    (name, cfg), = yaml.safe_load(open(f"{a.ckpt}/model/model.yaml")).items()
+    if cfg.get("backbone"):
+        raise ValueError(f"custom backbone {cfg['backbone']!r}: not yet supported")
+    if cfg.get("direct_forces") or cfg.get("direct_stress"):
+        raise ValueError("direct heads: not yet supported")
+    conditioning = list(cfg.get("conditioning", ["charge", "spin_multiplicity"]))
+    if set(conditioning) - {"charge", "spin_multiplicity"}:
+        raise ValueError(f"unknown conditioning keys {conditioning}")
+    flat = dict(np.load(a.params))
+    sr = {k[len("params/sr/"):].replace("/", "."): v for k, v in flat.items() if k.startswith("params/sr/")}
+    conv = load_petjax_convert(PETJAX_CONVERT)
+    model = IrisTrunk(cfg).eval()
+    mt = fill(model, sr, cfg, conv)
+    n = round_trip(mt, sr, cfg, conv)
+    n_sr = sum(np.asarray(v).size for v in sr.values())
+    print(f"{name}: {len(sr)} trunk leaves ({n_sr} parameters incl. energy_scale), round trip bit-identical on {n}")
+
+    from export_pytorch.export_pet_gguf import GGUFWriter, add_conditioning_inputs, example_export_args
+    from export_pytorch.fx_converter import export_torch_model
+
+    inputs, names, shapes = example_export_args(a.n_atoms, a.max_neighbors, cfg["cutoff"], forces=True)
+    if model.conditioning:
+        inputs, names, shapes = add_conditioning_inputs(inputs, names, shapes, a.n_atoms)
+    graph, weights = export_torch_model(
+        model, inputs, output_path=None, input_names=names,
+        input_dtypes={"species": "i32", "neighbor_species": "i32", "reverse_neighbor_index": "i32",
+                      "charge_index": "i32", "spin_index": "i32"},
+        dynamic_shapes=shapes, strict=False)
+    param_names = [p.replace(".", "_") for p, _ in model.named_parameters() if p.replace(".", "_") in weights]
+    energy_scale = float(np.asarray(sr["energy_scale"]).reshape(()))
+    baseline = {}
+    if not a.no_baseline:
+        b = yaml.safe_load(open(f"{a.ckpt}/model/baseline.yaml")) or {}
+        baseline = {int(z): float(v) for z, v in (b.get("elemental") or {}).items()}
+    nna = cfg.get("num_neighbors_adaptive")
+
+    w = GGUFWriter()
+    w.add_string("general.architecture", "pet-graph")
+    w.add_string("general.name", f"iris-petlr:{Path(a.ckpt).resolve()}")
+    w.add_string("general.version", "1.0.2")
+    w.add_string("pet.source", "iris PET-LR (ipsum/PET-LR, after M. Langer): scripts/pet_lr_port/iris_to_gguf.py")
+    w.add_float32("pet.cutoff", float(cfg["cutoff"]))
+    w.add_float32("pet.cutoff_width", float(cfg["cutoff_width"]))
+    w.add_int32("pet.d_pet", int(cfg["d_pet"]))
+    w.add_int32("pet.num_heads", int(cfg["num_heads"]))
+    w.add_float32("pet.energy_scale", energy_scale)
+    w.add_string("pet.cutoff_function", "bump")
+    w.add_int32("pet.forces_mode", 1)
+    w.add_int32("pet.nc_forces", 0)
+    if model.conditioning:
+        w.add_int32("pet.system_conditioning", 1)
+        w.add_int32("pet.max_charge", model.max_charge)
+        w.add_int32("pet.max_spin_multiplicity", model.max_spin_multiplicity)
+        # iris conditions only on the keys listed (absent charge = charge 0): the C++ side pins the rest
+        w.add_string("pet.conditioning_keys", ",".join(conditioning))
+    w.add_float32("pet.num_neighbors_adaptive", float(nna or 0.0))
+    w.add_float32("pet.cutoff_width_adaptive", float(cfg.get("cutoff_width_adaptive", cfg["cutoff_width"])))
+    w.add_string("pet.adaptive_cutoff_method", str(cfg.get("adaptive_cutoff_method", "grid")).lower())
+    species_map = []
+    for z in range(1, cfg["max_atomic_number"] + 1):
+        species_map += [z, z]  # Z-indexed tables (row 0 unused)
+    w.add_array_int32("pet.species_map", species_map)
+    if baseline:
+        w.add_array_int32("pet.composition_keys", list(baseline))
+        w.add_array_float32("pet.composition_values", list(baseline.values()))
+    w.add_string("graph.json", json.dumps(graph.to_dict()))
+    w.add_string("train.param_names", json.dumps(param_names))
+    w.add_string("train.state_dict_names",
+                 json.dumps({p.replace(".", "_"): metatrain_key(p) for p, _ in model.named_parameters()}))
+    w.add_string("graph.weight_shapes", json.dumps({k: list(t.shape) for k, t in weights.items()}))
+    for k, t in weights.items():
+        w.add_tensor(k, t, transpose_2d=False)
+    w.write(a.output)
+    leaked = sorted(m for m in sys.modules if m == "metatrain" or m.startswith("metatrain."))
+    assert not leaked, f"metatrain was imported: {leaked[:3]}"
+    print(f"wrote {a.output}: {len(graph.nodes)} nodes, {len(weights)} weights, energy_scale {energy_scale!r}, "
+          f"final_message_passing={model.final_mp}, layers={len(model.gnn_layers)}, nna={nna}, "
+          f"conditioning={conditioning if model.conditioning else None}; metatrain not imported")
+
+
+if __name__ == "__main__":
+    main()

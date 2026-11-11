@@ -34,6 +34,9 @@ def main():
     ap.add_argument("--x64", action="store_true")
     ap.add_argument("--precision", default="float32")
     ap.add_argument("--max", type=int, default=0)
+    # floor-spread knobs: padding changes the reduction shapes (as training batches do), not the maths
+    ap.add_argument("--kpad", type=int, default=8, help="k_sel rounded up to a multiple of this")
+    ap.add_argument("--bucket", default="multiples", help="atom / pair padding strategy (marathon next_size)")
     a = ap.parse_args()
 
     import jax
@@ -86,10 +89,10 @@ def main():
     atom_ptr, pair_ptr, overflow_any, t0 = [0], [0], False, time.time()
     for k, atoms in enumerate(frames):
         # bucketed (masked) padding so compilations are reused across frames
-        s = to_structure(atoms, lr.cutoff, skin=0.0, bucket_strategy="multiples",
-                         n_atoms_bucket_strategy="multiples", int_dtype=np.int32, float_dtype=fdt)
+        s = to_structure(atoms, lr.cutoff, skin=0.0, bucket_strategy=a.bucket,
+                         n_atoms_bucket_strategy=a.bucket, int_dtype=np.int32, float_dtype=fdt)
         sel = select_edges(s, cfg["nna"], cfg["cutoff"], cfg["cwa"], method=cfg["method"])
-        k_sel = -(-max(int(sel.counts.max()), 1) // 8) * 8
+        k_sel = -(-max(int(sel.counts.max()), 1) // a.kpad) * a.kpad
         Np = s["positions"].shape[0]
         cond = {}
         for key in lr.conditioning:
@@ -118,7 +121,8 @@ def main():
     meta = dict(ckpt=a.ckpt, frames=a.frames, x64=a.x64,
                 matmul_precision=str(jax.config.jax_default_matmul_precision),
                 device=str(jax.devices()[0]), jax=jax.__version__, host=platform.node(),
-                overflow=overflow_any, conditioning=list(lr.conditioning), **cfg)
+                overflow=overflow_any, kpad=a.kpad, bucket=a.bucket,
+                xla_flags=__import__('os').environ.get('XLA_FLAGS', ''), conditioning=list(lr.conditioning), **cfg)
     np.savez(a.out, atom_ptr=np.asarray(atom_ptr), pair_ptr=np.asarray(pair_ptr),
              meta=json.dumps(meta), **res)
     print(json.dumps(meta), f"{time.time() - t0:.1f}s")
