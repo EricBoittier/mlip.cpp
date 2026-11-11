@@ -2,6 +2,7 @@
 // on a neutral partner, the local charge's smoothness through the cluster link window, forces of the long-range term and
 // of the conditioning against central differences, the reduction to the structure's charge for one cluster, and a zero
 // long-range energy when no inter-cluster pair reaches lr_R - lr_t.
+#include "core/adaptive_cutoff.h"
 #include "runtime/graph_model.h"
 #include "runtime/lr_combined.h"
 
@@ -2448,4 +2449,199 @@ TEST_CASE("lrc: molecule plus an isolated atom (He, Ne, Li+, Cl-) at 6-30 A, fin
     CHECK(std::isfinite(r.energy));
     for (float f : r.forces) CHECK(std::isfinite(f));
   }
+}
+
+// ---- cluster links from the backbone's own edges (lrc_links = backbone) ------------------------------------------------
+namespace {
+// graph spec with backbone links: PET-OMol's cutoff (8 A, 16 adaptive neighbours, 0.5 A taper, grid method)
+LrcSpec links_spec(bool grid = true, double nadapt = 16.0) {
+  LrcSpec L = graph_spec();
+  L.links_backbone = true, L.bb_cutoff = 8.0, L.bb_nadapt = nadapt, L.bb_width = 0.5, L.bb_grid = grid;
+  return L;
+}
+// the backbone's pair cutoff of atoms i, j (a brute-force copy of GraphModel's radii)
+double pair_cutoff(const LrcSpec &L, int n, const double *x, int i, int j) {
+  auto rad = [&](int a) {
+    std::vector<double> d;
+    for (int k = 0; k < n; k++)
+      if (k != a) {
+        double s = 0;
+        for (int q = 0; q < 3; q++) s += (x[3 * a + q] - x[3 * k + q]) * (x[3 * a + q] - x[3 * k + q]);
+        if (std::sqrt(s) < L.bb_cutoff) d.push_back(std::sqrt(s));
+      }
+    if (!(L.bb_nadapt > 0)) return L.bb_cutoff;
+    return mlipcpp::adaptive::radius(L.bb_grid, int(d.size()), [&](int k) { return d[k]; }, L.bb_cutoff, L.bb_nadapt,
+                                     L.bb_width);
+  };
+  return 0.5 * (rad(i) + rad(j));
+}
+// Na+ with a water 2.4 A away (strong), a second water 3.1 A beyond it (strong at dense-ish radii? see the REQUIREs) and Cl-
+// in the link taper of the first water; every atom within 8 A of the link atoms, so moving any atom moves the radii
+const int32_t ZB[] = {11, 8, 1, 1, 8, 1, 1, 17};
+const std::vector<double> XB = {0, 0, 0, 2.4, 0.1, 0.2, 3.0, 0.8, 0.1, 2.9, -0.7, -0.2, 0.3, 3.1, 0.4,
+                                1.1, 3.6, 0.2, -0.4, 3.7, 0.7, 7.9, 1.2, 0.3};
+} // namespace
+
+TEST_CASE("lrc links backbone: links are the backbone's pair cutoffs; long-range and conditioning forces exact",
+          "[lrc][links]") {
+  SqeSpec S = sqe_spec();
+  S.lr_R = 10.0, S.lr_t = 2.0; // ignored by the inter-cluster Coulomb under backbone links
+  struct Case {
+    bool grid, qproj;
+    double nadapt, tol;
+  };
+  for (const Case cs : {Case{true, false, 16.0, 1e-8}, Case{true, true, 16.0, 1e-8}, Case{false, false, 16.0, 1e-8},
+                        Case{true, false, 0.0, 1e-8}}) {
+    LrcSpec L = links_spec(cs.grid, cs.nadapt);
+    L.qproj = cs.qproj;
+    if (!(cs.nadapt > 0)) L.link_b = 0.4; // c = 8 A everywhere: lo 4.4 A, so Cl- (4.9 A from an H) stays weakly linked
+    const int n = 8;
+    const LrcCondition c0 = lrc_condition(L, S, n, ZB, XB.data(), 0.0, 10, 1);
+    // Cl- (atom 7) is weakly linked to the first water's oxygen: lo < d < c for that pair
+    const double c71 = pair_cutoff(L, n, XB.data(), 7, 1), d71 = std::sqrt(std::pow(7.9 - 2.4, 2) + 1.1 * 1.1 + 0.01);
+    INFO("grid " << cs.grid << " qproj " << cs.qproj << " nadapt " << cs.nadapt << ": c(Cl, O) " << c71 << ", d " << d71
+                 << ", lo " << L.link_a * c71 + L.link_b);
+    REQUIRE(c0.cl.s >= 2);
+    REQUIRE(!c0.cl.trivial());
+    REQUIRE(c0.needs_cond_forces());
+    for (const auto &w : c0.cl.weak) {
+      const double c = pair_cutoff(L, n, XB.data(), w.i, w.j);
+      CHECK(c0.cl.rad.size() == size_t(n));
+      CHECK(0.5 * (c0.cl.rad[w.i] + c0.cl.rad[w.j]) == Approx(c).epsilon(1e-14));
+      if (cs.nadapt > 0) CHECK(w.dAc != 0);
+    }
+    for (double Q : {0.0, 1.0}) {
+      auto energy = [&](const std::vector<double> &x) {
+        const LrcCondition c = lrc_condition(L, S, n, ZB, x.data(), Q, 10, 1);
+        return lrc_energy(L, S, c, n, ZB, x.data(), Q, false).energy;
+      };
+      const LrcCondition cq = lrc_condition(L, S, n, ZB, XB.data(), Q, 10, 1);
+      const LrcEnergy e0 = lrc_energy(L, S, cq, n, ZB, XB.data(), Q, true);
+      double fmax = 0, err = 0;
+      for (size_t k = 0; k < XB.size(); k++) {
+        const double num = -fd(energy, XB, k, 1e-5);
+        fmax = std::max(fmax, std::abs(num)), err = std::max(err, std::abs(num - e0.forces[k]));
+      }
+      INFO("Q " << Q << " long-range: max |F| " << fmax << ", max error " << err);
+      CHECK(fmax > 1e-3);
+      CHECK(err < cs.tol * std::max(1.0, fmax));
+      // conditioning: sum_a w_a Q_loc_a (G_a = w_a / dS_a turns the conditioning forces into -d/dx of it), the same via
+      // the blend rows dS_a/dx
+      auto fS = [&](const std::vector<double> &x) {
+        const LrcCondition c = lrc_condition(L, S, n, ZB, x.data(), Q, 10, 1);
+        REQUIRE(c.cl.s == cq.cl.s);
+        double v = 0;
+        for (int a = 0; a < c.cl.s; a++) v += (0.7 - 0.4 * a) * c.Qloc[a];
+        return v;
+      };
+      std::vector<double> G(cq.cl.s, 0.0), F(3 * n, 0.0);
+      for (int a = 0; a < cq.cl.s; a++) {
+        REQUIRE(cq.dS[a] != 0);
+        G[a] = (0.7 - 0.4 * a) / cq.dS[a];
+      }
+      lrc_condition_forces(L, S, cq, n, ZB, XB.data(), G, F.data());
+      const std::vector<double> rows = lrc_blend_rows(L, S, cq, n, ZB, XB.data());
+      double ferr = 0, rerr = 0, fm = 0, spect = 0;
+      for (size_t k = 0; k < XB.size(); k++) {
+        const double num = -fd(fS, XB, k, 1e-5);
+        double fr = 0;
+        for (int a = 0; a < cq.cl.s; a++) fr -= G[a] * rows[size_t(a) * 3 * n + k];
+        fm = std::max(fm, std::abs(num)), ferr = std::max(ferr, std::abs(num - F[k])), rerr = std::max(rerr, std::abs(num - fr));
+        if (k < 3 || (k >= 12 && k < 21)) spect = std::max(spect, std::abs(num)); // Na+ and the second water: no link
+      }
+      INFO("Q " << Q << " conditioning: max |F| " << fm << ", error " << ferr << ", via rows " << rerr
+                << ", max |F| on atoms in no link " << spect);
+      CHECK(fm > 1e-4);
+      if (cs.nadapt > 0) CHECK(spect > 1e-4); // the radius chain reaches atoms that are in no link
+      CHECK(ferr < cs.tol * std::max(1.0, fm));
+      CHECK(rerr < cs.tol * std::max(1.0, fm));
+    }
+  }
+}
+
+TEST_CASE("lrc links backbone: E and S continuous through the backbone's disconnect; split exactly there", "[lrc][links]") {
+  SqeSpec S = sqe_spec();
+  S.lr_R = 10.0, S.lr_t = 2.0;
+  const LrcSpec L = links_spec();
+  // Li+ ... Na+ (Q = +2) along a fixed direction, d through the whole link taper and the disconnect
+  const int32_t Z2[] = {3, 11};
+  const double un = std::sqrt(0.92031 * 0.92031 + 0.34051 * 0.34051 + 0.19327 * 0.19327);
+  const double u[3] = {0.92031 / un, 0.34051 / un, -0.19327 / un};
+  auto xs = [&](double d) { return std::vector<double>{0, 0, 0, d * u[0], d * u[1], d * u[2]}; };
+  const double Q = 2.0;
+  auto at = [&](double d, double &E, double &Fu, double &Qloc, double &dQ) {
+    const auto x = xs(d);
+    const LrcCondition c = lrc_condition(L, S, 2, Z2, x.data(), Q, 10, 1);
+    const LrcEnergy e = lrc_energy(L, S, c, 2, Z2, x.data(), Q, true);
+    E = e.energy, Fu = 0;
+    for (int k = 0; k < 3; k++) Fu += e.forces[3 + k] * u[k];
+    Qloc = c.Qloc[0];
+    // d Qloc_0 / d d by the conditioning forces with G = (1 / dS) on super-node 0
+    dQ = 0;
+    if (c.cl.s == 2 && c.dS[0] != 0) {
+      std::vector<double> F(6, 0.0);
+      lrc_condition_forces(L, S, c, 2, Z2, x.data(), {1.0 / c.dS[0], 0.0}, F.data());
+      for (int k = 0; k < 3; k++) dQ -= F[3 + k] * u[k];
+    }
+    return c;
+  };
+  // the pair cutoff for two lone atoms: the radius where 1 + 16 (r / 8)^3 = 16 (about 7.81 A) once the partner is inside
+  double c_far = 0;
+  {
+    const auto x = xs(20.0);
+    c_far = 0.5 * (lrc_clusters(L, 2, x.data()).rad[0] + lrc_clusters(L, 2, x.data()).rad[1]);
+  }
+  INFO("pair cutoff of the lone ions " << c_far);
+  CHECK(c_far == Approx(7.81).margin(0.02));
+  double Ep = 0, Fp = 0, Qp = 0, dQp = 0, worstE = 0, worstQ = 0, dmax = 0;
+  bool first = true, joint_seen = false, split_seen = false;
+  for (double d = 4.0; d <= 9.0 + 1e-9; d += 1e-3) {
+    double E, Fu, Ql, dQ;
+    const LrcCondition c = at(d, E, Fu, Ql, dQ);
+    const double cij = c.cl.rad.empty() ? 0 : 0.5 * (c.cl.rad[0] + c.cl.rad[1]);
+    if (d <= L.link_a * cij + L.link_b) {
+      CHECK(c.cl.s == 1); // strong link: one cluster, the structure's charge, no long range
+      CHECK(E == 0.0);
+      joint_seen = true;
+    }
+    if (d >= cij) { // no backbone edge: split, every atom on its own charge, the full Coulomb
+      REQUIRE(c.cl.s == 2);
+      CHECK(c.cl.R[1] == 0.0);
+      const LrcEnergy e = lrc_energy(L, S, c, 2, Z2, xs(d).data(), Q, false);
+      CHECK(e.energy == Approx(KE * e.q[0] * e.q[1] / d).epsilon(1e-12));
+      split_seen = true;
+    }
+    if (!first) { // a step no larger than the trapezoid work + O(h^3), and Q_loc likewise
+      worstE = std::max(worstE, std::abs(E - Ep + 0.5 * (Fu + Fp) * 1e-3));
+      if (c.cl.s == 2) worstQ = std::max(worstQ, std::abs(Ql - Qp - 0.5 * (dQ + dQp) * 1e-3));
+      dmax = std::max(dmax, std::abs(Fu));
+    }
+    Ep = E, Fp = Fu, Qp = c.cl.s == 2 ? Ql : Q, dQp = dQ, first = false;
+  }
+  INFO("max |E step - trapezoid| " << worstE << " eV, Q_loc " << worstQ << " e; max |F| " << dmax);
+  CHECK(joint_seen);
+  CHECK(split_seen);
+  CHECK(worstE < 1e-6);
+  CHECK(worstQ < 1e-6);
+}
+
+TEST_CASE("lrc links backbone: unsupported settings throw; key absent keeps the window links", "[lrc][links]") {
+  SqeSpec S = sqe_spec();
+  LrcSpec L = links_spec();
+  CHECK_NOTHROW(L.links_check());
+  LrcSpec Li = L;
+  Li.intra = true;
+  CHECK_THROWS(Li.links_check());
+  LrcSpec Lm = mp_spec(1.0);
+  Lm.links_backbone = true, Lm.bb_cutoff = 8.0;
+  CHECK_THROWS(Lm.links_check());
+  LrcSpec Lb = L;
+  Lb.link_a = 1.0;
+  CHECK_THROWS(Lb.links_check());
+  const int32_t Z1[] = {11};
+  const std::vector<double> x1 = {0, 0, 0};
+  CHECK_THROWS(lrc_condition(L, S, 1, Z1, x1.data(), 1.0, 10, 1, cubic(20.0).data()));
+  const LrcSpec Lw = graph_spec(); // default: window links
+  CHECK(!Lw.links_backbone);
+  CHECK(lrc_clusters(Lw, 8, XB.data()).rad.empty());
 }
