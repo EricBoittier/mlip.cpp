@@ -45,9 +45,14 @@ void mark_precise_math(ggml_cgraph *g) {
   constexpr int slot = GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1;
   for (int i = 0; i < ggml_graph_n_nodes(g); i++) {
     ggml_tensor *t = ggml_graph_node(g, i);
-    const bool unary = t->op == GGML_OP_UNARY && (ggml_get_unary_op(t) == GGML_UNARY_OP_EXP ||
-                                                  ggml_get_unary_op(t) == GGML_UNARY_OP_SIGMOID);
-    if (t->op == GGML_OP_LOG || t->op == GGML_OP_SIN || t->op == GGML_OP_COS || t->op == GGML_OP_DIV || unary)
+    // MLIPCPP_PRECISE_MATH_SKIP=sigmoid,div,...: leave those op kinds on the fast kernels (bisection diagnostics)
+    static const std::string skip = [] { const char *e = std::getenv("MLIPCPP_PRECISE_MATH_SKIP"); return e ? e : ""; }();
+    auto on = [](const char *k) { return skip.find(k) == std::string::npos; };
+    const bool is_unary = t->op == GGML_OP_UNARY;
+    const bool unary = is_unary && ((ggml_get_unary_op(t) == GGML_UNARY_OP_EXP && on("exp")) ||
+                                    (ggml_get_unary_op(t) == GGML_UNARY_OP_SIGMOID && on("sigmoid")));
+    if ((t->op == GGML_OP_LOG && on("log")) || (t->op == GGML_OP_SIN && on("sin")) ||
+        (t->op == GGML_OP_COS && on("cos")) || (t->op == GGML_OP_DIV && on("div")) || unary)
       t->op_params[slot] = 1;
   }
 }
