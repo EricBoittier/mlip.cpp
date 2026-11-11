@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/bash -l
 #SBATCH --job-name=petlr-cuda-trunk
 #SBATCH --account=cosmo
 #SBATCH --partition=h100
@@ -13,10 +13,12 @@
 set -uo pipefail
 unset NVIDIA_TF32_OVERRIDE MLIPCPP_TF32
 export GGML_CUDA_NO_TF32=1
-module load gcc/13.2.0 cuda/12.5.1 cmake/3.27.9
+module load gcc/13.2.0 cuda/12.4.1 cmake/3.27.9 || exit 1
+which nvcc || { echo "no nvcc after module load"; exit 1; }
+export CUDAToolkit_ROOT=$(dirname $(dirname $(which nvcc)))
 W=/scratch/boittier/pet_lr_port/cuda; D=$W/deps
 nvidia-smi --query-gpu=name,power.limit,clocks.max.sm --format=csv
-cmake -S $W/src -B $W/build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=90 \
+cmake -S $W/src -B $W/build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=90 -DCUDAToolkit_ROOT=$CUDAToolkit_ROOT \
   -DMLIPCPP_BUILD_TESTS=ON -DCPM_ggml_SOURCE=$D/ggml -DCPM_fmt_SOURCE=$D/fmt -DCPM_nlohmann_json_SOURCE=$D/nlohmann_json \
   -DCPM_vesin_SOURCE=$D/vesin -DCPM_gpulite_SOURCE=$D/gpulite -DCPM_Catch2_SOURCE=$D/Catch2 > $W/cmake.log 2>&1 || { tail -30 $W/cmake.log; exit 1; }
 cmake --build $W/build -j 16 --target mlipcpp-eval mlipcpp-feats test_pet_lr_port > $W/build.log 2>&1 || { grep -m5 error $W/build.log; exit 1; }

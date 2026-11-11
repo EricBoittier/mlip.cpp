@@ -17,7 +17,6 @@ sys.path.insert(0, str(Path(__file__).parent))
 from compare_trunk import volumes
 from compare_feats import read_bin
 
-R = Path(sys.argv[1])
 
 
 def ref(p):
@@ -49,23 +48,29 @@ def m(x, y):
     return [max(E), max(F), max(H), max(V) if V else None]
 
 
-fmt = lambda v: " / ".join("–" if x is None else f"{x:.1e}" for x in v)
-print("| ckpt | family | cpp vs fp64 | cpu32 vs fp64 | gpu32 vs fp64 | cpp vs cpu32 | gpu32 vs cpu32 | vs fp64 | vs fp32 |")
-print("|---|---|---|---|---|---|---|---|---|")
-for ck, tag in (("readout-pol", ""), ("readout-4m", "_r4m")):
-    for s in ("mol", "ion", "cluster", "slab", "bulk"):
-        d = R / "ref" / ck
-        r64, r32 = ref(d / f"{s}_cpu64.npz"), ref(d / f"{s}_cpu32.npz")
-        c = cpp(R / f"out/{s}_trunk{tag}.json", R / f"out/{s}_feats{tag}.bin", R / f"frames/set_{s}_q0.extxyz")
-        g = ref(d / f"{s}_gpu32.npz") if (d / f"{s}_gpu32.npz").exists() else None
-        c64, f64, c32 = m(c, r64), m(r32, r64), m(c, r32)
-        g64, g32 = (m(g, r64), m(g, r32)) if g else ([None] * 4, [None] * 4)
-        floor64 = [max(1e-5, *(v for v in (a, b) if v is not None)) if a is not None else None for a, b in zip(f64, g64)]
-        def verdict(c, fl):
-            if any(f is None for x, f in zip(c, fl) if x is not None):
-                return "no floor"
-            worst = max(x / f for x, f in zip(c, fl) if x is not None)
-            return "PASS" if worst <= 1 else f"EXCEEDS {worst:.2f}x"
-        floor32 = [max(1e-5, b) if b is not None else None for b in g32]
-        print(f"| {ck} | {s} | {fmt(c64)} | {fmt(f64)} | {fmt(g64)} | {fmt(c32)} | {fmt(g32)} | "
-              f"{verdict(c64, floor64)} | {verdict(c32, floor32)} |")
+def main():
+    R = Path(sys.argv[1])
+    fmt = lambda v: " / ".join("–" if x is None else f"{x:.1e}" for x in v)
+    print("| ckpt | family | cpp vs fp64 | cpu32 vs fp64 | gpu32 vs fp64 | cpp vs cpu32 | gpu32 vs cpu32 | vs fp64 | vs fp32 |")
+    print("|---|---|---|---|---|---|---|---|---|")
+    for ck, tag in (("readout-pol", "_d"), ("readout-4m", "_d4")):  # direct GGUFs (iris_to_gguf.py)
+        for s in ("mol", "ion", "cluster", "slab", "bulk"):
+            d = R / "ref" / ck
+            r64, r32 = ref(d / f"{s}_cpu64.npz"), ref(d / f"{s}_cpu32.npz")
+            c = cpp(R / f"out/{s}_trunk{tag}.json", R / f"out/{s}_feats{tag}.bin", R / f"frames/set_{s}.extxyz")
+            g = ref(d / f"{s}_gpu32.npz") if (d / f"{s}_gpu32.npz").exists() else None
+            c64, f64, c32 = m(c, r64), m(r32, r64), m(c, r32)
+            g64, g32 = (m(g, r64), m(g, r32)) if g else ([None] * 4, [None] * 4)
+            floor64 = [max(1e-5, *(v for v in (a, b) if v is not None)) if a is not None else None for a, b in zip(f64, g64)]
+            def verdict(c, fl):
+                if any(f is None for x, f in zip(c, fl) if x is not None):
+                    return "no floor"
+                worst = max(x / f for x, f in zip(c, fl) if x is not None)
+                return "PASS" if worst <= 1 else f"EXCEEDS {worst:.2f}x"
+            floor32 = [max(1e-5, b) if b is not None else None for b in g32]
+            print(f"| {ck} | {s} | {fmt(c64)} | {fmt(f64)} | {fmt(g64)} | {fmt(c32)} | {fmt(g32)} | "
+                  f"{verdict(c64, floor64)} | {verdict(c32, floor32)} |")
+
+
+if __name__ == "__main__":
+    main()
