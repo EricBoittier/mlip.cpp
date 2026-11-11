@@ -28,7 +28,7 @@ import yaml
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
-from convert_iris import PETJAX_CONVERT, load_petjax_convert  # noqa: E402  (pure helpers, no metatrain)
+from petjax_convert import PETJAX_CONVERT, load_petjax_convert  # noqa: E402
 from iris_torch import IrisTrunk  # noqa: E402
 
 SUPPORTED = {"d_pet", "d_node", "d_head", "d_feedforward", "num_heads", "num_attention_layers", "num_gnn_layers",

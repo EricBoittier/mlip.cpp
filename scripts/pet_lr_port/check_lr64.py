@@ -20,7 +20,7 @@ from ase.io import read
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
 from check_torch64 import frames_info  # noqa: E402
-from convert_iris import PETJAX_CONVERT, load_petjax_convert  # noqa: E402
+from petjax_convert import PETJAX_CONVERT, load_petjax_convert  # noqa: E402
 from iris_to_gguf import fill  # noqa: E402
 from iris_torch import IrisLR, IrisTrunk, bisect_fermi  # noqa: E402
 
@@ -108,7 +108,8 @@ def main():
         with torch.no_grad():
             e_sr = trunk(*targs) * scale
             node, env = trunk._aux["node"], trunk._aux["env"]
-            mu_b, gapped, m_round, top, bottom = 0.0, False, torch.zeros(n, dtype=torch.float64), 0, 0
+            z0 = torch.zeros(n, dtype=torch.float64)
+            mu_b, gapped, m_round, top, bottom = 0.0, False, z0, z0, z0
             if lr.ref in ("fermi", "both"):
                 mu_b, gapped, m_round, top, bottom = bisect_fermi(lr, lr.scores(node), Q)
             e_lr = lr(node, t(Z, torch.long), t(atoms.get_positions()), t(ni.reshape(n, k), torch.long),

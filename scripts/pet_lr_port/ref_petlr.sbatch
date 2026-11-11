@@ -19,7 +19,7 @@ T=$(echo ${CK:-finetune/readout-pol} | tr / _)
 mkdir -p ref/$T
 export PYTHONUNBUFFERED=1 XLA_PYTHON_CLIENT_MEM_FRACTION=0.8
 nvidia-smi -L
-for s in mol ion cluster slab bulk; do
+for s in ${FAMS:-mol ion cluster slab bulk}; do
   JAX_PLATFORMS=cpu $P $C frames/set_$s.extxyz ref/$T/full_${s}_cpu64.npz --x64 > ref/$T/full_${s}_cpu64.log 2>&1
   JAX_PLATFORMS=cpu $P $C frames/set_$s.extxyz ref/$T/full_${s}_cpu32.npz > ref/$T/full_${s}_cpu32.log 2>&1
   echo "$s done"

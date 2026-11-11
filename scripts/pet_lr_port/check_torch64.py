@@ -17,7 +17,7 @@ import yaml
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
-from convert_iris import PETJAX_CONVERT, load_petjax_convert  # noqa: E402
+from petjax_convert import PETJAX_CONVERT, load_petjax_convert  # noqa: E402
 from iris_to_gguf import fill  # noqa: E402
 from iris_torch import IrisTrunk  # noqa: E402
 

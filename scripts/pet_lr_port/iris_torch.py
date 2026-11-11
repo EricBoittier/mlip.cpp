@@ -312,8 +312,8 @@ class IrisLR(nn.Module):
                 env, total_charge, mu_bisect, gapped, m_round, top, bottom, dipole_origin):
         """Per-atom LR energy [n] and the charges. Inputs beyond the trunk's: neighbor_index [n, k] (atom index of
         each slot), positions [n, 3], total_charge [1], the host's frozen-score bisection mu_bisect [1] and gapped
-        decision (gapped [1] in {0, 1}, m_round [n] rounded occupations, top / bottom [1] atom indices of the extremes
-        of s - m), dipole_origin [3]. `env` is the trunk's cutoff_bump at the pair cutoffs (padded slots 0)."""
+        decision (gapped [1] in {0, 1}, m_round [n] rounded occupations, top / bottom [n] indicator weights of the
+        extremes of s - m divided by their tie counts), dipole_origin [3]. `env` is the trunk's cutoff_bump at the pair cutoffs (padded slots 0)."""
         n, k = neighbor_index.shape
         keep = (~padding_mask).to(node.dtype)
         rev_flat = reverse_neighbor_index
@@ -338,7 +338,9 @@ class IrisLR(nn.Module):
             s = self.scores(node)
             mu_n = mu_bisect + ((self.occupation(s - mu_bisect)).sum() - total_charge) / torch.clamp(
                 self.density(s - mu_bisect).sum(), min=1e-6)
-            d_top, d_bot = (s - m_round)[top], (s - m_round)[bottom]
+            # top / bottom: indicator weights of the extremes of s - m, divided by the tie count, as JAX's max / min
+            # derivative splits over ties
+            d_top, d_bot = ((s - m_round) * top).sum(), ((s - m_round) * bottom).sum()
             mu = gapped * (0.5 * (d_top + d_bot)) + (1.0 - gapped) * mu_n
             x = s - mu
             q = self.occupation(x)
@@ -437,8 +439,9 @@ def bisect_fermi(lr, s, total, iterations=40, eps=1e-6):
     mu = 0.5 * (lo + hi)
     m = torch.round(lr.occupation(s - mu))
     d = s - m
-    top, bottom = int(torch.argmax(d)), int(torch.argmin(d))
-    mid = 0.5 * (d[top] + d[bottom])
-    gapped = (abs(float(m.sum()) - total) < 0.5) and float(d[top] - d[bottom]) < 1.0 and \
+    top = (d == d.max()).to(s.dtype); top = top / top.sum()
+    bottom = (d == d.min()).to(s.dtype); bottom = bottom / bottom.sum()
+    mid = 0.5 * float(d.max() + d.min())
+    gapped = (abs(float(m.sum()) - total) < 0.5) and float(d.max() - d.min()) < 1.0 and \
         float(lr.density(s - mid).sum()) < eps
     return float(mu), gapped, m, top, bottom
