@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """A seeded-init iris PETLR checkpoint folder (model/model.yaml, model/model.msgpack, model/baseline.yaml) for trunk
 options no omol-4m checkpoint has, run in his env: e.g. his biotrimers / multivalent trunk (final_message_passing
-False, 1 GNN layer, hard cutoff, spin-only conditioning). The LR branch is off (`lr: False`): trunk tests only.
+False, 1 GNN layer, hard cutoff, spin-only conditioning). The trunk presets keep the LR branch off (`lr: False`); the lr_* presets mount it.
 
-    python make_seeded.py OUT_DIR --preset multivalent|biotrimers [--seed 0] [--scale 0.5]
+    python make_seeded.py OUT_DIR --preset multivalent|biotrimers|lr_species|lr_both|lr_fermi_cold [--seed 0] [--scale 0.5]
 
 --scale multiplies every parameter after init by a seeded factor in [1 - s, 1 + s] per leaf and randomises the
 zero-initialised leaves, so no branch is trivially zero.
@@ -23,6 +23,22 @@ PRESETS = {
                        num_neighbors_adaptive=None, max_atomic_number=18),
 }
 
+# LR-branch presets on the multivalent trunk (adaptive off, so the oracle and the torch check share the plain list),
+# covering the IrisLR rows no omol-4m checkpoint exercises; zero-initialised leaves (incl. scalars: transfer gates,
+# lr_scale) are randomised, so every LR term carries force.
+_LR = dict(PRESETS["multivalent"], max_atomic_number=83, lr=True, physical_charges=True, charge_allocation="flows",
+           num_charges=1, inputs=["charge", "spin_multiplicity", "dipole_origin"])
+PRESETS.update({
+    # species reference, softplus conductance, 3 unshared polarisation passes with hardness, charge readout
+    "lr_species": dict(_LR, charge_reference="species", conductance_form="softplus", polarisation_passes=3,
+                       polarisation_shared=False, hardness=True, readout_charges=True, transfer_passes=2),
+    # both references, layerscale, 2 shared passes, Gaussian charges (erf / erfc), no hardness
+    "lr_both": dict(_LR, charge_reference="both", conductance_form="layerscale", polarisation_passes=2,
+                    polarisation_shared=True, hardness=False, smearing=1.0, readout_charges=True),
+    # fermi at T = 0.02 (gapped midpoint reachable), single pass, no readout
+    "lr_fermi_cold": dict(_LR, charge_reference="fermi", charge_temperature=0.02, polarisation_passes=1),
+})
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -34,7 +50,8 @@ def main():
     from marathon.io import write_msgpack, write_yaml
 
     from iris.pet.petlr import PETLR
-    cfg = {**PRESETS[a.preset], "lr": False}
+    cfg = {"lr": False, **PRESETS[a.preset]}
+    lr_on = bool(cfg["lr"])
     model = PETLR(**cfg)
     key = jax.random.PRNGKey(a.seed)
     params = model.init(key, *model.dummy_inputs())
@@ -43,7 +60,7 @@ def main():
     out = []
     for x, k in zip(leaves, keys):
         k1, k2 = jax.random.split(k)
-        if jnp.all(x == 0) and x.ndim:
+        if jnp.all(x == 0) and (x.ndim or lr_on):
             x = 0.1 * jax.random.normal(k1, x.shape, x.dtype)
         out.append(x * (1.0 + a.scale * jax.random.uniform(k2, (), x.dtype, -1.0, 1.0)))
     params = jax.tree.unflatten(tree, out)

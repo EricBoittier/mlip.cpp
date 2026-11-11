@@ -32,4 +32,4 @@ for s in fams:
         vals = [x[i] for x in rows.values() if x[i] is not None]
         if vals and c[i] is not None:
             print(f"  {lab}: his floor over {len(vals)} runs [{min(vals):.2e}, {max(vals):.2e}]; mlip.cpp {c[i]:.2e} "
-                  f"-> {'within' if c[i] <= max(max(vals), 1e-5) else 'ABOVE'} (ratio to his max {c[i] / max(vals):.2f})")
+                  f"-> {'within' if c[i] <= max(vals) else 'ABOVE'} (ratio to his max {c[i] / max(vals):.2f})")
