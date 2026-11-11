@@ -212,4 +212,233 @@ class IrisTrunk(nn.Module):
         node_e = self.node_final_layers[0](self.node_energy_heads[0](node))[:, 0]
         edge_e = self.edge_final_layers[0](self.edge_energy_heads[0](messages))[..., 0]
         edge_e = torch.where(padding_mask, torch.zeros_like(edge_e), edge_e)
-        return node_e + (edge_e * cut).sum(dim=1)
+        energy = node_e + (edge_e * cut).sum(dim=1)
+        self._aux = dict(node=node, r=r, env=cut)  # for IrisPETLR (the trunk's own outputs, not graph outputs)
+        return energy
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# The long-range branch of iris PETLR with physical charges and charge_allocation="flows" (iris.pet.petlr
+# `_PhysicalLRModuleTiled`, iris.pet.charges), open boundaries. Parameter names follow his flax tree `params/lr`.
+# ---------------------------------------------------------------------------------------------------------------
+
+EV_A = 14.399645478425667  # jaxpme.prefactors.eV_A
+
+
+def _flax_mlp(sizes):
+    """flax petjax.MLP: Dense -> SiLU -> ... -> Dense (no activation on the last)."""
+    layers = []
+    for a, b in zip(sizes[:-1], sizes[1:]):
+        layers += [nn.Linear(a, b), nn.SiLU()]
+    return nn.Sequential(*layers[:-1])
+
+
+class IrisLR(nn.Module):
+    """`_PhysicalLRModuleTiled` for the configurations of his flows runs: num_charges = 1, charge_reference fermi /
+    species / both, transfer passes with the edge-MLP drive, polarisation passes (shared or not, layerscale or softplus
+    conductance, hardness), readout_charges / readout_phi0, point or Gaussian (smearing) charges, open boundaries."""
+
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        d = cfg["d_node"]
+        dh = d if cfg.get("d_lr") is None else cfg["d_lr"]
+        dm = cfg["d_feedforward"] if cfg.get("d_lr") is None else cfg["d_lr"]
+        self.ref = cfg.get("charge_reference", "species")
+        if cfg.get("charge_allocation") != "flows" or not cfg.get("physical_charges") or cfg.get("num_charges", 1) != 1:
+            raise ValueError("IrisLR: physical charges, charge_allocation=flows and num_charges=1 only")
+        if self.ref not in ("fermi", "species", "both"):
+            raise ValueError(f"IrisLR: charge_reference {self.ref!r} not yet ported")
+        self.m_min, self.m_max, self.T = cfg.get("charge_state_min", -3), cfg.get("charge_state_max", 3), \
+            cfg.get("charge_temperature", 0.1)
+        self.cutoff, self.width, self.num_rbf = float(cfg["cutoff"]), float(cfg["cutoff_width"]), 8
+        self.sigma = cfg.get("smearing")
+        if self.ref in ("fermi", "both"):
+            self.score = nn.Linear(d, 1)
+        if self.ref in ("species", "both"):
+            self.species_charge = nn.Parameter(torch.zeros(cfg["max_atomic_number"] + 1))
+        self.transfer_passes = int(cfg.get("transfer_passes", 1))
+        for k in range(1, self.transfer_passes + 1):
+            setattr(self, f"transfer_embed_{k}", nn.Linear(d, dh))
+            setattr(self, f"transfer_mlp_{k}", _flax_mlp((2 * dh + self.num_rbf + 4, dh, 1)))
+            setattr(self, f"transfer_gate_{k}", nn.Parameter(torch.zeros(())))
+        self.passes = int(cfg.get("polarisation_passes", 1))
+        self.shared = bool(cfg.get("polarisation_shared", True))
+        self.form = cfg.get("conductance_form", "layerscale")
+        self.cscale = float(cfg.get("conductance_scale", 1.0))
+        self.cinit = float(cfg.get("conductance_init", -4.0))
+        self.hard = bool(cfg.get("hardness", True))
+        for k in range(1, (self.passes if not self.shared else min(self.passes, 2))):
+            sx = "" if k == 1 else f"_{k}"
+            setattr(self, f"pol_embed{sx}", nn.Linear(d, dh))
+            if self.form == "layerscale":
+                setattr(self, f"pol_gate_in{sx}", nn.Linear(2 * dh + self.num_rbf, dh))
+                setattr(self, f"pol_gate{sx}", nn.Linear(dh, 1))
+            else:
+                setattr(self, f"pol_conductance{sx}", _flax_mlp((2 * dh + self.num_rbf, dh, 1)))
+            if self.hard:
+                setattr(self, f"hardness_head{sx}", nn.Linear(d, 1))
+        self.readout = bool(cfg.get("readout_charges")) or bool(cfg.get("readout_phi0"))
+        if cfg.get("readout_phi0"):
+            raise ValueError("IrisLR: readout_phi0 not yet ported")
+        if self.readout:
+            n_in = 1
+            self.MLP_0 = _flax_mlp((n_in, dm, d))
+            self.LayerNorm_0 = nn.LayerNorm(d, eps=1e-6)
+            self.MLP_1 = _flax_mlp((d, dm, d))
+            self.LayerNorm_1 = nn.LayerNorm(d, eps=1e-6)
+            self.MLP_2 = _flax_mlp((d, dh, dh, 1))
+            self.lr_scale = nn.Parameter(torch.zeros(1))
+
+    # -- charge states (iris.pet.charges) --
+    def steps(self):
+        return [m - 0.5 for m in range(self.m_min + 1, self.m_max + 1)]
+
+    def occupation(self, x):
+        return self.m_min + sum(torch.sigmoid((x - c) / self.T) for c in self.steps())
+
+    def density(self, x):
+        out = 0
+        for c in self.steps():
+            s = torch.sigmoid((x - c) / self.T)
+            out = out + s * (1.0 - s)
+        return out / self.T
+
+    def scores(self, node):
+        bound = 0.5 * (self.m_max - self.m_min) + 2.0
+        return bound * torch.tanh(self.score(node)[:, 0] / bound)
+
+    def forward(self, node, species, positions, neighbor_index, padding_mask, reverse_neighbor_index, edge_vectors,
+                env, total_charge, mu_bisect, gapped, m_round, top, bottom, dipole_origin):
+        """Per-atom LR energy [n] and the charges. Inputs beyond the trunk's: neighbor_index [n, k] (atom index of
+        each slot), positions [n, 3], total_charge [1], the host's frozen-score bisection mu_bisect [1] and gapped
+        decision (gapped [1] in {0, 1}, m_round [n] rounded occupations, top / bottom [1] atom indices of the extremes
+        of s - m), dipole_origin [3]. `env` is the trunk's cutoff_bump at the pair cutoffs (padded slots 0)."""
+        n, k = neighbor_index.shape
+        keep = (~padding_mask).to(node.dtype)
+        rev_flat = reverse_neighbor_index
+        r = torch.sqrt((edge_vectors * edge_vectors).sum(dim=-1) + 1e-15)  # pet-jax safe_norm
+        # _edge_geometry: symmetric taper, zero where the reverse slot is padded
+        keep_rev = keep.reshape(n * k)[rev_flat].reshape(n, k)
+        env_rev = env.reshape(n * k)[rev_flat].reshape(n, k)
+        weight = 0.5 * (env + env_rev) * keep * keep_rev
+        mus = [self.cutoff * i / (self.num_rbf - 1) for i in range(self.num_rbf)]
+        rbf = torch.stack([torch.exp(-(((r - m) * self.num_rbf / self.cutoff) ** 2)) for m in mus], dim=-1)
+
+        def gather_atoms(x):  # x [n, ...] at each slot's neighbour -> [n, k, ...]
+            return x[neighbor_index.reshape(n * k)].reshape((n, k) + tuple(x.shape[1:]))
+
+        def flow_sum(t):  # sum_j 0.5 (t_ij - t_ji) w_ij
+            t_rev = t.reshape(n * k)[rev_flat].reshape(n, k)
+            return (0.5 * (t - t_rev) * weight).sum(dim=1)
+
+        # --- reference ---
+        aux = {}
+        if self.ref in ("fermi", "both"):
+            s = self.scores(node)
+            mu_n = mu_bisect + ((self.occupation(s - mu_bisect)).sum() - total_charge) / torch.clamp(
+                self.density(s - mu_bisect).sum(), min=1e-6)
+            d_top, d_bot = (s - m_round)[top], (s - m_round)[bottom]
+            mu = gapped * (0.5 * (d_top + d_bot)) + (1.0 - gapped) * mu_n
+            x = s - mu
+            q = self.occupation(x)
+            aux.update(scores=s, fermi_level=mu, metallicity=self.density(x).sum())
+            if self.ref == "both":
+                c = self.species_charge[species]
+                q = q + c - c.sum() / n
+        else:
+            c = self.species_charge[species]
+            q = c - (c.sum() - total_charge) / n
+        aux["charges_base"] = q
+        # --- transfer passes: edge MLP on node embeddings, charges and SR potentials ---
+        if self.sigma is None:
+            kern = keep / torch.where(padding_mask, torch.ones_like(r), r)
+        else:
+            kern = torch.erf(r / (math.sqrt(2.0) * self.sigma)) / torch.where(padding_mask, torch.ones_like(r), r) * keep
+        kernel_sr = weight * kern
+        moved = torch.zeros_like(q)
+        for p in range(1, self.transfer_passes + 1):
+            phi_sr = (kernel_sr * gather_atoms(q)).sum(dim=1)
+            a = getattr(self, f"transfer_embed_{p}")(node)
+            xin = torch.cat([a[:, None, :].expand(n, k, a.shape[1]), gather_atoms(a), rbf,
+                             q[:, None, None].expand(n, k, 1), gather_atoms(q)[..., None],
+                             phi_sr[:, None, None].expand(n, k, 1), gather_atoms(phi_sr)[..., None]], dim=-1)
+            t = getattr(self, f"transfer_mlp_{p}")(xin)[..., 0] * getattr(self, f"transfer_gate_{p}")
+            step = flow_sum(t)
+            q = q + step
+            moved = moved + step
+        aux["transfers"] = moved
+        # --- open-boundary potentials (jax-pme: prefactor * 1/2 sum_{j != i} q_j / r_ij) ---
+        D = positions[None, :, :] - positions[:, None, :]
+        R = torch.sqrt((D * D).sum(dim=-1) + 1e-15)
+        eye = torch.eye(n, dtype=positions.dtype)
+        K = (1.0 - eye) / (R + eye)
+        if self.sigma is not None:  # Gaussian charges: minus erfc(r / sqrt2 sigma) / r over the SR edges
+            pass  # handled per edge below
+
+        def potentials(qq):
+            phi = 0.5 * EV_A * (K @ qq)
+            if self.sigma is not None:
+                er = torch.erfc(r / (math.sqrt(2.0) * self.sigma)) / torch.where(padding_mask, torch.ones_like(r), r) * keep
+                phi = phi - 0.5 * EV_A * (er * gather_atoms(qq)).sum(dim=1)
+            return phi
+
+        phi = potentials(q)
+        extra = torch.zeros_like(q)
+        if self.passes > 1:
+            aux["charges_pass1"] = q
+            delta = torch.zeros_like(q)
+            for p in range(1, self.passes):
+                kk = 1 if self.shared else p
+                sx = "" if kk == 1 else f"_{kk}"
+                b = getattr(self, f"pol_embed{sx}")(node)
+                bi, bj = b[:, None, :].expand(n, k, b.shape[1]), gather_atoms(b)
+                sym = torch.cat([bi + bj, bi * bj, rbf], dim=-1)
+                if self.form == "layerscale":
+                    hidden = torch.nn.functional.silu(getattr(self, f"pol_gate_in{sx}")(sym))
+                    sigma_c = self.cscale * getattr(self, f"pol_gate{sx}")(hidden)[..., 0]
+                else:
+                    z = getattr(self, f"pol_conductance{sx}")(sym)[..., 0] + self.cinit
+                    sigma_c = torch.log(1.0 + torch.exp(-torch.abs(z))) + torch.relu(z)  # softplus
+                drive = sigma_c * (gather_atoms(phi) - phi[:, None])
+                step = flow_sum(drive)
+                if self.hard:
+                    zh = getattr(self, f"hardness_head{sx}")(node)[:, 0] + 2.0
+                    eta = torch.log(1.0 + torch.exp(-torch.abs(zh))) + torch.relu(zh)
+                    extra = extra + 0.5 * eta * step * step
+                delta = delta + step
+                q = q + step
+                phi = potentials(q)
+            aux["delta_charges"] = delta
+        aux["charges"] = q
+        aux["dipole"] = (q[:, None] * (positions - dipole_origin[None, :])).sum(dim=0)
+        energy = q * phi + extra
+        if self.readout:
+            h = node + self.MLP_0(q[:, None])
+            h = self.LayerNorm_0(h)
+            h = h + self.MLP_1(h)
+            h = self.LayerNorm_1(h)
+            energy = energy + self.MLP_2(h)[:, 0] * self.lr_scale
+        self._aux = aux
+        return energy
+
+
+def bisect_fermi(lr, s, total, iterations=40, eps=1e-6):
+    """Host side of iris `fermi_level` on frozen scores s [n] (numpy / torch double): (mu_bisect, gapped, m_round,
+    top, bottom). The in-graph part (Newton step, gapped midpoint) is IrisLR.forward."""
+    s = torch.as_tensor(s, dtype=torch.float64)
+    margin = 1.0 + 40.0 * lr.T
+    lo, hi = float(s.min()) - lr.m_max - margin, float(s.max()) - lr.m_min + margin
+    lo, hi = torch.tensor(lo, dtype=s.dtype), torch.tensor(hi, dtype=s.dtype)
+    for _ in range(iterations):
+        mid = 0.5 * (lo + hi)
+        above = (lr.occupation(s - mid).sum() - total) > 0
+        lo, hi = (mid, hi) if above else (lo, mid)
+    mu = 0.5 * (lo + hi)
+    m = torch.round(lr.occupation(s - mu))
+    d = s - m
+    top, bottom = int(torch.argmax(d)), int(torch.argmin(d))
+    mid = 0.5 * (d[top] + d[bottom])
+    gapped = (abs(float(m.sum()) - total) < 0.5) and float(d[top] - d[bottom]) < 1.0 and \
+        float(lr.density(s - mid).sum()) < eps
+    return float(mu), gapped, m, top, bottom
