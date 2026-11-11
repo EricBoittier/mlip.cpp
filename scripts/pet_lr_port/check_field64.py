@@ -88,6 +88,14 @@ def main():
         add("charges max|dq|", np.abs(aux["charges"].detach().numpy() - z["charges"][A]).max())
         df = aux["dipole_flow_atoms"].sum(0).detach().numpy()
         add("dipole_flow max|d| / max|D|", np.abs(df - z["dipole_flow"][f]).max() / max(np.abs(z["dipole_flow"][f]).max(), 1e-300))
+        if "dipole_induced" in z.files:  # induced dipoles: sum_i mu_i and alpha_i
+            di = aux["dipole_induced_atoms"].sum(0).detach().numpy()
+            add("dipole_induced max|d| / max|D|",
+                np.abs(di - z["dipole_induced"][f]).max() / max(np.abs(z["dipole_induced"][f]).max(), 1e-300))
+            add("|dipole_induced| (e A, scale)", np.abs(z["dipole_induced"][f]).max())
+            al = aux["polarisability_atoms"].detach().numpy()
+            add("polarisability max|d| / max|a|", np.abs(al - z["polarisability_atoms"][A]).max()
+                / np.abs(z["polarisability_atoms"][A]).max())
         # the field force from the frozen pass-1 charges
         lr.frozen = True
         pos2 = torch.tensor(at.get_positions(), requires_grad=True)

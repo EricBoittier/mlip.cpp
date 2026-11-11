@@ -13,7 +13,7 @@ import json
 import numpy as np
 
 KEYS = ("E", "F", "W", "q", "q_rel", "mu", "dipole", "dipole_abs", "metallicity", "qeq_residual", "charge_residual",
-        "dipole_flow")
+        "dipole_flow", "dipole_ind", "alpha")
 
 
 def per_frame(get, z):
@@ -49,6 +49,12 @@ def per_frame(get, z):
             out["dipole_flow"].append(np.abs(np.asarray(g["dipole_flow"]) - D).max() / max(np.abs(D).max(), 1e-12))
         if "struct/charge_residual" in z.files:  # threshold reference: his charge_residual [S] (signed, e)
             out["charge_residual"].append(abs(g["charge_residual"] - z["struct/charge_residual"][f]))
+        if "struct/dipole_induced" in z.files:  # induced dipoles: sum_i mu_i [S, 3] (e A), max|d| / max|D|
+            D = z["struct/dipole_induced"][f]
+            out["dipole_ind"].append(np.abs(np.asarray(g["dipole_ind"]) - D).max() / max(np.abs(D).max(), 1e-12))
+        if "atom/polarisability" in z.files:  # alpha_i (A^3), max|d| / max|alpha|
+            a_ = z["atom/polarisability"][A]
+            out["alpha"].append(np.abs(np.asarray(g["alpha"]) - a_).max() / max(np.abs(a_).max(), 1e-30))
     return {k: np.asarray(v, float) for k, v in out.items() if len(v)}
 
 
@@ -65,7 +71,9 @@ def from_cpp(path, z):
                     W=np.asarray(x["virial"]).reshape(3, 3) if "virial" in x else None,
                     dipole=np.asarray(x.get("dipole", [np.nan] * 3)), mu=x.get("fermi_level", np.nan),
                     metallicity=x.get("metallicity", np.nan), qeq_residual=x.get("metallicity", np.nan),
-                    charge_residual=x.get("charge_residual", np.nan), dipole_flow=x.get("dipole_flow", [np.nan] * 3))
+                    charge_residual=x.get("charge_residual", np.nan), dipole_flow=x.get("dipole_flow", [np.nan] * 3),
+                    dipole_ind=x.get("dipole_induced", [np.nan] * 3),
+                    alpha=np.asarray(x.get("polarisabilities", [np.nan] * (A.stop - A.start))))
     return per_frame(get, z)
 
 
@@ -88,6 +96,10 @@ def from_ref(path, z, conservative=False):
             g.update(charge_residual=r["struct/charge_residual"][f])
         if "struct/dipole_flow" in r.files:
             g.update(dipole_flow=r["struct/dipole_flow"][f])
+        if "struct/dipole_induced" in r.files:
+            g.update(dipole_ind=r["struct/dipole_induced"][f])
+        if "atom/polarisability" in r.files:
+            g.update(alpha=r["atom/polarisability"][A])
         return g
     return per_frame(get, z)
 

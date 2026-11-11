@@ -259,6 +259,8 @@ class IrisTrunk(_AuxMixin, nn.Module):
                 layers.append((node[:, 0, :], messages))
             if i < L - 1 or self.final_mp:
                 rev = edge.reshape(n * k, d)[reverse_neighbor_index].reshape(n, k, d)
+                if getattr(self, "_gather_taps", None) is not None:  # (check_fieldpbc64.py: his Born-charge taps)
+                    self._gather_taps.append(rev)
                 rev = torch.where(padding_mask.unsqueeze(-1), torch.zeros_like(rev), rev)
                 comb = self.combination_mlps[i](self.combination_norms[i](torch.cat([edge, rev], dim=-1)))
                 messages = messages + torch.where(padding_mask.unsqueeze(-1), torch.zeros_like(comb), comb)
@@ -370,11 +372,21 @@ class IrisLR(_AuxMixin, nn.Module):
         # frozen Fermi level (his frozen_fermi_level, the Born charges' tapped charges): mu (fermi) or the residual
         # correction (residual) out of the gradient; never exported (the field-force oracle check only)
         self.frozen = False
-        # induced dipoles: NOT ported. His path needs jax-pme EwaldDipole (lab-cosmo/jax-pme#38); its branch head 2a8d052
-        # predates the pair layout his pinned jax-pme (1c26495) merged, and his a98c2f6 batching fails on it
-        # (_flatten_jaxpme unpack): no oracle without rebasing that PR ourselves
-        if cfg.get("induced_dipoles"):
-            raise ValueError("IrisLR: induced_dipoles not ported (no oracle: jax-pme#38 is incompatible with his pin)")
+        # induced dipoles (his a98c2f6 iris.pet.petlr._induced_dipoles; jax-pme EwaldDipole of lab-cosmo/jax-pme#38,
+        # oracle = that PR's dipole commits rebased onto his pin 1c26495, 785337c left out: his batching unpacks the
+        # 4-tuple get_batch): alpha_i = softplus(gate) softplus(Dense(h_i) + polarisability_init), mu_i = alpha_i E_i /
+        # prefactor in the field E_i = 2 F_i (+ the external field) of the final charges; "field": energy q phi -
+        # 1/2 a |E|^2; "full": the charge + dipole Coulomb energy q phi' - mu . F' with the dipoles as sources, plus
+        # 1/2 a |E|^2 and - mu . E_ext (one step, not variational)
+        self.induced = cfg.get("induced_dipoles")
+        if self.induced is not None and self.induced not in ("field", "full"):
+            raise ValueError(f"induced_dipoles must be 'field' or 'full', got {self.induced!r}")
+        if self.induced is not None:
+            if not cfg.get("physical_charges"):
+                raise ValueError("induced_dipoles needs physical_charges")
+            self.polarisability_gate = nn.Parameter(torch.full((), -6.0))
+            self.polarisability_head = nn.Linear(d, 1)
+            self.pol_init = float(cfg.get("polarisability_init", 0.0))
         self.lrt = bool(cfg.get("long_range_transfer"))
         if self.lrt and cfg.get("smearing") is None:
             raise ValueError("long_range_transfer needs smearing")
@@ -467,6 +479,8 @@ class IrisLR(_AuxMixin, nn.Module):
             out.append(("charge_residual", 1))
         if self.conserving:
             out.append(("dipole_flow", 3))
+        if self.induced is not None:  # his dipole_induced [S, 3] (summed) and polarisability_atoms [N] (per atom)
+            out += [("dipole_induced", 3), ("polarisability", 1)]
         if self.field:
             # his field force E . Z0 (mlip.cpp, open structures): the pass-1 charges q0 and X, the quantity whose
             # gradient times a host weight is that of q0 at a frozen Fermi level (fermi: the scores s, weight f'(s - mu)
@@ -604,8 +618,22 @@ class IrisLR(_AuxMixin, nn.Module):
             # traceable: no eye of a dynamic size)
             K = torch.where(D2 <= 0.0, torch.zeros_like(R), torch.ones_like(R) / R)  # no reciprocal op in the converter
             coulomb = lambda qq: 0.5 * EV_A * (K @ qq)
+
+            def coulomb_dipole(qq, mm):
+                """jax-pme EwaldDipole (open: bare pairs, both directions): (phi, F) of charges qq and dipoles mm (None:
+                none), halved, x prefactor. D_ij = r_j - r_i: F_i = 1/2 sum_j q_j (r_i - r_j) / r^3 + (3 (mu_j . x) x -
+                mu_j) / r^3, phi_i += 1/2 sum_j mu_j . (r_i - r_j) / r^3"""
+                K3 = K * K * K
+                phi_ = 0.5 * EV_A * (K @ qq)
+                F_ = -(D * (K3 * qq[None, :])[..., None]).sum(dim=1)
+                if mm is not None:
+                    mD = (D * mm[None, :, :]).sum(dim=-1)  # mu_j . D_ij [n, n]
+                    phi_ = phi_ - 0.5 * EV_A * (mD * K3).sum(dim=1)
+                    F_ = F_ + (D * (3.0 * mD * K3 * K * K)[..., None]).sum(dim=1) - K3 @ mm
+                return phi_, 0.5 * EV_A * F_
         else:
             coulomb = ewald_potentials(positions, ewald)
+            coulomb_dipole = ewald_dipole_potentials(positions, ewald) if self.induced is not None else None
 
         def potentials(qq):
             phi = coulomb(qq)
@@ -614,6 +642,22 @@ class IrisLR(_AuxMixin, nn.Module):
                 er = (-torch.erf(r / (math.sqrt(2.0) * self.sigma)) + 1.0) / torch.where(padding_mask, torch.ones_like(r), r) * keep
                 phi = phi - 0.5 * EV_A * (er * gather_atoms(qq)).sum(dim=1)
             return phi
+
+        def potentials_dipole(qq, mm):
+            """his potentials_fn(q, mu): (phi, F) of EwaldDipole, the smearing correction (Gaussian charges) on the SR
+            edges: phi -= 1/2 sum_j kernel q_j + lever . mu_j, F -= 1/2 sum_j lever q_j, lever = kernel' / r R_ij"""
+            phi_, F_ = coulomb_dipole(qq, mm)
+            if self.sigma is not None:
+                a_s = math.sqrt(2.0) * self.sigma
+                rr = torch.where(padding_mask, torch.ones_like(r), r)
+                ker = (-torch.erf(rr / a_s) + 1.0) / rr * keep
+                gau = (2.0 / (math.sqrt(math.pi) * a_s)) * torch.exp(-((rr / a_s) * (rr / a_s))) * keep
+                lever = (-(gau + ker) / (rr * rr))[..., None] * edge_vectors  # [n, k, 3]
+                phi_ = phi_ - 0.5 * EV_A * (ker * gather_atoms(qq)).sum(dim=1)
+                if mm is not None:
+                    phi_ = phi_ - 0.5 * EV_A * (lever * gather_atoms(mm)).sum(dim=-1).sum(dim=1)
+                F_ = F_ - 0.5 * EV_A * (lever * gather_atoms(qq)[..., None]).sum(dim=1)
+            return phi_, F_
 
         if qeq_apply_x is not None:  # the host cg's operator graph (IrisQEqApplyGraph): no charges, no energy
             return self.qeq_apply(species, potentials, qeq_apply_x)
@@ -826,7 +870,26 @@ class IrisLR(_AuxMixin, nn.Module):
                 extra = extra + 0.5 * (flow * proj).sum(dim=1)
         aux["charges"] = q
         aux["dipole"] = ((positions - dipole_origin[None, :]) * q[:, None]).sum(dim=0)
-        energy = q * phi + extra
+        coul = q * phi
+        if self.induced is not None:
+            # the field of the final charges (EwaldDipole with zero dipoles), physical 2 F, plus the external field
+            _, Fh = potentials_dipole(q, None)
+            Ef = 2.0 * Fh if field is None else 2.0 * Fh + field[None, :]
+            # (the scalar gate as [1]: a 0-d softplus has no shape for the converter's ones_like; [n] * [1] broadcasts)
+            alpha = softplus(self.polarisability_head(node)[:, 0] + self.pol_init) * softplus(self.polarisability_gate.reshape(1))
+            a_p = alpha / EV_A
+            mu_i = a_p[:, None] * Ef
+            aux["polarisability_atoms"] = alpha
+            aux["dipole_induced_atoms"] = mu_i
+            work = 0.5 * a_p * (Ef * Ef).sum(dim=-1)
+            if self.induced == "field":
+                coul = coul - work
+            else:
+                phi2, F2 = potentials_dipole(q, mu_i)
+                coul = q * phi2 - (mu_i * F2).sum(dim=-1) + work
+                if field is not None:
+                    coul = coul - (mu_i * field[None, :]).sum(dim=-1)
+        energy = coul + extra
         if self.readout:
             h = node + self.MLP_0(q[:, None])
             h = self.LayerNorm_0(h)
@@ -903,6 +966,73 @@ def ewald_potentials(positions, e):
         slab = 4.0 * math.pi * (zn * M - 0.5 * (M2 + Q * zn * zn) - Q / 12.0 * b * b) / V
         return EV_A * (rs + 0.5 * (ks + corr + e["slab"] * slab))
     return phi
+
+
+def ewald_dipole_potentials(positions, e):
+    """jax-pme batched_tiled `EwaldDipole(prefactor=eV_A).potentials` (lab-cosmo/jax-pme#38 on 1c26495) on the inputs
+    of `ewald_potentials`: (q, mu) -> (phi [n], F [n, 3]), both halved (energy sum q phi - mu . F), x prefactor.
+    Real space (full list, 0.5 per slot = his half list both ways): from a source (q_j, mu_j) at x = -D / r (D = the
+    slot's r_j + shift - r_i), with psi = erfc(r / (s sqrt 2)) / r, d1 = psi', d2 = psi'':
+    phi += q psi - d1 mu . x, F += -q d1 x + (d2 - d1 / r) (mu . x) x + d1 / r mu. k space: S_k = sum_j (q_j +
+    i k . mu_j) exp(i k r_j), phi = sum_k W_k (c Sr + s Si), F = sum_k W_k k (s Sr - c Si); corrections: the charges'
+    self / background as `ewald_potentials`, the dipoles' self field + 4 beta^3 / (3 sqrt pi) mu (beta = 1 / (s sqrt 2)),
+    slab: M = sum q z + mu_z, M2 = sum q z^2 + 2 mu_z z, field -4 pi (M - Q z) / V n."""
+    n, kl = e["lr_index"].shape
+    idx = e["lr_index"].reshape(n * kl)
+    pos_j = positions[idx].reshape(n, kl, 3)
+    D = pos_j - positions[:, None, :] + e["lr_shift"]
+    D2 = (D * D).sum(dim=-1)
+    pad = e["lr_keep"] <= 0.0
+    r = torch.sqrt(torch.where(pad, torch.ones_like(D2), D2))
+    keep = torch.where(r - e["cutoff"] >= 0.0, torch.zeros_like(r), e["lr_keep"])
+    one_s = torch.ones_like(e["smearing"]) / e["smearing"]
+    inv_s = one_s * (1.0 / math.sqrt(2.0))  # beta = 1 / (s sqrt 2)
+    psi = (-torch.erf(r * inv_s) + 1.0) / r
+    g = (math.sqrt(2.0 / math.pi) * one_s) * torch.exp(-((r * inv_s) * (r * inv_s)))  # 2 / (sqrt(pi) a) exp(-(r/a)^2)
+    d1 = -(g + psi) / r
+    d2 = g * (one_s * one_s) - 2.0 * d1 / r  # 2 g / a^2 - 2 d1 / r, a^2 = 2 s^2
+    psi, d1, d2 = psi * keep, d1 * keep, d2 * keep
+    xh = -D / r[..., None]
+    kvec, V, s = e["kvec"], e["volume"], e["smearing"]
+    k2 = (kvec * kvec).sum(dim=-1)
+    W = 2.0 * (4.0 * math.pi) * torch.exp(-0.5 * (s * s) * k2) / k2 / V
+    theta = positions @ kvec.transpose(0, 1)
+    c, sn = torch.cos(theta), torch.sin(theta)
+    nh = e["slab_normal"]
+    zn = positions @ nh
+    dsf = (4.0 / (3.0 * math.sqrt(math.pi))) * inv_s * inv_s * inv_s
+
+    def pots(qq, mm):
+        q_j = qq[idx].reshape(n, kl)
+        rs = 0.5 * (psi * q_j).sum(dim=1)
+        Fr = 0.5 * (xh * (-(q_j * d1))[..., None]).sum(dim=1)
+        Sr, Si = c.transpose(0, 1) @ qq, sn.transpose(0, 1) @ qq
+        Q = qq.sum()
+        M, M2 = (qq * zn).sum(), (qq * zn * zn).sum()
+        if mm is not None:
+            mu_j = mm[idx].reshape(n, kl, 3)
+            mx = (mu_j * xh).sum(dim=-1)  # mu_j . x [n, kl]
+            rs = rs + 0.5 * (-(d1 * mx)).sum(dim=1)
+            Fr = Fr + 0.5 * ((xh * ((d2 - d1 / r) * mx)[..., None]).sum(dim=1) + (mu_j * (d1 / r)[..., None]).sum(dim=1))
+            kmu = mm @ kvec.transpose(0, 1)  # [n, K]
+            Sr = Sr - (kmu * sn).sum(dim=0)
+            Si = Si + (kmu * c).sum(dim=0)
+            mz = mm @ nh
+            M, M2 = M + mz.sum(), M2 + 2.0 * (mz * zn).sum()
+        a_k, b_k = W * Sr, W * Si
+        ks = c @ a_k + sn @ b_k
+        Fk = (sn * a_k[None, :] - c * b_k[None, :]) @ kvec
+        corr = -qq * (math.sqrt(2.0 / math.pi) * one_s) - 2.0 * (math.pi * s * s) * Q / V
+        b = e["slab_basis"]
+        slab = 4.0 * math.pi * (zn * M - 0.5 * (M2 + Q * zn * zn) - Q / 12.0 * b * b) / V
+        # -4 pi (M - Q z) / V along n, as (4 pi) (Q z - M) / V (a scalar / V traces as reciprocal; [n, 3] * [n, 1]: ggml
+        # repeats the second operand into the first)
+        Fs = nh[None, :].expand(n, 3) * ((4.0 * math.pi) * (Q * zn - M) / V)[:, None]
+        Fc = Fk + e["slab"] * Fs
+        if mm is not None:
+            Fc = Fc + mm * dsf
+        return EV_A * (rs + 0.5 * (ks + corr + e["slab"] * slab)), EV_A * (Fr + 0.5 * Fc)
+    return pots
 
 
 def ewald_reciprocal(positions, e):

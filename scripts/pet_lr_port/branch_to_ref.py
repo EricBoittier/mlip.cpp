@@ -21,6 +21,10 @@ if "field_forces" in r.files:  # under a field: his forces = -dE/dr + E . Z0 (ke
     out["field_forces"] = r["field_forces"]
 if "dipole_flow" in r.files and np.asarray(r["dipole_flow"]).size == 3 * S:  # [S, 3] (older refs: x only)
     out["struct/dipole_flow"] = np.asarray(r["dipole_flow"]).reshape(S, 3)
+if "dipole_induced" in r.files and np.asarray(r["dipole_induced"]).size == 3 * S:  # induced dipoles: sum_i mu_i [S, 3]
+    out["struct/dipole_induced"] = np.asarray(r["dipole_induced"]).reshape(S, 3)
+if "polarisability_atoms" in r.files:  # alpha_i [N] (A^3)
+    out["atom/polarisability"] = r["polarisability_atoms"]
 if "charges" in r.files:
     out["atom/charges"] = r["charges"]
 if "metallicity" in r.files:

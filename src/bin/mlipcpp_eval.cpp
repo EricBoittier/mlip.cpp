@@ -8,7 +8,8 @@
  *                [--iris-freeze-ewald 0|1] [--iris-max-neighbors N] [--no-forces]
  * iris PET-LR on CUDA: the F32 MUL_MATs reducing over K = 1036 (the 512-wide checkpoints' transfer-MLP first LINEAR)
  * accumulate in double by default; MLIPCPP_PRECISE_MATMUL_K=0 turns that off, =<K> moves it to another K,
- * MLIPCPP_PRECISE_MATMUL=1 (with _K unset) flags every F32 MUL_MAT; MLIPCPP_PRECISE_SUM / _SIGMOID / _SQRT=1 are
+ * MLIPCPP_PRECISE_MATMUL=1 (with _K unset) flags every F32 MUL_MAT; MLIPCPP_PRECISE_MATMUL_KERNEL=tiled|chunk|dot2
+ * picks the flagged product's kernel (tiled: the default's sums, bit-identical, faster; chunk / dot2: not bitwise); MLIPCPP_PRECISE_SUM / _SIGMOID / _SQRT=1 are
  * opt-in (see runtime/graph_model.cpp mark_precise_math). CPU results are unaffected by all of these.
  * (iris models: --iris-freeze-ewald 1 freezes the Ewald parameters over the frames of the file as his calculator does
  * over a run; --iris-max-neighbors overrides the GGUF's overflow limit, 0 = no check)
@@ -146,6 +147,7 @@ int main(int argc, char *argv[]) {
         f["energy"] = r.energy;
         f["forces"] = r.forces;
         if (r.has_stress()) f["stress"] = r.stress;
+        if (!r.field_forces.empty()) f["field_forces"] = r.field_forces; // his E . Z0 (in "forces" too)
         if (!r.virial.empty()) f["virial"] = r.virial; // full dE/d strain, row-major (eV), before symmetrisation
         if (!r.latent_charges.empty()) f["latent_charges"] = r.latent_charges; // Plato-PET-LR LES (e)
         if (!r.sqe_charges.empty()) f["sqe_charges"] = r.sqe_charges;           // pet.plato_lr.sqe (e)
@@ -156,6 +158,8 @@ int main(int argc, char *argv[]) {
           f["metallicity"] = r.metallicity;
           if (r.has_charge_residual) f["charge_residual"] = r.charge_residual;
           if (!r.dipole_flow.empty()) f["dipole_flow"] = r.dipole_flow;
+          if (!r.dipole_induced.empty()) f["dipole_induced"] = r.dipole_induced;
+          if (!r.polarisabilities.empty()) f["polarisabilities"] = r.polarisabilities;
           if (!r.components.empty()) f["components"] = r.components, f["component_charges"] = r.component_charges;
         }
       } catch (const std::exception &e) {

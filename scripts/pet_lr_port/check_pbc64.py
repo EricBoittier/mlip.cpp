@@ -105,6 +105,13 @@ def main():
                                                    / np.abs(D).max()))
         if "atom/charges" in zf.files:
             add("charges max|dq| (e)", np.abs(aux["charges"].detach().numpy() - zf["atom/charges"][A]).max())
+        if "struct/dipole_induced" in zf.files and "dipole_induced_atoms" in aux:  # induced dipoles (EwaldDipole)
+            D = zf["struct/dipole_induced"][f]
+            add("dipole_induced max|d|/max|D|", float(np.abs(aux["dipole_induced_atoms"].sum(0).detach().numpy() - D).max()
+                                                      / np.abs(D).max()))
+            al = zf["atom/polarisability"][A]
+            add("polarisability max|d|/max|a|", float(np.abs(aux["polarisability_atoms"].detach().numpy() - al).max()
+                                                      / np.abs(al).max()))
         if atoms.pbc.any():  # slabs too: his predict's stress (the calculator reports it for 3-D cells only)
             Wj = zf["virial"][f]
             add("virial max|dW|/max|W|" + ("" if atoms.pbc.all() else " (slab)"),
