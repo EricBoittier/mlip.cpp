@@ -118,9 +118,10 @@ TEST_CASE("pet_lr_port: iris fermi_level host side (bisection, gapped decision, 
     CHECK(std::fabs(wt - 1) < 1e-6);
     CHECK(std::fabs(wb - 1) < 1e-6);
   }
-  // T = 0.02, scores near integers with a three-way tie at the top: gapped, weights 1/3 on the tie
+  // T = 0.02, scores 0.1-0.2 above integers (m = 1, 1, 1, -1, 0, -1; sum 1 = Q): gapped; s - m = 0.2 three times
+  // (top, 1/3 each) and 0.1 - 2e-17 twice (-0.9 + 1; bottom, 1/2 each; 0.1 - 0 is larger in floating point)
   c.temperature = 0.02;
-  const std::vector<double> g = {1.0, 1.0, 1.0, -1.0, 0.0, -1.0};
+  const std::vector<double> g = {1.2, 1.2, 1.2, -0.9, 0.1, -0.9};
   const FermiHost h = fermi_host(g, 1.0, c);
   CHECK(h.gapped);
   for (int i = 0; i < 3; i++) CHECK(std::fabs(h.top[i] - 1.0 / 3.0) < 1e-7);
