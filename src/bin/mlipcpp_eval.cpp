@@ -225,7 +225,10 @@ int main(int argc, char *argv[]) {
             if (r.has_charge_residual) f["charge_residual"] = r.charge_residual;
             if (!r.dipole_flow.empty()) f["dipole_flow"] = r.dipole_flow;
             if (!r.components.empty()) f["components"] = r.components, f["component_charges"] = r.component_charges;
+            if (!r.dipole_induced.empty()) f["dipole_induced"] = r.dipole_induced;
+            if (!r.polarisabilities.empty()) f["polarisabilities"] = r.polarisabilities;
           }
+          if (!r.field_forces.empty()) f["field_forces"] = r.field_forces;
           f["atomic_energies"] = r.atomic_energies;
           frames.push_back(f);
           continue;

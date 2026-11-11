@@ -63,6 +63,9 @@ ModelResult to_model_result(const Result64 &r) {
     m.charge_residual = r.charge_residual, m.has_charge_residual = r.has_charge_residual;
     m.dipole_flow = r.dipole_flow;
     m.components = r.components, m.component_charges = r.component_charges;
+    m.dipole_induced = r.dipole_induced;
+    m.polarisabilities.assign(r.polarisabilities.begin(), r.polarisabilities.end());
+    m.field_forces = r.field_forces;
   }
   return m;
 }
@@ -393,14 +396,14 @@ Result64 IrisDriver::predict(const System64 &s, bool compute_forces) {
     if (L.field) {
       if (s.field) field_E = *s.field;
       field_on = field_E[0] != 0 || field_E[1] != 0 || field_E[2] != 0;
-      static const bool cons_only = [] {
+      const bool cons_only = [] { // (read per call: the tests toggle it)
         const char *e = std::getenv("MLIPCPP_FIELD_CONSERVATIVE_ONLY");
         return e && !std::strcmp(e, "1");
       }();
       const bool has_zf = std::any_of(L.columns.begin(), L.columns.end(), [](const auto &c) { return c.first == "zf_x"; });
-      if (compute_forces && !cons_only && field_on && (periodic || have_adaptive))
-        throw std::runtime_error("iris PET-LR: the field force E . Z0 is ported for open structures (hard cutoff) "
-                                 "only; periodic cells: energies, charges and dipoles only (mlipcpp-eval --no-forces)");
+      if (compute_forces && !cons_only && field_on && have_adaptive)
+        throw std::runtime_error("iris PET-LR: the field force E . Z0 is ported with a hard cutoff only (adaptive "
+                                 "cutoffs: energies, charges and dipoles only, mlipcpp-eval --no-forces)");
       if (compute_forces && !cons_only && field_on && !has_zf)
         throw std::runtime_error("iris PET-LR: this GGUF has no zf_q0 / zf_x columns for the field force; re-export it");
       if (cons_only) field_on = false;
@@ -714,14 +717,65 @@ Result64 IrisDriver::predict(const System64 &s, bool compute_forces) {
         sweep(cot);
         return minus_dr();
       };
-      std::vector<double> a(n);
-      for (int i = 0; i < n; i++) a[i] = c[i] * w[i];
-      const std::vector<double> FG = pass(a);
-      const std::vector<double> FQ = pass(w);
       field_force.assign(3 * size_t(n), 0.0);
-      for (int i = 0; i < n; i++)
-        for (int k = 0; k < 3; k++)
-          field_force[3 * i + k] = field_E[k] * aux[size_t(i) * C + cq] - FG[3 * i + k] + c[i] * FQ[3 * i + k];
+      if (!periodic) {
+        std::vector<double> a(n);
+        for (int i = 0; i < n; i++) a[i] = c[i] * w[i];
+        const std::vector<double> FG = pass(a);
+        const std::vector<double> FQ = pass(w);
+        for (int i = 0; i < n; i++)
+          for (int k = 0; k < 3; k++)
+            field_force[3 * i + k] = field_E[k] * aux[size_t(i) * C + cq] - FG[3 * i + k] + c[i] * FQ[3 * i + k];
+      } else {
+        // periodic (graph_model.cpp; his iris.pet.bec unfolded levers): the taps = INDEX nodes gathering pair rows
+        // across atoms (index reverse_neighbor_index, or a RESHAPE of neighbor_index). Pass 1: Q0 (a = w), its
+        // adjoints at the edge vectors and the taps; pass 2: the tap loss sum_g <lever lambda_g, y_g> alone
+        std::map<int, const GIRNode *> by_id;
+        for (const auto &nd : G.nodes) by_id[nd.id] = &nd;
+        std::vector<int> taps;
+        for (const auto &nd : G.nodes) {
+          if (nd.op != "INDEX" || nd.inputs.size() < 2) continue;
+          const std::string &ix = nd.inputs[1];
+          bool cross = ix == "input:reverse_neighbor_index";
+          if (!cross && ix.rfind("node:", 0) == 0) {
+            auto it = by_id.find(std::stoi(ix.substr(5)));
+            cross = it != by_id.end() && it->second->op == "RESHAPE" && !it->second->inputs.empty() &&
+                    it->second->inputs[0] == "input:neighbor_index";
+          }
+          if (cross) taps.push_back(nd.id);
+        }
+        for (int id : taps) {
+          const T64 *v = ex.node_value(id);
+          if (!v || v->shape.empty() || v->shape[0] != int64_t(slots))
+            throw std::runtime_error("iris PET-LR periodic field force: a cross-atom gather without pair rows");
+        }
+        ex.keep_grads_for = taps;
+        pass(w);
+        ex.keep_grads_for.clear();
+        std::vector<double> lever(slots, 0.0);
+        for (int f = 0; f < slots; f++)
+          if (pm[f] <= 0.5 && nb_atom[f] >= 0)
+            lever[f] = -(field_E[0] * ev[3 * f] + field_E[1] * ev[3 * f + 1] + field_E[2] * ev[3 * f + 2]);
+        const auto &gd = ex.input_grad("edge_vectors"); // the raw edge vectors, to the neighbour
+        if (!gd.empty())
+          for (int f = 0; f < slots; f++)
+            if (lever[f] != 0.0 && nb_atom[f] >= 0)
+              for (int k = 0; k < 3; k++) field_force[3 * nb_atom[f] + k] += lever[f] * gd[3 * f + k];
+        for (int id : taps) {
+          const std::vector<double> *lam = ex.node_grad(id);
+          std::vector<double> cv(ex.node_value(id)->numel(), 0.0);
+          if (lam) {
+            const size_t row = lam->size() / size_t(slots);
+            for (size_t f = 0; f < size_t(slots); f++)
+              for (size_t j = 0; j < row; j++) cv[f * row + j] = lever[f] * (*lam)[f * row + j];
+          }
+          ex.extra_cotangents[id] = std::move(cv);
+        }
+        const std::vector<double> FT = pass(std::vector<double>(n, 0.0));
+        for (int i = 0; i < n; i++)
+          for (int k = 0; k < 3; k++) field_force[3 * i + k] += field_E[k] * aux[size_t(i) * C + cq] - FT[3 * i + k];
+      }
+      R.field_forces = field_force;
     }
     // -d(<cot, out>)/dr including the adaptive cutoffs' chain (for the column gradients; the energy's below keeps
     // its own pieces for the virial)
@@ -910,11 +964,18 @@ Result64 IrisDriver::predict(const System64 &s, bool compute_forces) {
         col += width;
         continue;
       }
+      if (name == "polarisability") { // induced dipoles: alpha_i per atom
+        R.polarisabilities.resize(n);
+        for (int i = 0; i < n; i++) R.polarisabilities[i] = aux[size_t(i) * C + col];
+        col += width;
+        continue;
+      }
       std::vector<double> sum(width, 0.0);
       for (int i = 0; i < n; i++)
         for (int a = 0; a < width; a++) sum[a] += aux[size_t(i) * C + col + a];
       if (name == "charge_residual") R.charge_residual = sum[0], R.has_charge_residual = true;
       if (name == "dipole_flow") R.dipole_flow = sum;
+      if (name == "dipole_induced") R.dipole_induced = sum;
       col += width;
     }
     R.fermi_level = aux[5];

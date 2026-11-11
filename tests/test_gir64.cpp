@@ -347,6 +347,7 @@ const std::vector<std::pair<std::string, std::string>> &tiny_lr() {
       {"conserving residual", "petlr_tiny_ccresidual.gguf"}, {"qeq", "petlr_tiny_qeq.gguf"},
       {"threshold", "petlr_tiny_thr.gguf"},     {"conserving fermi + field (zero)", "petlr_tiny_ccfield.gguf"},
       {"les ladder + LR head", "petlr_les_ladder_lr.gguf"}, {"trunk only", "petlr_tiny_trunk.gguf"},
+      {"conserving + induced dipoles (zero field)", "petlr_tiny_ccind.gguf"},
       {"les ladder (trunk)", "petlr_les_ladder.gguf"}};
   return v;
 }

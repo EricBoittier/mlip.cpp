@@ -47,6 +47,8 @@ struct Result64 {
   /// conserving charges on several components: each atom's component and the Q_c of mlip.cpp's R-only rule
   std::vector<int> components;
   std::vector<double> component_charges;
+  /// induced dipoles: sum_i mu_i (e A) and alpha_i (A^3) per atom; under a nonzero field his E . Z0 (in forces too)
+  std::vector<double> dipole_induced, polarisabilities, field_forces;
 };
 
 /// the full graph, its inputs and dimensions of the last predict (tests: forward mode on the real graphs)

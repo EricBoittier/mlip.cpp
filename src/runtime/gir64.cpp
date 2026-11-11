@@ -1006,6 +1006,16 @@ template <class T> void Executor<T>::backward(const std::vector<T> &cot, bool wa
   }
   std::vector<std::vector<T>> adj(N);
   adj[out_index_] = cot;
+  for (auto &[id, c] : extra_cotangents) {
+    const int k = index_.at(id);
+    if (int64_t(c.size()) != vals_.at(k).numel()) throw std::runtime_error("fp64 executor: extra cotangent size");
+    if (adj[k].empty()) adj[k].assign(c.size(), T(0.0));
+    for (size_t e = 0; e < c.size(); e++) adj[k][e] += c[e];
+  }
+  extra_cotangents.clear();
+  std::vector<char> keep(N, keep_node_grads ? 1 : 0);
+  if (!keep_node_grads && !keep_grads_for.empty()) node_grads_.assign(N, {});
+  for (int id : keep_grads_for) keep[index_.at(id)] = 1;
   auto acc_ref = [&](const std::string &r, int64_t n) -> T * {
     if (!leaf_dep(r)) return nullptr;
     if (r.rfind("node:", 0) == 0) {
@@ -1048,7 +1058,7 @@ template <class T> void Executor<T>::backward(const std::vector<T> &cot, bool wa
     std::vector<T> gv = std::move(adj[kk]);
     adj[kk].clear();
     adj[kk].shrink_to_fit();
-    if (keep_node_grads) node_grads_[kk] = gv;
+    if (keep[kk]) node_grads_[kk] = gv;
     if (!dep[kk]) continue;
     const T *g = gv.data();
     const Tensor<T> &y = vals_[kk];

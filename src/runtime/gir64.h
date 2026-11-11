@@ -101,6 +101,10 @@ public:
   /// reverse sweep of <cotangent, output>; adjoints of the float inputs (all of them) and, with weights = true, of
   /// the weights. Several sweeps may follow one forward (different cotangents).
   void backward(const std::vector<T> &out_cotangent, bool weights = false);
+  /// cotangents added at internal nodes for the next backward (a loss sum_g <c_g, y_g> on top of the output's;
+  /// cleared by the backward), and the nodes whose adjoints the next backward keeps (node_grad)
+  std::map<int, std::vector<T>> extra_cotangents;
+  std::vector<int> keep_grads_for;
   /// adjoint of an input / weight after backward (empty if it does not influence the output)
   const std::vector<T> &input_grad(const std::string &name) const;
   const std::vector<T> &weight_grad(const std::string &name) const;

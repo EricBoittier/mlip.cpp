@@ -181,8 +181,6 @@ def main():
             tmp.write_text("".join(blocks))
             js = jd / (tag.replace("/", "__") + (".env32" if a.env_f32 else "") + ".json")
             extra = list(a.extra)
-            if "field" in tag and "bulk" in tag:  # his field force E . Z0 is open-structure only (raises otherwise)
-                extra.append("--no-forces")
             cmd = [a.eval, str(gg), str(tmp), str(js)] + ([] if a.env_f32 else ["--fp64"]) + extra
             env = dict(os.environ)
             if a.env_f32:
