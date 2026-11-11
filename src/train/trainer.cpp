@@ -418,6 +418,12 @@ Worker::StepGraph::~StepGraph() {
 
 size_t Worker::compute_buffer_bytes() const { return ggml_gallocr_get_buffer_size(galloc_, 0); }
 
+void Worker::release_compute_buffer() {
+  if (!cache_.empty() || !galloc_ || ggml_gallocr_get_buffer_size(galloc_, 0) == 0) return;
+  ggml_gallocr_free(galloc_);
+  galloc_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model_.backend()));
+}
+
 namespace {
 void fill_constants(const std::vector<std::pair<ggml_tensor *, float>> &cs) {
   std::vector<float> staging;
@@ -1065,6 +1071,7 @@ StepStats Worker::run(const Batch &b, double energy_scale, bool backward) {
 // the training forces; it is nonzero only inside a cluster transition (counted in lrc_transition).
 void Worker::lrc_prepare(const Batch &b, bool forces) {
   const int n = b.n_atoms, S = b.n_systems;
+  if (vs_on) release_compute_buffer(); // the charge pass below (q0, long-range forces) allocates its own
   lrc_lo_.assign(b.atom_charge.begin(), b.atom_charge.end());
   lrc_hi_ = lrc_lo_;
   lrc_blend_.assign(n, 0.0f);
@@ -1417,7 +1424,9 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
   // exact conditioning forces: F -= sum_a G_a dS_a/dx, G_a = sum over the super-node of dE/d(blend) (scaled units);
   // the rows are kept for the blend tangent of the MIXED pass
   std::vector<std::vector<double>> lrc_rows(lrc_exact ? lrc_cond_.size() : 0);
-  if (lrc_exact && gf.grad_blend) {
+  // (gblend holds dE/d(blend) when the FORCES graph had it; that graph is released above)
+  if (vs_on && lrc_exact && !gblend.empty()) release_compute_buffer(); // the blend rows run the charge pass
+  if (lrc_exact && !gblend.empty()) {
     for (size_t k = 0; k < lrc_cond_.size(); k++) {
       const runtime::LrcCondition &c = lrc_cond_[k];
       if (c.cl.s <= 1 || !c.needs_cond_forces()) continue;

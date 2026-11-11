@@ -307,6 +307,9 @@ public:
   // MIXED pass gets per-copy tangents w_v u and the per-copy energy cotangent -u . grad w_v (input atom_cotangent).
   // vs_on: the planner is on (MIXED graphs carry the input); counters for the log.
   bool vs_on = false;
+  /// lrc_states: free the shared compute buffer (graphs are built per batch for Plato models, none is cached) so that
+  /// the frozen charge pass, which allocates its own, has the device memory; the next graph allocates it again
+  void release_compute_buffer();
   int64_t vs_structs = 0, vs_evals = 0, vs_fix3 = 0, vs_real_atoms = 0, vs_packed_atoms = 0, vs_max = 0;
   std::vector<double> sqe_grad;
   double sqe_abs_energy = 0;
