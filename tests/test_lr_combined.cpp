@@ -8,6 +8,7 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 
@@ -1088,10 +1089,11 @@ TEST_CASE("lrc graph: an element without a Fukui parameter takes phi = 0 (rare g
   }
 }
 
-// Whole model (MLIPCPP_TEST_LRC_GGUF, e.g. FTq13, CPU): a water plus one isolated atom (He, Ne, Li+, Cl-) from 6 to 30
-// A: finite energy and forces, forces against central differences of the energy (fp32 tolerance as above), and no jump
-// in E(d) (consecutive points differ by the trapezoid work of the force along the path within a fp32 margin). A
-// rare gas inside one cluster plus a far fragment (Ar-Xe in contact, water at 15 A) is finite too.
+// Whole model (MLIPCPP_TEST_LRC_GGUF, e.g. FTq13, CPU): a water plus one isolated atom (He, Ne, Li+, Cl-), and
+// Li+(H2O) plus He or Kr (Q = +1: where the fallback phi changes the energy), from 6 to 30 A: finite energy and forces,
+// forces against central differences of the energy, and no jump in E(d) (consecutive points differ by the trapezoid
+// work of the force along the path within a fp32 margin). A rare gas inside one cluster plus a far fragment (Ar-Xe in
+// contact, water at 15 A) is finite too.
 TEST_CASE("lrc: molecule plus an isolated atom (He, Ne, Li+, Cl-) at 6-30 A, finite, FD forces, continuous",
           "[lrc][gguf]") {
   const char *path = std::getenv("MLIPCPP_TEST_LRC_GGUF");
@@ -1102,16 +1104,28 @@ TEST_CASE("lrc: molecule plus an isolated atom (He, Ne, Li+, Cl-) at 6-30 A, fin
   if (!m.plato_lr().lrc.enabled) SKIP("not a combined long-range model");
   const double u[3] = {-0.3, 0.2, std::sqrt(0.87)}; // unit vector, the lone atom's direction from the oxygen
   const float W[9] = {0, 0, 0, 0.757f, 0.586f, 0, -0.757f, 0.586f, 0};
-  auto run = [&](int32_t z, int Q, double d, bool forces) {
-    float x[12];
+  // li: the molecule is Li+(H2O) (Li 2 A from the O), so a neutral rare gas sits in a charged structure, where the
+  // fallback phi sets the residual share and enters the energy and the conditioning forces
+  auto run = [&](int32_t z, int Q, bool li, double d, bool forces) {
+    float x[15];
     std::copy(W, W + 9, x);
-    for (int k = 0; k < 3; k++) x[9 + k] = float(d * u[k]);
-    const int32_t Z[4] = {8, 1, 1, z};
-    mlipcpp::AtomicSystem sys(4, x, Z, nullptr);
+    int32_t Z[5] = {8, 1, 1, 3, z};
+    int n = 3;
+    if (li) x[9] = 0, x[10] = -2.0f, x[11] = 0, n = 4;
+    for (int k = 0; k < 3; k++) x[3 * n + k] = float(d * u[k]);
+    Z[n] = z;
+    mlipcpp::AtomicSystem sys(n + 1, x, Z, nullptr);
     sys.set_charge(Q), sys.set_spin_multiplicity(1);
     return m.predict(sys, forces);
   };
-  for (auto [z, Q] : std::vector<std::pair<int32_t, int>>{{2, 0}, {10, 0}, {3, 1}, {17, -1}}) {
+  struct Case {
+    int32_t z;
+    int Q;
+    bool li;
+  };
+  for (auto [z, Q, li] : std::vector<Case>{{2, 0, false}, {10, 0, false}, {3, 1, false}, {17, -1, false}, {2, 1, true},
+                                           {36, 1, true}}) {
+    const size_t a = li ? 4 : 3; // the lone atom
     std::vector<double> ds;
     for (double d = 6.0; d < 11.0; d += 0.025) ds.push_back(d); // fine through the 8-10 A cluster link window
     for (double d = 11.0; d <= 30.0; d += 0.5) ds.push_back(d);
@@ -1119,12 +1133,12 @@ TEST_CASE("lrc: molecule plus an isolated atom (He, Ne, Li+, Cl-) at 6-30 A, fin
     // margin is split in ten (down to 1e-3 A): steep but smooth stretches (2 eV/A over 0.03 A for Li+ at 7.94 A, where
     // the oxygen leaves the 8 A cutoff) pass at the finer step, a jump does not
     auto eval = [&](double d) {
-      const mlipcpp::ModelResult r = run(z, Q, d, true);
+      const mlipcpp::ModelResult r = run(z, Q, li, d, true);
       REQUIRE(std::isfinite(r.energy));
-      REQUIRE(r.forces.size() == 12);
+      REQUIRE(r.forces.size() == 3 * (a + 1));
       double Fu = 0;
-      for (int k = 0; k < 12; k++) REQUIRE(std::isfinite(r.forces[k]));
-      for (int k = 0; k < 3; k++) Fu += double(r.forces[9 + k]) * u[k];
+      for (float f : r.forces) REQUIRE(std::isfinite(f));
+      for (int k = 0; k < 3; k++) Fu += double(r.forces[3 * a + k]) * u[k];
       return std::pair<double, double>{double(r.energy), Fu};
     };
     std::function<double(double, std::pair<double, double>, double, std::pair<double, double>)> seg =
@@ -1141,7 +1155,7 @@ TEST_CASE("lrc: molecule plus an isolated atom (He, Ne, Li+, Cl-) at 6-30 A, fin
           }
           return worst;
         };
-    double worst_jump = 0, worst_fd = 0;
+    double worst_jump = 0, worst_fd = 0, fu_max = 0;
     std::pair<double, double> prev = eval(ds[0]);
     for (size_t p = 1; p < ds.size(); p++) {
       const std::pair<double, double> cur = eval(ds[p]);
@@ -1149,20 +1163,24 @@ TEST_CASE("lrc: molecule plus an isolated atom (He, Ne, Li+, Cl-) at 6-30 A, fin
       prev = cur;
     }
     for (double d0 : {8.5, 9.2, 9.8, 15.0}) {
-      const mlipcpp::ModelResult r = run(z, Q, d0, true);
+      const mlipcpp::ModelResult r = run(z, Q, li, d0, true);
       double Fu = 0;
-      for (int k = 0; k < 3; k++) Fu += double(r.forces[9 + k]) * u[k];
+      for (int k = 0; k < 3; k++) Fu += double(r.forces[3 * a + k]) * u[k];
       double best = 1e30;
       for (double h : {6.25e-4, 3.125e-4}) {
-        const double Fc = -(double(run(z, Q, d0 + h, false).energy) - double(run(z, Q, d0 - h, false).energy)) / (2 * h);
+        const double Fc = -(double(run(z, Q, li, d0 + h, false).energy) - double(run(z, Q, li, d0 - h, false).energy)) / (2 * h);
         best = std::min(best, std::abs(Fc - Fu));
       }
-      worst_fd = std::max(worst_fd, best);
+      worst_fd = std::max(worst_fd, best), fu_max = std::max(fu_max, std::abs(Fu));
     }
+    std::printf("lone atom Z %d Q %+d %s: max |F.u| at the FD points %.4f eV/A, worst |F_c - F.u| %.2e eV/A, worst "
+                "|dE - work| beyond margin %.2e eV\n",
+                int(z), Q, li ? "Li+(H2O)" : "H2O", fu_max, worst_fd, worst_jump);
     INFO("Z " << z << ", Q " << Q << ": worst |dE - trapezoid work| beyond fp32 margin " << worst_jump
               << " eV, worst |F_c - F.u| " << worst_fd << " eV/A");
     CHECK(worst_jump < 0.005);
-    CHECK(worst_fd < 0.05);
+    CHECK(worst_fd < 0.005); // measured <= 1.1e-3 eV/A (FTq13, CPU)
+    if (Q != 0) CHECK(fu_max > 0.01); // a charged structure: the FD check is not on a zero force
   }
   {
     const float x[15] = {0, 0, 0, 0, 0, 4.0f, 0, 0, 19.0f, 0.757f, 0.586f, 19.0f, -0.757f, 0.586f, 19.0f};
