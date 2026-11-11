@@ -563,7 +563,9 @@ bool GraphModel::use_ragged() {
   const char *e = std::getenv("MLIPCPP_RAGGED");
   if (!e || !*e || *e == '0') return false;
   std::string why;
-  if (conditioning_.enabled) {
+  if (interp_.stable_bump) {
+    why = "the ragged bump op has no stable-bump form (pet.cutoff_bump_stable / MLIPCPP_PET_STABLE_BUMP)";
+  } else if (conditioning_.enabled) {
     why = "does not implement charge / spin conditioning";
   } else if (cutoff_function_ != "bump" || nc_forces_ || long_range_ || !forces_mode_) {
     why = "needs a forces-mode model with the bump cutoff, no direct forces and no long range";
