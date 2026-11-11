@@ -47,7 +47,14 @@ void mark_precise_math(ggml_cgraph *g) {
     ggml_tensor *t = ggml_graph_node(g, i);
     // MLIPCPP_PRECISE_MATH_SKIP=sigmoid,div,...: leave those op kinds on the fast kernels (bisection diagnostics)
     static const std::string skip = [] { const char *e = std::getenv("MLIPCPP_PRECISE_MATH_SKIP"); return e ? e : ""; }();
-    auto on = [](const char *k) { return skip.find(k) == std::string::npos; };
+    // SIGMOID is NOT flagged by default: the precise kernel is correctly rounded (op test) and removes the 4-13x local
+    // error of the Fermi occupations, but moved no verdict and made seeded lr_both ion mu worse on CUDA (median 1.5e-7
+    // -> 2.1e-7, P 0.35-0.57 -> 0.90-0.93; bisected 2026-11-11, job 4891356): MLIPCPP_PRECISE_SIGMOID=1 turns it on
+    static const bool sig = [] { const char *e = std::getenv("MLIPCPP_PRECISE_SIGMOID"); return e && !std::strcmp(e, "1"); }();
+    auto on = [](const char *k) {
+      if (!std::strcmp(k, "sigmoid") && !sig) return false;
+      return skip.find(k) == std::string::npos;
+    };
     const bool is_unary = t->op == GGML_OP_UNARY;
     const bool unary = is_unary && ((ggml_get_unary_op(t) == GGML_UNARY_OP_EXP && on("exp")) ||
                                     (ggml_get_unary_op(t) == GGML_UNARY_OP_SIGMOID && on("sigmoid")));
