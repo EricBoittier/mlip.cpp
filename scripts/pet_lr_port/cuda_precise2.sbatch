@@ -20,19 +20,19 @@ export CC=$(which gcc) CXX=$(which g++) CUDAHOSTCXX=$(which g++)
 W=/scratch/boittier/pet_lr_port/cuda; P=/scratch/boittier/pet_lr_port; F=$P/frames; N=$W/nodegrad
 cmake --build $W/build_lr -j 16 > $W/build_precise2.log 2>&1; echo "build rc=$?"; grep -m10 -E " error|error:" $W/build_precise2.log
 $W/build_lr/tests/test_pet_lr_interp "*precise*" -s 2>&1 | grep -E "relative|passed|FAILED" | tail -6
-$W/build_lr/tests/test_pet_lr_interp 2>&1 | tail -1
+$W/build_lr/tests/test_pet_lr_interp 2>&1 | grep -E "passed|failed"
 $W/build_lr/tests/test_pet_lr_port 2>&1 | grep -E -A12 "FAILED" | head -40
-$W/build_lr/tests/test_pet_lr_port 2>&1 | tail -1
+$W/build_lr/tests/test_pet_lr_port 2>&1 | grep -E "passed|failed"
 rm -f $N/cold_slab_p2_cuda.bin
 MLIPCPP_NODE_GRAD_DUMP=$N/cold_slab_p2_cuda.bin $W/build_lr/bin/mlipcpp-eval $N/seeded_lr_fermi_cold_v5.gguf $N/slab_60_3.extxyz $N/cold_slab_p2_cuda.json --backend cuda > /dev/null 2>&1; echo "dump rc=$?"
-O=$W/out/pbc/cuda2; mkdir -p $O
-for g in ${GS:-seeded_lr_fermi_cold readout-pol_lr_nobase control_lr_nobase readout_lr_nobase readout-1m_lr_nobase readout-2m_lr_nobase readout-4m_lr_nobase seeded_lr_species seeded_lr_both}; do
+O=$W/out/pbc/cuda3; mkdir -p $O
+for g in ${GS:-seeded_lr_fermi_cold seeded_lr_both readout-pol_lr_nobase control_lr_nobase readout_lr_nobase readout-1m_lr_nobase readout-2m_lr_nobase readout-4m_lr_nobase seeded_lr_species seeded_lr_both}; do
   for s in bulk slab; do
     $W/build_lr/bin/mlipcpp-eval $W/gguf_pbc/$g.gguf $F/set_${s}_60.extxyz $O/${g}_${s}_cuda.json --backend cuda > $O/${g}_${s}.log 2>&1
     echo "$g $s rc=$? $(tail -n1 $O/${g}_${s}.log)"
   done
 done
-O=$W/out/lr/cuda2; mkdir -p $O
+O=$W/out/lr/cuda3; mkdir -p $O
 for g in readout-pol control readout readout-1m readout-2m readout-4m; do for s in ion cluster; do
   $W/build_lr/bin/mlipcpp-eval $W/gguf/${g}_lr_nobase.gguf $F/set_$s.extxyz $O/${g}_${s}_cuda.json --backend cuda > $O/${g}_${s}.log 2>&1
   echo "$g $s rc=$?"; done; done
