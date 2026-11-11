@@ -813,13 +813,23 @@ ModelResult GraphModel::predict_single_lrc(const AtomicSystem &system, bool comp
   // charge; MLIPCPP_LRC_FD_DS=1: the earlier central differences in S (h = 0.05), for checks
   static const bool fd_ds = [] { const char *e = std::getenv("MLIPCPP_LRC_FD_DS"); return e && *e == '1'; }();
   // lrc_states: the backbone energy as the weighted sum over the link states' graphs (lr_combined.h)
-  if (L.states && cond.cl.s > 1 && cell.empty()) {
+  // stress of the long-range / conditioning / state-weight virial (dE/d strain, 3 x 3) added to a Voigt stress (/ V)
+  auto add_virial = [&](std::vector<float> &stress, const std::vector<double> &vir) {
+    const double *h = hv.data();
+    const double V = std::abs(h[0] * (h[4] * h[8] - h[5] * h[7]) - h[1] * (h[3] * h[8] - h[5] * h[6]) +
+                              h[2] * (h[3] * h[7] - h[4] * h[6]));
+    constexpr int va[6] = {0, 1, 2, 1, 0, 0}, vb[6] = {0, 1, 2, 2, 2, 1};
+    for (int k = 0; k < 6; k++)
+      stress[k] = static_cast<float>(double(stress[k]) + 0.5 * (vir[3 * va[k] + vb[k]] + vir[3 * vb[k] + va[k]]) / V);
+  };
+  if (L.states && cond.cl.s > 1) { // (periodic cells too: one state applies to every image, lr_combined.h)
     const LrcStates st = lrc_states(L, cond.cl);
     if (st.active) {
       if (post_compute_hook) throw std::runtime_error("lrc_states: no capture hook on a multi-state structure");
       if (fd_ds) throw std::runtime_error("lrc_states: MLIPCPP_LRC_FD_DS is not supported");
       const size_t V = st.copies.size();
       std::vector<double> E(V), F(compute_forces ? 3 * size_t(n) : 0, 0.0), Ea(n, 0.0), Fnc, pg;
+      std::vector<double> Sw, virw(9, 0.0); // periodic: sum_v w_v stress_v (Voigt) and sum_v w_v (conditioning virial)_v
       ModelResult first;
       for (size_t v = 0; v < V; v++) {
         const double w = st.copies[v].w;
@@ -845,13 +855,22 @@ ModelResult GraphModel::predict_single_lrc(const AtomicSystem &system, bool comp
           if (rv.forces.size() == Fv.size())
             for (size_t k = 0; k < Fv.size(); k++) Fv[k] = double(rv.forces[k]);
           static const bool no_cf = [] { const char *e = std::getenv("MLIPCPP_LRC_NO_CONDF"); return e && *e == '1'; }();
+          std::vector<double> vv(9, 0.0);
           if (hc.needs_cond_forces() && !no_cf) {
             if (lrc_blend_grad_.size() != static_cast<size_t>(n)) throw std::runtime_error("lrc_states: no dE/dS");
             std::vector<double> G(hc.cl.s, 0.0);
             for (int i = 0; i < n; i++) G[hc.cl.sn[i]] += lrc_blend_grad_[i];
-            lrc_condition_forces(L, sq, hc, n, system.atomic_numbers(), x.data(), G, Fv.data(), nullptr);
+            lrc_condition_forces(L, sq, hc, n, system.atomic_numbers(), x.data(), G, Fv.data(),
+                                 cell.empty() ? nullptr : vv.data());
           }
           for (size_t k = 0; k < Fv.size(); k++) F[k] += w * Fv[k];
+          if (!cell.empty()) {
+            for (int k = 0; k < 9; k++) virw[k] += w * vv[k];
+            if (rv.stress.size() == 6) {
+              if (Sw.empty()) Sw.assign(6, 0.0);
+              for (int k = 0; k < 6; k++) Sw[k] += w * double(rv.stress[k]);
+            }
+          }
         }
         if (v == 0) first = std::move(rv);
       }
@@ -871,12 +890,17 @@ ModelResult GraphModel::predict_single_lrc(const AtomicSystem &system, bool comp
       r.energy = static_cast<float>(Eref + Emix + le.energy);
       r.sqe_charges.assign(le.q.begin(), le.q.end());
       if (compute_forces) {
-        std::vector<double> g(3 * size_t(n), 0.0); // d/dx sum_v E_v w_v
-        lrc_states_vjp(L, cond.cl, st, dE, g.data());
+        std::vector<double> g(3 * size_t(n), 0.0), vs(9, 0.0); // d/dx sum_v E_v w_v (and d/d strain)
+        lrc_states_vjp(L, cond.cl, st, dE, g.data(), cell.empty() ? nullptr : vs.data());
         r.forces.assign(3 * size_t(n), 0.0f);
         for (size_t k = 0; k < F.size(); k++)
           r.forces[k] = static_cast<float>(F[k] - g[k] + (k < le.forces.size() ? le.forces[k] : 0.0));
         r.has_forces = true;
+        if (!cell.empty() && Sw.size() == 6 && r.stress.size() == 6) { // sum_v w_v sigma_v + the virials / V
+          for (int k = 0; k < 6; k++) r.stress[k] = static_cast<float>(Sw[k]);
+          for (int k = 0; k < 9; k++) vs[k] += virw[k] + (le.virial.size() == 9 && !no_lr ? le.virial[k] : 0.0);
+          add_virial(r.stress, vs);
+        }
       }
       return r;
     }
@@ -930,14 +954,7 @@ ModelResult GraphModel::predict_single_lrc(const AtomicSystem &system, bool comp
     lrc_condition_forces(L, sq, cond, n, system.atomic_numbers(), x.data(), G, F.data(), vir.data());
   }
   for (size_t k = 0; k < F.size(); k++) r.forces[k] = static_cast<float>(double(r.forces[k]) + F[k]);
-  if (!cell.empty() && r.stress.size() == 6) { // the long-range and conditioning virial (Voigt, / V)
-    const double *h = hv.data();
-    const double V = std::abs(h[0] * (h[4] * h[8] - h[5] * h[7]) - h[1] * (h[3] * h[8] - h[5] * h[6]) +
-                              h[2] * (h[3] * h[7] - h[4] * h[6]));
-    constexpr int va[6] = {0, 1, 2, 1, 0, 0}, vb[6] = {0, 1, 2, 2, 2, 1};
-    for (int k = 0; k < 6; k++)
-      r.stress[k] = static_cast<float>(double(r.stress[k]) + 0.5 * (vir[3 * va[k] + vb[k]] + vir[3 * vb[k] + va[k]]) / V);
-  }
+  if (!cell.empty() && r.stress.size() == 6) add_virial(r.stress, vir); // the long-range and conditioning virial
   return r;
 }
 

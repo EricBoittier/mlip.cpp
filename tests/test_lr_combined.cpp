@@ -5,9 +5,12 @@
 #include "core/adaptive_cutoff.h"
 #include "runtime/graph_model.h"
 #include "runtime/lr_combined.h"
+#include "mlipcpp/io.h"
+#include <fstream>
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <cstdio>
 #include <cstring>
@@ -2643,7 +2646,10 @@ TEST_CASE("lrc links backbone: unsupported settings throw; key absent keeps the 
   CHECK_THROWS(Lb.links_check());
   const int32_t Z1[] = {11};
   const std::vector<double> x1 = {0, 0, 0};
-  CHECK_THROWS(lrc_condition(L, S, 1, Z1, x1.data(), 1.0, 10, 1, cubic(20.0).data()));
+  // periodic cells are supported since feat/lrc-states-pbc ("lrc pbc" tests); a slab cell (a zero row) still throws
+  CHECK_NOTHROW(lrc_condition(L, S, 1, Z1, x1.data(), 1.0, 10, 1, cubic(20.0).data()));
+  const std::vector<double> slab = {20, 0, 0, 0, 20, 0, 0, 0, 0};
+  CHECK_THROWS(lrc_clusters(L, 1, x1.data(), slab.data()));
   const LrcSpec Lw = graph_spec(); // default: window links
   CHECK(!Lw.links_backbone);
   CHECK(lrc_clusters(Lw, 8, XB.data()).rad.empty());
@@ -3090,4 +3096,894 @@ TEST_CASE("lrc neutral receivers: Q_loc rule, conditioning forces and blend rows
       CHECK(e2 < 1e-7 * std::max(1.0, f2));
     }
   }
+}
+
+// ---- periodic backbone links and link states (feat/lrc-states-pbc) ------------------------------------------------------
+namespace {
+// links_spec with the toy charge pass cut at 6 A (a periodic cell sums its pair terms over the images: the open
+// structure's charges while no image is within 6 A)
+LrcSpec pbc_links_spec(bool states = false, double eps = 1e-3, double cap = 16, double cap_lo = 8) {
+  LrcSpec L = links_spec();
+  auto q = std::make_shared<ToyQ>();
+  q->rcut = 6.0;
+  L.qsrc = q;
+  L.states = states, L.states_eps = eps, L.states_cap = cap, L.states_cap_lo = cap_lo;
+  return L;
+}
+std::vector<double> strain_v(std::vector<double> v, int a, int b, double e) {
+  for (size_t i = 0; i < v.size() / 3; i++) v[3 * i + a] += e * v[3 * i + b];
+  return v;
+}
+struct PbcSys {
+  std::vector<double> x, h;
+  std::vector<int32_t> Z;
+  int n() const { return int(Z.size()); }
+};
+// XB (Na+, two waters, Cl- weakly linked to the first water) in a triclinic ~20 A cell, moved so that the Cl- ... water
+// link crosses the cell boundary and wrapped into the cell
+PbcSys xb_box() {
+  PbcSys s;
+  s.h = {20, 0, 0, 2, 19, 0, -1, 1.5, 21};
+  s.Z.assign(ZB, ZB + 8);
+  s.x = XB;
+  for (int i = 0; i < 8; i++) {
+    s.x[3 * i] -= 4.5;
+    if (s.x[3 * i] < 0) s.x[3 * i] += 20;
+  }
+  return s;
+}
+// a percolating frame (three lines of O through the origin, 2 A apart, along the axes of a 12 A cubic cell: connected
+// to every image) with Li+ and Cl- in its pocket, each weakly linked to the frame (Cl- through an image) and to each other
+PbcSys frame_box(double L = 12.0) {
+  PbcSys s;
+  s.h = {L, 0, 0, 0, L, 0, 0, 0, L};
+  s.x = {0, 0, 0};
+  for (int a = 0; a < 3; a++)
+    for (int k = 1; k < int(L / 2.0 + 1e-9); k++) {
+      double p[3] = {0, 0, 0};
+      p[a] = 2.0 * k;
+      s.x.insert(s.x.end(), p, p + 3);
+    }
+  s.Z.assign(s.x.size() / 3, 8);
+  s.x.insert(s.x.end(), {4.2, 4.0, 6.3, 8.6, 7.9, 6.0});
+  s.Z.push_back(3), s.Z.push_back(17);
+  return s;
+}
+// replicate a cell (na x nb x nc)
+PbcSys supercell(const PbcSys &s, int na, int nb, int nc) {
+  PbcSys o;
+  const int N[3] = {na, nb, nc};
+  for (int a = 0; a < na; a++)
+    for (int b = 0; b < nb; b++)
+      for (int c = 0; c < nc; c++)
+        for (int i = 0; i < s.n(); i++) {
+          for (int k = 0; k < 3; k++) o.x.push_back(s.x[3 * i + k] + a * s.h[k] + b * s.h[3 + k] + c * s.h[6 + k]);
+          o.Z.push_back(s.Z[i]);
+        }
+  for (int r = 0; r < 3; r++)
+    for (int k = 0; k < 3; k++) o.h.push_back(N[r] * s.h[3 * r + k]);
+  return o;
+}
+// cell rows h: inverse (fractional f = x inv) and volume
+struct Cell3R {
+  double inv[3][3], V;
+  explicit Cell3R(const double *h) {
+    const double det = h[0] * (h[4] * h[8] - h[5] * h[7]) - h[1] * (h[3] * h[8] - h[5] * h[6]) + h[2] * (h[3] * h[7] - h[4] * h[6]);
+    V = std::abs(det);
+    for (int a = 0; a < 3; a++)
+      for (int b = 0; b < 3; b++)
+        inv[a][b] = (h[3 * ((b + 1) % 3) + (a + 1) % 3] * h[3 * ((b + 2) % 3) + (a + 2) % 3] -
+                     h[3 * ((b + 1) % 3) + (a + 2) % 3] * h[3 * ((b + 2) % 3) + (a + 1) % 3]) / det;
+  }
+};
+// an independent tin-foil Ewald sum of point charges (neutralising background; e^2 / A), any cell, its own splitting
+double ewald_ref(int n, const double *x, const double *q, const double *h) {
+  const Cell3R C(h);
+  const double al = 5.5 / std::cbrt(C.V) * 1.3;
+  double E = 0, Qt = 0;
+  for (int i = 0; i < n; i++) Qt += q[i], E -= al / std::sqrt(M_PI) * q[i] * q[i];
+  E -= M_PI / (2 * C.V * al * al) * Qt * Qt;
+  const int R = 3, K = 16;
+  for (int i = 0; i < n; i++)
+    for (int j = 0; j < n; j++)
+      for (int a = -R; a <= R; a++)
+        for (int b = -R; b <= R; b++)
+          for (int c = -R; c <= R; c++) {
+            if (i == j && !a && !b && !c) continue;
+            double r2 = 0;
+            for (int k = 0; k < 3; k++) {
+              const double d = x[3 * j + k] - x[3 * i + k] + a * h[k] + b * h[3 + k] + c * h[6 + k];
+              r2 += d * d;
+            }
+            const double r = std::sqrt(r2);
+            E += 0.5 * q[i] * q[j] * std::erfc(al * r) / r;
+          }
+  for (int a = -K; a <= K; a++)
+    for (int b = -K; b <= K; b++)
+      for (int c = -K; c <= K; c++) {
+        if (!a && !b && !c) continue;
+        double k[3], k2 = 0;
+        for (int t = 0; t < 3; t++) k[t] = 2 * M_PI * (a * C.inv[t][0] + b * C.inv[t][1] + c * C.inv[t][2]), k2 += k[t] * k[t];
+        double re = 0, im = 0;
+        for (int j = 0; j < n; j++) {
+          const double ph = k[0] * x[3 * j] + k[1] * x[3 * j + 1] + k[2] * x[3 * j + 2];
+          re += q[j] * std::cos(ph), im += q[j] * std::sin(ph);
+        }
+        E += 2 * M_PI / C.V * std::exp(-k2 / (4 * al * al)) / k2 * (re * re + im * im);
+      }
+  return E;
+}
+// a double-precision stand-in for the backbone on periodic cells (open when h is null): per copy v a pair term over the
+// copy's graph (every image pair inside the backbone pair cutoff c_ij, not dropped by the copy's link state),
+//   phi(r, c) = 0.3 exp(-r / 2) (1 - s(r - c + 1)),   zero at r >= c_ij,
+// with the pair cutoff's chain through the adaptive radii, plus a conditioning term sum_i kappa_i (k + S) of every atom's
+// super-node; F and the virial (dE/d strain) exact, as GraphModel assembles them
+struct ToyMixP {
+  LrcSpec L;
+  SqeSpec S;
+  const PbcSys *sys;
+  double Q;
+  double kappa_scale = 1.0;
+  static double phi(double r, double c, double &dr, double &dc) {
+    const double t = r - c + 1.0, sw = 1.0 - (t <= 0 ? 0.0 : t >= 1 ? 1.0 : t * t * t * (t * (6 * t - 15) + 10));
+    const double dsw = t <= 0 || t >= 1 ? 0.0 : -30.0 * t * t * (t - 1) * (t - 1), e = 0.3 * std::exp(-r / 2);
+    dr = e * (-0.5 * sw + dsw), dc = -e * dsw;
+    return e * sw;
+  }
+  double operator()(const std::vector<double> &x, const std::vector<double> &h, std::vector<double> *F = nullptr,
+                    std::vector<double> *vir = nullptr, LrcStates *out = nullptr, size_t *copies = nullptr) const {
+    const int n = sys->n();
+    const int32_t *Z = sys->Z.data();
+    const double *hp = h.empty() ? nullptr : h.data();
+    const LrcCondition c = lrc_condition(L, S, n, Z, x.data(), Q, 10, 1, hp);
+    const LrcStates st = lrc_states(L, c.cl);
+    if (out) *out = st;
+    const size_t V = st.active ? st.copies.size() : 1;
+    if (copies) *copies = V;
+    std::vector<double> E(V, 0.0);
+    if (F) F->assign(3 * size_t(n), 0.0);
+    if (vir) vir->assign(9, 0.0);
+    const int m = hp ? 2 : 0;
+    for (size_t v = 0; v < V; v++) {
+      const LrcCondition hc = st.active ? lrc_state_condition(L, c, st, v, Q, 10) : c;
+      const std::vector<int32_t> g = st.active ? st.drop_groups(c.cl, v) : std::vector<int32_t>(n, -1);
+      const double w = st.active ? st.copies[v].w : 1.0;
+      std::vector<double> Fv(3 * size_t(n), 0.0), Vv(9, 0.0), gr(n, 0.0);
+      auto add = [&](int i, int j, const double *d, double r, double dEdr) {
+        for (int a = 0; a < 3; a++) {
+          const double f = dEdr * d[a] / r;
+          Fv[3 * i + a] += f, Fv[3 * j + a] -= f;
+          for (int b = 0; b < 3; b++) Vv[3 * a + b] += f * d[b];
+        }
+      };
+      for (int i = 0; i < n; i++)
+        for (int j = i; j < n; j++)
+          for (int s0 = -m; s0 <= m; s0++)
+            for (int s1 = -m; s1 <= m; s1++)
+              for (int s2 = -m; s2 <= m; s2++) {
+                if (j == i && !(s0 > 0 || (s0 == 0 && (s1 > 0 || (s1 == 0 && s2 > 0))))) continue;
+                double d[3], r2 = 0;
+                for (int k = 0; k < 3; k++) {
+                  d[k] = x[3 * j + k] - x[3 * i + k];
+                  if (hp) d[k] += s0 * hp[k] + s1 * hp[3 + k] + s2 * hp[6 + k];
+                  r2 += d[k] * d[k];
+                }
+                const double r = std::sqrt(r2), cij = 0.5 * (c.cl.rad[i] + c.cl.rad[j]);
+                const bool drop = g[i] >= 0 && g[j] >= 0 && g[i] != g[j] && (g[i] >> 20) == (g[j] >> 20);
+                if (drop || r >= cij || r >= L.bb_cutoff) continue;
+                double dr, dc;
+                E[v] += phi(r, cij, dr, dc);
+                add(i, j, d, r, dr);
+                gr[i] += 0.5 * dc, gr[j] += 0.5 * dc;
+              }
+      // the pair cutoffs' chain through the adaptive radii (CSR of the clusters; periodic: the stored displacements)
+      for (int i = 0; i < n; i++)
+        for (int32_t e = c.cl.nb_start[i]; e < c.cl.nb_start[i + 1]; e++) {
+          if (gr[i] == 0 || c.cl.nb_jac[e] == 0) continue;
+          const int k = c.cl.nb_j[e];
+          double d[3];
+          for (int a = 0; a < 3; a++) d[a] = c.cl.nb_d.empty() ? x[3 * k + a] - x[3 * i + a] : c.cl.nb_d[3 * size_t(e) + a];
+          add(i, k, d, std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]), gr[i] * c.cl.nb_jac[e]);
+        }
+      std::vector<double> G(hc.cl.s, 0.0);
+      for (int i = 0; i < n; i++) {
+        const int a = hc.cl.sn[i];
+        const double kap = kappa_scale * (0.3 - 0.1 * (Z[i] % 5)); // per element (permutation invariant)
+        G[a] += kap, E[v] += kap * (hc.k[a] + hc.S[a]);
+      }
+      if (hc.cl.s > 1) lrc_condition_forces(L, S, hc, n, Z, x.data(), G, Fv.data(), Vv.data());
+      if (F)
+        for (size_t k = 0; k < Fv.size(); k++) (*F)[k] += w * Fv[k];
+      if (vir)
+        for (int k = 0; k < 9; k++) (*vir)[k] += w * Vv[k];
+    }
+    double Em = 0;
+    for (size_t v = 0; v < V; v++) Em += (st.active ? st.copies[v].w : 1.0) * E[v];
+    if ((F || vir) && st.active) {
+      std::vector<double> gw(3 * size_t(n), 0.0), vw(9, 0.0);
+      lrc_states_vjp(L, c.cl, st, E, gw.data(), vw.data());
+      if (F)
+        for (size_t k = 0; k < gw.size(); k++) (*F)[k] -= gw[k];
+      if (vir)
+        for (int k = 0; k < 9; k++) (*vir)[k] += vw[k];
+    }
+    // the long range on top (its own forces and virial)
+    const LrcEnergy le = lrc_energy(L, S, c, n, Z, x.data(), Q, F || vir);
+    if (F)
+      for (size_t k = 0; k < le.forces.size(); k++) (*F)[k] += le.forces[k];
+    if (vir && !le.virial.empty())
+      for (int k = 0; k < 9; k++) (*vir)[k] += le.virial[k];
+    return Em + le.energy;
+  }
+};
+// FD of the forces and of the virial (homogeneous strain of positions and cell) of f; returns {max|F|, ferr, max|vir|, verr}
+std::array<double, 4> fd_check(const std::function<double(const std::vector<double> &, const std::vector<double> &)> &f,
+                               const std::vector<double> &x, const std::vector<double> &h, const std::vector<double> &F,
+                               const std::vector<double> &vir, double hx = 1e-5) {
+  double fm = 0, fe = 0, vm = 0, ve = 0;
+  for (size_t k = 0; k < x.size(); k++) {
+    const double num = -fd([&](const std::vector<double> &y) { return f(y, h); }, x, k, hx);
+    fm = std::max(fm, std::abs(num)), fe = std::max(fe, std::abs(num - F[k]));
+  }
+  if (!h.empty())
+    for (int a = 0; a < 3; a++)
+      for (int b = 0; b < 3; b++) {
+        const double ep = 1e-6;
+        const double num = (f(strain_v(x, a, b, ep), strain_v(h, a, b, ep)) - f(strain_v(x, a, b, -ep), strain_v(h, a, b, -ep))) / (2 * ep);
+        vm = std::max(vm, std::abs(num)), ve = std::max(ve, std::abs(num - vir[3 * a + b]));
+      }
+  return {fm, fe, vm, ve};
+}
+} // namespace
+
+TEST_CASE("lrc pbc: periodic radii are the backbone's (every image within the cutoff), structure of the fixtures",
+          "[lrc][pbc]") {
+  SqeSpec S = sqe_spec();
+  const LrcSpec L = pbc_links_spec();
+  for (const PbcSys &s : {xb_box(), frame_box()}) {
+    const int n = s.n();
+    const LrcClusters c = lrc_clusters(L, n, s.x.data(), s.h.data());
+    // brute force: every image within 8 A
+    for (int i = 0; i < n; i++) {
+      std::vector<double> d;
+      for (int j = 0; j < n; j++)
+        for (int a = -2; a <= 2; a++)
+          for (int b = -2; b <= 2; b++)
+            for (int e = -2; e <= 2; e++) {
+              if (i == j && !a && !b && !e) continue;
+              double r2 = 0;
+              for (int k = 0; k < 3; k++) {
+                const double t = s.x[3 * j + k] - s.x[3 * i + k] + a * s.h[k] + b * s.h[3 + k] + e * s.h[6 + k];
+                r2 += t * t;
+              }
+              if (std::sqrt(r2) < 8.0) d.push_back(std::sqrt(r2));
+            }
+      std::sort(d.begin(), d.end());
+      const double r = mlipcpp::adaptive::radius(true, int(d.size()), [&](int k) { return d[k]; }, 8.0, 16.0, 0.5);
+      CHECK(c.rad[i] == Approx(r).epsilon(1e-12));
+      CHECK(c.nb_start[i + 1] - c.nb_start[i] == int(d.size()));
+    }
+  }
+  const PbcSys xb = xb_box(), fr = frame_box();
+  const LrcClusters cx = lrc_clusters(L, xb.n(), xb.x.data(), xb.h.data());
+  const LrcClusters co = lrc_clusters(L, 8, XB.data());
+  CHECK(cx.s == co.s);
+  CHECK(cx.images());
+  CHECK(!cx.trivial());
+  bool crosses = false;
+  for (const auto &w : cx.weak) {
+    CHECK(w.img);
+    crosses = crosses || std::abs(w.d[0] - (xb.x[3 * w.j] - xb.x[3 * w.i])) > 1;
+  }
+  CHECK(crosses); // the weak link goes through the cell boundary
+  for (int a = 0; a < cx.s; a++)
+    for (int b = 0; b < cx.s; b++) CHECK(cx.R[size_t(a) * cx.s + b] == Approx(co.R[size_t(a) * co.s + b]).margin(1e-12));
+  const LrcClusters cf = lrc_clusters(L, fr.n(), fr.x.data(), fr.h.data());
+  INFO("frame: super-nodes " << cf.s << ", super-edges " << cf.se.size());
+  REQUIRE(cf.s == 3);
+  CHECK(cf.perc[0] == 1);
+  CHECK(cf.perc[1] == 0);
+  CHECK(cf.perc[2] == 0);
+  CHECK(cf.se.size() == 3);
+  for (int a = 0; a < 3; a++) CHECK(cf.pnode[a] == 0);
+  CHECK(cf.fcomp[1] == cf.fcomp[2]);
+  for (double p : cf.p) CHECK((p > 0.05 && p < 0.95));
+}
+
+TEST_CASE("lrc pbc: large-box limit is the open structure exactly, up to the point charges' image term", "[lrc][pbc]") {
+  SqeSpec S = sqe_spec();
+  S.lr_R = 10.0, S.lr_t = 2.0;
+  for (bool qp : {false, true})
+    for (double Q : {0.0, 1.0}) {
+      LrcSpec L = pbc_links_spec();
+      L.qproj = qp;
+      const LrcCondition co = lrc_condition(L, S, 8, ZB, XB.data(), Q, 10, 1);
+      const LrcEnergy eo = lrc_energy(L, S, co, 8, ZB, XB.data(), Q, true);
+      double prev = 1e9;
+      for (double Lb : {60.0, 80.0, 100.0}) {
+        const std::vector<double> h = {Lb, 0, 0, 0, Lb, 0, 0, 0, Lb};
+        std::vector<double> x = XB;
+        for (double &t : x) t += 0.37 * Lb;
+        const LrcCondition c = lrc_condition(L, S, 8, ZB, x.data(), Q, 10, 1, h.data());
+        REQUIRE(c.cl.s == co.cl.s);
+        double dR = 0, dQ = 0;
+        for (size_t k = 0; k < c.cl.R.size(); k++) dR = std::max(dR, std::abs(c.cl.R[k] - co.cl.R[k]));
+        for (int a = 0; a < c.cl.s; a++) dQ = std::max(dQ, std::abs(c.Qloc[a] - co.Qloc[a]) + std::abs(c.S[a] - co.S[a]));
+        CHECK(dR < 1e-12);
+        CHECK(dQ < 1e-12);
+        const LrcEnergy e = lrc_energy(L, S, c, 8, ZB, x.data(), Q, true);
+        double dq = 0, direct = 0;
+        for (int i = 0; i < 8; i++) {
+          dq = std::max(dq, std::abs(e.q[i] - eo.q[i]));
+          for (int j = i + 1; j < 8; j++) direct += e.q[i] * e.q[j] / ToyQ::r(x.data(), i, j);
+        }
+        CHECK(dq < 1e-12);
+        const double img = 14.399645 * (ewald_ref(8, x.data(), e.q.data(), h.data()) - direct);
+        double fd_ = 0;
+        for (int k = 0; k < 24; k++) fd_ = std::max(fd_, std::abs(e.forces[k] - eo.forces[k]));
+        INFO("qproj " << qp << " Q " << Q << " L " << Lb << ": E " << e.energy << " open " << eo.energy << " image term "
+                      << img << ", E - image - open " << e.energy - img - eo.energy << ", max |F - F_open| " << fd_);
+        CHECK(std::abs(e.energy - img - eo.energy) < 1e-9);
+        CHECK(fd_ < 2e-3);
+        CHECK(fd_ < prev);
+        prev = fd_;
+      }
+    }
+}
+
+TEST_CASE("lrc pbc: long-range and conditioning forces and virial match differences (boundary link, percolating frame)",
+          "[lrc][pbc]") {
+  SqeSpec S = sqe_spec();
+  S.lr_R = 10.0, S.lr_t = 2.0;
+  for (const PbcSys &sy : {xb_box(), frame_box()})
+    for (bool qp : {false, true})
+      for (double Q : {0.0, 1.0}) {
+        LrcSpec L = pbc_links_spec();
+        L.qproj = qp;
+        const int n = sy.n();
+        auto energy = [&](const std::vector<double> &x, const std::vector<double> &h) {
+          const LrcCondition c = lrc_condition(L, S, n, sy.Z.data(), x.data(), Q, 10, 1, h.data());
+          return lrc_energy(L, S, c, n, sy.Z.data(), x.data(), Q, false).energy;
+        };
+        const LrcCondition c0 = lrc_condition(L, S, n, sy.Z.data(), sy.x.data(), Q, 10, 1, sy.h.data());
+        REQUIRE(c0.cl.images());
+        REQUIRE(c0.needs_cond_forces());
+        const LrcEnergy e0 = lrc_energy(L, S, c0, n, sy.Z.data(), sy.x.data(), Q, true);
+        auto r = fd_check(energy, sy.x, sy.h, e0.forces, e0.virial);
+        INFO("n " << n << " qproj " << qp << " Q " << Q << ": E_lr " << e0.energy << ", max |F| " << r[0] << " err "
+                  << r[1] << ", max |vir| " << r[2] << " err " << r[3]);
+        CHECK(r[0] > 1e-3);
+        CHECK(r[1] < 1e-6 * std::max(1.0, r[0]));
+        CHECK(r[2] > 1e-3);
+        CHECK(r[3] < 1e-6 * std::max(1.0, r[2]));
+        // conditioning: sum_i g_i (k + S) of each atom's super-node
+        auto fS = [&](const std::vector<double> &x, const std::vector<double> &h) {
+          const LrcCondition c = lrc_condition(L, S, n, sy.Z.data(), x.data(), Q, 10, 1, h.data());
+          double v = 0;
+          for (int i = 0; i < n; i++) v += (0.7 - 0.13 * (i % 7)) * (c.k[c.cl.sn[i]] + c.S[c.cl.sn[i]]);
+          return v;
+        };
+        std::vector<double> G(c0.cl.s, 0.0), F(3 * size_t(n), 0.0), vir(9, 0.0);
+        for (int i = 0; i < n; i++) G[c0.cl.sn[i]] += 0.7 - 0.13 * (i % 7);
+        lrc_condition_forces(L, S, c0, n, sy.Z.data(), sy.x.data(), G, F.data(), vir.data());
+        r = fd_check(fS, sy.x, sy.h, F, vir);
+        INFO("conditioning: max |F| " << r[0] << " err " << r[1] << ", max |vir| " << r[2] << " err " << r[3]);
+        CHECK(r[0] > 1e-6); // the xb fixture's Q_loc sits near an integer (dS small): a relative check too
+        CHECK(r[1] < 1e-6 * std::max(1.0, r[0]));
+        CHECK(r[1] < 1e-4 * r[0]);
+        CHECK(r[3] < 1e-6 * std::max(1.0, r[2]));
+      }
+}
+
+TEST_CASE("lrc pbc states: weights, forces and stress of the full mixture match differences (toy, double)",
+          "[lrc][pbc][states]") {
+  SqeSpec S = sqe_spec();
+  S.lr_R = 10.0, S.lr_t = 2.0;
+  for (const PbcSys &sy : {xb_box(), frame_box()})
+    for (double Q : {0.0, 1.0}) {
+      ToyMixP T{pbc_links_spec(true), S, &sy, Q};
+      std::vector<double> F, vir;
+      LrcStates st;
+      size_t V = 0;
+      T(sy.x, sy.h, &F, &vir, &st, &V);
+      REQUIRE(st.active);
+      double sw = 0;
+      for (const auto &cp : st.copies) sw += cp.w;
+      CHECK(sw == Approx(1.0).margin(1e-12));
+      auto r = fd_check([&](const std::vector<double> &x, const std::vector<double> &h) { return T(x, h); }, sy.x, sy.h, F, vir);
+      INFO("n " << sy.n() << " Q " << Q << ": copies " << V << ", max |F| " << r[0] << " err " << r[1] << ", max |vir| "
+                << r[2] << " err " << r[3]);
+      CHECK(V >= 2);
+      CHECK(r[0] > 1e-3);
+      CHECK(r[1] < 1e-6 * std::max(1.0, r[0]));
+      CHECK(r[2] > 1e-3);
+      CHECK(r[3] < 1e-6 * std::max(1.0, r[2]));
+    }
+}
+
+TEST_CASE("lrc pbc states: large box equals the open mixture (toy: states, weights, energy up to the image term)",
+          "[lrc][pbc][states]") {
+  SqeSpec S = sqe_spec();
+  S.lr_R = 10.0, S.lr_t = 2.0;
+  PbcSys op;
+  op.x = XB, op.Z.assign(ZB, ZB + 8);
+  for (double Q : {0.0, 1.0}) {
+    ToyMixP To{pbc_links_spec(true), S, &op, Q};
+    std::vector<double> Fo;
+    LrcStates sto;
+    const double Eo = To(op.x, {}, &Fo, nullptr, &sto);
+    const double Lb = 80.0;
+    PbcSys pb = op;
+    pb.h = {Lb, 0, 0, 0, Lb, 0, 0, 0, Lb};
+    for (double &t : pb.x) t += 0.31 * Lb;
+    ToyMixP Tp{pbc_links_spec(true), S, &pb, Q};
+    std::vector<double> Fp, vp;
+    LrcStates stp;
+    const double Ep = Tp(pb.x, pb.h, &Fp, &vp, &stp);
+    REQUIRE(stp.copies.size() == sto.copies.size());
+    for (size_t v = 0; v < stp.copies.size(); v++) CHECK(stp.copies[v].w == Approx(sto.copies[v].w).margin(1e-12));
+    const LrcCondition c = lrc_condition(Tp.L, S, 8, ZB, pb.x.data(), Q, 10, 1, pb.h.data());
+    const LrcEnergy e = lrc_energy(Tp.L, S, c, 8, ZB, pb.x.data(), Q, false);
+    double direct = 0;
+    for (int i = 0; i < 8; i++)
+      for (int j = i + 1; j < 8; j++) direct += e.q[i] * e.q[j] / ToyQ::r(pb.x.data(), i, j);
+    const double img = 14.399645 * (ewald_ref(8, pb.x.data(), e.q.data(), pb.h.data()) - direct);
+    double fd_ = 0;
+    for (int k = 0; k < 24; k++) fd_ = std::max(fd_, std::abs(Fp[k] - Fo[k]));
+    INFO("Q " << Q << ": E " << Ep << " open " << Eo << " image " << img << ", max |F - F_open| " << fd_);
+    CHECK(std::abs(Ep - img - Eo) < 1e-9);
+    CHECK(fd_ < 2e-3);
+  }
+}
+
+TEST_CASE("lrc pbc: invariance (translation, lattice-vector shifts, permutation, rotation of positions and cell)",
+          "[lrc][pbc]") {
+  SqeSpec S = sqe_spec();
+  S.lr_R = 10.0, S.lr_t = 2.0;
+  for (const PbcSys &sy : {xb_box(), frame_box()}) {
+    ToyMixP T{pbc_links_spec(true), S, &sy, 1.0};
+    std::vector<double> F0, v0;
+    const double E0 = T(sy.x, sy.h, &F0, &v0);
+    const int n = sy.n();
+    // translation and lattice shifts of single atoms
+    PbcSys t = sy;
+    for (int i = 0; i < n; i++)
+      for (int a = 0; a < 3; a++) t.x[3 * i + a] += 1.234 * (a + 1) + (i % 3 == 1 ? sy.h[3 + a] - sy.h[a] : 0.0);
+    ToyMixP Tt{T.L, S, &t, 1.0};
+    std::vector<double> F1, v1;
+    CHECK(Tt(t.x, t.h, &F1, &v1) == Approx(E0).epsilon(1e-11));
+    for (size_t k = 0; k < F0.size(); k++) CHECK(F1[k] == Approx(F0[k]).margin(1e-9));
+    for (int k = 0; k < 9; k++) CHECK(v1[k] == Approx(v0[k]).margin(1e-9));
+    // permutation (reverse order)
+    PbcSys p = sy;
+    for (int i = 0; i < n; i++) {
+      p.Z[i] = sy.Z[n - 1 - i];
+      for (int a = 0; a < 3; a++) p.x[3 * i + a] = sy.x[3 * (n - 1 - i) + a];
+    }
+    ToyMixP Tp{T.L, S, &p, 1.0};
+    std::vector<double> F2, v2;
+    CHECK(Tp(p.x, p.h, &F2, &v2) == Approx(E0).epsilon(1e-11));
+    for (int i = 0; i < n; i++)
+      for (int a = 0; a < 3; a++) CHECK(F2[3 * i + a] == Approx(F0[3 * (n - 1 - i) + a]).margin(1e-9));
+    // rotation of positions and cell together
+    const double th = 0.7, ph = 0.4;
+    const double Rm[3][3] = {{std::cos(th), -std::sin(th) * std::cos(ph), std::sin(th) * std::sin(ph)},
+                             {std::sin(th), std::cos(th) * std::cos(ph), -std::cos(th) * std::sin(ph)},
+                             {0, std::sin(ph), std::cos(ph)}};
+    PbcSys q = sy;
+    auto rot = [&](const double *v, double *o) {
+      for (int a = 0; a < 3; a++) o[a] = Rm[a][0] * v[0] + Rm[a][1] * v[1] + Rm[a][2] * v[2];
+    };
+    for (int i = 0; i < n; i++) rot(&sy.x[3 * i], &q.x[3 * i]);
+    for (int r = 0; r < 3; r++) rot(&sy.h[3 * r], &q.h[3 * r]);
+    ToyMixP Tq{T.L, S, &q, 1.0};
+    std::vector<double> F3, v3;
+    CHECK(Tq(q.x, q.h, &F3, &v3) == Approx(E0).epsilon(1e-11));
+    for (int i = 0; i < n; i++) {
+      double fr[3];
+      rot(&F0[3 * i], fr);
+      for (int a = 0; a < 3; a++) CHECK(F3[3 * i + a] == Approx(fr[a]).margin(1e-9));
+    }
+  }
+}
+
+TEST_CASE("lrc pbc: supercells are extensive (long range and the state mixture; exact sum over states)", "[lrc][pbc]") {
+  SqeSpec S = sqe_spec();
+  S.lr_R = 10.0, S.lr_t = 2.0;
+  struct Case {
+    PbcSys s;
+    int na, nb, nc;
+    double kappa;
+  };
+  // eps tiny and no cap: the exact sum over the states. With the eps cut, components joined through a percolating
+  // super-node are cut jointly (supercell consistent to O(eps) there). Conditioning term: off for the frame, whose
+  // percolating super-node's charge per cell is not intensive (Q0 of the cell)
+  for (const Case &cs : {Case{xb_box(), 2, 2, 2, 1.0}, Case{frame_box(), 2, 1, 1, 0.0}, Case{frame_box(), 2, 2, 1, 0.0}}) {
+    const PbcSys sc = supercell(cs.s, cs.na, cs.nb, cs.nc);
+    const int k = cs.na * cs.nb * cs.nc;
+    ToyMixP T1{pbc_links_spec(true, 1e-14, 1e12, 1e11), S, &cs.s, 0.0, cs.kappa};
+    ToyMixP Tk{pbc_links_spec(true, 1e-14, 1e12, 1e11), S, &sc, 0.0, cs.kappa};
+    std::vector<double> F1, Fk, v1, vk;
+    size_t V1 = 0, Vk = 0;
+    const double E1 = T1(cs.s.x, cs.s.h, &F1, &v1, nullptr, &V1), Ek = Tk(sc.x, sc.h, &Fk, &vk, nullptr, &Vk);
+    const LrcCondition c1 = lrc_condition(T1.L, S, cs.s.n(), cs.s.Z.data(), cs.s.x.data(), 0.0, 10, 1, cs.s.h.data());
+    const LrcCondition ck = lrc_condition(Tk.L, S, sc.n(), sc.Z.data(), sc.x.data(), 0.0, 10, 1, sc.h.data());
+    const double l1 = lrc_energy(T1.L, S, c1, cs.s.n(), cs.s.Z.data(), cs.s.x.data(), 0.0, false).energy;
+    const double lk = lrc_energy(Tk.L, S, ck, sc.n(), sc.Z.data(), sc.x.data(), 0.0, false).energy;
+    INFO("n " << cs.s.n() << " x" << k << ": E " << E1 << " -> " << Ek << " (" << Ek / k << " per cell), E_lr " << l1
+              << " -> " << lk << ", copies " << V1 << " -> " << Vk);
+    CHECK(lk == Approx(k * l1).epsilon(1e-10));
+    CHECK(Ek == Approx(k * E1).epsilon(1e-10));
+    double fe = 0;
+    for (size_t i = 0; i < Fk.size(); i++) fe = std::max(fe, std::abs(Fk[i] - F1[i % F1.size()]));
+    CHECK(fe < 1e-9);
+    for (int q = 0; q < 9; q++) CHECK(vk[q] == Approx(k * v1[q]).margin(1e-8));
+  }
+}
+
+TEST_CASE("lrc pbc: continuous through a link disconnect and a strong join in a box (toy mixture, fine scans)",
+          "[lrc][pbc][states]") {
+  SqeSpec S = sqe_spec();
+  S.lr_R = 10.0, S.lr_t = 2.0;
+  struct Scan {
+    int atom;            // the moving atom (frame_box: Li+ 16, Cl- 17)
+    double dir[3], len;  // direction (normalised below) and length (A)
+    const char *what;
+  };
+  for (const Scan &sc : {Scan{16, {-1.0, -1.0, 0.0}, 2.2, "Li+ into the frame (strong join)"},
+                         Scan{17, {1.0, 1.0, -0.4}, 3.0, "Cl- away (disconnects from Li+ and the frame)"}})
+    for (double Q : {0.0, 1.0}) {
+      PbcSys sy = frame_box();
+      ToyMixP T{pbc_links_spec(true), S, &sy, Q};
+      const double nr = std::sqrt(sc.dir[0] * sc.dir[0] + sc.dir[1] * sc.dir[1] + sc.dir[2] * sc.dir[2]);
+      double u[3];
+      for (int a = 0; a < 3; a++) u[a] = sc.dir[a] / nr;
+      // |dE - trapezoid work| per step over [t0, t0 + len] at step h; where the worst step starts (tw)
+      auto scan = [&](double t0, double len, double h, double &tw, int *s0 = nullptr, int *s1 = nullptr) {
+        std::vector<double> x = sy.x, F;
+        for (int a = 0; a < 3; a++) x[3 * sc.atom + a] += t0 * u[a];
+        const int N = int(len / h + 0.5);
+        double Ep = 0, Fu = 0, worst = 0;
+        for (int k = 0; k <= N; k++) {
+          if (k)
+            for (int a = 0; a < 3; a++) x[3 * sc.atom + a] += h * u[a];
+          const double E = T(x, sy.h, &F);
+          double fu = 0;
+          for (int a = 0; a < 3; a++) fu += F[3 * sc.atom + a] * u[a];
+          if (k) {
+            const double e = std::abs(E - Ep + 0.5 * h * (fu + Fu));
+            if (e > worst) worst = e, tw = t0 + (k - 1) * h;
+          }
+          Ep = E, Fu = fu;
+          if (s0 || s1) {
+            const int s = lrc_clusters(T.L, sy.n(), x.data(), sy.h.data()).s;
+            if (k == 0 && s0) *s0 = s;
+            if (s1) *s1 = s;
+          }
+        }
+        return worst;
+      };
+      int s0 = -1, s1 = -1;
+      double tw = 0, tw2 = 0;
+      const double h = 2e-4, worst = scan(0.0, sc.len, h, tw, &s0, &s1);
+      // a residual of the trapezoid rule, not a step: it falls as h^3 around the worst point
+      const double fine = scan(tw - 2e-3, 4e-3 + h, h / 4, tw2);
+      INFO(sc.what << ", Q " << Q << ": super-nodes " << s0 << " -> " << s1 << ", worst |dE - work| per step " << worst
+                   << " at t = " << tw << " A; at h / 4 around it " << fine);
+      CHECK(s0 != s1);
+      // measured: Li+ scan <= 1e-10 and h^3; Cl- scan 1.7e-9 eV at 1.1019 A that does not fall with h: there Li+ joins
+      // the frame strongly (its pair crosses lo as Cl- moves the frame atoms' radii) while the Cl- link (p ~ 2e-8) is in
+      // edge states below the eps cut, which the merged super-edge then keeps. The lrc_states eps cut is not consistent
+      // across a strong merge (open structures alike; size <= the cut mass times the copies' energy differences); E_lr
+      // itself is continuous there to 1e-11
+      CHECK(worst < 1e-8);
+    }
+}
+
+TEST_CASE("lrc pbc: partly percolating clusters, wrapping weak components (fallback), slabs; a bulk cell is the plain model",
+          "[lrc][pbc]") {
+  SqeSpec S = sqe_spec();
+  S.lr_R = 10.0, S.lr_t = 2.0;
+  LrcSpec L = pbc_links_spec();
+  // a wire (one line of O 2 A apart along x in a 12 x 20 x 20 cell) and an ion far from it: the wire percolates (one
+  // super-node, no long range with its own images), the ion is a finite cluster; forces and virial exact
+  {
+    PbcSys w;
+    for (int k = 0; k < 6; k++) w.x.insert(w.x.end(), {2.0 * k, 0, 0}), w.Z.push_back(8);
+    w.x.insert(w.x.end(), {5.0, 10.0, 10.0}), w.Z.push_back(3);
+    w.h = {12, 0, 0, 0, 20, 0, 0, 0, 20};
+    const LrcCondition c = lrc_condition(L, S, 7, w.Z.data(), w.x.data(), 0.0, 10, 1, w.h.data());
+    REQUIRE(c.cl.s == 2);
+    CHECK(c.cl.perc[0] == 1);
+    CHECK(c.cl.perc[1] == 0);
+    CHECK(!c.cl.fallback);
+    const LrcEnergy e = lrc_energy(L, S, c, 7, w.Z.data(), w.x.data(), 0.0, true);
+    auto energy = [&](const std::vector<double> &x, const std::vector<double> &h) {
+      const LrcCondition cc = lrc_condition(L, S, 7, w.Z.data(), x.data(), 0.0, 10, 1, h.data());
+      return lrc_energy(L, S, cc, 7, w.Z.data(), x.data(), 0.0, false).energy;
+    };
+    const auto r = fd_check(energy, w.x, w.h, e.forces, e.virial);
+    INFO("wire + ion: E_lr " << e.energy << ", max |F| " << r[0] << " err " << r[1] << ", max |vir| " << r[2] << " err " << r[3]);
+    CHECK(r[0] > 1e-4);
+    CHECK(r[2] > 1e-2);
+    CHECK(r[1] < 1e-6 * std::max(1.0, r[0]));
+    CHECK(r[3] < 1e-6 * std::max(1.0, r[2]));
+  }
+  // a bare ion weakly linked to its own image (7 A cell): the weak component wraps, so it is one percolating cluster
+  // (the fallback): rows at Q, no long range
+  {
+    const int32_t Z1[] = {11};
+    const double x1[] = {1, 2, 3};
+    const std::vector<double> h = {7, 0, 0, 0, 30, 0, 0, 0, 30};
+    const LrcCondition c = lrc_condition(L, S, 1, Z1, x1, 1.0, 10, 1, h.data());
+    CHECK(c.cl.fallback);
+    CHECK(c.cl.bulk);
+    CHECK(lrc_energy(L, S, c, 1, Z1, x1, 1.0, true).energy == 0.0);
+  }
+  // a ring of three ions weakly linked through the boundary (cycle with a cell offset): one percolating cluster
+  {
+    const int32_t Z3[] = {11, 17, 11};
+    const double x3[] = {0, 0, 0, 6.5, 0.3, 0, 13.0, -0.2, 0.4};
+    const std::vector<double> h = {19.5, 0, 0, 0, 30, 0, 0, 0, 30};
+    const LrcCondition c = lrc_condition(L, S, 3, Z3, x3, 1.0, 10, 1, h.data());
+    INFO("ring: super-nodes " << c.cl.s << ", fallback " << c.cl.fallback);
+    CHECK(c.cl.fallback);
+    CHECK(c.cl.s == 1);
+  }
+  // a slab cell (zero row) is refused
+  {
+    const int32_t Z1[] = {11};
+    const double x1[] = {1, 2, 3};
+    const std::vector<double> h = {20, 0, 0, 0, 20, 0, 0, 0, 0};
+    CHECK_THROWS(lrc_clusters(L, 1, x1, h.data()));
+  }
+  // lrc_slab with backbone links
+  {
+    LrcSpec Ls = L;
+    Ls.slab = LrcSpec::Slab::YB;
+    CHECK_THROWS(Ls.links_check());
+  }
+  // bulk: rock salt 2.8 A, one percolating super-node, E_lr = 0, rows at Q, the charge pass never runs
+  {
+    LrcSpec Lb = L;
+    Lb.qsrc = std::make_shared<NoQ>();
+    std::vector<double> x;
+    std::vector<int32_t> Z;
+    for (int a = 0; a < 2; a++)
+      for (int b = 0; b < 2; b++)
+        for (int c = 0; c < 2; c++) x.insert(x.end(), {2.8 * a + 0.1, 2.8 * b, 2.8 * c - 0.2}), Z.push_back((a + b + c) % 2 ? 17 : 11);
+    const std::vector<double> h = {5.6, 0, 0, 0, 5.6, 0, 0, 0, 5.6};
+    for (double Q : {0.0, 1.0}) {
+      const LrcCondition c = lrc_condition(Lb, S, 8, Z.data(), x.data(), Q, 10, 1, h.data());
+      CHECK(c.cl.bulk);
+      CHECK(c.cl.s == 1);
+      for (int i = 0; i < 8; i++) CHECK(c.row_charge[i] + double(c.blend[i]) == Approx(Q));
+      const LrcEnergy e = lrc_energy(Lb, S, c, 8, Z.data(), x.data(), Q, true);
+      CHECK(e.energy == 0.0);
+      CHECK(!lrc_states(Lb, c.cl).active);
+    }
+  }
+}
+
+
+TEST_CASE("lrc pbc: full model (GGUF) forces and stress vs differences, large-box limit, bulk", "[lrc][pbc][gguf]") {
+  const char *path = std::getenv("MLIPCPP_TEST_STATES_GGUF");
+  if (!path || !*path || !std::filesystem::exists(path)) SKIP("MLIPCPP_TEST_STATES_GGUF not set");
+  mlipcpp::runtime::GraphModel m;
+  m.set_backend_preference(mlipcpp::BackendPreference::CPU);
+  REQUIRE(m.load_from_gguf(path));
+  const LrcSpec &L = m.plato_lr().lrc;
+  REQUIRE(L.states);
+  REQUIRE(L.links_backbone);
+  auto predict = [&](const std::vector<int32_t> &Z, const std::vector<double> &x, const std::vector<double> &h, int Q,
+                     bool forces) {
+    const int n = int(Z.size());
+    std::vector<float> xf(x.begin(), x.end());
+    mlipcpp::AtomicSystem sys(n, xf.data(), Z.data(), nullptr);
+    if (!h.empty()) {
+      float lat[3][3];
+      for (int a = 0; a < 3; a++)
+        for (int b = 0; b < 3; b++) lat[a][b] = float(h[3 * a + b]);
+      sys = mlipcpp::AtomicSystem(n, xf.data(), Z.data(), nullptr);
+      sys.set_cell(mlipcpp::Cell(lat, true, true, true));
+    }
+    sys.set_charge(Q), sys.set_spin_multiplicity(1);
+    return m.predict(sys, forces);
+  };
+  auto volume = [](const std::vector<double> &h) {
+    return std::abs(h[0] * (h[4] * h[8] - h[5] * h[7]) - h[1] * (h[3] * h[8] - h[5] * h[6]) + h[2] * (h[3] * h[7] - h[4] * h[6]));
+  };
+  // FD of one atom's force along u (best of three steps) and of three strain components (Richardson, fp32)
+  auto check = [&](const char *what, const std::vector<int32_t> &Z, const std::vector<double> &x, const std::vector<double> &h,
+                   int Q, int atom, const double *u) {
+    const mlipcpp::ModelResult r = predict(Z, x, h, Q, true);
+    REQUIRE(r.forces.size() == x.size());
+    REQUIRE(r.stress.size() == 6);
+    double Fu = 0;
+    for (int k = 0; k < 3; k++) Fu += double(r.forces[3 * atom + k]) * u[k];
+    double best = 1e30;
+    for (double s : {2e-3, 1e-3, 5e-4}) {
+      std::vector<double> xp = x, xm = x;
+      for (int k = 0; k < 3; k++) xp[3 * atom + k] += s * u[k], xm[3 * atom + k] -= s * u[k];
+      const double Fc = -(double(predict(Z, xp, h, Q, false).energy) - double(predict(Z, xm, h, Q, false).energy)) / (2 * s);
+      best = std::min(best, std::abs(Fc - Fu));
+    }
+    const double V = volume(h);
+    constexpr int va[3] = {0, 1, 0}, vb[3] = {0, 1, 1}, vk[3] = {0, 1, 5};
+    double verr = 0, vmax = 0;
+    for (int c = 0; c < 3; c++) {
+      auto D = [&](double e) { // symmetric strain e (a, b) on positions and cell
+        auto st = [&](std::vector<double> v, double t) {
+          for (size_t i = 0; i < v.size() / 3; i++) {
+            const double pa = v[3 * i + va[c]], pb = v[3 * i + vb[c]];
+            if (va[c] == vb[c]) v[3 * i + va[c]] += t * pa;
+            else v[3 * i + va[c]] += 0.5 * t * pb, v[3 * i + vb[c]] += 0.5 * t * pa;
+          }
+          return v;
+        };
+        return (double(predict(Z, st(x, e), st(h, e), Q, false).energy) - double(predict(Z, st(x, -e), st(h, -e), Q, false).energy)) / (2 * e);
+      };
+      static const double es = [] { const char *e = std::getenv("MLIPCPP_TEST_STRAIN_H"); return e ? std::atof(e) : 4e-3; }();
+      const double num = (4 * D(es) - D(2 * es)) / 3, ana = double(r.stress[vk[c]]) * V;
+      vmax = std::max(vmax, std::abs(ana)), verr = std::max(verr, std::abs(num - ana));
+      INFO(what << " strain " << c << ": dE/de " << num << " stress V " << ana);
+    }
+    INFO(what << ": E " << r.energy << ", F.u " << Fu << ", |F_c - F.u| " << best << "; max |stress V| " << vmax
+              << " eV, max |FD - stress V| " << verr);
+    CHECK(best < std::max(0.05, 0.02 * std::abs(Fu)));
+    CHECK(verr < std::max(0.05, 0.02 * vmax));
+    std::printf("[pbc gguf] %s: E %.6f F.u %.5f |dF| %.2e max|sV| %.4f |dsV| %.2e\n", what, double(r.energy), Fu, best, vmax, verr);
+  };
+  const double un = std::sqrt(0.92031 * 0.92031 + 0.34051 * 0.34051 + 0.19327 * 0.19327);
+  const double u[3] = {0.92031 / un, 0.34051 / un, -0.19327 / un};
+  // 1. Li+ ... Na+ (Q = +2) in the link taper, in a 20 A triclinic cell (two copies)
+  {
+    const std::vector<int32_t> Z = {3, 11};
+    const std::vector<double> h = {20, 0, 0, 1.5, 19.5, 0, -1, 2, 21};
+    std::vector<double> x = {1.0, 2.0, 3.0, 0, 0, 0};
+    for (int k = 0; k < 3; k++) x[3 + k] = x[k] + 6.6 * u[k];
+    const LrcClusters c = lrc_clusters(L, 2, x.data(), h.data());
+    const LrcStates st = lrc_states(L, c);
+    REQUIRE(st.active);
+    check("Li+ Na+ 6.6 A, 20 A cell", Z, x, h, 2, 1, u);
+  }
+  // 2. Li+ in a cavity of rock salt (27 sites removed around a Cl site; Q = 0): one percolating super-node and the ion,
+  //    weakly linked to it; and the same rock salt without the ion's link (centre)
+  {
+    const double s = 2.82;
+    std::vector<int32_t> Z;
+    std::vector<double> x;
+    for (int i = 0; i < 6; i++)
+      for (int j = 0; j < 6; j++)
+        for (int k = 0; k < 6; k++) {
+          if (std::max({std::abs(i - 3), std::abs(j - 3), std::abs(k - 3)}) <= 1) continue;
+          x.insert(x.end(), {i * s, j * s, k * s}), Z.push_back((i + j + k) % 2 == 0 ? 11 : 17);
+        }
+    const std::vector<double> h = {6 * s, 0, 0, 0, 6 * s, 0, 0, 0, 6 * s};
+    Z.push_back(3);
+    x.insert(x.end(), {3 * s, 3 * s, 3 * s});
+    const int li = int(Z.size()) - 1;
+    bool found = false;
+    for (double o = 0.0; o < 1.5 && !found; o += 0.02) {
+      std::vector<double> y = x;
+      y[3 * li] += o, y[3 * li + 1] += 0.4 * o, y[3 * li + 2] += 0.2 * o;
+      const LrcClusters c = lrc_clusters(L, int(Z.size()), y.data(), h.data());
+      if (c.s == 2 && !c.se.empty() && c.p[0] > 0.2 && c.p[0] < 0.8) {
+        std::printf("[pbc gguf] cavity: Li+ offset %.2f A, super-nodes %d, percolating %d, p %.3f, weak pairs %zu\n", o,
+                    c.s, int(c.perc[0]), c.p[0], c.weak.size());
+        CHECK(c.perc[0] == 1);
+        const LrcStates st = lrc_states(L, c);
+        CHECK(st.active);
+        check("Li+ in a rock-salt cavity, weak link", Z, y, h, 0, li, u);
+        found = true;
+      }
+    }
+    CHECK(found);
+    // the fp32 floor of these strain differences: the same cell without the ion (one bulk super-node, the plain model)
+    std::vector<int32_t> Zb(Z.begin(), Z.end() - 1);
+    std::vector<double> xb(x.begin(), x.end() - 3);
+    check("rock-salt cavity without the ion (bulk, plain model)", Zb, xb, h, 1, 0, u);
+  }
+  // 3. the large-box limit: Li+ ... Na+ at 6.6 A in 60 / 80 A cubic cells vs open; the backbone part (E - E_lr) differs
+  //    only by the mesh / LES heads' periodic vs open treatment (reported), E_lr by the point charges' image term
+  {
+    const std::vector<int32_t> Z = {3, 11};
+    std::vector<double> x0 = {0, 0, 0, 0, 0, 0};
+    for (int k = 0; k < 3; k++) x0[3 + k] = 6.6 * u[k];
+    const mlipcpp::ModelResult ro = predict(Z, x0, {}, 2, true);
+    const LrcCondition co = lrc_condition(L, m.plato_lr().sqe, 2, Z.data(), x0.data(), 2.0, 10, 1);
+    const double elo = lrc_energy(L, m.plato_lr().sqe, co, 2, Z.data(), x0.data(), 2.0, false).energy;
+    for (double Lb : {60.0, 80.0}) {
+      std::vector<double> x = x0;
+      for (double &t : x) t += 0.4 * Lb;
+      const std::vector<double> h = {Lb, 0, 0, 0, Lb, 0, 0, 0, Lb};
+      const mlipcpp::ModelResult rp = predict(Z, x, h, 2, true);
+      const LrcCondition cp = lrc_condition(L, m.plato_lr().sqe, 2, Z.data(), x.data(), 2.0, 10, 1, h.data());
+      const LrcEnergy ep = lrc_energy(L, m.plato_lr().sqe, cp, 2, Z.data(), x.data(), 2.0, false);
+      const double img = 14.399645 * (ewald_ref(2, x.data(), ep.q.data(), h.data()) - ep.q[0] * ep.q[1] / ToyQ::r(x.data(), 0, 1));
+      double fd_ = 0;
+      for (int k = 0; k < 6; k++) fd_ = std::max(fd_, std::abs(double(rp.forces[k]) - double(ro.forces[k])));
+      std::printf("[pbc gguf] large box %.0f A: E_lr pbc - open - image term %.2e eV; backbone part (E - E_lr) pbc - open "
+                  "%.5f eV; max |F_pbc - F_open| %.2e eV/A; q %.4f %.4f (open %.4f %.4f)\n",
+                  Lb, ep.energy - elo - img, (double(rp.energy) - ep.energy) - (double(ro.energy) - elo), fd_, cp.q0.q0[0],
+                  cp.q0.q0[1], co.q0.q0[0], co.q0.q0[1]);
+      std::printf("[pbc gguf]   raw charge pass: pbc %.6f %.6f, open %.6f %.6f\n", cp.q0.qraw[0], cp.q0.qraw[1],
+                  co.q0.qraw[0], co.q0.qraw[1]);
+      CHECK(std::abs(ep.energy - elo - img) < 1e-6);
+      CHECK(fd_ < 0.05);
+    }
+  }
+}
+
+// diagnostics for the periodic smoke (not a test): per frame of MLIPCPP_DIAG_XYZ (extxyz, any number of frames) with the
+// model MLIPCPP_DIAG_GGUF, one JSON line to MLIPCPP_DIAG_OUT: super-nodes (sizes, percolating), weak links (A and
+// super-edge p), cluster charge totals Q0 and Q_loc, the states (copies, M, lambda), fallbacks
+TEST_CASE("lrc pbc: cluster diagnostics of periodic frames", "[.pbc_diag]") {
+  const char *gp = std::getenv("MLIPCPP_DIAG_GGUF"), *xp = std::getenv("MLIPCPP_DIAG_XYZ"), *op = std::getenv("MLIPCPP_DIAG_OUT");
+  if (!gp || !xp || !op) SKIP("MLIPCPP_DIAG_GGUF / _XYZ / _OUT not set");
+  mlipcpp::runtime::GraphModel m;
+  m.set_backend_preference(mlipcpp::BackendPreference::CPU);
+  REQUIRE(m.load_from_gguf(gp));
+  const LrcSpec &L = m.plato_lr().lrc;
+  std::ifstream in(xp);
+  std::FILE *out = std::fopen(op, "w");
+  REQUIRE(out);
+  for (int f = 0;; f++) {
+    in >> std::ws;
+    if (!in.good() || in.peek() == EOF) break;
+    const mlipcpp::AtomicSystem sys = mlipcpp::io::read_xyz(in);
+    const int n = sys.num_atoms();
+    std::vector<double> x(sys.positions(), sys.positions() + 3 * size_t(n)), h;
+    if (const mlipcpp::Cell *c = sys.cell())
+      for (int a = 0; a < 9; a++) h.push_back(double(c->matrix[a / 3][a % 3]));
+    std::string err;
+    LrcCondition c;
+    try {
+      c = lrc_condition(L, m.plato_lr().sqe, n, sys.atomic_numbers(), x.data(), double(sys.charge()), 10,
+                        sys.spin_multiplicity(), h.empty() ? nullptr : h.data());
+    } catch (const std::exception &e) {
+      err = e.what();
+    }
+    std::fprintf(out, "{\"frame\": %d, \"n\": %d", f, n);
+    if (!err.empty()) {
+      for (char &ch : err)
+        if (ch == '"') ch = '\'';
+      std::fprintf(out, ", \"error\": \"%s\"}\n", err.c_str());
+      continue;
+    }
+    const LrcClusters &cl = c.cl;
+    std::vector<int> size(cl.s, 0);
+    for (int i = 0; i < n; i++) size[cl.sn[i]]++;
+    std::fprintf(out, ", \"s\": %d, \"bulk\": %d, \"fallback\": %d, \"sizes\": [", cl.s, int(cl.bulk), int(cl.fallback));
+    for (int a = 0; a < cl.s; a++) std::fprintf(out, "%s%d", a ? ", " : "", size[a]);
+    std::fprintf(out, "], \"perc\": [");
+    for (size_t a = 0; a < cl.perc.size(); a++) std::fprintf(out, "%s%d", a ? ", " : "", cl.perc[a]);
+    std::fprintf(out, "], \"Q0\": [");
+    for (int a = 0; a < cl.s; a++) std::fprintf(out, "%s%.5f", a ? ", " : "", c.Q0[a]);
+    std::fprintf(out, "], \"Qloc\": [");
+    for (int a = 0; a < cl.s; a++) std::fprintf(out, "%s%.5f", a ? ", " : "", c.Qloc[a]);
+    std::fprintf(out, "], \"p\": [");
+    for (size_t e = 0; e < cl.p.size(); e++) std::fprintf(out, "%s%.5g", e ? ", " : "", cl.p[e]);
+    std::fprintf(out, "], \"A\": [");
+    for (size_t w = 0; w < cl.weak.size(); w++) std::fprintf(out, "%s%.4g", w ? ", " : "", cl.weak[w].A);
+    double rmin = 1e9, rmax = 0;
+    for (double r : cl.rad) rmin = std::min(rmin, r), rmax = std::max(rmax, r);
+    std::fprintf(out, "], \"rad_min\": %.4f, \"rad_max\": %.4f", cl.rad.empty() ? 0.0 : rmin, rmax);
+    const LrcStates st = lrc_states(L, cl);
+    std::fprintf(out, ", \"E_lr\": %.6f",
+                 lrc_energy(L, m.plato_lr().sqe, c, n, sys.atomic_numbers(), x.data(), double(sys.charge()), false).energy);
+    if (std::getenv("MLIPCPP_DIAG_FULL")) { // per-atom super-node and the weak links (i, j, A, image displacement)
+      std::fprintf(out, ", \"sn\": [");
+      for (int i = 0; i < n; i++) std::fprintf(out, "%s%d", i ? ", " : "", cl.sn[i]);
+      std::fprintf(out, "], \"weak\": [");
+      for (size_t w = 0; w < cl.weak.size(); w++)
+        std::fprintf(out, "%s[%d, %d, %.4g, %.4f, %.4f, %.4f]", w ? ", " : "", cl.weak[w].i, cl.weak[w].j, cl.weak[w].A,
+                     cl.weak[w].d[0], cl.weak[w].d[1], cl.weak[w].d[2]);
+      std::fprintf(out, "]");
+    }
+    std::fprintf(out, ", \"states\": %d, \"copies\": %zu, \"M\": %.4f, \"lambda\": %.4f, \"fix3_comps\": %d}\n",
+                 int(st.active), st.active ? st.copies.size() : size_t(1), st.M, st.lambda, st.fix3_comps);
+    std::fflush(out);
+  }
+  std::fclose(out);
 }

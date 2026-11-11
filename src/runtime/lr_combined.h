@@ -44,6 +44,27 @@
 //  - anything else (a slab, a wire, a network next to separate molecules, weak links that wrap the cell) throws.
 // Forces and the virial (dE/d strain, for the stress) are exact in both cases.
 //
+// Periodic cells under lrc_links = backbone (and lrc_states = mix; feat/lrc-states-pbc). The tiling's backbone graph:
+// adaptive radii from every image within the backbone cutoff, strong links (d <= lo_ij) and weak ones (lo_ij < d < c_ij)
+// through the images. Every strong component of the tiling is either finite or percolating (connected to every one of
+// its images: liquids, ionic solutions, crystals). Super-nodes are the strong components modulo the lattice (a
+// percolating one is ONE super-node; its Q0 is its charge per cell, with no interpolation across its own images), and
+// the weak links between them (with their image displacements) give the super-edges, R, Q_loc, lrc_qproj's states and
+// the lrc_states copies exactly as for open structures (one state applies to every image: a copy drops the backbone
+// edges between the groups it separates at every image shift). The long range is the expectation over a tiling whose
+// image copies carry independent link states (so a supercell is consistent):
+//   E_lr = KE [ Ewald_W(q) - sum_{a finite} (1 - r_a^2) D_aa - sum_{a < b, same finite component} (R_ab - r_a r_b) D_ab ]
+// with r_a = R(a, P) the probability that a is joined to the percolating super-node P of its weak component (r_P = 1;
+// r_a = 0 without one), Ewald_W the tin-foil Ewald sum (neutralising background) with every pair of super-nodes a, b
+// weighted W_ab = 1 - r_a r_b when both belong to P's weak component (1 otherwise), D_ab the direct sum of q_i q_j / r
+// over the pairs of a and b in the unwrapped frame of their finite component. Limits: without a percolating super-node
+// this is Ewald(q) minus the linked pairs weighted R (the open model's (1 - R) up to the images' term KE [Ewald(q) -
+// direct(q)], exactly); one bulk super-node gives 0 (no charge pass: the plain model); a finite super-node whose link to
+// P becomes strong (r -> 1) joins P continuously. A weak component that reaches its own images (a cycle of weak links
+// through the cell boundary, a weak link to its own image, or two percolating clusters: an infinite chain of link
+// states) is taken as one percolating cluster (fallback, like max_super_edges: not smooth where it first forms; counted
+// in LrcClusters::fallback). Slab cells (a zero cell row, lrc_slab) throw.
+//
 // Intra-cluster long range (pet.plato_lr.lrc_intra = "ewald"; absent key or "none" = everything above, bit for bit):
 // the reliability mask leaves the energy (R = 0 there, consistently, open and periodic), so the Coulomb term of the
 // charges also acts inside a connected cluster and in a bulk cell,
@@ -224,7 +245,8 @@ struct LrcSpec {
   // gradients carry the adaptive-cutoff chain rule (d r_i / d d_ik, as the backbone's forces). The inter-cluster
   // Coulomb term has no distance switch under these links (weight 1 - R_ab on every inter-cluster pair; such pairs are
   // at least lo_ij apart): it is fully on exactly where the backbone has disconnected the two clusters.
-  // Open structures, graph q0 mode without lrc_mp / lrc_pol / lrc_intra only (others throw).
+  // Open structures and periodic cells (see "Periodic cells under lrc_links = backbone" above), graph q0 mode without
+// lrc_mp / lrc_pol / lrc_intra / lrc_slab only (others throw).
   bool links_backbone = false;
   double link_a = 0.5, link_b = 1.0;
   // backbone link states (pet.plato_lr.lrc_states = "mix", needs lrc_links = backbone; absent key or "none" = the
@@ -291,6 +313,8 @@ struct LrcClusters {
     int i, j, e; // atoms, super-edge index
     double A, dA; // link value and dA/dr
     double dAc = 0; // backbone links: dA/dc_ij (c_ij the pair cutoff, through the adaptive radii)
+    bool img = false;                 // periodic backbone links: the link's image displacement d = x_j' - x_i below
+    std::array<double, 3> d{0, 0, 0}; // replaces the cluster-frame difference xh_j - xh_i (lrc_links = backbone, PBC)
   };
   std::vector<Weak> weak;
   std::vector<std::pair<int, int>> se; // super-edges (a < b)
@@ -314,6 +338,12 @@ struct LrcClusters {
   // d r_i / d d_ik (CSR: nb_start [n + 1], nb_j, nb_jac); empty for the window links
   std::vector<double> rad, nb_jac;
   std::vector<int32_t> nb_start, nb_j;
+  std::vector<double> nb_d; // periodic: the displacement x_k' - x_i of every CSR neighbour (3 per entry; empty when open)
+  // periodic backbone links (lr_combined.h "Periodic cells under lrc_links = backbone"): per super-node, whether it
+  // percolates (its strong component is connected to every image), the percolating super-node of its weak component
+  // (-1: none) and its finite component (super-nodes joined by weak links between finite super-nodes; -1 when
+  // percolating). Empty otherwise.
+  std::vector<int32_t> perc, pnode, fcomp;
   bool trivial() const; // one super-node, or no weak links (R binary)
 };
 
@@ -403,9 +433,10 @@ LrcStates lrc_states(const LrcSpec &L, const LrcClusters &c);
 /// components and everything else as c (returns c itself for the all-fix-3 copy)
 LrcCondition lrc_state_condition(const LrcSpec &L, const LrcCondition &c, const LrcStates &st, size_t v, double Q,
                                  int max_charge);
-/// g [3n] += d/dx sum_v E_v w_v(x) (the copies' energies E held fixed)
+/// g [3n] += d/dx sum_v E_v w_v(x) (the copies' energies E held fixed); vir (periodic, may be null) += its strain
+/// derivative
 void lrc_states_vjp(const LrcSpec &L, const LrcClusters &c, const LrcStates &st, const std::vector<double> &E,
-                    double *g);
+                    double *g, double *vir = nullptr);
 /// grad p_e for every super-edge e (rows, E x 3n)
 std::vector<double> lrc_superedge_grads(const LrcSpec &L, const LrcClusters &c, int n);
 
