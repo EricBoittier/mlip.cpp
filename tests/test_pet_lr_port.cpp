@@ -8,8 +8,10 @@
 //  - the Voigt stress is sym(W) / V;
 //  - pet.conditioning_keys = spin_multiplicity: the energy does not depend on the charge.
 #include "mlipcpp/mlipcpp.hpp"
+#include "../src/runtime/graph_model.h"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <cmath>
 #include <cstdlib>
@@ -331,5 +333,169 @@ TEST_CASE("pet_lr_port: iris PET-LR in a 3-D cell and a slab: forces = -dE/dx an
       INFO("max |FD - W| = " << wv << " eV, max |W| = " << scale << " eV");
       CHECK(wv < 2e-3 * scale + 2e-3);
     }
+  }
+}
+
+TEST_CASE("pet_lr_port: slab virial chain rule (normal / basis): W = dE/d eps at frozen Ewald parameters (FD)",
+          "[pet_lr_port]") {
+  // His predict's slab virial (his calculator reports no slab stress) is the strain derivative with the Ewald
+  // parameters of the frame held (his compose_cell: the effective non-periodic row a constant, wavelength /
+  // smearing / k grid fixed): mlip.cpp's host chain rule through the slab normal n = (a1 x a2) / |a1 x a2| and the
+  // basis |h_k . n| is checked here against that derivative, with the Ewald parameters frozen at the unstrained
+  // frame (ModelOptions::iris_freeze_ewald). All nine components, positions and every cell row strained.
+  std::vector<float> x;
+  std::vector<int32_t> Z;
+  float cell[9];
+  water_box(x, Z, cell);
+  x.resize(27), Z.resize(9);
+  // plus Na below and Cl above the three waters: a large dipole along the normal (|q| ~0.1 e on 11 A), so the slab
+  // (Yeh-Berkowitz) term and with it the normal / basis chain rule carry a visible share of the virial
+  x.insert(x.end(), {4.0f, 4.6f, -1.0f, 4.9f, 4.4f, 10.0f});
+  Z.insert(Z.end(), {11, 17});
+  const int n = int(Z.size());
+  float c[9];
+  std::copy(cell, cell + 9, c);
+  c[8] = 22.0f;
+  const bool pbc[3] = {true, true, false};
+  for (const auto &[label, path] : lr_ggufs()) {
+    INFO("model: " << label << ", slab (pbc T T F, 22 A vacuum vector)");
+    ModelOptions mo;
+    mo.iris_freeze_ewald = true;
+    Predictor m(path, mo);
+    PredictOptions po;
+    po.compute_forces = true, po.compute_stress = true;
+    po.charge = 0, po.spin_multiplicity = 1;
+    const Result r = m.predict(n, x.data(), Z.data(), c, pbc, po); // freezes the parameters on this frame
+    REQUIRE(r.virial.size() == 9);
+    PredictOptions pe = po;
+    pe.compute_forces = false, pe.compute_stress = false;
+    auto strained = [&](int i, int j, double e) {
+      std::vector<float> y(x.size());
+      float c2[9];
+      for (int k = 0; k < n; k++)
+        for (int a = 0; a < 3; a++) y[3 * k + a] = float(x[3 * k + a] + (a == i ? e * x[3 * k + j] : 0.0));
+      for (int v = 0; v < 3; v++)
+        for (int a = 0; a < 3; a++) c2[3 * v + a] = float(c[3 * v + a] + (a == i ? e * c[3 * v + j] : 0.0));
+      return double(m.predict(n, y.data(), Z.data(), c2, pbc, pe).energy);
+    };
+    // Richardson from h = 2e-3 / 1e-3 (the strain energy is strongly curved here: fd(h) moves by ~1 eV between
+    // h = 5e-4 and 4e-3, so |fd(h) - fd(2h)| is truncation, not noise, and is NOT allowed for); the fp32 energy
+    // noise is bounded a priori: 2 ulp of E per energy, i.e. <= (4/3 + 1/6) * 2 * 2 ulp(E) / (2 h) in the extrapolate
+    const double E0 = std::abs(double(r.energy));
+    const double noise = 3.0 * (2.0 * 1.2e-7 * E0) / 1e-3;
+    double scale = 0, wv = 0, anti = 0;
+    for (double w : r.virial) scale = std::max(scale, std::abs(w));
+    for (int i = 0; i < 3; i++)
+      for (int j = 0; j < 3; j++) {
+        auto fd = [&](double h) { return (strained(i, j, h) - strained(i, j, -h)) / (2 * h); };
+        const double f1 = fd(1e-3), f2 = fd(2e-3);
+        wv = std::max(wv, std::abs((4.0 * f1 - f2) / 3.0 - r.virial[3 * j + i]));
+        anti = std::max(anti, std::abs(r.virial[3 * i + j] - r.virial[3 * j + i]));
+      }
+    INFO("max |FD - W| = " << wv << " eV, max |W| = " << scale << " eV, max antisym " << anti << ", fp32 noise bound "
+                           << noise << " eV (|E| " << E0 << ")");
+    CHECK(wv < 2e-3 * scale + 2e-3 + noise);
+    CHECK(scale > 0.05);
+    // the normal-row (vacuum) components are not trivially zero through the positions
+    CHECK(std::abs(r.virial[8]) > 1e-3);
+  }
+}
+
+TEST_CASE("pet_lr_port: iris Ewald parameters frozen per run (his calculator) vs per call (his oracle)",
+          "[pet_lr_port]") {
+  using mlipcpp::runtime::GraphModel;
+  namespace iris = mlipcpp::runtime::iris;
+  std::vector<float> x;
+  std::vector<int32_t> Z;
+  float cell[9];
+  water_box(x, Z, cell);
+  x.resize(27), Z.resize(9);
+  const int n = int(Z.size());
+  const auto path = lr_ggufs().front().second;
+  GraphModel a, b;
+  REQUIRE(a.load_from_gguf(path));
+  REQUIRE(b.load_from_gguf(path));
+  b.set_iris_freeze_ewald(true);
+  const int num_k = a.iris_lr().num_k;
+  auto sys = [&](const std::vector<float> &y, int m, const float *c, bool slab) {
+    float L[3][3];
+    for (int r = 0; r < 3; r++)
+      for (int q = 0; q < 3; q++) L[r][q] = c[3 * r + q];
+    AtomicSystem s(m, y.data(), Z.data());
+    s.set_cell(Cell(L, true, true, !slab));
+    return s;
+  };
+  auto fresh = [&](const AtomicSystem &s) { // his _freeze on this frame
+    double h[3][3];
+    bool p[3];
+    for (int r = 0; r < 3; r++) {
+      p[r] = s.cell()->periodic[r];
+      for (int q = 0; q < 3; q++) h[r][q] = s.cell()->matrix[r][q];
+    }
+    std::vector<double> pos(s.positions(), s.positions() + 3 * s.num_atoms());
+    return iris::ewald_freeze(h, p, pos.data(), s.num_atoms(), num_k, a.iris_lr().smearing, a.iris_lr().slab_margin)
+        .to_vec();
+  };
+  // the first call of a system: the frozen parameters are this frame's, and the result is bit for bit per call
+  const AtomicSystem s0 = sys(x, n, cell, false);
+  const auto r0a = a.predict(s0, true), r0b = b.predict(s0, true);
+  CHECK(r0a.energy == r0b.energy);
+  CHECK(r0a.forces == r0b.forces);
+  const std::vector<double> p0 = b.iris_frozen_ewald();
+  CHECK(p0 == fresh(s0));
+  // a 6 % larger cell (an NPT-like move): frozen keeps the first frame's parameters; per call re-derives them
+  float c2[9];
+  std::vector<float> y(x);
+  for (int k = 0; k < 9; k++) c2[k] = cell[k] * 1.06f;
+  for (float &v : y) v *= 1.06f;
+  const AtomicSystem s1 = sys(y, n, c2, false);
+  const auto r1a = a.predict(s1, true), r1b = b.predict(s1, true);
+  CHECK(b.iris_frozen_ewald() == p0);
+  CHECK(fresh(s1)[9] != p0[9]); // (the wavelength would have moved)
+  // Ewald converged at both parameter sets: the energies agree to the fp32 level
+  CHECK(std::abs(double(r1a.energy) - double(r1b.energy)) < 1e-5 * std::max(1.0, std::abs(double(r1a.energy))));
+  // a new system (three atoms fewer) refreezes
+  const AtomicSystem s2 = sys(y, n - 3, c2, false);
+  (void)b.predict(s2, false);
+  CHECK(b.iris_frozen_ewald() == fresh(s2));
+  // slab: a 0.5 A excursion of the lowest water stays within the 2 A margin (kept); 3.5 A outgrows it (refrozen)
+  float cs[9];
+  std::copy(cell, cell + 9, cs);
+  cs[8] = 30.0f;
+  const AtomicSystem t0 = sys(x, n, cs, true);
+  (void)b.predict(t0, false);
+  const std::vector<double> q0 = b.iris_frozen_ewald();
+  CHECK(q0 == fresh(t0));
+  std::vector<float> z(x);
+  for (int k = 0; k < 3; k++) z[3 * k + 2] -= 0.5f; // (water 0 is the lowest: away from the slab)
+  (void)b.predict(sys(z, n, cs, true), false);
+  CHECK(b.iris_frozen_ewald() == q0);
+  for (int k = 0; k < 3; k++) z[3 * k + 2] -= 3.0f;
+  const AtomicSystem t2 = sys(z, n, cs, true);
+  const auto r3a = a.predict(t2, true), r3b = b.predict(t2, true);
+  CHECK(b.iris_frozen_ewald() == fresh(t2));
+  CHECK(b.iris_frozen_ewald() != q0);
+  CHECK(r3a.energy == r3b.energy);
+}
+
+TEST_CASE("pet_lr_port: iris models raise when an atom has more than max_neighbors neighbours (his calculator)",
+          "[pet_lr_port]") {
+  std::vector<float> x;
+  std::vector<int32_t> Z;
+  float cell[9];
+  water_box(x, Z, cell); // 72 atoms in a 9 A cube: every atom has ~40 neighbours within 5 A
+  const int n = int(Z.size());
+  const bool pbc[3] = {true, true, true};
+  PredictOptions po;
+  po.compute_forces = true, po.charge = 0, po.spin_multiplicity = 1;
+  for (const char *g : {"petlr_tiny_trunk.gguf", "petlr_tiny_fermi.gguf"}) {
+    INFO(g);
+    ModelOptions lim, off, wide;
+    lim.iris_max_neighbors = 20, off.iris_max_neighbors = 0, wide.iris_max_neighbors = 500;
+    Predictor ml(resource(g), lim), mo(resource(g), off), mw(resource(g), wide);
+    CHECK_THROWS_WITH(ml.predict(n, x.data(), Z.data(), cell, pbc, po),
+                      Catch::Matchers::ContainsSubstring("more than max_neighbors=20"));
+    const Result a = mo.predict(n, x.data(), Z.data(), cell, pbc, po), b = mw.predict(n, x.data(), Z.data(), cell, pbc, po);
+    CHECK(a.energy == b.energy); // below the limit: the check changes nothing
   }
 }

@@ -74,6 +74,15 @@ struct Result {
 struct ModelOptions {
   Backend backend = Backend::Auto;
   float cutoff_override = 0.0f; ///< 0 = use model default
+  /// iris PET-LR models only (after M. Langer, ipsum/PET-LR): freeze the Ewald parameters (wavelength, smearing,
+  /// real-space cutoff, k grid, a slab's effective cell) at the first periodic call of a system, as his ASE
+  /// calculator does for a run, until the system (atom count, numbers, pbc) changes or a slab outgrows its margin.
+  /// false (default): re-derived per call, as his oracle (predict on a fresh batch per structure).
+  bool iris_freeze_ewald = false;
+  /// iris models only: raise when an atom has more than this many neighbours within the cutoff, as his calculator
+  /// does. -1 (default): the GGUF's pet.iris.max_neighbors (his to_sample.max_neighbors; absent in GGUFs written
+  /// before 2026-11-11: no check); 0: no check (every neighbour kept, the behaviour of non-iris models).
+  int iris_max_neighbors = -1;
 };
 
 /**

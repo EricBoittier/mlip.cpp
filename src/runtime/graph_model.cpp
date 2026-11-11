@@ -410,6 +410,7 @@ bool GraphModel::load_from_gguf(const std::string &path) {
   nc_forces_ = (loader.get_int32("pet.nc_forces", 0) != 0);
   iris_lr_ = {};
   iris_lr_.enabled = loader.get_int32("pet.iris_lr", 0) != 0;
+  iris_max_neighbors_ = loader.get_int32("pet.iris.max_neighbors", 0);
   if (iris_lr_.enabled) {
     iris_lr_.n_out = loader.get_int32("pet.iris_lr.n_out", 8);
     iris_lr_.reference = loader.get_string("pet.iris_lr.reference", "");
@@ -730,6 +731,17 @@ ModelResult GraphModel::predict_single(
     const AtomicSystem &system, bool compute_forces,
     const std::function<void()> &post_compute_hook,
     std::vector<float> *parameter_gradients) {
+  if (iris_max_neighbors_ > 0 && system.num_atoms() > 0) {
+    // his Calculator.calculate: more than max_neighbors pairs within the cutoff of one atom is an error (training
+    // trimmed the farthest; mlip.cpp would keep them all and silently differ from every run of his)
+    const NeighborList nl = NeighborListBuilder(NeighborListOptions{cutoff_, true, false}).build(system);
+    std::vector<int> cnt(system.num_atoms(), 0);
+    for (int p = 0; p < nl.num_pairs(); p++)
+      if (nl.distances[p] < cutoff_) cnt[nl.centers[p]]++;
+    if (*std::max_element(cnt.begin(), cnt.end()) > iris_max_neighbors_)
+      throw std::runtime_error("an atom has more than max_neighbors=" + std::to_string(iris_max_neighbors_) +
+                               " neighbours within the cutoff " + std::to_string(cutoff_));
+  }
   if (plato_lr_.lrc.enabled && system.num_atoms() > 0)
     return predict_single_lrc(system, compute_forces, post_compute_hook, parameter_gradients);
   const SqeSpec &sq = plato_lr_.sqe;
@@ -980,7 +992,13 @@ ModelResult GraphModel::predict_single_impl(
     return e && *e && *e != '0';
   }();
   // per-atom outputs / weights and dE/d(blend) come from the plain graph only
-  if (!no_cache && !post_compute_hook && !parameter_gradients && cached_path_supported() &&
+  // MLIPCPP_NODE_GRAD_DUMP=<file>: append every GIR node's forward value and dE/d(node) (the backward graph's
+  // accumulated gradient) per structure (diagnostics, parity work: compare_node_grads_iris.py); plain path only
+  static const char *node_grad_dump = [] {
+    const char *e = std::getenv("MLIPCPP_NODE_GRAD_DUMP");
+    return e && *e ? e : nullptr;
+  }();
+  if (!no_cache && !node_grad_dump && !post_compute_hook && !parameter_gradients && cached_path_supported() &&
       system.num_atoms() > 0 && !force_uncached_ && atom_w_.empty() && !lrc_want_blend_grad_)
     return predict_cached(system, compute_forces);
   GraphProfile profile;
@@ -1364,8 +1382,33 @@ ModelResult GraphModel::predict_single_impl(
         for (int b = 0; b < 3; b++) cell[a][b] = c->matrix[a][b];
       }
       std::vector<double> pos(system.positions(), system.positions() + 3 * size_t(n_atoms));
-      const iris::EwaldSetup es = iris::ewald_setup(cell, pbc, pos.data(), n_atoms, iris_lr_.num_k,
-                                                    iris_lr_.smearing, iris_lr_.slab_margin);
+      iris::EwaldSetup es;
+      if (!iris_lr_.freeze_ewald) {
+        es = iris::ewald_setup(cell, pbc, pos.data(), n_atoms, iris_lr_.num_k, iris_lr_.smearing,
+                               iris_lr_.slab_margin);
+      } else { // his Calculator: frozen at the first call of a system, refrozen when a slab outgrows its margin
+        auto &fz = iris_lr_.frozen;
+        const int32_t *Z = system.atomic_numbers();
+        const bool same = fz.valid && fz.n == n_atoms && std::equal(Z, Z + n_atoms, fz.numbers.begin()) &&
+                          fz.pbc[0] == pbc[0] && fz.pbc[1] == pbc[1] && fz.pbc[2] == pbc[2];
+        iris::EwaldFrozen f;
+        bool refreeze = !same;
+        if (same) {
+          f = iris::EwaldFrozen::from_vec(fz.params);
+          if (f.slab && iris::slab_thickness(cell, f.slab_axis, pos.data(), n_atoms) > f.thickness) {
+            std::fprintf(stderr, "[mlipcpp iris] the slab outgrew its margin: new Ewald parameters\n");
+            refreeze = true;
+          }
+        }
+        if (refreeze) {
+          f = iris::ewald_freeze(cell, pbc, pos.data(), n_atoms, iris_lr_.num_k, iris_lr_.smearing,
+                                 iris_lr_.slab_margin);
+          fz.valid = true, fz.n = n_atoms, fz.numbers.assign(Z, Z + n_atoms);
+          for (int a = 0; a < 3; a++) fz.pbc[a] = pbc[a];
+          fz.params = f.to_vec();
+        }
+        es = iris::ewald_apply(f, cell, pbc);
+      }
       // full real-space list at rc + skin (his half list at rc + skin, both directions); r < rc masked in-graph
       NeighborList lr = NeighborListBuilder(NeighborListOptions{float(es.cutoff + 0.5), true, false}).build(system);
       std::vector<int> cnt(n_atoms, 0);
@@ -1793,6 +1836,11 @@ ModelResult GraphModel::predict_single_impl(
           for (; g; g = g->view_src) ggml_set_output(g);
     if (cond_blend_t && (cond_blend_t->flags & GGML_TENSOR_FLAG_PARAM))
       if (ggml_tensor *g = ggml_graph_get_grad(cgraph, cond_blend_t)) ggml_set_output(g);
+    if (node_grad_dump) // keep every forward value and gradient alive (no buffer reuse, no in-place ops)
+      interp_.capture_all_outputs([&](int, const std::string &, ggml_tensor *t) {
+        ggml_set_output(t);
+        if (ggml_tensor *g = ggml_graph_get_grad(cgraph, t)) ggml_set_output(g);
+      });
   } else {
     cgraph = ggml_new_graph(compute_ctx);
     ggml_build_forward_expand(cgraph, output);
@@ -2302,6 +2350,37 @@ ModelResult GraphModel::predict_single_impl(
   }
 
   profile.mark("readback");
+  if (node_grad_dump && backward) {
+    // per structure: int32 'FRME', int32 count; per entry: int32 id, int32 name length, name, value block, int32
+    // has_grad, [grad block]; block: int32 ndims, int64 ne[ndims], int64 nb[ndims] (byte strides: views are written
+    // as their raw extent), int32 dtype (0 f32, 1 i32, 2 other), int64 nbytes, data
+    std::vector<std::tuple<int, std::string, ggml_tensor *>> entries;
+    interp_.capture_all_outputs([&](int id, const std::string &name, ggml_tensor *t) { entries.emplace_back(id, name, t); });
+    if (FILE *fp = std::fopen(node_grad_dump, "ab")) {
+      const int32_t hdr[2] = {0x454D5246, int32_t(entries.size())};
+      std::fwrite(hdr, 4, 2, fp);
+      auto block = [fp](ggml_tensor *t) {
+        const int32_t nd = ggml_n_dims(t);
+        const int32_t dt = t->type == GGML_TYPE_F32 ? 0 : t->type == GGML_TYPE_I32 ? 1 : 2;
+        std::vector<int64_t> ne(t->ne, t->ne + nd), nb(t->nb, t->nb + nd);
+        std::vector<char> data((t->data || t->view_src) ? ggml_nbytes(t) : 0);
+        if (!data.empty()) ggml_backend_tensor_get(t, data.data(), 0, data.size());
+        const int64_t n = int64_t(data.size());
+        std::fwrite(&nd, 4, 1, fp), std::fwrite(ne.data(), 8, nd, fp), std::fwrite(nb.data(), 8, nd, fp);
+        std::fwrite(&dt, 4, 1, fp), std::fwrite(&n, 8, 1, fp), std::fwrite(data.data(), 1, data.size(), fp);
+      };
+      for (const auto &[id, name, t] : entries) {
+        const int32_t id32 = id, nl = int32_t(name.size());
+        std::fwrite(&id32, 4, 1, fp), std::fwrite(&nl, 4, 1, fp), std::fwrite(name.data(), 1, nl, fp);
+        block(t);
+        ggml_tensor *g = ggml_graph_get_grad(cgraph, t);
+        const int32_t has = g && (g->data || g->view_src) ? 1 : 0;
+        std::fwrite(&has, 4, 1, fp);
+        if (has) block(g);
+      }
+      std::fclose(fp);
+    }
+  }
   // Hook for callers that want to inspect intermediate tensors. Runs while
   // the compute buffer (and therefore every node_outputs_ tensor) is still
   // alive on the active backend.

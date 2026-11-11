@@ -101,12 +101,48 @@ struct EwaldSetup {
   std::vector<std::array<int, 3>> k_grid; // halfspace integer k (lexicographic first of each +-k pair, k = 0 out)
 };
 
-inline EwaldSetup ewald_setup(const double cell[3][3], const bool pbc[3], const double *pos, int n, int num_k,
-                              double smearing_cfg, double slab_margin) {
-  EwaldSetup e;
+/// The parameters his calculator freezes for a run (Calculator._freeze): the effective cell (a slab's normal row
+/// shrunk), the wavelength, smearing, real-space cutoff and, for a slab, the thickness limit (thickness + margin)
+/// beyond which it re-freezes (Calculator._outgrown).
+struct EwaldFrozen {
   double eff[3][3];
+  double wavelength = 0, smearing = 0, cutoff = 0;
+  double thickness = -1; // slab: the thickness + margin at freezing; -1: 3-D
+  bool slab = false;
+  int slab_axis = -1;
+  std::vector<double> to_vec() const {
+    std::vector<double> v(&eff[0][0], &eff[0][0] + 9);
+    v.insert(v.end(), {wavelength, smearing, cutoff, thickness, slab ? 1.0 : 0.0, double(slab_axis)});
+    return v;
+  }
+  static EwaldFrozen from_vec(const std::vector<double> &v) {
+    EwaldFrozen f;
+    std::copy(v.begin(), v.begin() + 9, &f.eff[0][0]);
+    f.wavelength = v[9], f.smearing = v[10], f.cutoff = v[11], f.thickness = v[12], f.slab = v[13] != 0;
+    f.slab_axis = int(v[14]);
+    return f;
+  }
+};
+
+/// A slab's thickness along the normal of its two periodic vectors (his _slab_thickness)
+inline double slab_thickness(const double cell[3][3], int k, const double *pos, int n) {
+  const double *v1 = cell[(k + 1) % 3], *v2 = cell[(k + 2) % 3];
+  double nh[3] = {v1[1] * v2[2] - v1[2] * v2[1], v1[2] * v2[0] - v1[0] * v2[2], v1[0] * v2[1] - v1[1] * v2[0]};
+  const double nn = std::sqrt(nh[0] * nh[0] + nh[1] * nh[1] + nh[2] * nh[2]);
+  for (double &x : nh) x /= nn;
+  double zmin = 1e300, zmax = -1e300;
+  for (int i = 0; i < n; i++) {
+    const double z = pos[3 * i] * nh[0] + pos[3 * i + 1] * nh[1] + pos[3 * i + 2] * nh[2];
+    zmin = std::min(zmin, z), zmax = std::max(zmax, z);
+  }
+  return zmax - zmin;
+}
+
+inline EwaldFrozen ewald_freeze(const double cell[3][3], const bool pbc[3], const double *pos, int n, int num_k,
+                                double smearing_cfg, double slab_margin) {
+  EwaldFrozen e;
   for (int a = 0; a < 3; a++)
-    for (int b = 0; b < 3; b++) eff[a][b] = cell[a][b];
+    for (int b = 0; b < 3; b++) e.eff[a][b] = cell[a][b];
   const int np = int(pbc[0]) + int(pbc[1]) + int(pbc[2]);
   if (np != 3 && np != 2) throw std::runtime_error("iris PET-LR: periodic in 3 or 2 directions only");
   auto norm = [](const double *v) { return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); };
@@ -117,24 +153,29 @@ inline EwaldSetup ewald_setup(const double cell[3][3], const bool pbc[3], const 
     double nh[3] = {v1[1] * v2[2] - v1[2] * v2[1], v1[2] * v2[0] - v1[0] * v2[2], v1[0] * v2[1] - v1[1] * v2[0]};
     const double nn = norm(nh);
     for (double &x : nh) x /= nn;
-    double zmin = 1e300, zmax = -1e300;
-    for (int i = 0; i < n; i++) {
-      const double z = pos[3 * i] * nh[0] + pos[3 * i + 1] * nh[1] + pos[3 * i + 2] * nh[2];
-      zmin = std::min(zmin, z), zmax = std::max(zmax, z);
-    }
-    const double thickness = (zmax - zmin) + slab_margin;
+    const double thickness = slab_thickness(cell, k, pos, n) + slab_margin;
+    e.thickness = thickness;
     const double h_cell = std::fabs(cell[k][0] * nh[0] + cell[k][1] * nh[1] + cell[k][2] * nh[2]);
     const double h_min = thickness + 1.5 * std::max(norm(v1), norm(v2));
     if (h_cell > h_min)
-      for (int b = 0; b < 3; b++) eff[k][b] = cell[k][b] * (h_min / h_cell);
+      for (int b = 0; b < 3; b++) e.eff[k][b] = cell[k][b] * (h_min / h_cell);
   }
   if (num_k <= 0) throw std::runtime_error("iris PET-LR: periodic structure but pet.iris_lr.num_k is not set");
-  e.wavelength = std::cbrt(norm(eff[0]) * norm(eff[1]) * norm(eff[2]) / (2.0 * num_k));
+  e.wavelength = std::cbrt(norm(e.eff[0]) * norm(e.eff[1]) * norm(e.eff[2]) / (2.0 * num_k));
   e.smearing = smearing_cfg > 0 ? smearing_cfg : 2.0 * e.wavelength;
   e.cutoff = 8.0 * e.wavelength;
+  return e;
+}
+
+/// The Ewald setup of one call at frozen parameters `f` (the current cell's periodic rows, the frozen effective
+/// normal row of a slab, the k grid sized on the frozen effective cell, as his to_lr on the batch he builds).
+inline EwaldSetup ewald_apply(const EwaldFrozen &f, const double cell[3][3], const bool pbc[3]) {
+  EwaldSetup e;
+  e.wavelength = f.wavelength, e.smearing = f.smearing, e.cutoff = f.cutoff;
+  e.slab = f.slab, e.slab_axis = f.slab_axis;
   int ns[3];
   for (int a = 0; a < 3; a++) { // numpy on the float32 effective cell: norm and the division in float32
-    const float x = float(eff[a][0]), y = float(eff[a][1]), z = float(eff[a][2]);
+    const float x = float(f.eff[a][0]), y = float(f.eff[a][1]), z = float(f.eff[a][2]);
     const float l = std::sqrt(x * x + y * y + z * z);
     ns[a] = int(std::ceil(l / float(e.wavelength)));
   }
@@ -146,8 +187,14 @@ inline EwaldSetup ewald_setup(const double cell[3][3], const bool pbc[3], const 
         if (kx > 0 || (kx == 0 && ky > 0) || (kx == 0 && ky == 0 && kz > 0)) e.k_grid.push_back({kx, ky, kz});
       }
   for (int a = 0; a < 3; a++)
-    for (int b = 0; b < 3; b++) e.cellc[a][b] = pbc[a] ? cell[a][b] : double(float(eff[a][b]));
+    for (int b = 0; b < 3; b++) e.cellc[a][b] = pbc[a] ? cell[a][b] : double(float(f.eff[a][b]));
   return e;
+}
+
+/// Per call (his oracle): freeze on this structure and apply.
+inline EwaldSetup ewald_setup(const double cell[3][3], const bool pbc[3], const double *pos, int n, int num_k,
+                              double smearing_cfg, double slab_margin) {
+  return ewald_apply(ewald_freeze(cell, pbc, pos, n, num_k, smearing_cfg, slab_margin), cell, pbc);
 }
 
 } // namespace mlipcpp::runtime::iris

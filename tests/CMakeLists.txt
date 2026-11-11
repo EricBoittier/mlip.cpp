@@ -268,7 +268,8 @@ catch_discover_tests(test_adaptive_grid)
 # PET-LR port (scripts/pet_lr_port): model-level checks of converted iris GGUFs (tiny committed models in
 # resources/petlr_tiny_*.gguf; MLIPCPP_PETLR_GGUF / MLIPCPP_PETLR_LR_GGUF override)
 add_executable(test_pet_lr_port test_pet_lr_port.cpp)
-target_link_libraries(test_pet_lr_port PRIVATE mlipcpp Catch2::Catch2WithMain)
+target_link_libraries(test_pet_lr_port PRIVATE mlipcpp ggml fmt::fmt Catch2::Catch2WithMain)
+target_include_directories(test_pet_lr_port PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/)
 target_compile_definitions(test_pet_lr_port PRIVATE MLIPCPP_TEST_RESOURCES="${CMAKE_CURRENT_SOURCE_DIR}/resources")
 catch_discover_tests(test_pet_lr_port)
 

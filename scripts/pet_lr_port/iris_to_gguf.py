@@ -288,6 +288,11 @@ def main():
             w.add_float32("pet.iris_lr.smearing", float(ts.get("smearing") or 0.0))  # 0: 2 wavelength
             w.add_int32("pet.iris_lr.halfspace", int(ts.get("halfspace", True)))
             w.add_float32("pet.iris_lr.slab_margin", 2.0)
+    # his calculator raises when an atom has more than max_neighbors neighbours within the cutoff (training pipeline
+    # to_sample.max_neighbors); mlip.cpp raises there too for iris GGUFs (0: no config.yaml, no check)
+    ts_all = (yaml.safe_load(open(f"{a.ckpt}/config.yaml"))["training_pipeline"]["to_sample"]
+              if Path(f"{a.ckpt}/config.yaml").exists() else {})
+    w.add_int32("pet.iris.max_neighbors", int(ts_all.get("max_neighbors") or 0))
     w.add_string("pet.cutoff_function", "bump")
     w.add_int32("pet.forces_mode", 1)
     w.add_int32("pet.nc_forces", 0)

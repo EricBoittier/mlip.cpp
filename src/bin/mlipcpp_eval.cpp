@@ -5,6 +5,9 @@
  * (scripts/conditioning/parity_*.py).
  *
  *   mlipcpp-eval MODEL.gguf IN.xyz OUT.json [--backend cpu|cuda|...] [--charge Q] [--spin S] [--repeat N]
+ *                [--iris-freeze-ewald 0|1] [--iris-max-neighbors N]
+ * (iris models: --iris-freeze-ewald 1 freezes the Ewald parameters over the frames of the file as his calculator does
+ * over a run; --iris-max-neighbors overrides the GGUF's overflow limit, 0 = no check)
  *
  * --repeat N: each frame is evaluated N + 1 times (the first a warm-up) and its
  * median wall time per evaluation is written as "seconds".
@@ -55,7 +58,8 @@ int main(int argc, char *argv[]) {
     return 1;
   }
   std::optional<int> charge, spin;
-  int repeat = 0;
+  int repeat = 0, max_nb = -1;
+  bool freeze = false;
   std::string backend = "cpu";
   for (int i = 4; i + 1 < argc; i++) {
     const std::string a = argv[i];
@@ -63,6 +67,8 @@ int main(int argc, char *argv[]) {
     else if (a == "--charge") charge = std::stoi(argv[++i]);
     else if (a == "--spin") spin = std::stoi(argv[++i]);
     else if (a == "--repeat") repeat = std::stoi(argv[++i]);
+    else if (a == "--iris-freeze-ewald") freeze = std::stoi(argv[++i]) != 0;
+    else if (a == "--iris-max-neighbors") max_nb = std::stoi(argv[++i]);
     else {
       std::cerr << "unknown option " << a << "\n";
       return 1;
@@ -71,6 +77,7 @@ int main(int argc, char *argv[]) {
   try {
     ModelOptions mo;
     mo.backend = parse(backend);
+    mo.iris_freeze_ewald = freeze, mo.iris_max_neighbors = max_nb;
     Predictor model(argv[1], mo);
     std::ifstream in(argv[2]);
     if (!in) throw std::runtime_error(std::string("cannot read ") + argv[2]);

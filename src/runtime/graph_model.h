@@ -183,8 +183,25 @@ public:
     double slab_margin = 2.0;
     std::string graph_open, graph_pbc; // the two GIR graphs (same weights); interp_ holds one at a time
     bool pbc_loaded = false;
+    bool freeze_ewald = false;      // his calculator's per-run Ewald parameters (ModelOptions::iris_freeze_ewald)
+    struct Frozen {                 // the frozen parameters and the system they belong to
+      bool valid = false;
+      int n = 0;
+      std::vector<int32_t> numbers;
+      bool pbc[3] = {false, false, false};
+      std::vector<double> params; // iris::EwaldFrozen, flattened (iris_lr.h)
+    } frozen;
   };
   const IrisLRSpec &iris_lr() const { return iris_lr_; }
+  /// iris models: his calculator raises when an atom has more than max_neighbors neighbours within the cutoff
+  /// (GGUF pet.iris.max_neighbors, his training pipeline's to_sample.max_neighbors; 0 / absent: no check, as for
+  /// non-iris models, which keep every neighbour)
+  int iris_max_neighbors() const { return iris_max_neighbors_; }
+  void set_iris_max_neighbors(int m) { iris_max_neighbors_ = m; }
+  /// iris PET-LR: freeze the Ewald parameters per run (see ModelOptions::iris_freeze_ewald); resets the frozen set
+  void set_iris_freeze_ewald(bool on) { iris_lr_.freeze_ewald = on; iris_lr_.frozen = {}; }
+  /// the frozen Ewald parameters (iris::EwaldFrozen::to_vec; empty before the first periodic call)
+  const std::vector<double> &iris_frozen_ewald() const { return iris_lr_.frozen.params; }
   /// Plato-PET-LR components (GGUF pet.plato_lr.*; enabled false: a plain PET)
   const PetPlatoLRSpec &plato_lr() const { return plato_lr_; }
   const std::string &gguf_path() const { return gguf_path_; }
@@ -220,6 +237,7 @@ private:
   bool forces_mode_ = false;
   bool nc_forces_ = false;
   IrisLRSpec iris_lr_;
+  int iris_max_neighbors_ = 0;
   GraphInterpreter scores_interp_; // iris PET-LR: trunk + score head (fermi / both references)
   PetPlatoLRSpec plato_lr_;
   std::vector<PetPlatoLRStructure> plato_st_; // the cached path's structure (set before fit_cached_graph)
