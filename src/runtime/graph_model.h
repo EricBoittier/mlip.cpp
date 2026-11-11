@@ -23,6 +23,8 @@ typedef struct ggml_backend *ggml_backend_t;
 typedef struct ggml_backend_buffer *ggml_backend_buffer_t;
 typedef struct ggml_gallocr *ggml_gallocr_t;
 
+namespace mlipcpp::runtime::fp64 { class IrisFp64; }
+
 namespace mlipcpp::runtime {
 
 struct CachedGraph;
@@ -273,6 +275,7 @@ public:
   void check_iris_overflow(int max_selected) const;
 private:
   GraphInterpreter scores_interp_; // iris PET-LR: trunk + score head (fermi / both references; QEq: chi)
+  std::shared_ptr<fp64::IrisFp64> fp64_; // MLIPCPP_EXEC=fp64: the fp64 executor (runtime/iris_fp64.h)
   GraphInterpreter qeq_interp_;    // iris QEq: the host cg's operator graph (no trunk)
   QEqStats iris_qeq_stats_;
   PetPlatoLRSpec plato_lr_;

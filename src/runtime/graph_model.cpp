@@ -6,6 +6,7 @@
 #include "core/p3m.h"
 #include "core/masses.h"
 #include "iris_lr.h"
+#include "iris_fp64.h"
 
 #include <nlohmann/json.hpp>
 
@@ -1101,6 +1102,13 @@ ModelResult GraphModel::predict_single_impl(
     const char *e = std::getenv("MLIPCPP_NODE_GRAD_DUMP");
     return e && *e ? e : nullptr;
   }();
+  // MLIPCPP_EXEC=fp64: iris GGUFs on the fp64 executor (runtime/iris_fp64.h); anything else raises, never falls back
+  if (fp64::exec_fp64_requested()) {
+    if (post_compute_hook || parameter_gradients || !atom_w_.empty() || lrc_want_blend_grad_)
+      throw std::runtime_error("MLIPCPP_EXEC=fp64: hooks, parameter gradients and energy weights are not supported");
+    if (!fp64_) fp64_ = std::make_shared<fp64::IrisFp64>(*this);
+    return fp64::to_model_result(fp64_->predict(fp64::to_system64(system), compute_forces));
+  }
   if (!no_cache && !node_grad_dump && !post_compute_hook && !parameter_gradients && cached_path_supported() &&
       system.num_atoms() > 0 && !force_uncached_ && atom_w_.empty() && !lrc_want_blend_grad_)
     return predict_cached(system, compute_forces);
