@@ -195,7 +195,24 @@ int main(int argc, char **argv) {
         const double fdv = (loss_at(+1) - loss_at(-1)) / (2 * h), rel = std::abs(fdv - gn) / gn;
         best = std::min(best, rel), line += fmt::format(" h {:.0e}: FD {:.6g} (rel {:.2e})", h, fdv, rel);
       }
-      worker.set_params(p0), worker.zero_grads(), worker.tail_cotangent = false;
+      worker.set_params(p0), worker.zero_grads();
+      { // the same group in parts of 3 structures (MLIPCPP_TAIL_CHUNK): same loss and gradient
+        std::vector<Batch> parts;
+        for (size_t a = 0; a < tids.size(); a += 3) {
+          const std::vector<int64_t> ids(tids.begin() + a, tids.begin() + std::min(tids.size(), a + 3));
+          parts.push_back(make_batch(split, nl, ids, {}, worker.model().species_to_index(), sc, worker.model().cutoff(), 0, 0,
+                                     0, &planner));
+        }
+        const double Lp = worker.run_tail(parts, sc.energy_scale, pairs, tl, 1.0);
+        const std::vector<float> gp = worker.get_grads();
+        double dg = 0, gm = 0;
+        for (size_t q = 0; q < g.size(); q++) dg = std::max(dg, double(std::abs(gp[q] - g[q]))), gm = std::max(gm, double(std::abs(g[q])));
+        fmt::print("states-fd tail in parts of 3: L {:.8g} vs {:.8g}, max |dg| {:.3e} (max |g| {:.3e}) -> {}\n", Lp, L0, dg, gm,
+                   std::abs(Lp - L0) <= 1e-6 * std::abs(L0) && dg <= 1e-4 * gm ? "PASS" : "FAIL");
+        ok = ok && std::abs(Lp - L0) <= 1e-6 * std::abs(L0) && dg <= 1e-4 * gm;
+        worker.zero_grads();
+      }
+      worker.tail_cotangent = false;
       fmt::print("states-fd tail loss: L {:.6g}, |g| {:.6g};{} -> {}\n", L0, gn, line, best < 2e-2 ? "PASS" : "FAIL");
       ok = ok && best < 2e-2;
     }

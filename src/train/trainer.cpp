@@ -1268,6 +1268,48 @@ double Worker::run_tail(const Batch &b, double energy_scale, const std::vector<T
   return L;
 }
 
+double Worker::run_tail(const std::vector<Batch> &parts, double energy_scale, const std::vector<TailPair> &pairs,
+                        const TailLoss &tl, double mult, std::vector<double> *r) {
+  if (parts.size() == 1) return run_tail(parts[0], energy_scale, pairs, tl, mult, r);
+  if (!tail_cotangent) throw std::logic_error("run_tail: tail_cotangent is off");
+  if (sqe) throw std::runtime_error("run_tail: a split tail group is not supported with SQE");
+  std::vector<double> E;
+  std::vector<int> off(parts.size() + 1, 0), npk;
+  for (size_t q = 0; q < parts.size(); q++) {
+    const std::vector<double> Eq = energies(parts[q], energy_scale);
+    const int K = parts[q].structures();
+    E.insert(E.end(), Eq.begin(), Eq.begin() + K);
+    for (int k = 0; k < K; k++) npk.push_back(parts[q].n_per_system[k]);
+    off[q + 1] = off[q] + K;
+  }
+  for (const TailPair &p : pairs)
+    if (npk.at(p.k) != npk.at(p.l)) throw std::runtime_error("tail pair of different sizes");
+  std::vector<double> dLdE;
+  const double L = tl.eval(pairs, E, &dLdE);
+  if (r) {
+    r->clear();
+    for (const TailPair &p : pairs) r->push_back(tl.residual(p, E));
+  }
+  for (size_t q = 0; q < parts.size(); q++) {
+    const Batch &b = parts[q];
+    bool any = false;
+    for (int k = off[q]; k < off[q + 1]; k++) any = any || dLdE[k] != 0.0;
+    if (!any) continue;
+    if (lrc) lrc_prepare(b, false); // (energies() of the last part left another batch prepared)
+    plato_batch_ = &b;
+    ecot_.assign(b.n_systems, 0.0f);
+    for (int k = 0; k < b.structures(); k++)
+      ecot_[k] = static_cast<float>(mult * dLdE[off[q] + k] * energy_scale * b.n_per_system[k]);
+    std::unique_ptr<StepGraph> once;
+    zero_norms_ = true;
+    StepGraph &g = graph(b.n_atoms, b.max_neighbors, b.n_systems, BACKWARD, once);
+    upload_inputs(g, b);
+    zero_norms_ = false;
+    compute(g);
+  }
+  return L;
+}
+
 StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool backward) {
   const int n = b.n_atoms, m = b.max_neighbors, S = b.n_systems;
   if (lrc) lrc_prepare(b, true);
@@ -2924,7 +2966,20 @@ void train(const TrainOptions &o) {
     const TailGroup &g = tail_set.groups[gs[std::uniform_int_distribution<size_t>(0, gs.size() - 1)(rng)]];
     const auto R = random_o3(rng);
     std::vector<std::array<float, 9>> rot(g.ids.size(), R);
-    return std::make_pair(&g, make_batch(*tail_split, nl_tail, g.ids, rot, species, scaling, cutoff, 0, 0, 0, &planner));
+    // MLIPCPP_TAIL_CHUNK=C > 0: the group as parts of C structures (Worker::run_tail over parts: same loss and gradient)
+    static const int chunk = [] { const char *e = std::getenv("MLIPCPP_TAIL_CHUNK"); return e && *e ? std::atoi(e) : 0; }();
+    std::vector<Batch> parts;
+    if (chunk <= 0 || g.ids.size() <= size_t(chunk)) {
+      parts.push_back(make_batch(*tail_split, nl_tail, g.ids, rot, species, scaling, cutoff, 0, 0, 0, &planner));
+    } else {
+      for (size_t a = 0; a < g.ids.size(); a += chunk) {
+        const size_t e = std::min(g.ids.size(), a + chunk);
+        const std::vector<int64_t> ids(g.ids.begin() + a, g.ids.begin() + e);
+        parts.push_back(make_batch(*tail_split, nl_tail, ids, std::vector<std::array<float, 9>>(ids.size(), R), species,
+                                   scaling, cutoff, 0, 0, 0, &planner));
+      }
+    }
+    return std::make_pair(&g, std::move(parts));
   };
 
   // --pair-data: same-geometry charge / spin-state groups (a MemmapSplit + pairs.tsv); one group per pair_every-th

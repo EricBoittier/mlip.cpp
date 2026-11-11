@@ -321,6 +321,12 @@ public:
   /// pairs: local indices into the batch; returns the loss, the normalised residuals in `r` (optional).
   double run_tail(const Batch &b, double energy_scale, const std::vector<TailPair> &pairs, const TailLoss &tl,
                   double mult, std::vector<double> *r = nullptr);
+  /// The same over a group split into parts (consecutive structures of the group, each part a batch of whole
+  /// structures with their lrc_states copies): the energies of every part, the loss once over the group, then one
+  /// backward pass per part with its slice of dL/dE (identical loss and gradient; bounds the graph of a long scan whose
+  /// copies multiply its size; MLIPCPP_TAIL_CHUNK). Not with SQE.
+  double run_tail(const std::vector<Batch> &parts, double energy_scale, const std::vector<TailPair> &pairs,
+                  const TailLoss &tl, double mult, std::vector<double> *r = nullptr);
   /// The model energies (eV, without the composition baseline; host lrc / SQE energies included) of the batch's
   /// real structures: one FORWARD pass, no gradient (run_tail's first half; the held-out pair errors).
   std::vector<double> energies(const Batch &b, double energy_scale);
