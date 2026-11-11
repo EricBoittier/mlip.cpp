@@ -63,8 +63,12 @@ void mark_precise_math(ggml_cgraph *g) {
     // with it (GPU op test 4096 / 4096 = CPU sqrtf; the fast-math default 3352 / 4096) and it takes the les-water
     // ladder presets' CUDA E into his range (mol_z18 P vs his gpu32 0.70 -> 0.57, 0.72 -> 0.53; maxima 1.05-1.15x ->
     // 0.99-1.05x), but readout-pol cluster E P moved 0.68 -> 0.74 and lr_both ion E max 1.04x -> 1.11x (job 4893238,
-    // 2026-11-11): the E verdicts there track the shared fp32 input-rounding bias, not op accuracy. Default: the user's
-    // call; MLIPCPP_PRECISE_SQRT=1 turns it on
+    // 2026-11-11): the E verdicts there track the shared fp32 input-rounding bias, not op accuracy. DECIDED OPT-IN
+    // with full-H100 data (2026-11-11, same binary, tiled precise MUL_MAT default, every reference cell; table in
+    // scripts/pet_lr_port/sqrt_decision.py): no speed cost, plain ladders improve (mol P vs his gpu32 0.82 -> 0.70,
+    // still outside), but periodic slab forces get systematically worse (readout-pol slab F P 0.39-0.51 over 7
+    // flag-off replicates -> 0.71-0.73, arithmetic, not input rounding; slab W P 0.03-0.10 -> 0.20-0.43) and 28 cells
+    // leave his range vs 24 entering it. MLIPCPP_PRECISE_SQRT=1 turns it on
     static const bool psqrt = [] { const char *e = std::getenv("MLIPCPP_PRECISE_SQRT"); return e && !std::strcmp(e, "1"); }();
     // MUL_MAT accumulating in double (ggml-cuda-precise-mulmat.patch). DEFAULT (user decision 2026-11-11): the F32
     // MUL_MATs reducing over K = 1036 (the transfer MLP's first LINEAR of the 512-wide PET-LR checkpoints, whose
