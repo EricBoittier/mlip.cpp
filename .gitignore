@@ -55,3 +55,4 @@ packages/mlip.js/src/gpu/
 website/dist/
 website/node_modules/
 a.out.*
+!tests/resources/petlr_tiny_*.gguf

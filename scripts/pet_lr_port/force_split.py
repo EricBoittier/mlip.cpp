@@ -26,7 +26,7 @@ from check_torch64 import frames_info  # noqa: E402
 from ase.io import read  # noqa: E402
 
 
-def read_split(path):
+def read_split(path, v2=True):
     raw = open(path, "rb").read()
     off, out = 0, []
     while off < len(raw):
@@ -40,7 +40,11 @@ def read_split(path):
         gpos = take(3 * n, np.float32).reshape(n, 3); off += 12 * n
         fcut = take(3 * n, np.float32).reshape(n, 3); off += 12 * n
         sc = float(take(1, np.float32)[0]); off += 4
-        out.append(dict(n=n, k=k, nb=nb, pm=pm, gev=gev, gcv=gcv, gpos=gpos, fcut=fcut, scale=sc))
+        rec = dict(n=n, k=k, nb=nb, pm=pm, gev=gev, gcv=gcv, gpos=gpos, fcut=fcut, scale=sc)
+        if v2:  # dumps from 2026-11-11 05:00 on also carry the graph inputs edge_vectors / cutoff_values
+            rec["ev"] = take(3 * s, np.float32).reshape(n, k, 3); off += 12 * s
+            rec["cv"] = take(s, np.float32).reshape(n, k); off += 4 * s
+        out.append(rec)
     return out
 
 

@@ -1944,6 +1944,8 @@ ModelResult GraphModel::predict_single_impl(
           std::fwrite(fcut.data(), sizeof(float), fcut.size(), fp);
           const float sc = energy_scale_;
           std::fwrite(&sc, sizeof(float), 1, fp);
+          std::fwrite(ev_data.data(), sizeof(float), size_t(total_slots) * 3, fp); // the graph's inputs
+          std::fwrite(cv_data.data(), sizeof(float), total_slots, fp);
           std::fclose(fp);
         }
       }
