@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Settle an fp32 order-statistic verdict with the fp64 executor: split each fp32 run's error against his JAX fp64 into
 an INPUT-ROUNDING part and an ARITHMETIC part, using X_f = mlip.cpp's fp64 executor on the float32-rounded inputs both
-fp32 pipelines see (MLIPCPP_EXEC=fp64 mlipcpp-eval: positions / cell as float, every operation after that in double).
+fp32 pipelines see (mlipcpp-eval --fp64-f32-inputs: positions / cell rounded to float, every operation after that and
+the outputs in double; MLIPCPP_EXEC=fp64 also rounds the OUTPUTS to float, an upper bound only).
 
     python fp64_verdict.py REF64.npz XF.json --cpp NAME=CPP.json [...] --his NAME=RUN32.npz [...] [--keys E F q]
                            [--xd XD.json]
@@ -68,10 +69,11 @@ def err(a, b, key, ref):
 
 
 def paired(a, b):
+    """P(a worse than b), ties counted as 1/2 (bitwise-equal runs give 0.5, not 0)"""
     m = np.isfinite(a) & np.isfinite(b)
     if not m.any():
         return np.nan, 0
-    return float(np.mean(a[m] > b[m])), int(m.sum())
+    return float(np.mean(a[m] > b[m]) + 0.5 * np.mean(a[m] == b[m])), int(m.sum())
 
 
 def main():
@@ -117,10 +119,13 @@ def main():
             pt = [f"{h} {paired(tot[c], tot[h])[0]:.2f}" for h in hn]
             pa = [f"{h} {paired(ari[c], ari[h])[0]:.2f}" for h in hn]
             print(f"    P({c} worse)  total: {', '.join(pt)}  |  arithmetic: {', '.join(pa)}")
-        if len(hn) > 1:
-            pt = [paired(tot[x], tot[y])[0] for x, y in itertools.permutations(hn, 2)]
-            pa = [paired(ari[x], ari[y])[0] for x, y in itertools.permutations(hn, 2)]
-            print(f"    his pairwise P range  total: {min(pt):.2f}-{max(pt):.2f}  |  arithmetic: {min(pa):.2f}-{max(pa):.2f}")
+        # his pairwise range over INDEPENDENT pairs (bitwise-identical runs, e.g. his cpu32 / cpu32_v2 on E, dropped)
+        pairs = [(x, y) for x, y in itertools.permutations(hn, 2) if not np.array_equal(tot[x], tot[y], equal_nan=True)]
+        if pairs:
+            pt = [paired(tot[x], tot[y])[0] for x, y in pairs]
+            pa = [paired(ari[x], ari[y])[0] for x, y in pairs]
+            print(f"    his pairwise P range ({len(pairs)} independent ordered pairs)  total: {min(pt):.2f}-{max(pt):.2f}  |  "
+                  f"arithmetic: {min(pa):.2f}-{max(pa):.2f}")
 
 
 if __name__ == "__main__":

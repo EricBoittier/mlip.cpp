@@ -9,6 +9,7 @@
 // threads. The same layouts as the CUDA MD kernels (src/md/md_kernels.cu).
 
 #include "graph_cache.h"
+#include "iris_fp64.h"
 #include "graph_model.h"
 #include "core/adaptive_cutoff.h"
 #include "core/padding.h"
@@ -1142,6 +1143,8 @@ GraphModel::DeviceTotals GraphModel::predict_device_step(const DeviceStep &) {
 // again before anything is added into the caller's forces (added by a kernel
 // that reads the same verdict on the device).
 GraphModel::DeviceTotals GraphModel::predict_device_step(const DeviceStep &in) {
+  if (fp64::exec_fp64_requested()) // never a silent fp32 fallback: the fp64 executor is host-only
+    throw std::runtime_error("MLIPCPP_EXEC=fp64: the device MD step has no fp64 executor (host predict only)");
   static const bool full_fp32 = [] { // as predict(): TF32 only with MLIPCPP_TF32
     if (std::getenv("MLIPCPP_TF32")) return false;
     setenv("GGML_CUDA_NO_TF32", "1", 0);

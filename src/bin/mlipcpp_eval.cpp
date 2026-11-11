@@ -14,6 +14,7 @@
  * (iris models: --iris-freeze-ewald 1 freezes the Ewald parameters over the frames of the file as his calculator does
  * over a run; --iris-max-neighbors overrides the GGUF's overflow limit, 0 = no check)
  *
+ * --fp64-f32-inputs: the same on the float32-rounded positions / cell (the fp32 path's inputs), outputs in double.
  * --fp64: iris GGUFs on the fp64 executor (runtime/iris_fp64.h; PARITY.md "fp64 executor"): positions, cell and every
  * host value in double (positions and Lattice re-read from the extxyz text, not through the float AtomicSystem), the
  * graph in double, results written with 17 significant digits. MLIPCPP_EXEC=fp64 is the same executor behind the float
@@ -117,11 +118,14 @@ int main(int argc, char *argv[]) {
   double qeq_tol = -1.0;
   bool freeze = false;
   std::string backend = "cpu";
-  bool fp64 = false;
+  bool fp64 = false, f32_inputs = false;
   for (int i = 4; i < argc; i++) {
     const std::string a = argv[i];
     if (a == "--no-forces") { no_forces = true; continue; } // energies (and charges / dipoles) only
     if (a == "--fp64") { fp64 = true; continue; }
+    // the fp64 executor on the float32-rounded positions / cell the fp32 path sees (outputs in double): the
+    // input-rounding / arithmetic split of an fp32 error (scripts/pet_lr_port/fp64_verdict.py)
+    if (a == "--fp64-f32-inputs") { fp64 = f32_inputs = true; continue; }
     if (i + 1 >= argc) {
       std::cerr << "option " << a << " needs a value\n";
       return 1;
@@ -208,7 +212,7 @@ int main(int argc, char *argv[]) {
           runtime::fp64::System64 s64 = runtime::fp64::to_system64(sys);
           bool lat = false;
           double h[3][3];
-          read_double_frame(frame_text, s64.n, s64.positions, lat, h);
+          if (!f32_inputs) read_double_frame(frame_text, s64.n, s64.positions, lat, h);
           if (lat && s64.has_cell)
             for (int a = 0; a < 3; a++)
               for (int b = 0; b < 3; b++) s64.cell[a][b] = h[a][b];
