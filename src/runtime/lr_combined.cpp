@@ -7,6 +7,7 @@
 #include <gguf.h>
 
 #include <algorithm>
+#include <atomic>
 #include <map>
 #include <array>
 #include <cmath>
@@ -33,6 +34,73 @@ double dist(const double *x, int i, int j) {
   double d2 = 0;
   for (int k = 0; k < 3; k++) d2 += (x[3 * i + k] - x[3 * j + k]) * (x[3 * i + k] - x[3 * j + k]);
   return std::sqrt(d2);
+}
+
+std::atomic<int> g_lrc_threads{1};
+
+// open structures: every atom's neighbours k != i with dist(x, i, k) < rc, in increasing k (the order, and the
+// distances, of the all-pairs loop they replace), from cubic bins of side >= rc over the bounding box
+struct OpenNeighbors {
+  std::vector<int64_t> start; // n + 1
+  std::vector<int> j;
+  std::vector<double> r;
+};
+OpenNeighbors open_neighbors(int n, const double *x, double rc) {
+  OpenNeighbors o;
+  o.start.assign(n + 1, 0);
+  if (n == 0) return o;
+  double lo[3], hi[3];
+  for (int a = 0; a < 3; a++) lo[a] = hi[a] = x[a];
+  for (int i = 1; i < n; i++)
+    for (int a = 0; a < 3; a++) lo[a] = std::min(lo[a], x[3 * i + a]), hi[a] = std::max(hi[a], x[3 * i + a]);
+  // bin side bw >= rc (any |x_i - x_j| < rc lies in adjacent bins); at most 128 bins per direction
+  int nb[3];
+  double bw[3];
+  for (int a = 0; a < 3; a++) {
+    const double ext = hi[a] - lo[a];
+    bw[a] = std::max(rc * (1.0 + 1e-9) + 1e-9, ext / 128.0);
+    nb[a] = std::clamp(static_cast<int>(ext / bw[a]) + 1, 1, 129);
+  }
+  const size_t nbin = size_t(nb[0]) * nb[1] * nb[2];
+  std::vector<int> bin(n);
+  std::vector<int64_t> head(nbin + 1, 0);
+  std::vector<std::array<int, 3>> b3(n);
+  for (int i = 0; i < n; i++) {
+    for (int a = 0; a < 3; a++) b3[i][a] = std::clamp(static_cast<int>((x[3 * i + a] - lo[a]) / bw[a]), 0, nb[a] - 1);
+    bin[i] = (b3[i][0] * nb[1] + b3[i][1]) * nb[2] + b3[i][2];
+    head[bin[i] + 1]++;
+  }
+  for (size_t b = 0; b < nbin; b++) head[b + 1] += head[b];
+  std::vector<int> atoms(n);
+  {
+    std::vector<int64_t> fill(head.begin(), head.end() - 1);
+    for (int i = 0; i < n; i++) atoms[fill[bin[i]]++] = i; // increasing i inside each bin
+  }
+  std::vector<std::vector<std::pair<int, double>>> nbr(n);
+  const int nt = std::max(1, g_lrc_threads.load());
+#pragma omp parallel for num_threads(nt) schedule(dynamic, 64)
+  for (int i = 0; i < n; i++) {
+    auto &v = nbr[i];
+    for (int d0 = -1; d0 <= 1; d0++)
+      for (int d1 = -1; d1 <= 1; d1++)
+        for (int d2 = -1; d2 <= 1; d2++) {
+          const int t0 = b3[i][0] + d0, t1 = b3[i][1] + d1, t2 = b3[i][2] + d2;
+          if (t0 < 0 || t1 < 0 || t2 < 0 || t0 >= nb[0] || t1 >= nb[1] || t2 >= nb[2]) continue;
+          const size_t b = (size_t(t0) * nb[1] + t1) * nb[2] + t2;
+          for (int64_t q = head[b]; q < head[b + 1]; q++) {
+            const int k = atoms[q];
+            if (k == i) continue;
+            const double r = dist(x, i, k);
+            if (r < rc) v.push_back({k, r});
+          }
+        }
+    std::sort(v.begin(), v.end(), [](const auto &p, const auto &q) { return p.first < q.first; });
+  }
+  for (int i = 0; i < n; i++) o.start[i + 1] = o.start[i] + int64_t(nbr[i].size());
+  o.j.resize(o.start[n]), o.r.resize(o.start[n]);
+  for (int i = 0; i < n; i++)
+    for (size_t k = 0; k < nbr[i].size(); k++) o.j[o.start[i] + k] = nbr[i][k].first, o.r[o.start[i] + k] = nbr[i][k].second;
+  return o;
 }
 // g += dE/dx of a pair term E(r_ij); vir (3 x 3, may be null) += its strain derivative d (dE/dd), d = x_j - x_i
 void add_pair(double *g, const double *x, int i, int j, double r, double dEdr, double *vir = nullptr) {
@@ -986,24 +1054,21 @@ inline void backbone_link(const LrcSpec &L, double r, double c, double &A, doubl
 
 // the backbone's adaptive radius of every atom (c.rad) and d r_i / d d_ik for its neighbours within the cutoff (open
 // structures; the same function as GraphModel's, on the same neighbours, so the pair cutoffs are the backbone's)
-void backbone_radii(const LrcSpec &L, int n, const double *x, LrcClusters &c) {
+void backbone_radii(const LrcSpec &L, int n, LrcClusters &c, const OpenNeighbors &nb) {
   const double rc = L.bb_cutoff;
   c.rad.assign(n, rc);
   c.nb_start.assign(n + 1, 0), c.nb_j.clear(), c.nb_jac.clear();
   if (!(L.bb_nadapt > 0)) return; // a plain cutoff: c_ij = rc, no position dependence
-  std::vector<double> d;
+  // nb holds every k != i with d_ik < rc, in increasing k: the edges, in order, of the all-pairs loop
+  for (int i = 0; i < n; i++) c.nb_start[i + 1] = static_cast<int32_t>(nb.start[i + 1]);
+  c.nb_j.assign(nb.j.begin(), nb.j.end());
+  c.nb_jac.resize(nb.j.size());
+  const int nt = std::max(1, g_lrc_threads.load());
+#pragma omp parallel for num_threads(nt) schedule(dynamic, 16)
   for (int i = 0; i < n; i++) {
-    d.clear();
-    for (int k = 0; k < n; k++) {
-      if (k == i) continue;
-      const double r = dist(x, i, k);
-      if (r < rc) d.push_back(r), c.nb_j.push_back(k);
-    }
-    const size_t e0 = c.nb_jac.size();
-    c.nb_jac.resize(e0 + d.size());
-    c.rad[i] = adaptive::radius(L.bb_grid, static_cast<int>(d.size()), [&](int k) { return d[k]; }, rc, L.bb_nadapt,
-                                L.bb_width, c.nb_jac.data() + e0);
-    c.nb_start[i + 1] = static_cast<int32_t>(c.nb_jac.size());
+    const double *d = nb.r.data() + nb.start[i];
+    c.rad[i] = adaptive::radius(L.bb_grid, static_cast<int>(nb.start[i + 1] - nb.start[i]), [&](int k) { return d[k]; },
+                                rc, L.bb_nadapt, L.bb_width, c.nb_jac.data() + nb.start[i]);
   }
 }
 
@@ -1171,19 +1236,24 @@ LrcClusters clusters_periodic_bb(const LrcSpec &L, int n, const double *x, const
   });
   c.rad.assign(n, rc);
   c.nb_start.assign(n + 1, 0), c.nb_j.clear(), c.nb_jac.clear(), c.nb_d.clear();
-  if (L.bb_nadapt > 0) {
-    std::vector<double> d;
+  if (L.bb_nadapt > 0) { // the atoms' radii are independent: in parallel, each as before
+    for (int i = 0; i < n; i++) c.nb_start[i + 1] = c.nb_start[i] + static_cast<int32_t>(nb[i].size());
+    const size_t ne = size_t(c.nb_start[n]);
+    c.nb_j.resize(ne), c.nb_d.resize(3 * ne), c.nb_jac.resize(ne);
+    const int nt = std::max(1, g_lrc_threads.load());
+#pragma omp parallel for num_threads(nt) schedule(dynamic, 16)
     for (int i = 0; i < n; i++) {
+      thread_local std::vector<double> d;
       d.clear();
+      const size_t e0 = size_t(c.nb_start[i]);
+      size_t e = e0;
       for (const auto &[k, v] : nb[i]) {
-        d.push_back(std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])), c.nb_j.push_back(k);
-        c.nb_d.insert(c.nb_d.end(), v.begin(), v.end());
+        d.push_back(std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])), c.nb_j[e] = k;
+        for (int a = 0; a < 3; a++) c.nb_d[3 * e + a] = v[a];
+        e++;
       }
-      const size_t e0 = c.nb_jac.size();
-      c.nb_jac.resize(e0 + d.size());
       c.rad[i] = adaptive::radius(L.bb_grid, static_cast<int>(d.size()), [&](int k) { return d[k]; }, rc, L.bb_nadapt,
                                   L.bb_width, c.nb_jac.data() + e0);
-      c.nb_start[i + 1] = static_cast<int32_t>(c.nb_jac.size());
     }
   }
   // strong components of the tiling (with their wraps) and the weak pairs
@@ -1400,6 +1470,8 @@ LrcClusters clusters_periodic(const LrcSpec &L, int n, const double *x, const do
 }
 } // namespace
 
+void lrc_set_threads(int n) { g_lrc_threads.store(std::max(1, n)); }
+
 LrcClusters lrc_clusters(const LrcSpec &L, int n, const double *x, const double *cell) {
   if (cell) return clusters_periodic(L, n, x, cell);
   LrcClusters c;
@@ -1407,10 +1479,14 @@ LrcClusters lrc_clusters(const LrcSpec &L, int n, const double *x, const double 
   std::vector<int> par(n);
   std::iota(par.begin(), par.end(), 0);
   std::vector<std::pair<int, int>> weak;
-  if (L.links_backbone) backbone_radii(L, n, x, c);
+  // the pairs that can act (r < bb_cutoff with backbone links, else r < a_off), in the all-pairs loop's order
+  const OpenNeighbors nb = open_neighbors(n, x, L.links_backbone ? L.bb_cutoff : L.a_off);
+  if (L.links_backbone) backbone_radii(L, n, c, nb);
   for (int i = 0; i < n; i++)
-    for (int j = i + 1; j < n; j++) {
-      const double r = dist(x, i, j);
+    for (int64_t e = nb.start[i]; e < nb.start[i + 1]; e++) {
+      const int j = nb.j[e];
+      if (j <= i) continue;
+      const double r = nb.r[e];
       if (L.links_backbone) { // strong inside lo_ij, weak up to the pair cutoff c_ij, none beyond (no backbone edge)
         if (r >= L.bb_cutoff) continue;
         const double cij = 0.5 * (c.rad[i] + c.rad[j]), lo = L.link_a * cij + L.link_b;

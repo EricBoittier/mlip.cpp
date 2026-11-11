@@ -806,6 +806,7 @@ ModelResult GraphModel::predict_single_lrc(const AtomicSystem &system, bool comp
   }
   const int n = system.num_atoms();
   std::vector<double> x(system.positions(), system.positions() + 3 * size_t(n));
+  lrc_set_threads(backend_provider_ ? backend_provider_->n_threads() : 1); // the cluster search's host threads
   const LrcCondition cond = lrc_condition(L, sq, n, system.atomic_numbers(), x.data(), double(system.charge()),
                                           conditioning_.max_charge, system.spin_multiplicity(),
                                           cell.empty() ? nullptr : cell.data());
