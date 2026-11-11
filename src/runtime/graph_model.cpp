@@ -824,13 +824,15 @@ ModelResult GraphModel::predict_single_lrc(const AtomicSystem &system, bool comp
   const int n = system.num_atoms();
   std::vector<double> x(system.positions(), system.positions() + 3 * size_t(n));
   lrc_set_threads(backend_provider_ ? backend_provider_->n_threads() : 1); // the cluster search's host threads
-  // Overlap: after a plain call (one open cluster or a bulk cell: the structure's charge, no long range, no states), the
-  // cluster search runs on a host thread while this thread computes the plain graph. If the search finds the plain case
+  // Overlap: after a plain call on a periodic cell (one bulk cluster: the structure's charge, no long range, no states) and
+  // for a cell of the same size (MD in a condensed phase), the cluster search runs on a host thread while this thread
+  // computes the plain graph. If the search finds the plain case
   // again, that graph is this call's result exactly (the same predict_single_impl call as below with no per-atom
   // conditioning); otherwise it is dropped and the call continues as without the overlap. (lrc_clusters is pure host
   // code; lrc_condition, whose charge pass may use a device, is not run on the other thread.)
   static const bool overlap = [] { const char *e = std::getenv("MLIPCPP_LRC_OVERLAP"); return !(e && *e == '0'); }();
-  if (overlap && lrc_last_plain_ && !L.intra && !post_compute_hook && !parameter_gradients) {
+  if (overlap && lrc_last_plain_ && lrc_last_plain_n_ == n && !cell.empty() && !L.intra && !post_compute_hook &&
+      !parameter_gradients) {
     std::future<LrcClusters> fc = std::async(std::launch::async, [&] {
       return lrc_clusters(L, n, x.data(), cell.empty() ? nullptr : cell.data());
     });
@@ -961,8 +963,8 @@ ModelResult GraphModel::predict_single_lrc(const AtomicSystem &system, bool comp
   lrc_want_blend_grad_ = false;
   const std::vector<double> blend_grad = lrc_blend_grad_;
   // one open cluster or a bulk cell: the plain model (lrc_intra: the long range still acts inside)
-  lrc_last_plain_ = cond.cl.s == 1 && !cond.cl.images() && !L.intra;
-  if (lrc_last_plain_) return r;
+  lrc_last_plain_ = cond.cl.s == 1 && !cond.cl.images() && !L.intra && !cell.empty(), lrc_last_plain_n_ = n;
+  if (cond.cl.s == 1 && !cond.cl.images() && !L.intra) return r;
   LrcEnergy le = lrc_energy(L, sq, cond, n, system.atomic_numbers(), x.data(), double(system.charge()), compute_forces);
   // MLIPCPP_LRC_NO_LR=1: drop the long-range energy and forces (diagnostics only: ablations on fixed weights)
   static const bool no_lr = [] { const char *e = std::getenv("MLIPCPP_LRC_NO_LR"); return e && *e == '1'; }();
