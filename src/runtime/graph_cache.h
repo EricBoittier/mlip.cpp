@@ -4,6 +4,7 @@
 
 #include "pet_plato_lr.h"
 #include <memory>
+#include <ggml-alloc.h>
 #include <ggml-backend.h>
 #include <ggml.h>
 
@@ -79,6 +80,42 @@ struct CachedGraph {
   ~CachedGraph() {
     if (inputs) ggml_backend_buffer_free(inputs);
     if (ctx) ggml_free(ctx);
+  }
+};
+
+/// The graph of GraphModel's general path (predict_single_impl: per-atom outputs, atom energy weights, dE/d blend,
+/// lrc_states edge drops, structures without edges), kept for one exact shape: the same graph (same nodes, same
+/// kernels) as a fresh build, without the per-call build, allocations and constant uploads. A kept graph goes through
+/// its own ggml_gallocr (memory reused along the graph), its constants in const_buffer.
+struct PlainGraph {
+  struct Key {
+    int n_atoms = 0, M = 0, periodic = 0;
+    bool forces = false, backward = false, blend_grad = false, atom_w = false, no_edges = false;
+    bool operator==(const Key &) const = default;
+  } key;
+  ggml_context *input_ctx = nullptr, *compute_ctx = nullptr;
+  ggml_backend_buffer_t input_buffer = nullptr, compute_buffer = nullptr, const_buffer = nullptr;
+  ggml_gallocr_t galloc = nullptr; // a kept graph's allocator (compute_buffer: a graph built for one call)
+  ggml_tensor *species = nullptr, *neighbor_species = nullptr, *edge_vectors = nullptr, *padding_mask = nullptr,
+              *reverse = nullptr, *charge_index = nullptr, *spin_index = nullptr, *charge_index_unit = nullptr,
+              *cond_blend = nullptr, *atom_w = nullptr, *edge_distances = nullptr, *cutoff_factors = nullptr,
+              *cutoff_values = nullptr, *output = nullptr, *nc_output = nullptr, *latent_q = nullptr;
+  ggml_cgraph *cgraph = nullptr;
+  bool forces = false; // dE/d edge vectors in the graph
+  std::unique_ptr<PetPlatoLR> plato;
+  size_t bytes = 0; // device bytes held (inputs + compute)
+
+  PlainGraph() = default;
+  PlainGraph(const PlainGraph &) = delete;
+  PlainGraph &operator=(const PlainGraph &) = delete;
+  ~PlainGraph() {
+    plato.reset();
+    if (galloc) ggml_gallocr_free(galloc);
+    if (const_buffer) ggml_backend_buffer_free(const_buffer);
+    if (compute_buffer) ggml_backend_buffer_free(compute_buffer);
+    if (input_buffer) ggml_backend_buffer_free(input_buffer);
+    if (compute_ctx) ggml_free(compute_ctx);
+    if (input_ctx) ggml_free(input_ctx);
   }
 };
 

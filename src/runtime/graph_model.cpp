@@ -353,7 +353,10 @@ static constexpr size_t COMPUTE_CTX_SIZE = 512 * 1024 * 1024; // 512 MB
 GraphModel::GraphModel()
     : neighbor_builder_(NeighborListOptions{cutoff_, true, false}) {}
 
+void GraphModel::PlainGraphDeleter::operator()(PlainGraph *graph) const { delete graph; }
+
 GraphModel::~GraphModel() {
+  plain_graphs_.clear();
   cached_.reset();
   release_cached_resources();
   if (ragged_fold_buffer_) ggml_backend_buffer_free(ragged_fold_buffer_);
@@ -369,6 +372,7 @@ GraphModel::~GraphModel() {
 
 bool GraphModel::load_from_gguf(const std::string &path) {
   constexpr size_t TEMP_CTX_SIZE = 512 * 1024 * 1024;
+  plain_graphs_.clear(); // graphs of the previous weights
 
   // Create temporary context with data allocation
   ggml_context *temp_ctx = ggml_init({TEMP_CTX_SIZE, nullptr, false});
@@ -1242,141 +1246,57 @@ ModelResult GraphModel::predict_single_impl(
     compute_forces = false;
   }
   const bool backward = compute_forces || blend_only;
-  interp_.set_exact_padding_mask(no_edges && !std::getenv("MLIPCPP_PAD_EMPTY"));
-
-  // Set symbolic dimensions for this system
-  interp_.set_dimension("n_atoms", n_atoms);
-  interp_.set_dimension("max_neighbors", max_neighbors);
-  interp_.set_dimension("n_edges", n_atoms * max_neighbors);
-  interp_.set_dimension("max_neighbors_plus_one", max_neighbors + 1);
-
+  const bool exact_mask = no_edges && !std::getenv("MLIPCPP_PAD_EMPTY");
   const int total_slots = n_atoms * max_neighbors;
 
-  // --- Create input context ---
-  ggml_context *input_ctx = ggml_init({INPUT_CTX_SIZE, nullptr, true});
-  std::unique_ptr<ggml_context, decltype(&ggml_free)> input_owner(input_ctx,
-                                                                  ggml_free);
-  if (!input_ctx) {
-    throw std::runtime_error("Failed to create input context");
-  }
-
-  // Create input tensors
-  ggml_tensor *species_t = ggml_new_tensor_1d(input_ctx, GGML_TYPE_I32, n_atoms);
-  ggml_set_name(species_t, "species");
-
-  ggml_tensor *neighbor_species_t =
-      ggml_new_tensor_2d(input_ctx, GGML_TYPE_I32, max_neighbors, n_atoms);
-  ggml_set_name(neighbor_species_t, "neighbor_species");
-
-  ggml_tensor *edge_vectors_t =
-      ggml_new_tensor_3d(input_ctx, GGML_TYPE_F32, 3, max_neighbors, n_atoms);
-  ggml_set_name(edge_vectors_t, "edge_vectors");
-
-  ggml_tensor *padding_mask_t =
-      ggml_new_tensor_2d(input_ctx, GGML_TYPE_F32, max_neighbors, n_atoms);
-  ggml_set_name(padding_mask_t, "padding_mask");
-
-  ggml_tensor *reverse_neighbor_index_t =
-      ggml_new_tensor_1d(input_ctx, GGML_TYPE_I32, total_slots);
-  ggml_set_name(reverse_neighbor_index_t, "reverse_neighbor_index");
-
-  ggml_tensor *coulomb_t = nullptr;
-  if (long_range_ && !p3m_) {
-    coulomb_t = ggml_new_tensor_2d(input_ctx, GGML_TYPE_F32, n_atoms, n_atoms);
-    ggml_set_name(coulomb_t, "coulomb_matrix");
-    if (compute_forces)
-      ggml_set_param(coulomb_t);
-  }
-
-  // charge / spin conditioning: the table rows of the structure, per atom
-  ggml_tensor *charge_index_t = nullptr, *spin_index_t = nullptr, *charge_index_unit_t = nullptr;
-  ggml_tensor *cond_blend_t = nullptr;
-  if (conditioning_.enabled && (plato_lr_.frag.cond_gate || plato_lr_.lrc.enabled)) {
-    charge_index_unit_t = ggml_new_tensor_1d(input_ctx, GGML_TYPE_I32, n_atoms);
-    ggml_set_name(charge_index_unit_t, "charge_index_unit");
-  }
-  if (conditioning_.enabled && plato_lr_.lrc.enabled) {
-    cond_blend_t = ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, n_atoms);
-    ggml_set_name(cond_blend_t, "cond_blend");
-    if (backward && lrc_want_blend_grad_) ggml_set_param(cond_blend_t); // dE/dS (exact conditioning forces)
-  }
-  ggml_tensor *atom_w_t = nullptr;
-  if (compute_forces && !atom_w_.empty()) {
-    if (atom_w_.size() != static_cast<size_t>(n_atoms)) throw std::logic_error("atom energy weights: atom count");
-    atom_w_t = ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, n_atoms);
-    ggml_set_name(atom_w_t, "atom_energy_weights");
-  }
-  if (conditioning_.enabled) {
-    charge_index_t = ggml_new_tensor_1d(input_ctx, GGML_TYPE_I32, n_atoms);
-    ggml_set_name(charge_index_t, "charge_index");
-    spin_index_t = ggml_new_tensor_1d(input_ctx, GGML_TYPE_I32, n_atoms);
-    ggml_set_name(spin_index_t, "spin_index");
-  }
-
-  // Mode-specific inputs
-  ggml_tensor *edge_distances_t = nullptr;
-  ggml_tensor *cutoff_factors_t = nullptr;
-  ggml_tensor *cutoff_values_t = nullptr;
-
-  if (!forces_mode_) {
-    edge_distances_t =
-        ggml_new_tensor_2d(input_ctx, GGML_TYPE_F32, max_neighbors, n_atoms);
-    ggml_set_name(edge_distances_t, "edge_distances");
-
-    cutoff_factors_t =
-        ggml_new_tensor_2d(input_ctx, GGML_TYPE_F32, max_neighbors, n_atoms);
-    ggml_set_name(cutoff_factors_t, "cutoff_factors");
-  } else {
-    cutoff_values_t =
-        ggml_new_tensor_2d(input_ctx, GGML_TYPE_F32, max_neighbors, n_atoms);
-    ggml_set_name(cutoff_values_t, "cutoff_values");
-  }
-
-  // Mark edge_vectors as parameter for gradient computation
-  if (compute_forces) {
-    ggml_set_param(edge_vectors_t);
-    // Adaptive cutoff models also need ∂E/∂cutoff_values to recover the
-    // missing chain in the virial stress (correction added in C++).
-    if (cutoff_values_t && num_neighbors_adaptive_ > 0.0f) {
-      ggml_set_param(cutoff_values_t);
-    }
-  }
-
-  // Plato-PET-LR: positions (and strain) inputs of the long-range ops, read by the
-  // interpreter's MLIPCPP_* builders
-  std::unique_ptr<PetPlatoLR> plato;
+  int periodic_dims = 0;
+  if (const Cell *c = system.cell()) periodic_dims = c->periodic[0] + c->periodic[1] + c->periodic[2];
+  PetPlatoLRStructure plato_st;
   if (plato_lr_.enabled) {
-    PetPlatoLRStructure st;
-    st.a0 = 0, st.a1 = n_atoms;
+    plato_st.a0 = 0, plato_st.a1 = n_atoms;
     if (const Cell *c = system.cell()) {
-      const int np = c->periodic[0] + c->periodic[1] + c->periodic[2];
-      if (np != 0 && np != 3 && plato_lr_.long_range())
+      if (periodic_dims != 0 && periodic_dims != 3 && plato_lr_.long_range())
         throw std::runtime_error("Plato-PET-LR long range needs full or no periodicity");
-      st.periodic = np == 3;
+      plato_st.periodic = periodic_dims == 3;
       for (int a = 0; a < 3; a++)
-        for (int b = 0; b < 3; b++) st.cell[a][b] = c->matrix[a][b];
+        for (int b = 0; b < 3; b++) plato_st.cell[a][b] = c->matrix[a][b];
     }
-    st.charge = system.charge();
-    plato = std::make_unique<PetPlatoLR>();
-    plato->create(input_ctx, plato_lr_, {st}, n_atoms, compute_forces && plato_lr_.long_range());
+    plato_st.charge = system.charge();
   }
 
-  // Allocate input buffer
-  ggml_backend_buffer_t input_buffer =
-      ggml_backend_alloc_ctx_tensors(input_ctx, compute_backend_);
-  std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)>
-      input_buffer_owner(input_buffer, ggml_backend_buffer_free);
-  if (!input_buffer) {
-    throw std::runtime_error("Failed to allocate input buffer");
+  // The graph of this exact shape (graph_cache.h PlainGraph): built on the first call, later calls only upload its
+  // inputs. Separated clusters of the combined long-range model come this way on every call (charge pass and its
+  // vector-Jacobian product, dE/d blend, link-state copies), where the rebuild (graph, backward graph, device buffers,
+  // one synchronous upload per constant) cost several times the compute and serialised processes sharing the GPU.
+  const bool keep_graph = !no_cache && !post_compute_hook && !parameter_gradients && !long_range_;
+  const PlainGraph::Key key{n_atoms,
+                            max_neighbors,
+                            periodic_dims,
+                            compute_forces,
+                            backward,
+                            backward && lrc_want_blend_grad_,
+                            compute_forces && !atom_w_.empty(),
+                            exact_mask};
+  std::unique_ptr<PlainGraph, PlainGraphDeleter> fresh;
+  PlainGraph *pg = nullptr;
+  if (keep_graph) {
+    for (size_t k = 0; k < plain_graphs_.size(); k++) {
+      if (plain_graphs_[k]->key != key) continue;
+      if (plain_graphs_[k]->plato && !plain_graphs_[k]->plato->refresh({plato_st})) { // another mesh / k set
+        plain_graphs_.erase(plain_graphs_.begin() + static_cast<std::ptrdiff_t>(k));
+        break;
+      }
+      std::rotate(plain_graphs_.begin(), plain_graphs_.begin() + static_cast<std::ptrdiff_t>(k),
+                  plain_graphs_.begin() + static_cast<std::ptrdiff_t>(k) + 1);
+      pg = plain_graphs_.front().get();
+      break;
+    }
   }
-
-  if (plato) {
-    std::vector<float> pos(system.positions(), system.positions() + 3 * size_t(n_atoms));
-    plato->upload(pos.data());
-    interp_.custom_op = [&](ggml_context *ctx, const GIRNode &node, const std::vector<ggml_tensor *> &in) {
-      return plato->build(ctx, node, in);
-    };
-  }
+  const bool rebuilt = pg == nullptr;
+  if (profile.enabled)
+    std::fprintf(stderr, "GRAPH_PLAIN n=%d M=%d forces=%d backward=%d blend_grad=%d atom_w=%d no_edges=%d %s\n", n_atoms,
+                 max_neighbors, int(key.forces), int(key.backward), int(key.blend_grad), int(key.atom_w),
+                 int(key.no_edges), rebuilt ? (keep_graph ? "build" : "build-uncached") : "reuse");
 
   // --- Pack neighbor list data ---
   std::vector<int32_t> species_data(n_atoms);
@@ -1469,41 +1389,137 @@ ModelResult GraphModel::predict_single_impl(
     }
   }
 
-  // Copy data to tensors
-  ggml_backend_tensor_set(species_t, species_data.data(), 0,
-                          species_data.size() * sizeof(int32_t));
-  ggml_backend_tensor_set(neighbor_species_t, ns_data.data(), 0,
-                          ns_data.size() * sizeof(int32_t));
-  ggml_backend_tensor_set(edge_vectors_t, ev_data.data(), 0,
-                          ev_data.size() * sizeof(float));
-  ggml_backend_tensor_set(padding_mask_t, pm_data.data(), 0,
-                          pm_data.size() * sizeof(float));
-  ggml_backend_tensor_set(reverse_neighbor_index_t, rni_data.data(), 0,
-                          rni_data.size() * sizeof(int32_t));
+  ggml_tensor *species_t = nullptr, *neighbor_species_t = nullptr, *edge_vectors_t = nullptr,
+              *padding_mask_t = nullptr, *reverse_neighbor_index_t = nullptr, *coulomb_t = nullptr,
+              *charge_index_t = nullptr, *spin_index_t = nullptr, *charge_index_unit_t = nullptr,
+              *cond_blend_t = nullptr, *atom_w_t = nullptr, *edge_distances_t = nullptr,
+              *cutoff_factors_t = nullptr, *cutoff_values_t = nullptr, *output = nullptr, *nc_output = nullptr,
+              *latent_q = nullptr;
+  ggml_tensor *lr_charges = nullptr, *lr_potentials = nullptr,
+              *lr_charge_adjoint = nullptr;
+  ggml_cgraph *cgraph = nullptr, *charge_graph = nullptr;
+  ggml_tensor *loss_t = nullptr;
+  if (rebuilt) {
+  fresh.reset(new PlainGraph());
+  pg = fresh.get();
+  pg->key = key;
+  interp_.set_exact_padding_mask(exact_mask);
 
-  if (coulomb_t) {
-    ggml_backend_tensor_set(coulomb_t, coulomb.matrix.data(), 0,
-                            coulomb.matrix.size() * sizeof(float));
-    interp_.set_input("coulomb_matrix", coulomb_t);
+  // Set symbolic dimensions for this system
+  interp_.set_dimension("n_atoms", n_atoms);
+  interp_.set_dimension("max_neighbors", max_neighbors);
+  interp_.set_dimension("n_edges", n_atoms * max_neighbors);
+  interp_.set_dimension("max_neighbors_plus_one", max_neighbors + 1);
+
+  // --- Create input context ---
+  ggml_context *input_ctx = pg->input_ctx = ggml_init({INPUT_CTX_SIZE, nullptr, true});
+  if (!input_ctx) {
+    throw std::runtime_error("Failed to create input context");
   }
 
-  if (atom_w_t) ggml_backend_tensor_set(atom_w_t, atom_w_.data(), 0, atom_w_.size() * sizeof(float));
+  // Create input tensors
+  species_t = ggml_new_tensor_1d(input_ctx, GGML_TYPE_I32, n_atoms);
+  ggml_set_name(species_t, "species");
+
+  neighbor_species_t =
+      ggml_new_tensor_2d(input_ctx, GGML_TYPE_I32, max_neighbors, n_atoms);
+  ggml_set_name(neighbor_species_t, "neighbor_species");
+
+  edge_vectors_t =
+      ggml_new_tensor_3d(input_ctx, GGML_TYPE_F32, 3, max_neighbors, n_atoms);
+  ggml_set_name(edge_vectors_t, "edge_vectors");
+
+  padding_mask_t =
+      ggml_new_tensor_2d(input_ctx, GGML_TYPE_F32, max_neighbors, n_atoms);
+  ggml_set_name(padding_mask_t, "padding_mask");
+
+  reverse_neighbor_index_t =
+      ggml_new_tensor_1d(input_ctx, GGML_TYPE_I32, total_slots);
+  ggml_set_name(reverse_neighbor_index_t, "reverse_neighbor_index");
+
+  if (long_range_ && !p3m_) {
+    coulomb_t = ggml_new_tensor_2d(input_ctx, GGML_TYPE_F32, n_atoms, n_atoms);
+    ggml_set_name(coulomb_t, "coulomb_matrix");
+    if (compute_forces)
+      ggml_set_param(coulomb_t);
+  }
+
+  // charge / spin conditioning: the table rows of the structure, per atom
+  if (conditioning_.enabled && (plato_lr_.frag.cond_gate || plato_lr_.lrc.enabled)) {
+    charge_index_unit_t = ggml_new_tensor_1d(input_ctx, GGML_TYPE_I32, n_atoms);
+    ggml_set_name(charge_index_unit_t, "charge_index_unit");
+  }
+  if (conditioning_.enabled && plato_lr_.lrc.enabled) {
+    cond_blend_t = ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, n_atoms);
+    ggml_set_name(cond_blend_t, "cond_blend");
+    if (backward && lrc_want_blend_grad_) ggml_set_param(cond_blend_t); // dE/dS (exact conditioning forces)
+  }
+  if (compute_forces && !atom_w_.empty()) {
+    if (atom_w_.size() != static_cast<size_t>(n_atoms)) throw std::logic_error("atom energy weights: atom count");
+    atom_w_t = ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, n_atoms);
+    ggml_set_name(atom_w_t, "atom_energy_weights");
+  }
   if (conditioning_.enabled) {
-    const auto [ci, si] = conditioning_.rows(system.charge(), system.spin_multiplicity());
-    (void)ci;
-    std::vector<int32_t> c = charge_rows(n_atoms, system.charge(), system.spin_multiplicity()), sp(n_atoms, si);
-    ggml_backend_tensor_set(charge_index_t, c.data(), 0, c.size() * sizeof(int32_t));
-    ggml_backend_tensor_set(spin_index_t, sp.data(), 0, sp.size() * sizeof(int32_t));
+    charge_index_t = ggml_new_tensor_1d(input_ctx, GGML_TYPE_I32, n_atoms);
+    ggml_set_name(charge_index_t, "charge_index");
+    spin_index_t = ggml_new_tensor_1d(input_ctx, GGML_TYPE_I32, n_atoms);
+    ggml_set_name(spin_index_t, "spin_index");
+  }
+
+  // Mode-specific inputs
+  if (!forces_mode_) {
+    edge_distances_t =
+        ggml_new_tensor_2d(input_ctx, GGML_TYPE_F32, max_neighbors, n_atoms);
+    ggml_set_name(edge_distances_t, "edge_distances");
+
+    cutoff_factors_t =
+        ggml_new_tensor_2d(input_ctx, GGML_TYPE_F32, max_neighbors, n_atoms);
+    ggml_set_name(cutoff_factors_t, "cutoff_factors");
+  } else {
+    cutoff_values_t =
+        ggml_new_tensor_2d(input_ctx, GGML_TYPE_F32, max_neighbors, n_atoms);
+    ggml_set_name(cutoff_values_t, "cutoff_values");
+  }
+
+  // Mark edge_vectors as parameter for gradient computation
+  if (compute_forces) {
+    ggml_set_param(edge_vectors_t);
+    // Adaptive cutoff models also need ∂E/∂cutoff_values to recover the
+    // missing chain in the virial stress (correction added in C++).
+    if (cutoff_values_t && num_neighbors_adaptive_ > 0.0f) {
+      ggml_set_param(cutoff_values_t);
+    }
+  }
+
+  // Plato-PET-LR: positions (and strain) inputs of the long-range ops, read by the
+  // interpreter's MLIPCPP_* builders
+  if (plato_lr_.enabled) {
+    pg->plato = std::make_unique<PetPlatoLR>();
+    pg->plato->create(input_ctx, plato_lr_, {plato_st}, n_atoms, compute_forces && plato_lr_.long_range());
+  }
+  PetPlatoLR *plato = pg->plato.get();
+
+  // Allocate input buffer
+  ggml_backend_buffer_t input_buffer = pg->input_buffer =
+      ggml_backend_alloc_ctx_tensors(input_ctx, compute_backend_);
+  if (!input_buffer) {
+    throw std::runtime_error("Failed to allocate input buffer");
+  }
+
+  if (plato) {
+    interp_.custom_op = [plato](ggml_context *ctx, const GIRNode &node, const std::vector<ggml_tensor *> &in) {
+      return plato->build(ctx, node, in);
+    };
+  }
+
+  // Register the inputs
+  if (coulomb_t) interp_.set_input("coulomb_matrix", coulomb_t);
+  if (conditioning_.enabled) {
     interp_.set_input("charge_index", charge_index_t);
     interp_.set_input("spin_index", spin_index_t);
     if (charge_index_unit_t) {
-      const std::vector<int32_t> cu = charge_rows(n_atoms, system.charge(), system.spin_multiplicity(), true);
-      ggml_backend_tensor_set(charge_index_unit_t, cu.data(), 0, cu.size() * sizeof(int32_t));
       interp_.set_input("charge_index_unit", charge_index_unit_t);
       if (cond_blend_t) {
-        std::vector<float> bl(n_atoms, 0.0f);
-        if (!lrc_blend_.empty()) bl = lrc_blend_;
-        ggml_backend_tensor_set(cond_blend_t, bl.data(), 0, bl.size() * sizeof(float));
         interp_.set_input("cond_blend", cond_blend_t);
         install_lrc_blend(interp_, cond_blend_t);
       } else {
@@ -1511,40 +1527,26 @@ ModelResult GraphModel::predict_single_impl(
       }
     }
   }
-
-  // Register common inputs
   interp_.set_input("species", species_t);
   interp_.set_input("neighbor_species", neighbor_species_t);
   interp_.set_input("edge_vectors", edge_vectors_t);
   interp_.set_input("padding_mask", padding_mask_t);
   if (plato) plato->set_padding_mask(padding_mask_t), plato->set_fused_frames(true);
   interp_.set_input("reverse_neighbor_index", reverse_neighbor_index_t);
-
-  // Register mode-specific inputs
   if (!forces_mode_) {
-    ggml_backend_tensor_set(edge_distances_t, ed_data.data(), 0,
-                            ed_data.size() * sizeof(float));
-    ggml_backend_tensor_set(cutoff_factors_t, cf_data.data(), 0,
-                            cf_data.size() * sizeof(float));
     interp_.set_input("edge_distances", edge_distances_t);
     interp_.set_input("cutoff_factors", cutoff_factors_t);
   } else {
-    ggml_backend_tensor_set(cutoff_values_t, cv_data.data(), 0,
-                            cv_data.size() * sizeof(float));
     interp_.set_input("cutoff_values", cutoff_values_t);
   }
 
   profile.mark("inputs");
-  // --- Build and compute ---
-  ggml_context *compute_ctx = ggml_init({COMPUTE_CTX_SIZE, nullptr, true});
-  std::unique_ptr<ggml_context, decltype(&ggml_free)> compute_owner(compute_ctx,
-                                                                    ggml_free);
+  // --- Build ---
+  ggml_context *compute_ctx = pg->compute_ctx = ggml_init({COMPUTE_CTX_SIZE, nullptr, true});
   if (!compute_ctx) {
     throw std::runtime_error("Failed to create compute context");
   }
 
-  ggml_tensor *lr_charges = nullptr, *lr_potentials = nullptr,
-              *lr_charge_adjoint = nullptr;
   interp_.coulomb_application = {};
   if (p3m_) {
     interp_.coulomb_application = [&](ggml_context *ctx, ggml_tensor *charges) {
@@ -1563,7 +1565,6 @@ ModelResult GraphModel::predict_single_impl(
       return lr_potentials;
     };
   }
-  ggml_tensor *output = nullptr;
   interp_.set_input_gradients(compute_forces);
   try {
     output = interp_.build(compute_ctx);
@@ -1584,7 +1585,6 @@ ModelResult GraphModel::predict_single_impl(
     throw std::runtime_error("Failed to build computation graph");
   }
   // nc-force models output [n_atoms, 4] = (energy | force): split the columns
-  ggml_tensor *nc_output = nullptr;
   if (nc_forces_) {
     ggml_tensor *full = output;
     output = ggml_cont(compute_ctx, ggml_view_2d(compute_ctx, full, 1, n_atoms, full->nb[1], 0));
@@ -1593,14 +1593,12 @@ ModelResult GraphModel::predict_single_impl(
     ggml_set_output(nc_output);
   }
   ggml_set_output(output);
-  ggml_tensor *latent_q = plato ? plato->charges() : nullptr;
+  latent_q = plato ? plato->charges() : nullptr;
   if (latent_q) ggml_set_output(latent_q);
-
-  ggml_cgraph *cgraph = nullptr;
 
   if (backward) {
     // Build forward + backward graph
-    ggml_tensor *total_energy = atom_w_t ? ggml_sum(compute_ctx, ggml_mul(compute_ctx, output,
+    ggml_tensor *total_energy = loss_t = atom_w_t ? ggml_sum(compute_ctx, ggml_mul(compute_ctx, output,
                                                                           ggml_reshape(compute_ctx, atom_w_t, output)))
                                          : ggml_sum(compute_ctx, output);
     // Seed the backbone with the native solver's charge adjoint in a second
@@ -1610,6 +1608,7 @@ ModelResult GraphModel::predict_single_impl(
           ggml_add(compute_ctx, total_energy,
                    ggml_sum(compute_ctx, ggml_mul(compute_ctx, lr_charges,
                                                   lr_charge_adjoint)));
+    loss_t = total_energy;
     ggml_set_loss(total_energy);
     ggml_set_output(total_energy);
 
@@ -1630,6 +1629,8 @@ ModelResult GraphModel::predict_single_impl(
       if (lr_grad)
         ggml_set_output(lr_grad);
     }
+    if (cutoff_values_t && (cutoff_values_t->flags & GGML_TENSOR_FLAG_PARAM))
+      if (ggml_tensor *g = ggml_graph_get_grad(cgraph, cutoff_values_t)) ggml_set_output(g); // (read back below)
     ggml_tensor *grad = ggml_graph_get_grad(cgraph, edge_vectors_t);
     if (grad) {
       ggml_set_output(grad);
@@ -1648,27 +1649,131 @@ ModelResult GraphModel::predict_single_impl(
     if (nc_output) ggml_build_forward_expand(cgraph, nc_output);
   }
 
-  ggml_cgraph *charge_graph = nullptr;
   if (lr_charges) {
     charge_graph = ggml_new_graph_custom(compute_ctx, 32768, false);
     ggml_build_forward_expand(charge_graph, lr_charges);
   }
-  ggml_backend_buffer_t compute_buffer =
-      ggml_backend_alloc_ctx_tensors(compute_ctx, compute_backend_);
-  std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)>
-      compute_buffer_owner(compute_buffer, ggml_backend_buffer_free);
-  if (!compute_buffer) {
-    throw std::runtime_error("Failed to allocate compute buffer");
+  size_t compute_bytes = 0;
+  if (keep_graph) {
+    // a kept graph: its own allocator (memory reused along the graph, as the cached path's; every tensor read back
+    // is an output), the constants and the loss seed in a buffer of their own, which the allocator does not reuse
+    std::vector<std::pair<ggml_tensor *, float>> constants = interp_.take_constants();
+    if (loss_t)
+      if (ggml_tensor *acc = ggml_graph_get_grad_acc(cgraph, loss_t)) constants.emplace_back(acc, 1.0f);
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(compute_backend_);
+    const size_t align = ggml_backend_buft_get_alignment(buft);
+    size_t size = 0;
+    std::vector<size_t> offset;
+    for (auto &c : constants) {
+      ggml_set_input(c.first);
+      offset.push_back(size);
+      size += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, c.first), align);
+    }
+    if (!constants.empty()) {
+      pg->const_buffer = ggml_backend_buft_alloc_buffer(buft, size);
+      if (!pg->const_buffer) throw std::runtime_error("Failed to allocate the graph constants");
+      char *base = static_cast<char *>(ggml_backend_buffer_get_base(pg->const_buffer));
+      for (size_t k = 0; k < constants.size(); k++)
+        ggml_backend_tensor_alloc(pg->const_buffer, constants[k].first, base + offset[k]);
+    }
+    pg->galloc = ggml_gallocr_new(buft);
+    if (!pg->galloc || !ggml_gallocr_alloc_graph(pg->galloc, cgraph))
+      throw std::runtime_error("Failed to allocate compute buffer");
+    std::vector<float> staging;
+    for (auto &[t, value] : constants) {
+      staging.assign(ggml_nelements(t), value);
+      ggml_backend_tensor_set(t, staging.data(), 0, ggml_nbytes(t));
+    }
+    compute_bytes = size + ggml_gallocr_get_buffer_size(pg->galloc, 0);
+  } else {
+    ggml_backend_buffer_t compute_buffer = pg->compute_buffer =
+        ggml_backend_alloc_ctx_tensors(compute_ctx, compute_backend_);
+    if (!compute_buffer) {
+      throw std::runtime_error("Failed to allocate compute buffer");
+    }
+    interp_.init_constants();
+    compute_bytes = ggml_backend_buffer_get_size(compute_buffer);
   }
+  pg->species = species_t, pg->neighbor_species = neighbor_species_t, pg->edge_vectors = edge_vectors_t;
+  pg->padding_mask = padding_mask_t, pg->reverse = reverse_neighbor_index_t;
+  pg->charge_index = charge_index_t, pg->spin_index = spin_index_t, pg->charge_index_unit = charge_index_unit_t;
+  pg->cond_blend = cond_blend_t, pg->atom_w = atom_w_t;
+  pg->edge_distances = edge_distances_t, pg->cutoff_factors = cutoff_factors_t, pg->cutoff_values = cutoff_values_t;
+  pg->output = output, pg->nc_output = nc_output, pg->latent_q = latent_q, pg->cgraph = cgraph;
+  pg->forces = compute_forces;
+  pg->bytes = ggml_backend_buffer_get_size(input_buffer) + compute_bytes;
+  if (profile.enabled) std::fprintf(stderr, "GRAPH_PLAIN bytes=%.1f MiB nodes=%d\n", pg->bytes / 1048576.0, ggml_graph_n_nodes(cgraph));
+  // keep it (most recent first; at most kMaxPlainGraphs graphs and kMaxPlainBytes device bytes)
+  constexpr size_t kMaxPlainGraphs = 8, kMaxPlainBytes = size_t(512) << 20;
+  if (keep_graph && pg->bytes <= kMaxPlainBytes) {
+    plain_graphs_.insert(plain_graphs_.begin(), std::move(fresh));
+    size_t total = 0, k = 0;
+    for (; k < plain_graphs_.size(); k++) {
+      total += plain_graphs_[k]->bytes;
+      if (k >= kMaxPlainGraphs || total > kMaxPlainBytes) break;
+    }
+    plain_graphs_.resize(k);
+  }
+  } else {
+    species_t = pg->species, neighbor_species_t = pg->neighbor_species, edge_vectors_t = pg->edge_vectors;
+    padding_mask_t = pg->padding_mask, reverse_neighbor_index_t = pg->reverse;
+    charge_index_t = pg->charge_index, spin_index_t = pg->spin_index, charge_index_unit_t = pg->charge_index_unit;
+    cond_blend_t = pg->cond_blend, atom_w_t = pg->atom_w;
+    edge_distances_t = pg->edge_distances, cutoff_factors_t = pg->cutoff_factors, cutoff_values_t = pg->cutoff_values;
+    output = pg->output, nc_output = pg->nc_output, latent_q = pg->latent_q, cgraph = pg->cgraph;
+    compute_forces = pg->forces;
+    profile.mark("inputs");
+  }
+  PetPlatoLR *plato = pg->plato.get();
 
-  interp_.init_constants();
+  // --- Upload the inputs (every call) ---
+  // asynchronous copies on the compute backend's stream and one synchronisation (a synchronous copy per tensor waited
+  // for a time slice of a shared GPU each)
+  auto set_in = [&](ggml_tensor *t, const void *data, size_t bytes) {
+    ggml_backend_tensor_set_async(compute_backend_, t, data, 0, bytes);
+  };
+  set_in(species_t, species_data.data(), species_data.size() * sizeof(int32_t));
+  set_in(neighbor_species_t, ns_data.data(), ns_data.size() * sizeof(int32_t));
+  set_in(edge_vectors_t, ev_data.data(), ev_data.size() * sizeof(float));
+  set_in(padding_mask_t, pm_data.data(), pm_data.size() * sizeof(float));
+  set_in(reverse_neighbor_index_t, rni_data.data(), rni_data.size() * sizeof(int32_t));
+  if (coulomb_t) set_in(coulomb_t, coulomb.matrix.data(), coulomb.matrix.size() * sizeof(float));
+  if (atom_w_t) {
+    if (atom_w_.size() != static_cast<size_t>(n_atoms)) throw std::logic_error("atom energy weights: atom count");
+    set_in(atom_w_t, atom_w_.data(), atom_w_.size() * sizeof(float));
+  }
+  std::vector<int32_t> cond_rows, cond_spin, cond_rows_unit; // (alive until the synchronisation below)
+  std::vector<float> cond_bl;
+  if (conditioning_.enabled) {
+    const auto [ci, si] = conditioning_.rows(system.charge(), system.spin_multiplicity());
+    (void)ci;
+    cond_rows = charge_rows(n_atoms, system.charge(), system.spin_multiplicity()), cond_spin.assign(n_atoms, si);
+    set_in(charge_index_t, cond_rows.data(), cond_rows.size() * sizeof(int32_t));
+    set_in(spin_index_t, cond_spin.data(), cond_spin.size() * sizeof(int32_t));
+    if (charge_index_unit_t) {
+      cond_rows_unit = charge_rows(n_atoms, system.charge(), system.spin_multiplicity(), true);
+      set_in(charge_index_unit_t, cond_rows_unit.data(), cond_rows_unit.size() * sizeof(int32_t));
+      if (cond_blend_t) {
+        cond_bl.assign(n_atoms, 0.0f);
+        if (!lrc_blend_.empty()) cond_bl = lrc_blend_;
+        set_in(cond_blend_t, cond_bl.data(), cond_bl.size() * sizeof(float));
+      }
+    }
+  }
+  if (!forces_mode_) {
+    set_in(edge_distances_t, ed_data.data(), ed_data.size() * sizeof(float));
+    set_in(cutoff_factors_t, cf_data.data(), cf_data.size() * sizeof(float));
+  } else {
+    set_in(cutoff_values_t, cv_data.data(), cv_data.size() * sizeof(float));
+  }
   if (plato && plato->needs_neighbor_index()) {
     std::vector<int32_t> nbr(neighbor_atoms_vec.begin(), neighbor_atoms_vec.end());
     for (auto &j : nbr) j = std::max(j, 0);
     plato->set_neighbor_index(std::move(nbr));
   }
-  if (plato) plato->upload(system.positions()); // again: the inputs made while building
-  profile.mark("build_allocate");
+  if (plato) plato->upload(system.positions(), compute_backend_); // the inputs made while building too
+  ggml_backend_synchronize(compute_backend_);
+  profile.mark(rebuilt ? "build_allocate" : "upload");
 
   P3MResult mesh_result;
   std::vector<float> charge_values;
