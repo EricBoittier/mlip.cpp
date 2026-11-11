@@ -418,6 +418,11 @@ bool GraphModel::load_from_gguf(const std::string &path) {
     iris_lr_.temperature = loader.get_float32("pet.iris_lr.charge_temperature", 0.1f);
     iris_lr_.iterations = loader.get_int32("pet.iris_lr.fermi_iterations", 40);
     iris_lr_.eps = loader.get_float32("pet.iris_lr.fermi_eps", 1e-6f);
+    iris_lr_.num_k = loader.get_int32("pet.iris_lr.num_k", 0);
+    iris_lr_.smearing = loader.get_float32("pet.iris_lr.smearing", 0.0f);
+    iris_lr_.slab_margin = loader.get_float32("pet.iris_lr.slab_margin", 2.0f);
+    if (loader.get_int32("pet.iris_lr.halfspace", 1) != 1)
+      throw std::runtime_error("pet.iris_lr.halfspace = 0: only his default halfspace k grid is ported");
     if (iris_lr_.reference != "fermi" && iris_lr_.reference != "species" && iris_lr_.reference != "both")
       throw std::runtime_error("pet.iris_lr.reference: " + iris_lr_.reference);
     if (iris_lr_.n_out != 8) throw std::runtime_error("pet.iris_lr.n_out != 8");
@@ -511,6 +516,11 @@ bool GraphModel::load_from_gguf(const std::string &path) {
     throw std::runtime_error("No graph.json found in GGUF file");
   }
   interp_.load_graph(graph_json);
+  if (iris_lr_.enabled) {
+    iris_lr_.graph_open = graph_json;
+    iris_lr_.graph_pbc = loader.get_string("graph_pbc.json", "");
+    iris_lr_.pbc_loaded = false;
+  }
   scores_interp_ = GraphInterpreter();
   if (iris_lr_.enabled && iris_lr_.reference != "species") {
     const std::string sj = loader.get_string("graph_scores.json", "");
@@ -1326,10 +1336,88 @@ ModelResult GraphModel::predict_single_impl(
   ggml_tensor *iris_nbr = nullptr, *iris_pos = nullptr, *iris_Q = nullptr, *iris_mu = nullptr,
               *iris_gapped = nullptr, *iris_mround = nullptr, *iris_top = nullptr, *iris_bottom = nullptr,
               *iris_r0 = nullptr;
+  // periodic cells: his jax-pme Ewald (graph_pbc.json): the real-space list at rc + skin in [n, n_lr] slots, the
+  // halfspace k vectors, the volume; lattice shifts S @ cell, k vectors and volume are gradient inputs (virial)
+  ggml_tensor *ew_index = nullptr, *ew_shift = nullptr, *ew_keep = nullptr, *ew_kvec = nullptr, *ew_vol = nullptr,
+              *ew_smear = nullptr, *ew_cut = nullptr, *ew_slab = nullptr, *ew_normal = nullptr, *ew_basis = nullptr;
+  std::vector<int32_t> ew_index_d;
+  std::vector<float> ew_shift_d, ew_keep_d, ew_kvec_d, ew_scalars(5, 0.f), ew_normal_d(3, 0.f);
+  std::vector<int32_t> ew_S;                // integer lattice shift of each slot (virial)
+  std::vector<std::array<int, 3>> ew_kgrid; // integer k of each k vector (virial)
+  double ew_h[3][3] = {};                   // the cell the Ewald maths uses
+  int ew_slab_axis = -1;
+  bool iris_pbc = false;
   if (iris_lr_.enabled) {
-    if (const Cell *c = system.cell())
-      if (c->periodic[0] || c->periodic[1] || c->periodic[2])
-        throw std::runtime_error("iris PET-LR: periodic structures are not yet ported (open boundaries only)");
+    const Cell *c = system.cell();
+    iris_pbc = c && (c->periodic[0] || c->periodic[1] || c->periodic[2]);
+    if (iris_pbc && iris_lr_.graph_pbc.empty())
+      throw std::runtime_error("iris PET-LR: periodic structure but the GGUF has no graph_pbc.json (re-export)");
+    if (iris_pbc != iris_lr_.pbc_loaded) {
+      interp_.load_graph(iris_pbc ? iris_lr_.graph_pbc : iris_lr_.graph_open);
+      iris_lr_.pbc_loaded = iris_pbc;
+    }
+    if (iris_pbc) {
+      double cell[3][3];
+      bool pbc[3];
+      for (int a = 0; a < 3; a++) {
+        pbc[a] = c->periodic[a];
+        for (int b = 0; b < 3; b++) cell[a][b] = c->matrix[a][b];
+      }
+      std::vector<double> pos(system.positions(), system.positions() + 3 * size_t(n_atoms));
+      const iris::EwaldSetup es = iris::ewald_setup(cell, pbc, pos.data(), n_atoms, iris_lr_.num_k,
+                                                    iris_lr_.smearing, iris_lr_.slab_margin);
+      // full real-space list at rc + skin (his half list at rc + skin, both directions); r < rc masked in-graph
+      NeighborList lr = NeighborListBuilder(NeighborListOptions{float(es.cutoff + 0.5), true, false}).build(system);
+      std::vector<int> cnt(n_atoms, 0);
+      for (int p = 0; p < lr.num_pairs(); p++) cnt[lr.centers[p]]++;
+      const int kl = std::max(1, *std::max_element(cnt.begin(), cnt.end()));
+      ew_index_d.assign(size_t(n_atoms) * kl, 0), ew_keep_d.assign(size_t(n_atoms) * kl, 0.f);
+      ew_shift_d.assign(size_t(n_atoms) * kl * 3, 0.f);
+      ew_S.assign(size_t(n_atoms) * kl * 3, 0);
+      ew_kgrid = es.k_grid, ew_slab_axis = es.slab ? es.slab_axis : -1;
+      for (int a = 0; a < 3; a++)
+        for (int b = 0; b < 3; b++) ew_h[a][b] = es.cellc[a][b];
+      std::fill(cnt.begin(), cnt.end(), 0);
+      for (int p = 0; p < lr.num_pairs(); p++) {
+        const int i = lr.centers[p];
+        const size_t sl = size_t(i) * kl + cnt[i]++;
+        ew_index_d[sl] = lr.neighbors[p], ew_keep_d[sl] = 1.f;
+        for (int a = 0; a < 3; a++) ew_S[3 * sl + a] = lr.cell_shifts[p][a];
+        for (int b = 0; b < 3; b++) {
+          double v = 0;
+          for (int a = 0; a < 3; a++) v += lr.cell_shifts[p][a] * es.cellc[a][b];
+          ew_shift_d[3 * sl + b] = float(v);
+        }
+      }
+      const auto &h = es.cellc;
+      const double det = h[0][0] * (h[1][1] * h[2][2] - h[1][2] * h[2][1]) -
+                         h[0][1] * (h[1][0] * h[2][2] - h[1][2] * h[2][0]) +
+                         h[0][2] * (h[1][0] * h[2][1] - h[1][1] * h[2][0]);
+      double rec[3][3]; // rows b_i = 2 pi (a_j x a_k) / det: 2 pi inv(cell)^T
+      for (int i = 0; i < 3; i++) {
+        const double *aj = h[(i + 1) % 3], *ak = h[(i + 2) % 3];
+        rec[i][0] = 2 * M_PI * (aj[1] * ak[2] - aj[2] * ak[1]) / det;
+        rec[i][1] = 2 * M_PI * (aj[2] * ak[0] - aj[0] * ak[2]) / det;
+        rec[i][2] = 2 * M_PI * (aj[0] * ak[1] - aj[1] * ak[0]) / det;
+      }
+      ew_kvec_d.resize(3 * es.k_grid.size());
+      for (size_t m = 0; m < es.k_grid.size(); m++)
+        for (int b = 0; b < 3; b++)
+          ew_kvec_d[3 * m + b] = float(es.k_grid[m][0] * rec[0][b] + es.k_grid[m][1] * rec[1][b] + es.k_grid[m][2] * rec[2][b]);
+      ew_scalars = {float(std::fabs(det)), float(es.smearing), float(es.cutoff), es.slab ? 1.f : 0.f, 0.f};
+      if (es.slab) {
+        const int k = es.slab_axis;
+        const double *v1 = h[(k + 1) % 3], *v2 = h[(k + 2) % 3];
+        double nh[3] = {v1[1] * v2[2] - v1[2] * v2[1], v1[2] * v2[0] - v1[0] * v2[2], v1[0] * v2[1] - v1[1] * v2[0]};
+        const double nn = std::sqrt(nh[0] * nh[0] + nh[1] * nh[1] + nh[2] * nh[2]);
+        for (int b = 0; b < 3; b++) ew_normal_d[b] = float(nh[b] / nn);
+        ew_scalars[4] = float(std::fabs((h[k][0] * nh[0] + h[k][1] * nh[1] + h[k][2] * nh[2]) / nn));
+      }
+      interp_.set_dimension("n_lr", kl);
+      interp_.set_dimension("n_kvec", int64_t(es.k_grid.size()));
+    }
+  }
+  if (iris_lr_.enabled) {
     auto mk = [&](ggml_tensor *t, const char *name) { ggml_set_name(t, name); return t; };
     iris_nbr = mk(ggml_new_tensor_2d(input_ctx, GGML_TYPE_I32, max_neighbors, n_atoms), "neighbor_index");
     iris_pos = mk(ggml_new_tensor_2d(input_ctx, GGML_TYPE_F32, 3, n_atoms), "positions");
@@ -1341,6 +1429,21 @@ ModelResult GraphModel::predict_single_impl(
     iris_top = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, n_atoms), "top");
     iris_bottom = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, n_atoms), "bottom");
     iris_r0 = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, 3), "dipole_origin");
+    if (iris_pbc) {
+      const int64_t kl = int64_t(ew_keep_d.size()) / n_atoms, K = int64_t(ew_kvec_d.size()) / 3;
+      ew_index = mk(ggml_new_tensor_2d(input_ctx, GGML_TYPE_I32, kl, n_atoms), "lr_index");
+      ew_shift = mk(ggml_new_tensor_3d(input_ctx, GGML_TYPE_F32, 3, kl, n_atoms), "lr_shift");
+      ew_keep = mk(ggml_new_tensor_2d(input_ctx, GGML_TYPE_F32, kl, n_atoms), "lr_keep");
+      ew_kvec = mk(ggml_new_tensor_2d(input_ctx, GGML_TYPE_F32, 3, K), "kvec");
+      ew_vol = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, 1), "volume");
+      ew_smear = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, 1), "smearing");
+      ew_cut = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, 1), "cutoff");
+      ew_slab = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, 1), "slab");
+      ew_normal = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, 3), "slab_normal");
+      ew_basis = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, 1), "slab_basis");
+      if (compute_forces)
+        for (ggml_tensor *t : {ew_shift, ew_kvec, ew_vol, ew_normal, ew_basis}) ggml_set_param(t);
+    }
   }
 
   // Allocate input buffer
@@ -1544,6 +1647,17 @@ ModelResult GraphModel::predict_single_impl(
       ggml_backend_tensor_set(t, zeros.data(), 0, zeros.size() * sizeof(float));
     for (ggml_tensor *t : {iris_nbr, iris_pos, iris_Q, iris_mu, iris_gapped, iris_mround, iris_top, iris_bottom, iris_r0})
       interp_.set_input(ggml_get_name(t), t);
+    if (iris_pbc) {
+      ggml_backend_tensor_set(ew_index, ew_index_d.data(), 0, ew_index_d.size() * sizeof(int32_t));
+      ggml_backend_tensor_set(ew_shift, ew_shift_d.data(), 0, ew_shift_d.size() * sizeof(float));
+      ggml_backend_tensor_set(ew_keep, ew_keep_d.data(), 0, ew_keep_d.size() * sizeof(float));
+      ggml_backend_tensor_set(ew_kvec, ew_kvec_d.data(), 0, ew_kvec_d.size() * sizeof(float));
+      ggml_tensor *sc[5] = {ew_vol, ew_smear, ew_cut, ew_slab, ew_basis};
+      for (int i = 0; i < 5; i++) ggml_backend_tensor_set(sc[i], &ew_scalars[i], 0, sizeof(float));
+      ggml_backend_tensor_set(ew_normal, ew_normal_d.data(), 0, 3 * sizeof(float));
+      for (ggml_tensor *t : {ew_index, ew_shift, ew_keep, ew_kvec, ew_vol, ew_smear, ew_cut, ew_slab, ew_normal, ew_basis})
+        interp_.set_input(ggml_get_name(t), t);
+    }
     // the scores graph reads the trunk's inputs, by name
     if (scores_interp_.has_graph())
       for (const auto &in : scores_interp_.graph().inputs) {
@@ -1666,6 +1780,8 @@ ModelResult GraphModel::predict_single_impl(
     ggml_tensor *grad = ggml_graph_get_grad(cgraph, edge_vectors_t);
     ggml_tensor *pos_grad = iris_pos ? ggml_graph_get_grad(cgraph, iris_pos) : nullptr;
     if (pos_grad) ggml_set_output(pos_grad);
+    for (ggml_tensor *t : {ew_shift, ew_kvec, ew_vol, ew_normal, ew_basis})
+      if (ggml_tensor *g = t ? ggml_graph_get_grad(cgraph, t) : nullptr) ggml_set_output(g);
     if (grad) {
       ggml_set_output(grad);
     } else if (!pos_grad) {
@@ -1954,6 +2070,77 @@ ModelResult GraphModel::predict_single_impl(
           std::vector<float> gp(3 * size_t(n_atoms));
           ggml_backend_tensor_get(g, gp.data(), 0, gp.size() * sizeof(float));
           for (int i = 0; i < n_atoms * 3; i++) result.forces[i] -= gp[i];
+          if (iris_pbc) { // the Ewald virial (row-major, as plato_geps): his predict stress
+            // sum_i r_a dE/dr_b + (h^T dE/dh)_ab, with dE/dh through the graph inputs that depend on the cell h the
+            // Ewald maths uses: shifts S @ h, k = n @ 2 pi h^-T, V = |det h|, a slab's normal and basis; a slab's
+            // effective (non-periodic) row is a constant (his compose_cell). The edge-vector terms follow below.
+            // scripts/pet_lr_port/check_pbc64.py checks this sum against the strain derivative (fp64, 1e-15).
+            std::vector<double> w(9, 0.0);
+            double G[3][3] = {};
+            auto grad = [&](ggml_tensor *t, size_t n) {
+              std::vector<float> d(n, 0.f);
+              if (ggml_tensor *g = t ? ggml_graph_get_grad(cgraph, t) : nullptr)
+                ggml_backend_tensor_get(g, d.data(), 0, n * sizeof(float));
+              return d;
+            };
+            const float *x = system.positions();
+            for (int i = 0; i < n_atoms; i++)
+              for (int a = 0; a < 3; a++)
+                for (int b = 0; b < 3; b++) w[3 * a + b] += double(x[3 * i + a]) * gp[3 * i + b];
+            const std::vector<float> gs = grad(ew_shift, ew_shift_d.size());
+            for (size_t sl = 0; sl < ew_keep_d.size(); sl++)
+              if (ew_keep_d[sl] > 0.f)
+                for (int a = 0; a < 3; a++)
+                  for (int b = 0; b < 3; b++) G[a][b] += double(ew_S[3 * sl + a]) * gs[3 * sl + b];
+            const auto &h = ew_h;
+            const double det = h[0][0] * (h[1][1] * h[2][2] - h[1][2] * h[2][1]) -
+                               h[0][1] * (h[1][0] * h[2][2] - h[1][2] * h[2][0]) +
+                               h[0][2] * (h[1][0] * h[2][1] - h[1][1] * h[2][0]);
+            double X[3][3]; // inv(h)
+            for (int i = 0; i < 3; i++)
+              for (int j = 0; j < 3; j++) {
+                const int i1 = (j + 1) % 3, i2 = (j + 2) % 3, j1 = (i + 1) % 3, j2 = (i + 2) % 3;
+                X[i][j] = (h[i1][j1] * h[i2][j2] - h[i1][j2] * h[i2][j1]) / det;
+              }
+            const std::vector<float> gk = grad(ew_kvec, ew_kvec_d.size());
+            double dR[3][3] = {}; // dE/dR, R = 2 pi h^-T (rows), k = n @ R
+            for (size_t m = 0; m < ew_kgrid.size(); m++)
+              for (int i = 0; i < 3; i++)
+                for (int b = 0; b < 3; b++) dR[i][b] += double(ew_kgrid[m][i]) * gk[3 * m + b];
+            // dE/dX = 2 pi dR^T; dE/dh = -X^T (dE/dX) X^T
+            for (int a = 0; a < 3; a++)
+              for (int b = 0; b < 3; b++) {
+                double v = 0;
+                for (int p = 0; p < 3; p++)
+                  for (int q = 0; q < 3; q++) v += X[p][a] * 2 * M_PI * dR[q][p] * X[b][q];
+                G[a][b] -= v;
+              }
+            const double gV = grad(ew_vol, 1)[0];
+            for (int a = 0; a < 3; a++)
+              for (int b = 0; b < 3; b++) G[a][b] += gV * std::fabs(det) * X[b][a];
+            if (ew_slab_axis >= 0) { // n = c / |c|, c = a1 x a2; basis = |h_k . n|
+              const int k = ew_slab_axis;
+              const double *a1 = h[(k + 1) % 3], *a2 = h[(k + 2) % 3];
+              const double c[3] = {a1[1] * a2[2] - a1[2] * a2[1], a1[2] * a2[0] - a1[0] * a2[2],
+                                   a1[0] * a2[1] - a1[1] * a2[0]};
+              const double cn = std::sqrt(c[0] * c[0] + c[1] * c[1] + c[2] * c[2]);
+              const double nh[3] = {c[0] / cn, c[1] / cn, c[2] / cn};
+              const double hk_n = h[k][0] * nh[0] + h[k][1] * nh[1] + h[k][2] * nh[2];
+              const std::vector<float> gn0 = grad(ew_normal, 3);
+              const double gb = grad(ew_basis, 1)[0];
+              double gn[3], gc[3];
+              for (int b = 0; b < 3; b++) gn[b] = gn0[b] + gb * (hk_n >= 0 ? 1.0 : -1.0) * h[k][b];
+              const double ngn = nh[0] * gn[0] + nh[1] * gn[1] + nh[2] * gn[2];
+              for (int b = 0; b < 3; b++) gc[b] = (gn[b] - nh[b] * ngn) / cn;
+              const double r1[3] = {a2[1] * gc[2] - a2[2] * gc[1], a2[2] * gc[0] - a2[0] * gc[2], a2[0] * gc[1] - a2[1] * gc[0]};
+              const double r2[3] = {gc[1] * a1[2] - gc[2] * a1[1], gc[2] * a1[0] - gc[0] * a1[2], gc[0] * a1[1] - gc[1] * a1[0]};
+              for (int b = 0; b < 3; b++) G[(k + 1) % 3][b] += r1[b], G[(k + 2) % 3][b] += r2[b], G[k][b] = 0;
+            }
+            for (int a = 0; a < 3; a++)
+              for (int b = 0; b < 3; b++)
+                for (int A = 0; A < 3; A++) w[3 * a + b] += h[A][a] * G[A][b];
+            plato_geps.assign(w.begin(), w.end()); // (no Plato branch in an iris model: the slot is free)
+          }
         }
 
       // MLIPCPP_FORCE_SPLIT=<file>: append this structure's force pieces (diagnostics, parity work): n, k, the

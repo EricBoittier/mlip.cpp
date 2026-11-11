@@ -29,7 +29,7 @@ import yaml
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
 from petjax_convert import PETJAX_CONVERT, load_petjax_convert  # noqa: E402
-from iris_torch import IrisLR, IrisPETLRGraph, IrisScoresGraph, IrisTrunk  # noqa: E402
+from iris_torch import IrisLR, IrisPETLRGraph, IrisPETLRGraphPBC, IrisScoresGraph, IrisTrunk  # noqa: E402
 
 SUPPORTED = {"d_pet", "d_node", "d_head", "d_feedforward", "num_heads", "num_attention_layers", "num_gnn_layers",
              "cutoff", "cutoff_width", "cutoff_width_adaptive", "adaptive_cutoff_method", "num_neighbors_adaptive",
@@ -165,7 +165,7 @@ def main():
     dtypes = {"species": "i32", "neighbor_species": "i32", "reverse_neighbor_index": "i32",
               "charge_index": "i32", "spin_index": "i32", "neighbor_index": "i32"}
     energy_scale = float(np.asarray(sr["energy_scale"]).reshape(()))
-    graph_scores = None
+    graph_scores = graph_pbc = None
     if a.lr:
         if not cfg.get("lr"):
             raise ValueError("--lr: the checkpoint has no LR branch (lr: false)")
@@ -191,6 +191,20 @@ def main():
         shapes = shapes[:3] + (shapes[3] + (dict(nk), {0: atom}, None, None, None, {0: atom}, {0: atom}, {0: atom},
                                             None),)
         model_export = export
+        # the periodic graph (his jax-pme Ewald), same parameters
+        kl, K = 13, 17
+        n_lr, n_kvec = torch.export.Dim("n_lr", min=1, max=100000), torch.export.Dim("n_kvec", min=1, max=100000)
+        ew_in = (torch.zeros(n, kl, dtype=torch.long), torch.randn(n, kl, 3, generator=g), torch.ones(n, kl),
+                 torch.randn(K, 3, generator=g), torch.ones(1) * 1000.0, torch.ones(1) * 2.0, torch.ones(1) * 8.0,
+                 torch.zeros(1), torch.tensor([0.0, 0.0, 1.0]), torch.ones(1))
+        ew_shapes = ({0: atom, 1: n_lr}, {0: atom, 1: n_lr}, {0: atom, 1: n_lr}, {0: n_kvec}, None, None, None, None,
+                     None, None)
+        export_pbc = IrisPETLRGraphPBC(model, lr, energy_scale).eval()
+        pdtypes = dict(dtypes, lr_index="i32")
+        graph_pbc, wpbc = export_checked(
+            export_torch_model, export_pbc, inputs + ew_in, output_path=None,
+            input_names=names + list(IrisPETLRGraphPBC.EWALD), input_dtypes=pdtypes,
+            dynamic_shapes=shapes[:3] + (shapes[3] + ew_shapes,), strict=False)
     else:
         model_export = model
     graph, weights = export_checked(
@@ -215,6 +229,15 @@ def main():
     unresolved = refs - set(weights)
     if unresolved:
         raise ValueError(f"graph reads weights that are not written: {sorted(unresolved)[:5]}")
+    if graph_pbc is not None:
+        prefs = {x[7:] for nd in graph_pbc.to_dict()["nodes"] for x in nd["inputs"] if x.startswith("weight:")}
+        missing = prefs - set(weights)
+        if missing:
+            raise ValueError(f"periodic graph reads weights the open graph does not write: {sorted(missing)[:5]}")
+        for nd in graph_pbc.to_dict()["nodes"]:  # integer inputs never arithmetic operands (as above)
+            if nd["op"] in ("ADD", "SUB", "MUL", "DIV", "POW", "MATMUL") and \
+                    {"input:lr_index", "input:species", "input:neighbor_index"} & set(nd["inputs"]):
+                raise ValueError(f"periodic graph node {nd['id']} {nd['op']} {nd['inputs']}: integer operand")
     if graph_scores is not None:
         sweights = {(k.lower() if k.lower() in weights and k not in weights else k): v for k, v in sweights.items()}
         missing = set(sweights) - set(weights)
@@ -232,6 +255,8 @@ def main():
         json.dump(graph.to_dict(), open(a.dump_json + ".graph.json", "w"))
         if graph_scores is not None:
             json.dump(graph_scores.to_dict(), open(a.dump_json + ".scores.json", "w"))
+        if graph_pbc is not None:
+            json.dump(graph_pbc.to_dict(), open(a.dump_json + ".pbc.json", "w"))
     w = GGUFWriter()
     w.add_string("general.architecture", "pet-graph")
     w.add_string("general.name", f"iris-petlr:{Path(a.ckpt).resolve()}")
@@ -255,6 +280,14 @@ def main():
         w.add_string("pet.iris_lr.dipole_origin", "center_of_mass")
         if graph_scores is not None:
             w.add_string("graph_scores.json", json.dumps(graph_scores.to_dict()))
+        if graph_pbc is not None:  # his calculator's Ewald settings (Calculator.from_checkpoint: the sampler's)
+            w.add_string("graph_pbc.json", json.dumps(graph_pbc.to_dict()))
+            ts = (yaml.safe_load(open(f"{a.ckpt}/config.yaml"))["training_pipeline"]["to_sample"]
+                  if Path(f"{a.ckpt}/config.yaml").exists() else {})
+            w.add_int32("pet.iris_lr.num_k", int(ts.get("num_k") or 0))
+            w.add_float32("pet.iris_lr.smearing", float(ts.get("smearing") or 0.0))  # 0: 2 wavelength
+            w.add_int32("pet.iris_lr.halfspace", int(ts.get("halfspace", True)))
+            w.add_float32("pet.iris_lr.slab_margin", 2.0)
     w.add_string("pet.cutoff_function", "bump")
     w.add_int32("pet.forces_mode", 1)
     w.add_int32("pet.nc_forces", 0)

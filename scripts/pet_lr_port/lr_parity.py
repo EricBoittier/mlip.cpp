@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Full PETLR parity (after M. Langer, ipsum/PET-LR): mlip.cpp (pet.iris_lr GGUF, mlipcpp-eval JSON) and each of his
 fp32 runs, all against his fp64 (`ref_petlr.py --x64`), per output: energy (|dE| / sum|E_i|), forces
-(max|dF| / max|F|), charges (max|dq|), mu (|dmu|), dipole (max|dD| / max|D|), metallicity (|d|). Max over frames,
+(max|dF| / max|F|), virial (max|dW| / max|W|, periodic 3-D), charges (max|dq|), mu (|dmu|), dipole (max|dD| / max|D|), metallicity (|d|). Max over frames,
 the floor verdict against the max of his runs, and the paired per-frame P(mlip.cpp worse than his run) with its
 z score (n frames, 0.5 = same distribution).
 
@@ -12,7 +12,7 @@ import json
 
 import numpy as np
 
-KEYS = ("E", "F", "q", "q_rel", "mu", "dipole", "dipole_abs", "metallicity")
+KEYS = ("E", "F", "W", "q", "q_rel", "mu", "dipole", "dipole_abs", "metallicity")
 
 
 def per_frame(get, z):
@@ -28,12 +28,15 @@ def per_frame(get, z):
         e = z["atom/energy"][A]
         out["E"].append(abs(g["E"] - e.sum()) / np.abs(e).sum())
         out["F"].append(np.abs(g["F"] - z["forces"][A]).max() / np.abs(z["forces"][A]).max())
+        if "virial" in z.files and np.all(np.isfinite(z["virial"][f])) and g.get("W") is not None:
+            out["W"].append(np.abs(g["W"] - z["virial"][f]).max() / np.abs(z["virial"][f]).max())
+        periodic = "virial" in z.files and np.all(np.isfinite(z["virial"][f]))
         if "atom/charges" in z.files:
             out["q"].append(np.abs(g["q"] - z["atom/charges"][A]).max())
             out["q_rel"].append(out["q"][-1] / np.abs(z["atom/charges"][A]).max())
-            D = z["struct/dipole"][f]
-            out["dipole"].append(np.abs(g["dipole"] - D).max() / max(np.abs(D).max(), 1e-12))
-            out["dipole_abs"].append(np.abs(g["dipole"] - D).max())
+            D = z["struct/dipole"][f]  # (no dipole for a periodic cell: his calculator reports none)
+            out["dipole"].append(np.nan if periodic else np.abs(g["dipole"] - D).max() / max(np.abs(D).max(), 1e-12))
+            out["dipole_abs"].append(np.nan if periodic else np.abs(g["dipole"] - D).max())
         if "int/fermi_level" in z.files:
             out["mu"].append(abs(g["mu"] - z["int/fermi_level"][A][0]))
             out["metallicity"].append(abs(g["metallicity"] - z["struct/metallicity"][f]))
@@ -44,10 +47,13 @@ def from_cpp(path, z):
     fr = json.load(open(path))["frames"]
 
     def get(f, A):
+        if f >= len(fr):  # a shorter run (first frames only)
+            return None
         x = fr[f]
         if "error" in x:
             return None
         return dict(E=x["energy"], F=np.asarray(x["forces"]).reshape(-1, 3), q=np.asarray(x.get("charges", [])),
+                    W=np.asarray(x["virial"]).reshape(3, 3) if "virial" in x else None,
                     dipole=np.asarray(x.get("dipole", [np.nan] * 3)), mu=x.get("fermi_level", np.nan),
                     metallicity=x.get("metallicity", np.nan))
     return per_frame(get, z)
@@ -57,7 +63,7 @@ def from_ref(path, z):
     r = np.load(path)
 
     def get(f, A):
-        g = dict(E=r["atom/energy"][A].sum(), F=r["forces"][A])
+        g = dict(E=r["atom/energy"][A].sum(), F=r["forces"][A], W=r["virial"][f] if "virial" in r.files else None)
         if "atom/charges" in r.files:
             g.update(q=r["atom/charges"][A], dipole=r["struct/dipole"][f])
         if "int/fermi_level" in r.files:

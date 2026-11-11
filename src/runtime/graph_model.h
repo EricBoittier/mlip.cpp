@@ -177,6 +177,12 @@ public:
     double temperature = 0.1;
     int iterations = 40;
     double eps = 1e-6;
+    // periodic cells (his jax-pme tiled Ewald at the calculator's frozen parameters; graph_pbc.json)
+    int num_k = 0;                  // 0: no periodic graph
+    double smearing = 0;            // 0: 2 wavelength
+    double slab_margin = 2.0;
+    std::string graph_open, graph_pbc; // the two GIR graphs (same weights); interp_ holds one at a time
+    bool pbc_loaded = false;
   };
   const IrisLRSpec &iris_lr() const { return iris_lr_; }
   /// Plato-PET-LR components (GGUF pet.plato_lr.*; enabled false: a plain PET)

@@ -16,6 +16,12 @@ constexpr int64_t DIM_MAX_NEIGHBORS = -1000002;
 constexpr int64_t DIM_SEQ_LEN = -1000003;          // n_atoms * (max_neighbors + 1)
 constexpr int64_t DIM_N_EDGES = -1000004;          // n_atoms * max_neighbors
 constexpr int64_t DIM_MN_PLUS_ONE = -1000005;      // max_neighbors + 1
+// Further named dimensions (e.g. "n_lr", "n_kvec", "n_atoms*n_lr" of the iris PET-LR periodic graph): the i-th
+// distinct name seen while parsing gets the code DIM_NAMED_BASE - i. The interpreter resolves a name as the
+// product of its '*' factors (set_dimension names or integers) and leaves it -1 (the behaviour before named
+// dimensions) when a factor is not set or the name is not such a product.
+constexpr int64_t DIM_NAMED_BASE = -2000000;
+const std::string *named_dim(int64_t code); // nullptr if `code` is not a named dimension
 
 // Data types matching the Python GGMLDtype
 enum class GIRDtype { F32, F16, I32, I16, I8, BOOL };

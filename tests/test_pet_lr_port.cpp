@@ -228,3 +228,108 @@ TEST_CASE("pet_lr_port: iris PET-LR on atoms without neighbours keeps the Coulom
     iris_check(m, {0, 0, 0, 8.0f, 0.3f, -0.2f}, {11, 17}, 0, 2e-5, gapped ? -1.0 : 5e-6);
   }
 }
+
+// ---- periodic cells (his jax-pme tiled Ewald at the calculator's frozen parameters; graph_pbc.json) ----
+TEST_CASE("pet_lr_port: iris PET-LR in a 3-D cell and a slab: forces = -dE/dx and the virial = dE/d eps (FD)",
+          "[pet_lr_port]") {
+  // 3 waters of the jittered lattice in its 9 A cube: sparse enough that every atom keeps all its pairs within the
+  // 5 A trunk cutoff (the adaptive cutoff saturates), so the trunk list, and with it his Gaussian-charge SR
+  // correction (erfc / r on the SR edges: discontinuous where the selection changes), is fixed under the FD steps;
+  // ~50 eV total energies keep the fp32 FD noise ~1e-3 eV/A
+  std::vector<float> x;
+  std::vector<int32_t> Z;
+  float cell[9];
+  water_box(x, Z, cell);
+  x.resize(27), Z.resize(9);
+  const int n = int(Z.size());
+  for (const auto &[label, path] : lr_ggufs()) {
+    ModelOptions mo;
+    Predictor m(path, mo);
+    for (int slab = 0; slab < 2; slab++) {
+      INFO("model: " << label << (slab ? ", slab (pbc T T F, 22 A vacuum vector)" : ", 3-D cell"));
+      float c[9];
+      std::copy(cell, cell + 9, c);
+      if (slab) c[8] = 22.0f;
+      const bool pbc[3] = {true, true, !slab};
+      PredictOptions po;
+      po.compute_forces = true, po.compute_stress = true;
+      po.charge = 0, po.spin_multiplicity = 1;
+      const Result r = m.predict(n, x.data(), Z.data(), c, pbc, po);
+      REQUIRE(r.forces.size() == 3 * size_t(n));
+      REQUIRE(r.virial.size() == 9);
+      double qs = 0;
+      for (float q : r.charges) qs += q;
+      CHECK(std::fabs(qs) < 2e-4);
+      auto energy = [&](const std::vector<float> &y, const float *cc) {
+        PredictOptions p = po;
+        p.compute_forces = false, p.compute_stress = false;
+        return double(m.predict(n, y.data(), Z.data(), cc, pbc, p).energy);
+      };
+      // forces: the three coordinates of up to 5 atoms, Richardson from h = 2e-3 and 1e-3 A. His real-space Ewald sum
+      // drops pairs at r >= rc (a jump of ~erfc(2.83) q_i q_j / rc in the energy), and his forces are the
+      // derivative at a fixed pair set: FD only atoms with no pair image within 0.02 A of rc
+      double cd[3][3];
+      for (int a = 0; a < 3; a++)
+        for (int b = 0; b < 3; b++) cd[a][b] = c[3 * a + b];
+      std::vector<double> xd(x.begin(), x.end());
+      const auto es = mlipcpp::runtime::iris::ewald_setup(cd, pbc, xd.data(), n, 1024, 0.0, 2.0);
+      std::vector<int> atoms_fd;
+      for (int i = 0; i < n && atoms_fd.size() < 5; i++) {
+        bool near = false;
+        for (int j = 0; j < n && !near; j++)
+          for (int s0 = -2; s0 <= 2 && !near; s0++)
+            for (int s1 = -2; s1 <= 2 && !near; s1++)
+              for (int s2 = (slab ? 0 : -2); s2 <= (slab ? 0 : 2) && !near; s2++) {
+                double d2 = 0;
+                for (int a = 0; a < 3; a++) {
+                  const double v = x[3 * j + a] - x[3 * i + a] + s0 * cd[0][a] + s1 * cd[1][a] + s2 * cd[2][a];
+                  d2 += v * v;
+                }
+                near = std::fabs(std::sqrt(d2) - es.cutoff) < 0.02;
+              }
+        if (!near) atoms_fd.push_back(i);
+      }
+      REQUIRE(atoms_fd.size() >= 3);
+      double worst = 0, fmax = 0;
+      for (double f : r.forces) fmax = std::max(fmax, std::fabs(f));
+      for (int idx = 0; idx < 3 * int(atoms_fd.size()); idx++) {
+        const int k = 3 * atoms_fd[idx / 3] + idx % 3;
+        auto fd = [&](double h) {
+          std::vector<float> xp = x, xm = x;
+          xp[k] += float(h), xm[k] -= float(h);
+          return -(energy(xp, c) - energy(xm, c)) / (double(xp[k]) - double(xm[k]));
+        };
+        // (steps 2e-3 / 1e-3 A: at 8e-3 the adaptive selection of the Gaussian-charge model's trunk changes,
+        // whose SR erfc correction then jumps; torch fp64 FD at 1e-5 = autograd = these forces to 6e-7). The fp32
+        // energy noise (his Gaussian-charge model: ~1e-4 eV on -174 eV, i.e. ~0.1 eV/A at these steps) is
+        // measured as |fd(h) - fd(2h)| (the truncation part of that is ~1e-6 here) and allowed for; a wrong
+        // derivative is systematic, the same in both differences, and is not absorbed
+        const double f1 = fd(1e-3), f2 = fd(2e-3);
+        worst = std::max(worst, std::fabs((4.0 * f1 - f2) / 3.0 - r.forces[k]) - 2.0 * std::fabs(f1 - f2));
+      }
+      INFO("max |F_FD - F| = " << worst << " eV/A, max |F| = " << fmax);
+      CHECK(worst < 5e-3 + 1e-3 * fmax);
+      CHECK(fmax > 0.05);
+      if (slab) continue; // (his calculator reports no stress for a slab; the virial is his predict's, not a strain derivative)
+      const double h = 2e-3;
+      auto strained = [&](int i, int j, double e) {
+        std::vector<float> y(x.size());
+        float c2[9];
+        for (int k = 0; k < n; k++)
+          for (int a = 0; a < 3; a++) y[3 * k + a] = float(x[3 * k + a] + (a == i ? e * x[3 * k + j] : 0.0));
+        for (int v = 0; v < 3; v++)
+          for (int a = 0; a < 3; a++) c2[3 * v + a] = float(c[3 * v + a] + (a == i ? e * c[3 * v + j] : 0.0));
+        return energy(y, c2);
+      };
+      double scale = 0, wv = 0;
+      for (double w : r.virial) scale = std::max(scale, std::abs(w));
+      for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++) {
+          const double fd = (strained(i, j, h) - strained(i, j, -h)) / (2 * h);
+          wv = std::max(wv, std::abs(fd - r.virial[3 * j + i]));
+        }
+      INFO("max |FD - W| = " << wv << " eV, max |W| = " << scale << " eV");
+      CHECK(wv < 2e-3 * scale + 2e-3);
+    }
+  }
+}

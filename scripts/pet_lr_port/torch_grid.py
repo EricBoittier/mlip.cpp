@@ -190,6 +190,8 @@ def ewald_inputs(pos, cell, prm, skin=0.5):
     else:
         nh, basis = torch.zeros(3, dtype=pos.dtype), torch.zeros(1, dtype=pos.dtype)
     t = lambda x: torch.tensor([float(x)], dtype=pos.dtype)
-    return dict(lr_index=torch.from_numpy(ni.reshape(n, k)), lr_shift=shift.reshape(n, k, 3),
+    Sfull = np.zeros((n * k, 3)); Sfull[slot] = S
+    return dict(lr_S=torch.from_numpy(Sfull), cellc=cellc,
+                lr_index=torch.from_numpy(ni.reshape(n, k)), lr_shift=shift.reshape(n, k, 3),
                 lr_keep=keep.reshape(n, k), kvec=kvec, volume=V, smearing=t(np.float32(prm["smearing"])),
                 cutoff=t(np.float32(rc)), slab=t(slab), slab_normal=nh, slab_basis=basis)

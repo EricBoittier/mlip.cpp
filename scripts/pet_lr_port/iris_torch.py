@@ -487,23 +487,24 @@ def ewald_potentials(positions, e):
     D2 = (D * D).sum(dim=-1)
     pad = e["lr_keep"] <= 0.0
     r = torch.sqrt(torch.where(pad, torch.ones_like(D2), D2))
-    keep = torch.where(r >= e["cutoff"], torch.zeros_like(r), e["lr_keep"])
-    inv_s = 1.0 / (math.sqrt(2.0) * e["smearing"])
+    keep = torch.where(r - e["cutoff"] >= 0.0, torch.zeros_like(r), e["lr_keep"])  # (ge with a tensor: unmapped)
+    one_s = torch.ones_like(e["smearing"]) / e["smearing"]  # 1 / s (no reciprocal op in the converter)
+    inv_s = one_s * (1.0 / math.sqrt(2.0))
     v_sr = (-torch.erf(r * inv_s) + 1.0) / r * keep  # 1/r - erf/r as (1 - erf) / r (ggml has erf only)
     kvec, V, s = e["kvec"], e["volume"], e["smearing"]
     k2 = (kvec * kvec).sum(dim=-1)
     W = 2.0 * (4.0 * math.pi) * torch.exp(-0.5 * (s * s) * k2) / k2 / V
-    theta = positions @ kvec.T  # [n, K]
+    theta = positions @ kvec.transpose(0, 1)  # [n, K]
     c, sn = torch.cos(theta), torch.sin(theta)
     zn = positions @ e["slab_normal"]  # [n]
 
     def phi(qq):
         q_j = qq[e["lr_index"].reshape(n * kl)].reshape(n, kl)
         rs = 0.5 * (v_sr * q_j).sum(dim=1)
-        Sr, Si = qq @ c, qq @ sn  # [K]
+        Sr, Si = c.transpose(0, 1) @ qq, sn.transpose(0, 1) @ qq  # [K] (matrix @ vector)
         ks = c @ (W * Sr) + sn @ (W * Si)
         Q = qq.sum()
-        corr = -qq * (math.sqrt(2.0 / math.pi) / s) - 2.0 * (math.pi * s * s) * Q / V
+        corr = -qq * (math.sqrt(2.0 / math.pi) * one_s) - 2.0 * (math.pi * s * s) * Q / V
         M, M2 = (qq * zn).sum(), (qq * zn * zn).sum()
         b = e["slab_basis"]
         slab = 4.0 * math.pi * (zn * M - 0.5 * (M2 + Q * zn * zn) - Q / 12.0 * b * b) / V
@@ -561,6 +562,38 @@ class IrisPETLRGraph(IrisTrunk):
         padding_mask, reverse = args[0], args[1]
         e_lr = self.lr(node, species, positions, neighbor_index, padding_mask, reverse, edge_vectors, env,
                        total_charge, mu_bisect, gapped, m_round, top, bottom, dipole_origin)
+        aux = self.lr._aux
+        q = aux["charges"]
+        zero = torch.zeros_like(q)
+        mu = aux.get("fermi_level")
+        mu_col = (zero + mu) if mu is not None else zero
+        s_col = aux["scores"] if "scores" in aux else zero
+        dens = self.lr.density(s_col - mu) if mu is not None else zero
+        dip = (positions - dipole_origin[None, :]) * q[:, None]
+        return torch.cat([(e_sr + e_lr)[:, None], q[:, None], dip, mu_col[:, None], s_col[:, None], dens[:, None]],
+                         dim=-1)
+
+
+class IrisPETLRGraphPBC(IrisPETLRGraph):
+    """IrisPETLRGraph for periodic cells (3-D or slabs): the open all-pair Coulomb replaced by his jax-pme Ewald
+    (`ewald_potentials`). Extra inputs after dipole_origin: lr_index [n, n_lr] (i32), lr_shift [n, n_lr, 3],
+    lr_keep [n, n_lr], kvec [n_kvec, 3], volume [1], smearing [1], cutoff [1], slab [1], slab_normal [3],
+    slab_basis [1]. Same parameters (and names) as IrisPETLRGraph: one GGUF carries both graphs."""
+
+    EWALD = ("lr_index", "lr_shift", "lr_keep", "kvec", "volume", "smearing", "cutoff", "slab", "slab_normal",
+             "slab_basis")
+
+    def forward(self, species, neighbor_species, edge_vectors, *args):
+        ew = dict(zip(self.EWALD, args[-len(self.EWALD):]))
+        args = args[:-len(self.EWALD)]
+        trunk_args = args[:3 + self.n_cond]
+        (neighbor_index, positions, total_charge, mu_bisect, gapped, m_round, top, bottom,
+         dipole_origin) = args[3 + self.n_cond:]
+        e_sr = IrisTrunk.forward(self, species, neighbor_species, edge_vectors, *trunk_args) * self.energy_scale
+        node, env = self._aux["node"], self._aux["env"]
+        padding_mask, reverse = args[0], args[1]
+        e_lr = self.lr(node, species, positions, neighbor_index, padding_mask, reverse, edge_vectors, env,
+                       total_charge, mu_bisect, gapped, m_round, top, bottom, dipole_origin, ewald=ew)
         aux = self.lr._aux
         q = aux["charges"]
         zero = torch.zeros_like(q)

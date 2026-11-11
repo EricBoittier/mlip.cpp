@@ -186,6 +186,21 @@ std::vector<int64_t> GraphInterpreter::resolve_shape(
             "'max_neighbors' to be set.");
       }
       resolved.push_back(it_m->second + 1);
+    } else if (const std::string *name = named_dim(dim)) {
+      // a named dimension: the product of its '*' factors (set_dimension names or integers), else -1
+      int64_t v = 1;
+      size_t a = 0;
+      while (v > 0) {
+        const size_t b = name->find('*', a);
+        const std::string f = name->substr(a, b == std::string::npos ? std::string::npos : b - a);
+        auto it = dimensions_.find(f);
+        if (it != dimensions_.end()) v *= it->second;
+        else if (!f.empty() && f.find_first_not_of("0123456789") == std::string::npos) v *= std::stoll(f);
+        else v = -1;
+        if (b == std::string::npos) break;
+        a = b + 1;
+      }
+      resolved.push_back(v);
     } else {
       // Regular concrete dimension
       resolved.push_back(dim);

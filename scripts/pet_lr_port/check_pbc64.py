@@ -35,9 +35,10 @@ def energy(cfg, trunk, lr, scale, pos, cell, Z, spin, Q, prm, hard=False, lr_on=
     e = ewald_inputs(pos, cell, prm)
     if taps is not None:  # cut the graph at the inputs mlip.cpp feeds, keep their values
         ev = ev.detach().requires_grad_(True)
-        for key in ("lr_shift", "kvec", "volume"):
+        for key in ("lr_shift", "kvec", "volume", "slab_normal", "slab_basis"):
             e[key] = e[key].detach().requires_grad_(True)
-        taps.update(edge_vectors=ev, **{key: e[key] for key in ("lr_shift", "kvec", "volume")})
+        taps.update(edge_vectors=ev, lr_S=e["lr_S"], cellc=e["cellc"].detach(), k_grid=torch.as_tensor(prm["k_grid"]),
+                    **{key: e[key] for key in ("lr_shift", "kvec", "volume", "slab_normal", "slab_basis")})
         freeze_cut = True  # (compared against a strain virial with the cutoffs frozen too)
     if freeze_cut:
         g["cutoff_values"] = g["cutoff_values"].detach()
@@ -91,23 +92,40 @@ def main():
         add("forces max|dF|/max|F|", np.abs(F - Fj).max() / np.abs(Fj).max())
         if "atom/charges" in zf.files:
             add("charges max|dq| (e)", np.abs(aux["charges"].detach().numpy() - zf["atom/charges"][A]).max())
-        if atoms.pbc.all():
+        if atoms.pbc.any():  # slabs too: his predict's stress (the calculator reports it for 3-D cells only)
             Wj = zf["virial"][f]
-            add("virial max|dW|/max|W|", np.abs(ge.numpy() - Wj).max() / np.abs(Wj).max())
+            add("virial max|dW|/max|W|" + ("" if atoms.pbc.all() else " (slab)"),
+                np.abs(ge.numpy() - Wj).max() / np.abs(Wj).max())
             if not a.no_host_virial:
                 taps = {}
                 P1 = P0.clone().requires_grad_(True)
                 E1, _ = energy(cfg, trunk, lr, scale, P1, C0, Z, spin, Q, prm, hard=a.hard, taps=taps)
-                keys = ["edge_vectors", "lr_shift", "kvec", "volume"]
+                keys = ["edge_vectors", "lr_shift", "kvec", "volume", "slab_normal", "slab_basis"]
                 gs = torch.autograd.grad(E1, [P1] + [taps[k] for k in keys])
                 g = dict(zip(["positions"] + keys, gs))
+                # mlip.cpp's host virial: positions and edge terms, plus h^T dE/dh of the Ewald inputs as functions
+                # of the cell h the Ewald maths uses (S @ h, k = n @ 2 pi h^-T, V = |det h|), the slab's effective
+                # (non-periodic) row held fixed: his compose_cell / predict stress, slabs included
                 W = P1.detach().T @ g["positions"]
-                for key in ("edge_vectors", "lr_shift"):  # padded slots (zero vectors) carry no virial
-                    x = taps[key].detach().reshape(-1, 3)
-                    gk = torch.nan_to_num(g[key].reshape(-1, 3)) * (x.abs().sum(-1, keepdim=True) > 0)
-                    W = W + x.T @ gk
-                W = W - g["kvec"].T @ taps["kvec"].detach()  # k -> (I + eps)^-T k: d/d eps_ab = -sum_k g_a k_b
-                W = W + torch.eye(3) * float(taps["volume"]) * float(g["volume"])
+                x = taps["edge_vectors"].detach().reshape(-1, 3)  # padded slots (zero vectors) carry no virial
+                gk = torch.nan_to_num(g["edge_vectors"].reshape(-1, 3)) * (x.abs().sum(-1, keepdim=True) > 0)
+                W = W + x.T @ gk
+                h = taps["cellc"]; X = torch.linalg.inv(h)
+                G = taps["lr_S"].T @ g["lr_shift"].reshape(-1, 3)
+                dR = taps["k_grid"].T @ g["kvec"]
+                G = G - X.T @ (2.0 * np.pi * dR.T) @ X.T
+                G = G + float(g["volume"]) * float(taps["volume"]) * X.T
+                if not atoms.pbc.all():  # the slab normal n = c / |c|, c = a1 x a2, and basis |h_k . n|
+                    k = int(np.argmax(~atoms.pbc))
+                    a1, a2 = h[(k + 1) % 3], h[(k + 2) % 3]
+                    c = torch.linalg.cross(a1, a2); cn = torch.sqrt((c * c).sum()); nh = c / cn
+                    hk_n = (h[k] * nh).sum()
+                    gn = g["slab_normal"] + float(g["slab_basis"]) * torch.sign(hk_n) * h[k]
+                    gc = (gn - nh * (nh * gn).sum()) / cn
+                    G[(k + 1) % 3] += torch.linalg.cross(a2, gc)
+                    G[(k + 2) % 3] += torch.linalg.cross(gc, a1)
+                    G[k] = 0.0
+                W = W + h.T @ G
                 eps2 = torch.zeros(3, 3, requires_grad=True)
                 E2, _ = energy(cfg, trunk, lr, scale, P0 + P0 @ eps2, C0 + C0 @ eps2, Z, spin, Q, prm, hard=a.hard,
                                freeze_cut=True)
