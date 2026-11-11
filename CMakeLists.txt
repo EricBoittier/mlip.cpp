@@ -303,6 +303,8 @@ else()
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-precise-unary.patch"
         # and SIGMOID in double / DIV as __fdiv_rn under the same flag (the Fermi occupations of iris PET-LR)
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-precise-sigmoid-div.patch"
+        # and SUM / SUM_ROWS accumulating in double under the same flag (as ggml-cpu's ggml_float sums)
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-precise-sum.patch"
     )
     # the source cache is keyed by the ggml tag and the patches' contents:
     # CPM's default key hashes the arguments, i.e. the patch paths, so every

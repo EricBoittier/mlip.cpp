@@ -8,6 +8,9 @@ env (kuma /scratch/boittier/ipsum/envs/iris-<branch>/bin/python), read-only on t
     python ref_branch.py CKPT_DIR FRAMES.extxyz OUT.npz [--x64] [--precision float32] [--max N]
                          [--cutoffs hard|differentiable] [--max-neighbors 59]
 
+--x64: the batch is cast to float64 and the exact positions put back (his batch builder stores float32, so without
+this the "fp64" oracle sees fp32-rounded positions: 4e-7 relative in E on the seeded lr_both ions; as ref_petlr.py).
+Validated against the calculator oracle (ref_petlr.py, same env, same checkpoint): see PARITY.md.
 Writes energy [S], forces [N, 3], atom_ptr, every per-atom / per-structure array predict returns (charges, ...),
 and overflow [S] (his calculator would raise there; the batch trims to max_neighbors as training does).
 Open structures (no cell) only for now.
@@ -54,6 +57,8 @@ def main():
     prep = ToSample(cutoff=model.cutoff, cutoffs=a.cutoffs, max_neighbors=a.max_neighbors, inputs=inputs, keys=keys,
                     properties=props, with_lr=True, num_k=16,
                     **({"num_neighbors_adaptive": nna} if a.cutoffs != "hard" else {}))
+    from petjax.utils import cast_floats
+    run = jax.jit(lambda b: predict(model, params, b))
     frames = read(a.frames, ":")
     if a.max:
         frames = frames[:a.max]
@@ -74,7 +79,12 @@ def main():
         from marathon.grain import Record as R, RecordMetadata as M
         (rec,) = list(batcher(iter([R(metadata=M(index=0, record_key=0), data=prep.map(at))])))
         batch = jax.tree.map(jnp.asarray, rec.data)
-        res = predict(model, params, batch)
+        if a.x64:  # ToSample / pet_batcher build float32 batches: cast, then put back the exact positions (open)
+            batch = cast_floats(batch, jnp.float64)
+            pos = np.array(np.asarray(batch["positions"]), dtype=np.float64)
+            pos[:n] = at.get_positions()
+            batch = {**batch, "positions": jnp.asarray(pos)}
+        res = run(batch)
         res = jax.tree.map(np.asarray, res)
         for k, v in res.items():
             v = np.asarray(v)

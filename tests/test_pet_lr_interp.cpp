@@ -325,3 +325,52 @@ TEST_CASE("pet_lr_interp: precise SIGMOID / DIV on the GPU backend (flagged ops)
   ggml_free(ctx);
   ggml_backend_free(gpu);
 }
+
+// ggml-cuda-precise-sum.patch: SUM / SUM_ROWS accumulate in double when flagged (ggml-cpu always does: ggml_float in
+// ggml_vec_sum_f32); the default CUDA kernels accumulate in float (cub / the warp-tree reduce_rows). Candidate from the
+// per-node fp64 oracle: the Ewald / Coulomb potential sums of the charge path at 2.5-7x the local error of a torch fp32
+// sum on CUDA. Rows with cancellation (alternating large terms): flagged = the host double sum rounded once, on every row.
+TEST_CASE("pet_lr_interp: precise SUM / SUM_ROWS on the GPU backend (flagged ops)", "[pet_lr_port]") {
+  ggml_backend_t gpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+  if (!gpu) {
+    SUCCEED("no GPU backend");
+    return;
+  }
+  const int nc = 1500, nr = 300; // ncols >= 1024: the 128-thread default kernel, and nr / nsm < 2: the 512-thread one
+  std::vector<float> x(size_t(nc) * nr);
+  for (int r = 0; r < nr; r++)
+    for (int c = 0; c < nc; c++)
+      x[size_t(r) * nc + c] = float((c % 2 ? -1.0 : 1.0) * (1.0 + 1e3 * std::fabs(std::sin(0.37 * c + r))) +
+                                    1e-2 * std::cos(1.3 * c * (r + 1)));
+  ggml_context *ctx = ggml_init({16 * 1024 * 1024, nullptr, true});
+  ggml_tensor *tx = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nc, nr);
+  ggml_tensor *outs[4] = {ggml_sum_rows(ctx, tx), ggml_sum(ctx, tx), ggml_sum_rows(ctx, tx), ggml_sum(ctx, tx)};
+  constexpr int slot = GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1;
+  for (int k = 0; k < 2; k++) outs[k]->op_params[slot] = 1; // outs[2, 3]: the default (float) kernels, for the record
+  ggml_cgraph *g = ggml_new_graph(ctx);
+  for (ggml_tensor *o : outs) ggml_set_output(o), ggml_build_forward_expand(g, o);
+  ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, gpu);
+  ggml_backend_tensor_set(tx, x.data(), 0, x.size() * 4);
+  REQUIRE(ggml_backend_graph_compute(gpu, g) == GGML_STATUS_SUCCESS);
+  std::vector<float> rows(nr), rows_fast(nr);
+  float tot = 0, tot_fast = 0;
+  ggml_backend_tensor_get(outs[0], rows.data(), 0, nr * 4);
+  ggml_backend_tensor_get(outs[2], rows_fast.data(), 0, nr * 4);
+  ggml_backend_tensor_get(outs[1], &tot, 0, 4);
+  ggml_backend_tensor_get(outs[3], &tot_fast, 0, 4);
+  int exact = 0, exact_fast = 0;
+  double all = 0;
+  for (int r = 0; r < nr; r++) {
+    double s = 0;
+    for (int c = 0; c < nc; c++) s += double(x[size_t(r) * nc + c]);
+    all += s;
+    exact += rows[r] == float(s), exact_fast += rows_fast[r] == float(s);
+  }
+  INFO("SUM_ROWS = host double sum rounded: flagged " << exact << "/" << nr << ", default " << exact_fast << "/" << nr
+                                                      << "; SUM flagged " << tot << " default " << tot_fast << " host " << float(all));
+  CHECK(exact == nr);
+  CHECK(tot == float(all));
+  ggml_backend_buffer_free(buf);
+  ggml_free(ctx);
+  ggml_backend_free(gpu);
+}

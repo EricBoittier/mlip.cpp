@@ -38,7 +38,8 @@ namespace {
 /// Ewald structure factors), and whose __expf in SIGMOID loses accuracy with |x| (the Fermi occupations at small T),
 /// with 2-ulp approximate division (DIV: __fdiv_rn when flagged, ggml-cuda-precise-sigmoid-div.patch). Flags every
 /// LOG / SIN / COS / EXP / SIGMOID / DIV node of `g` (forward and backward) for the
-/// double-precision kernels; the CPU backend's kernels are already accurate and ignore the flag. Other models
+/// double-precision kernels, and (opt-in, MLIPCPP_PRECISE_SUM=1) every SUM / SUM_ROWS for double accumulation
+/// (ggml-cuda-precise-sum.patch); the CPU backend's kernels are already accurate and ignore the flag. Other models
 /// never call this (their CUDA kernels stay the fast ones, bit for bit). MLIPCPP_PRECISE_MATH=0 turns it off.
 void mark_precise_math(ggml_cgraph *g) {
   if (!g) return;
@@ -51,14 +52,21 @@ void mark_precise_math(ggml_cgraph *g) {
     // error of the Fermi occupations, but moved no verdict and made seeded lr_both ion mu worse on CUDA (median 1.5e-7
     // -> 2.1e-7, P 0.35-0.57 -> 0.90-0.93; bisected 2026-11-11, job 4891356): MLIPCPP_PRECISE_SIGMOID=1 turns it on
     static const bool sig = [] { const char *e = std::getenv("MLIPCPP_PRECISE_SIGMOID"); return e && !std::strcmp(e, "1"); }();
+    // SUM / SUM_ROWS in double (as ggml-cpu) is NOT flagged by default either: it reaches the potential sums (their
+    // local errors drop to the torch fp32 level) but moved no verdict (CUDA charges P 0.58-0.75 unchanged, median q
+    // error 8.5e-7 -> 8.8e-7; job 4891425, 2026-11-11): MLIPCPP_PRECISE_SUM=1 turns it on
+    static const bool psum = [] { const char *e = std::getenv("MLIPCPP_PRECISE_SUM"); return e && !std::strcmp(e, "1"); }();
     auto on = [](const char *k) {
       if (!std::strcmp(k, "sigmoid") && !sig) return false;
+      if (!std::strcmp(k, "sum") && !psum) return false;
       return skip.find(k) == std::string::npos;
     };
     const bool is_unary = t->op == GGML_OP_UNARY;
     const bool unary = is_unary && ((ggml_get_unary_op(t) == GGML_UNARY_OP_EXP && on("exp")) ||
                                     (ggml_get_unary_op(t) == GGML_UNARY_OP_SIGMOID && on("sigmoid")));
-    if ((t->op == GGML_OP_LOG && on("log")) || (t->op == GGML_OP_SIN && on("sin")) ||
+    // SUM / SUM_ROWS: double accumulation (ggml-cuda-precise-sum.patch), as ggml-cpu (ggml_float) does
+    const bool sum = (t->op == GGML_OP_SUM || t->op == GGML_OP_SUM_ROWS) && on("sum");
+    if (sum || (t->op == GGML_OP_LOG && on("log")) || (t->op == GGML_OP_SIN && on("sin")) ||
         (t->op == GGML_OP_COS && on("cos")) || (t->op == GGML_OP_DIV && on("div")) || unary)
       t->op_params[slot] = 1;
   }
