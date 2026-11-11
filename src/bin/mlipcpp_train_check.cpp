@@ -30,7 +30,7 @@ int main(int argc, char **argv) {
   mlipcpp::train::install_crash_backtrace();
   std::string data, init, out, cache_dir;
   int n = 64, gpus = 1, first = 0;
-  bool node_grads_on = false, mb_failed = false, profile = false, sweep = false;
+  bool node_grads_on = false, mb_failed = false, profile = false, sweep = false, states_fd = false;
   Worker::Conservative cons;
   Worker::ChargeCorr qcorr;
   std::string qtarget = "mulliken";
@@ -59,6 +59,7 @@ int main(int argc, char **argv) {
     else if (a == "--charge-corr-min") qcorr.r_min = std::stod(v);
     else if (a == "--charge-corr-target") qtarget = v;
     else if (a == "--loss") huber = v == "huber";
+    else if (a == "--states-fd") states_fd = v == "1";
     else if (a == "--huber-delta-e") de = std::stod(v);
     else if (a == "--huber-delta-f") df = std::stod(v);
   }
@@ -84,7 +85,54 @@ int main(int argc, char **argv) {
   nl.taper = cons.on && adaptive.enabled();
   std::vector<int64_t> ids(n);
   std::iota(ids.begin(), ids.end(), first);
-  Batch b = make_batch(split, nl, ids, {}, worker.model().species_to_index(), sc, worker.model().cutoff());
+  // a combined (lrc) model as mlipcpp-train sets it up: exact conditioning forces; lrc_states: the copies
+  StatePlanner planner;
+  if (worker.model().plato_lr().lrc.enabled) {
+    worker.lrc = &worker.model().plato_lr().lrc, worker.lrc_sqe = &worker.model().plato_lr().sqe;
+    worker.lrc_exact = worker.lrc->graph;
+    if (worker.lrc->states) planner.lrc = worker.lrc, worker.vs_on = true;
+  }
+  Batch b = make_batch(split, nl, ids, {}, worker.model().species_to_index(), sc, worker.model().cutoff(), 0, 0, 0,
+                       &planner);
+  if (states_fd) {
+    // --states-fd 1: the loss gradient of the batch (lrc_states copies included) against central differences of the
+    // loss along g / |g|: (L(p + h g/|g|) - L(p - h g/|g|)) / 2h -> |g|; then per structure the same for the energy
+    // loss alone (energy weight only), so the force-loss path (tangents w_v u, cotangents -u . grad w_v) is checked too
+    fmt::print("states-fd: {} structures, {} copies ({} atoms packed)\n", b.structures(), b.copies(), b.n_atoms);
+    const std::vector<float> p0 = worker.get_params();
+    auto check = [&](const char *what) {
+      worker.zero_grads();
+      const StepStats s0 = worker.run(b, sc.energy_scale, true);
+      const std::vector<float> g = worker.get_grads();
+      double gn = 0;
+      for (float x : g) gn += double(x) * x;
+      gn = std::sqrt(gn);
+      double best = 1e30;
+      std::string line;
+      for (double h : {1e-2, 3e-3, 1e-3, 3e-4}) {
+        auto loss_at = [&](double sgn) {
+          std::vector<float> p = p0;
+          for (size_t q = 0; q < p.size(); q++) p[q] += static_cast<float>(sgn * h / gn * g[q]);
+          worker.set_params(p);
+          return double(worker.run(b, sc.energy_scale, false).loss);
+        };
+        const double fdv = (loss_at(+1) - loss_at(-1)) / (2 * h), rel = std::abs(fdv - gn) / gn;
+        best = std::min(best, rel);
+        line += fmt::format(" h {:.0e}: FD {:.6g} (rel {:.2e})", h, fdv, rel);
+      }
+      worker.set_params(p0);
+      fmt::print("states-fd {}: L {:.6g}, |g| {:.6g};{} -> {}\n", what, s0.loss, gn, line, best < 2e-2 ? "PASS" : "FAIL");
+      return best < 2e-2;
+    };
+    bool ok = check("energy + force loss");
+    const Worker::Conservative keep = worker.conservative;
+    worker.conservative.energy = 0, worker.conservative.nc_force = 0;
+    ok = check("force loss alone") && ok;
+    worker.conservative = keep;
+    worker.conservative.force = 0, worker.conservative.nc_force = 0;
+    ok = check("energy loss alone") && ok;
+    return ok ? 0 : 1;
+  }
 
   // gradient of every IR node output, for scripts/train/compare_node_grads.py
   // grad points into the compute context, which run() frees: copy ne and data in after_compute

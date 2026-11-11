@@ -302,6 +302,12 @@ public:
   double lrc_cond_force_sum = 0; // sum over structures of max |F_cond| (eV/A), for the log
   int64_t lrc_cond_n = 0;
   void lrc_prepare(const Batch &b, bool forces);
+  // lrc_states (runtime/lr_combined.h): batches carry each multi-state structure's copies (Batch::vs_*); the energy
+  // row of a structure weights its copies (w_v / N), the forces combine as sum_v w_v F_v - sum_v E_v grad w_v, and the
+  // MIXED pass gets per-copy tangents w_v u and the per-copy energy cotangent -u . grad w_v (input atom_cotangent).
+  // vs_on: the planner is on (MIXED graphs carry the input); counters for the log.
+  bool vs_on = false;
+  int64_t vs_structs = 0, vs_evals = 0, vs_fix3 = 0, vs_real_atoms = 0, vs_packed_atoms = 0, vs_max = 0;
   std::vector<double> sqe_grad;
   double sqe_abs_energy = 0;
   int64_t sqe_n = 0;
@@ -387,6 +393,7 @@ private:
     ggml_tensor *ecot = nullptr; // tail loss: dL/d(d_energy) per structure [S, 1]
     // lrc exact conditioning forces: the blend input, FORCES its gradient, MIXED its tangent
     ggml_tensor *blend = nullptr, *grad_blend = nullptr, *dblend = nullptr;
+    ggml_tensor *acot = nullptr; // lrc_states, MIXED: the per-atom energy cotangent [n, 1]
     ~StepGraph();
   };
   /// graph kinds: the loss (FORWARD / BACKWARD to the weights); conservative
@@ -417,6 +424,18 @@ private:
   void frag_charge_stats(StepGraph &g, const Batch &b, StepStats &st);
   float plato_jvp_scale_ = 1.0f;
   bool zero_norms_ = false;           // run_tail: energy and force loss norms 0
+  // lrc_states, per multi-state structure of the batch: its systems (copy order), clusters (batch positions), states
+  struct VsStruct {
+    int k = 0;
+    std::vector<int> sys;
+    runtime::LrcClusters cl;
+    runtime::LrcStates st;
+  };
+  std::vector<VsStruct> vs_;
+  std::vector<int> vs_sys_a0_;                  // first atom of every system
+  std::vector<char> vs_member_;                 // per system: part of a multi-state structure
+  std::vector<float> vs_aw_, vs_acot_;          // atom weights with the copies; MIXED atom cotangent
+  std::vector<std::vector<double>> vs_rows_;    // per system: dS/dx rows of its conditioning (lazy)
   std::vector<float> ecot_;           // run_tail: the cotangent of this batch
   void plato_create(StepGraph &g, ggml_context *ctx, int n, bool grad);
 

@@ -7,6 +7,7 @@
 #include <gguf.h>
 
 #include <algorithm>
+#include <map>
 #include <array>
 #include <cmath>
 #include <complex>
@@ -328,6 +329,15 @@ LrcSpec LrcSpec::from_gguf(const GGUFLoader &G, const SqeSpec &S) {
       if (!L.graph) throw std::runtime_error("lrc_links backbone: needs the graph q0 mode");
       L.links_check();
     }
+    // backbone link states (absent key or "none": conditioning-only links, bit for bit)
+    const std::string sm = G.get_string("pet.plato_lr.lrc_states", "none");
+    if (sm != "none" && sm != "mix") throw std::runtime_error("lrc: lrc_states must be none or mix");
+    L.states = sm == "mix";
+    if (L.states) {
+      if (!L.links_backbone) throw std::runtime_error("lrc_states mix: needs lrc_links = backbone");
+      scalar("states_eps", L.states_eps), scalar("states_cap", L.states_cap), scalar("states_cap_lo", L.states_cap_lo);
+      L.links_check();
+    }
   }
   if (L.graph) {
     L.qmodel = G.get_string("pet.plato_lr.lrc_qmodel", "");
@@ -416,6 +426,10 @@ void LrcSpec::to_gguf(gguf_context *g) const {
   if (links_backbone) { // absent key = window (earlier GGUFs unchanged)
     gguf_set_val_str(g, "pet.plato_lr.lrc_links", "backbone");
     scalar("link_a", link_a), scalar("link_b", link_b);
+  }
+  if (states) { // absent key = none (earlier GGUFs unchanged)
+    gguf_set_val_str(g, "pet.plato_lr.lrc_states", "mix");
+    scalar("states_eps", states_eps), scalar("states_cap", states_cap), scalar("states_cap_lo", states_cap_lo);
   }
   if (slab != Slab::None) { // absent keys = slabs refused (earlier GGUFs unchanged)
     gguf_set_val_str(g, "pet.plato_lr.lrc_slab", slab == Slab::YB ? "yb" : "ewald2d");
@@ -763,6 +777,12 @@ double LrcSpec::fukui_phi_of(int z, bool minus) const {
 }
 
 void LrcSpec::links_check() const {
+  if (states) {
+    if (!links_backbone) throw std::runtime_error("lrc_states mix: needs lrc_links = backbone");
+    if (!(states_eps > 0 && states_eps < 0.1)) throw std::runtime_error("lrc_states: states_eps must be in (0, 0.1)");
+    if (!(states_cap_lo >= 1 && states_cap > states_cap_lo))
+      throw std::runtime_error("lrc_states: needs 1 <= states_cap_lo < states_cap");
+  }
   if (!links_backbone) return;
   if (!graph) throw std::runtime_error("lrc_links backbone: needs the graph q0 mode");
   if (mp || pol || intra) throw std::runtime_error("lrc_links backbone: not with lrc_mp / lrc_pol / lrc_intra");
@@ -1291,6 +1311,28 @@ bool LrcCondition::needs_cond_forces() const {
   return false;
 }
 
+namespace {
+// the blend S, dS / dQloc, floor k per super-node from c.Qloc, and the rows / blend per atom
+void condition_rows(const LrcSpec &L, LrcCondition &c, int n, int max_charge) {
+  const int s = c.cl.s;
+  for (int a = 0; a < s; a++) {
+    double v = c.Qloc[a];
+    const double rv = std::round(v);
+    if (std::abs(v - rv) < 1e-9) v = rv; // solver noise on an integer
+    const double k = std::floor(v), u = (v - k - 0.5) / L.cond_w + 0.5;
+    c.k[a] = static_cast<int32_t>(k), c.S[a] = sstep(u), c.dS[a] = dsstep(u) / L.cond_w;
+  }
+  c.row_charge.resize(n), c.row_charge_hi.resize(n), c.blend.resize(n);
+  for (int i = 0; i < n; i++) {
+    const int a = c.cl.sn[i];
+    const int k = std::clamp<int>(c.k[a], -max_charge, max_charge);
+    c.row_charge[i] = k, c.row_charge_hi[i] = std::min(k + 1, max_charge), c.blend[i] = float(c.S[a]);
+    if (c.k[a] + 1 > max_charge || c.k[a] < -max_charge) c.blend[i] = c.k[a] >= max_charge ? 0.0f : 1.0f;
+  }
+}
+
+} // namespace
+
 LrcCondition lrc_condition(const LrcSpec &L, const SqeSpec &S, int n, const int32_t *Z, const double *x, double Q,
                            int max_charge, int spin, const double *cell) {
   LrcCondition c;
@@ -1312,20 +1354,7 @@ LrcCondition lrc_condition(const LrcSpec &L, const SqeSpec &S, int n, const int3
       for (int b = 0; b < s; b++) c.Qloc[a] += c.cl.R[size_t(a) * s + b] * c.Q0[b];
     if (L.cond_global) c.Qloc.assign(s, Q); // global conditioning: no position dependence (dS = 0)
   }
-  for (int a = 0; a < s; a++) {
-    double v = c.Qloc[a];
-    const double rv = std::round(v);
-    if (std::abs(v - rv) < 1e-9) v = rv; // solver noise on an integer
-    const double k = std::floor(v), u = (v - k - 0.5) / L.cond_w + 0.5;
-    c.k[a] = static_cast<int32_t>(k), c.S[a] = sstep(u), c.dS[a] = dsstep(u) / L.cond_w;
-  }
-  c.row_charge.resize(n), c.row_charge_hi.resize(n), c.blend.resize(n);
-  for (int i = 0; i < n; i++) {
-    const int a = c.cl.sn[i];
-    const int k = std::clamp<int>(c.k[a], -max_charge, max_charge);
-    c.row_charge[i] = k, c.row_charge_hi[i] = std::min(k + 1, max_charge), c.blend[i] = float(c.S[a]);
-    if (c.k[a] + 1 > max_charge || c.k[a] < -max_charge) c.blend[i] = c.k[a] >= max_charge ? 0.0f : 1.0f;
-  }
+  condition_rows(L, c, n, max_charge);
   return c;
 }
 
@@ -1360,6 +1389,298 @@ std::vector<double> lrc_blend_rows(const LrcSpec &L, const SqeSpec &S, const Lrc
     double *r = rows.data() + size_t(a) * 3 * n; // lrc_condition_forces subtracts dS_a/dx
     lrc_condition_forces(L, S, c, n, Z, x, G, r);
     for (int k = 0; k < 3 * n; k++) r[k] = -r[k];
+  }
+  return rows;
+}
+
+// ---- backbone link states (LrcSpec::states) ------------------------------------------------------------------------
+std::vector<int32_t> LrcStates::drop_groups(const LrcClusters &c, size_t v) const {
+  const int n = static_cast<int>(c.sn.size());
+  std::vector<int32_t> g(n, -1);
+  if (!active) return g;
+  const LrcStateCopy &cp = copies.at(v);
+  for (int i = 0; i < n; i++) {
+    const int a = c.sn[i], k = comp_of[a];
+    if (k < 0) continue;
+    // fix-3 mode: one group for the whole component (no edge dropped); a partition: the group's label
+    int32_t lab = comp_nodes[k].front();
+    if (cp.choice[k] >= 0) {
+      const auto &nodes = comp_nodes[k];
+      const size_t q = std::find(nodes.begin(), nodes.end(), a) - nodes.begin();
+      lab = parts[k][cp.choice[k]][q];
+    }
+    g[i] = (k << 20) + lab;
+  }
+  return g;
+}
+
+LrcStates lrc_states(const LrcSpec &L, const LrcClusters &c) {
+  LrcStates st;
+  if (!L.states || c.trivial()) return st;
+  const int E = static_cast<int>(c.se.size());
+  const double eps = L.states_eps;
+  st.comps = weak_components(c);
+  const int K = static_cast<int>(st.comps.size());
+  st.comp_of.assign(c.s, -1);
+  st.comp_nodes.resize(K), st.parts.resize(K);
+  // per component: its choices (partitions, -1 = fix 3) with weight and d weight / dp (over all super-edges), and the
+  // smooth partition count N_c with its gradient
+  struct Choice {
+    int32_t part;
+    double w;
+    std::vector<double> dw;
+  };
+  std::vector<std::vector<Choice>> choices(K);
+  std::vector<double> Nc(K, 0.0);
+  std::vector<std::vector<double>> dNc(K, std::vector<double>(E, 0.0));
+  for (int k = 0; k < K; k++) {
+    const std::vector<int> &edges = st.comps[k];
+    std::vector<int> &nodes = st.comp_nodes[k];
+    for (int e : edges) nodes.push_back(c.se[e].first), nodes.push_back(c.se[e].second);
+    std::sort(nodes.begin(), nodes.end());
+    nodes.erase(std::unique(nodes.begin(), nodes.end()), nodes.end());
+    for (int a : nodes) st.comp_of[a] = k;
+    const int m = static_cast<int>(edges.size());
+    if (m > L.max_super_edges) { // fix 3's fallback component (R = 1 within it, no gradient): fix 3 here too
+      choices[k].push_back({-1, 1.0, std::vector<double>(E, 0.0)});
+      Nc[k] = 1.0, st.fix3_comps++;
+      continue;
+    }
+    // edge states with P >= eps / 4 (depth-first, a partial product only shrinks): below that every weight and count
+    // contribution is zero with zero derivative
+    struct Leaf {
+      uint64_t bits;
+      double P;
+    };
+    std::vector<Leaf> leaves;
+    const double thr = 0.25 * eps;
+    std::vector<std::pair<int, double>> stack; // (depth, product) with bits alongside
+    std::vector<uint64_t> sbits;
+    stack.push_back({0, 1.0}), sbits.push_back(0);
+    while (!stack.empty()) {
+      const auto [d, P] = stack.back();
+      const uint64_t b = sbits.back();
+      stack.pop_back(), sbits.pop_back();
+      if (P < thr) continue;
+      if (d == m) {
+        leaves.push_back({b, P});
+        continue;
+      }
+      const double p = c.p[edges[d]];
+      stack.push_back({d + 1, P * (1.0 - p)}), sbits.push_back(b);
+      stack.push_back({d + 1, P * p}), sbits.push_back(b | (uint64_t(1) << d));
+    }
+    // partitions of the component's super-nodes
+    std::map<std::vector<int32_t>, int> index;
+    std::vector<double> W, cprod; // per partition: kept weight, prod (1 - s2)
+    std::vector<std::vector<double>> dW;
+    std::vector<std::vector<std::pair<double, std::vector<double>>>> s2terms; // per partition: (s2, d s2 / dp) per leaf
+    std::vector<int> par(c.s);
+    std::vector<double> fac(m), pre(m + 1), suf(m + 1);
+    for (const Leaf &lf : leaves) {
+      for (int a : nodes) par[a] = a;
+      for (int q = 0; q < m; q++) {
+        const bool on = (lf.bits >> q) & 1;
+        fac[q] = on ? c.p[edges[q]] : 1.0 - c.p[edges[q]];
+        if (on) {
+          const int ra = uf_find(par, c.se[edges[q]].first), rb = uf_find(par, c.se[edges[q]].second);
+          if (ra != rb) par[std::max(ra, rb)] = std::min(ra, rb);
+        }
+      }
+      std::vector<int32_t> lab(nodes.size());
+      for (size_t q = 0; q < nodes.size(); q++) lab[q] = uf_find(par, nodes[q]); // the smallest super-node of the group
+      pre[0] = 1, suf[m] = 1;
+      for (int q = 0; q < m; q++) pre[q + 1] = pre[q] * fac[q];
+      for (int q = m - 1; q >= 0; q--) suf[q] = suf[q + 1] * fac[q];
+      const double P = pre[m];
+      std::vector<double> dP(E, 0.0);
+      for (int q = 0; q < m; q++) dP[edges[q]] = pre[q] * suf[q + 1] * (((lf.bits >> q) & 1) ? 1.0 : -1.0);
+      auto [it, fresh] = index.try_emplace(lab, static_cast<int>(W.size()));
+      if (fresh) W.push_back(0.0), dW.emplace_back(E, 0.0), s2terms.emplace_back(), st.parts[k].push_back(lab);
+      const int pi = it->second;
+      const double u1 = 2.0 * P / eps - 1.0, s1 = sstep(u1), ds1 = dsstep(u1) * 2.0 / eps;
+      const double u2 = 4.0 * P / eps - 1.0, s2 = sstep(u2), ds2 = dsstep(u2) * 4.0 / eps;
+      W[pi] += P * s1;
+      const double dwdP = s1 + P * ds1;
+      for (int e : edges) dW[pi][e] += dwdP * dP[e];
+      std::vector<double> d2(E, 0.0);
+      for (int e : edges) d2[e] = ds2 * dP[e];
+      s2terms[pi].push_back({s2, std::move(d2)});
+    }
+    // smooth count: N_c = sum over partitions of 1 - prod over its edge states (1 - s2)
+    for (size_t pi = 0; pi < W.size(); pi++) {
+      const auto &T = s2terms[pi];
+      bool one = false;
+      double prod = 1.0;
+      for (const auto &t : T) one = one || t.first >= 1.0, prod *= 1.0 - t.first;
+      if (one) {
+        Nc[k] += 1.0; // flat there: zero derivative
+        continue;
+      }
+      Nc[k] += 1.0 - prod;
+      for (const auto &t : T) {
+        const double others = prod / (1.0 - t.first);
+        for (int e : edges) dNc[k][e] += others * t.second[e];
+      }
+    }
+    // the mass guard: lam_m = 1 - s((W_c - 0.5) / 0.4); renormalised partition weights (1 - lam_m) W_p / W_c
+    double Wc = 0;
+    std::vector<double> dWc(E, 0.0);
+    for (size_t pi = 0; pi < W.size(); pi++) {
+      Wc += W[pi];
+      for (int e : edges) dWc[e] += dW[pi][e];
+    }
+    const double um = (Wc - 0.5) / 0.4, lam = 1.0 - sstep(um), dlam = -dsstep(um) / 0.4;
+    // the component's factor of the smooth copy count: N_c + lam (-> 1 where the component appears or vanishes)
+    Nc[k] += lam;
+    for (int e : edges) dNc[k][e] += dlam * dWc[e];
+    if (lam < 1.0) {
+      for (size_t pi = 0; pi < W.size(); pi++) {
+        if (!(W[pi] > 0)) continue;
+        Choice ch{static_cast<int32_t>(pi), (1.0 - lam) * W[pi] / Wc, std::vector<double>(E, 0.0)};
+        for (int e : edges)
+          ch.dw[e] = -dlam * dWc[e] * W[pi] / Wc + (1.0 - lam) * (dW[pi][e] * Wc - W[pi] * dWc[e]) / (Wc * Wc);
+        choices[k].push_back(std::move(ch));
+      }
+    }
+    if (lam > 0.0) {
+      Choice ch{-1, lam, std::vector<double>(E, 0.0)};
+      for (int e : edges) ch.dw[e] = dlam * dWc[e];
+      choices[k].push_back(std::move(ch));
+      st.fix3_comps++;
+    }
+  }
+  // the cap: M = prod_c (N_c + lam_c), lambda = s((M - lo) / (cap - lo)) for the whole structure's fix-3 copy
+  st.M = 1.0;
+  for (int k = 0; k < K; k++) st.M *= Nc[k];
+  std::vector<double> dM(E, 0.0);
+  for (int k = 0; k < K; k++) {
+    double others = 1.0;
+    for (int k2 = 0; k2 < K; k2++)
+      if (k2 != k) others *= Nc[k2];
+    for (int e : st.comps[k]) dM[e] += others * dNc[k][e];
+  }
+  const double uc = (st.M - L.states_cap_lo) / (L.states_cap - L.states_cap_lo);
+  st.lambda = sstep(uc);
+  std::vector<double> dlamG(E, 0.0);
+  for (int e = 0; e < E; e++) dlamG[e] = dsstep(uc) / (L.states_cap - L.states_cap_lo) * dM[e];
+  // copies: the product of the components' choices, weight (1 - lambda) prod w_c, plus the fix-3 copy (lambda)
+  std::map<std::vector<int32_t>, size_t> where;
+  auto add = [&](const std::vector<int32_t> &choice, double w, const std::vector<double> &dw) {
+    auto [it, fresh] = where.try_emplace(choice, st.copies.size());
+    if (fresh) st.copies.push_back({choice, 0.0, std::vector<double>(E, 0.0)});
+    LrcStateCopy &cp = st.copies[it->second];
+    cp.w += w;
+    for (int e = 0; e < E; e++) cp.dw[e] += dw[e];
+  };
+  if (st.lambda < 1.0) {
+    std::vector<size_t> idx(K, 0);
+    for (;;) {
+      std::vector<int32_t> choice(K);
+      double w = 1.0 - st.lambda;
+      std::vector<double> dw(E);
+      for (int e = 0; e < E; e++) dw[e] = -dlamG[e];
+      for (int k = 0; k < K; k++) {
+        const Choice &ch = choices[k][idx[k]];
+        choice[k] = ch.part;
+        for (int e = 0; e < E; e++) dw[e] *= ch.w; // d(prod) by the product rule below
+      }
+      // dw = -dlam prod w_c + (1 - lambda) sum_c (prod_{c' != c} w_c') dw_c
+      for (int k = 0; k < K; k++) {
+        double others = 1.0 - st.lambda;
+        for (int k2 = 0; k2 < K; k2++)
+          if (k2 != k) others *= choices[k2][idx[k2]].w;
+        for (int e = 0; e < E; e++) dw[e] += others * choices[k][idx[k]].dw[e];
+        w *= choices[k][idx[k]].w;
+      }
+      add(choice, w, dw);
+      int k = 0;
+      while (k < K && ++idx[k] == choices[k].size()) idx[k] = 0, k++;
+      if (k == K) break;
+    }
+  }
+  if (st.lambda > 0.0) add(std::vector<int32_t>(K, -1), st.lambda, dlamG);
+  // a copy of zero weight with zero gradient is not evaluated
+  st.copies.erase(std::remove_if(st.copies.begin(), st.copies.end(),
+                                 [](const LrcStateCopy &cp) {
+                                   if (cp.w != 0) return false;
+                                   for (double v : cp.dw)
+                                     if (v != 0) return false;
+                                   return true;
+                                 }),
+                  st.copies.end());
+  double sum = 0;
+  for (const auto &cp : st.copies) sum += cp.w;
+  if (!(std::abs(sum - 1.0) < 1e-9))
+    throw std::logic_error("lrc_states: the copy weights sum to " + std::to_string(sum));
+  bool plain = st.copies.size() == 1;
+  if (plain)
+    for (int32_t ch : st.copies[0].choice) plain = plain && ch < 0;
+  st.active = !plain;
+  if (!st.active) st.copies.clear();
+  return st;
+}
+
+LrcCondition lrc_state_condition(const LrcSpec &L, const LrcCondition &c, const LrcStates &st, size_t v, double Q,
+                                 int max_charge) {
+  (void)Q;
+  const LrcStateCopy &cp = st.copies.at(v);
+  bool all_fix3 = true;
+  for (int32_t ch : cp.choice) all_fix3 = all_fix3 && ch < 0;
+  if (all_fix3) return c;
+  LrcCondition h = c;
+  LrcClusters &cl = h.cl;
+  const int s = cl.s;
+  // keep the super-edges (and weak links) of the fix-3-mode components only, renumbered
+  std::vector<int> keep_e(c.cl.se.size(), -1);
+  cl.se.clear(), cl.p.clear(), cl.weak.clear();
+  for (size_t e = 0; e < c.cl.se.size(); e++) {
+    const int k = st.comp_of[c.cl.se[e].first];
+    if (k >= 0 && cp.choice[k] >= 0) continue;
+    keep_e[e] = static_cast<int>(cl.se.size());
+    cl.se.push_back(c.cl.se[e]), cl.p.push_back(c.cl.p[e]);
+  }
+  for (const auto &wk : c.cl.weak)
+    if (keep_e[wk.e] >= 0) {
+      auto w = wk;
+      w.e = keep_e[wk.e];
+      cl.weak.push_back(w);
+    }
+  // R: binary within the state-mode components (same group), unchanged elsewhere
+  for (size_t k = 0; k < st.comps.size(); k++) {
+    if (cp.choice[k] < 0) continue;
+    const auto &nodes = st.comp_nodes[k];
+    const auto &lab = st.parts[k][cp.choice[k]];
+    for (size_t qa = 0; qa < nodes.size(); qa++)
+      for (size_t qb = 0; qb < nodes.size(); qb++)
+        cl.R[size_t(nodes[qa]) * s + nodes[qb]] = lab[qa] == lab[qb] ? 1.0 : 0.0;
+  }
+  const int n = static_cast<int>(cl.sn.size());
+  h.Qloc.assign(s, 0.0);
+  for (int a = 0; a < s; a++)
+    for (int b = 0; b < s; b++) h.Qloc[a] += cl.R[size_t(a) * s + b] * h.Q0[b];
+  if (L.cond_global) h.Qloc.assign(s, Q);
+  condition_rows(L, h, n, max_charge);
+  return h;
+}
+
+void lrc_states_vjp(const LrcSpec &L, const LrcClusters &c, const LrcStates &st, const std::vector<double> &E,
+                    double *g) {
+  if (!st.active) return;
+  if (E.size() != st.copies.size()) throw std::logic_error("lrc_states_vjp: one energy per copy");
+  std::vector<double> dp(c.se.size(), 0.0);
+  for (size_t v = 0; v < st.copies.size(); v++)
+    for (size_t e = 0; e < dp.size(); e++) dp[e] += E[v] * st.copies[v].dw[e];
+  weak_links_grad(L, c, dp, c.xh.data(), g, nullptr);
+}
+
+std::vector<double> lrc_superedge_grads(const LrcSpec &L, const LrcClusters &c, int n) {
+  const size_t E = c.se.size();
+  std::vector<double> rows(E * 3 * size_t(n), 0.0);
+  for (size_t e = 0; e < E; e++) {
+    std::vector<double> dp(E, 0.0);
+    dp[e] = 1.0;
+    weak_links_grad(L, c, dp, c.xh.data(), rows.data() + e * 3 * size_t(n), nullptr);
   }
   return rows;
 }

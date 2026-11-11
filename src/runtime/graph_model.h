@@ -305,6 +305,8 @@ private:
   // (input cond_blend) of the local-charge conditioning; empty: the structure's charge, blend 0
   std::vector<int32_t> lrc_hi_;
   std::vector<float> lrc_blend_;
+  // lrc_states: per atom the edge-drop group of the copy being evaluated (LrcStates::drop_groups; empty: no drop)
+  std::vector<int32_t> lrc_drop_;
   // combined model: dE/d(blend) per atom of the last predict_single_impl with forces (scaled to eV), when asked
   bool lrc_want_blend_grad_ = false;
   std::vector<double> lrc_blend_grad_;
