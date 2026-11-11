@@ -37,6 +37,12 @@ struct ModelResult {
   bool has_charge_residual = false;
   /// conserving charges (his feat/conserving-charges): the dipole of the edge flows, P_flow = -1/2 sum_e F_e R_e (e A)
   std::vector<double> dipole_flow;
+  /// induced dipoles (his induced_dipoles, feat/conserving-charges): sum_i mu_i (e A) and the polarisabilities
+  /// alpha_i (A^3) per atom
+  std::vector<double> dipole_induced;
+  std::vector<float> polarisabilities;
+  /// under a nonzero field (field-input models): his field force E . Z0 [3 n] (eV/A), already in `forces`
+  std::vector<double> field_forces;
   /// conserving charges on several components: each atom's component and their charges Q_c (mlip.cpp's R-only rule)
   std::vector<int> components;
   std::vector<double> component_charges;

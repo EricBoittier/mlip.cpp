@@ -58,7 +58,10 @@ std::vector<std::pair<std::string, std::string>> lr_ggufs() {
           // energy-gradient path, dipole_flow and the zf columns) and the les-water ladder with its LR head
           // (les_ladder_lr_c0: charge_layer 0, 3 unshared passes)
           {"conserving fermi + field input (zero field)", resource("petlr_tiny_ccfield.gguf")},
-          {"les ladder + LR head (charge_layer 0)", resource("petlr_les_ladder_lr.gguf")}};
+          {"les ladder + LR head (charge_layer 0)", resource("petlr_les_ladder_lr.gguf")},
+          // induced dipoles (his a98c2f6 induced_dipoles="full", jax-pme EwaldDipole: open pairs, 3-D / slab Ewald with
+          // dipoles; make_seeded.py cc_ind_full: residual, one pass, Gaussian charges, field input at zero field)
+          {"conserving residual + induced dipoles (full, Gaussian charges)", resource("petlr_tiny_ccind.gguf")}};
 }
 
 // 24 water molecules in a 9.0 A cube, a fixed jittered lattice (deterministic)
@@ -588,9 +591,14 @@ TEST_CASE("pet_lr_port: slab virial chain rule (normal / basis): W = dE/d eps at
         for (int a = 0; a < 3; a++) c2[3 * v + a] = float(c[3 * v + a] + (a == i ? e * c[3 * v + j] : 0.0));
       return double(m.predict(n, y.data(), Z.data(), c2, pbc, pe).energy);
     };
-    // Richardson from h = 2e-3 / 1e-3 (the strain energy is strongly curved here: fd(h) moves by ~1 eV between
-    // h = 5e-4 and 4e-3, so |fd(h) - fd(2h)| is truncation, not noise, and is NOT allowed for); the fp32 energy
-    // noise is bounded a priori: 2 ulp of E per energy, i.e. <= (4/3 + 1/6) * 2 * 2 ulp(E) / (2 h) in the extrapolate
+    // Richardson from TWO step pairs, h = 1e-3 / 2e-3 and 4e-3 / 8e-3, per component the closer one: an analytic error
+    // of W shows at every step, while the two pairs fail differently (the small pair on fp32 ROUNDOFF, the large one
+    // on O(h^4) truncation of the strongly curved strain energies). Before, the small pair alone with a noise bound of
+    // 2 ulp of E: the step scan [.slab_fd_scan] showed the conserving residual preset's fd(h) - W to be non-monotonic
+    // and ~1/h at small h (|E| 117 eV, |W| 309 eV, energy noise ~5e-4 eV = ~40 ulp of |E|: a sum of far larger
+    // cancelling Coulomb / slab terms), so that pair carried 0.59 eV (CPU) / 1.10 eV (H100 with MLIPCPP_PRECISE_SQRT=1,
+    // another rounding draw) of noise against a 0.70 eV tolerance (2.2e-3 x |W| + noise): 4e-3 / 8e-3 gives 0.10 eV
+    // there, while species_weighted (|W| 1946) needs the small pair (0.49 vs 2.1 eV at the large one: truncation).
     const double E0 = std::abs(double(r.energy));
     const double noise = 3.0 * (2.0 * 1.2e-7 * E0) / 1e-3;
     double scale = 0, wv = 0, anti = 0;
@@ -598,8 +606,9 @@ TEST_CASE("pet_lr_port: slab virial chain rule (normal / basis): W = dE/d eps at
     for (int i = 0; i < 3; i++)
       for (int j = 0; j < 3; j++) {
         auto fd = [&](double h) { return (strained(i, j, h) - strained(i, j, -h)) / (2 * h); };
-        const double f1 = fd(1e-3), f2 = fd(2e-3);
-        wv = std::max(wv, std::abs((4.0 * f1 - f2) / 3.0 - r.virial[3 * j + i]));
+        const double f1 = fd(1e-3), f2 = fd(2e-3), f4 = fd(4e-3), f8 = fd(8e-3);
+        const double w = r.virial[3 * j + i];
+        wv = std::max(wv, std::min(std::abs((4.0 * f1 - f2) / 3.0 - w), std::abs((4.0 * f4 - f8) / 3.0 - w)));
         anti = std::max(anti, std::abs(r.virial[3 * i + j] - r.virial[3 * j + i]));
       }
     INFO("max |FD - W| = " << wv << " eV, max |W| = " << scale << " eV, max antisym " << anti << ", fp32 noise bound "
@@ -609,6 +618,101 @@ TEST_CASE("pet_lr_port: slab virial chain rule (normal / basis): W = dE/d eps at
     // the normal-row (vacuum) components are not trivially zero through the positions
     CHECK(std::abs(r.virial[8]) > 1e-3);
   }
+}
+
+TEST_CASE("pet_lr_port: field force E . Z0 on a periodic cell (his unfolded levers) = the open closed form",
+          "[pet_lr_port]") {
+  // His E . Z0 (Born charges of the pass-1 charges at a frozen Fermi level, contracted with the field) is not an
+  // energy gradient: no FD. mlip.cpp computes it by two different constructions: on open structures the closed form
+  // E q0 + d[sum_j (E . r_j) q0_j] - (E . r_k) dQ0 (two backward passes), on periodic cells his iris.pet.bec levers
+  // (-R . E on the raw edge vectors and on every cross-atom gather; one more pass). A molecule alone in a large cell
+  // (no image within the cutoff) has the same pass-1 charges either way, so the two must agree (Result::field_forces).
+  std::vector<float> x;
+  std::vector<int32_t> Z;
+  float cell[9];
+  water_box(x, Z, cell);
+  x.resize(36), Z.resize(12); // four waters
+  x.insert(x.end(), {4.0f, 4.6f, 1.0f});
+  Z.push_back(11); // and a sodium (Q +1)
+  const int n = int(Z.size());
+  for (int i = 0; i < n; i++)
+    for (int a = 0; a < 3; a++) x[3 * i + a] += 12.0f;
+  const float big[9] = {36.0f, 0, 0, 0, 37.0f, 0, 0, 0, 38.0f};
+  const bool pbc[3] = {true, true, true};
+  ModelOptions mo;
+  Predictor m(resource("petlr_tiny_ccfield.gguf"), mo);
+  PredictOptions po;
+  po.compute_forces = true;
+  po.charge = 1, po.spin_multiplicity = 1;
+  po.field = {0.12, -0.21, 0.17};
+  const Result ro = m.predict(n, x.data(), Z.data(), nullptr, nullptr, po);
+  const Result rp = m.predict(n, x.data(), Z.data(), big, pbc, po);
+  REQUIRE(rp.virial.size() == 9); // the periodic graph ran
+  REQUIRE(ro.field_forces.size() == 3 * size_t(n));
+  REQUIRE(rp.field_forces.size() == 3 * size_t(n));
+  double worst = 0, scale = 0, eq0 = 0;
+  for (size_t i = 0; i < ro.field_forces.size(); i++) {
+    worst = std::max(worst, std::abs(ro.field_forces[i] - rp.field_forces[i]));
+    scale = std::max(scale, std::abs(ro.field_forces[i]));
+    eq0 = std::max(eq0, std::abs(ro.field_forces[i] - po.field[i % 3] * ro.charges[i / 3])); // beyond E q0
+  }
+  INFO("max|E.Z0 open - E.Z0 periodic| = " << worst << ", max|E.Z0| " << scale << ", max|E.Z0 - E q0| " << eq0);
+  CHECK(eq0 > 1e-2 * scale);            // the charge-response part is there, not just E q0
+  CHECK(worst < 2e-5 * scale + 1e-7);   // the two constructions agree (fp32)
+}
+
+// Hidden diagnostic (not run by default; tag [.slab_fd_scan]): the slab virial FD of the test above per component
+// for a scan of the strain step h, plain central differences and the Richardson pairs (h, 2h), with W, |E| and the
+// energies E(+-h). A real analytic error stays constant in h; fp32 / reduction noise grows as 1/h; truncation as h^2
+// (central) or h^4 (Richardson). MLIPCPP_PETLR_LR_GGUF selects the model (default the conserving residual preset).
+TEST_CASE("pet_lr_port: slab virial FD step scan (diagnostic)", "[.slab_fd_scan]") {
+  std::vector<float> x;
+  std::vector<int32_t> Z;
+  float cell[9];
+  water_box(x, Z, cell);
+  x.resize(27), Z.resize(9);
+  x.insert(x.end(), {4.0f, 4.6f, -1.0f, 4.9f, 4.4f, 10.0f});
+  Z.insert(Z.end(), {11, 17});
+  const int n = int(Z.size());
+  float c[9];
+  std::copy(cell, cell + 9, c);
+  c[8] = 22.0f;
+  const bool pbc[3] = {true, true, false};
+  const char *e = std::getenv("MLIPCPP_PETLR_LR_GGUF");
+  const std::string path = e && *e ? e : resource("petlr_tiny_ccresidual.gguf");
+  ModelOptions mo;
+  mo.iris_freeze_ewald = true;
+  Predictor m(path, mo);
+  PredictOptions po;
+  po.compute_forces = true, po.compute_stress = true;
+  po.charge = 0, po.spin_multiplicity = 1;
+  const Result r = m.predict(n, x.data(), Z.data(), c, pbc, po);
+  REQUIRE(r.virial.size() == 9);
+  PredictOptions pe = po;
+  pe.compute_forces = false, pe.compute_stress = false;
+  auto strained = [&](int i, int j, double h) {
+    std::vector<float> y(x.size());
+    float c2[9];
+    for (int k = 0; k < n; k++)
+      for (int a = 0; a < 3; a++) y[3 * k + a] = float(x[3 * k + a] + (a == i ? h * x[3 * k + j] : 0.0));
+    for (int v = 0; v < 3; v++)
+      for (int a = 0; a < 3; a++) c2[3 * v + a] = float(c[3 * v + a] + (a == i ? h * c[3 * v + j] : 0.0));
+    return double(m.predict(n, y.data(), Z.data(), c2, pbc, pe).energy);
+  };
+  std::printf("slab FD scan: %s, |E| %.9g\n", path.c_str(), double(r.energy));
+  const double hs[] = {2.5e-4, 5e-4, 1e-3, 2e-3, 4e-3, 8e-3};
+  for (int i = 0; i < 3; i++)
+    for (int j = 0; j < 3; j++) {
+      double fd[6];
+      std::printf("  (i %d, j %d) W %.6f | E0 %.9g\n", i, j, r.virial[3 * j + i], double(r.energy));
+      for (int t = 0; t < 6; t++) {
+        const double ep = strained(i, j, hs[t]), em = strained(i, j, -hs[t]);
+        fd[t] = (ep - em) / (2 * hs[t]);
+        std::printf("    h %.1e  E+ %.9g E- %.9g  FD %.6f  FD-W %+.6f%s", hs[t], ep, em, fd[t], fd[t] - r.virial[3 * j + i],
+                    t ? "" : "\n");
+        if (t) std::printf("  Rich(h/2,h)-W %+.6f\n", (4.0 * fd[t - 1] - fd[t]) / 3.0 - r.virial[3 * j + i]);
+      }
+    }
 }
 
 TEST_CASE("pet_lr_port: iris Ewald parameters frozen per run (his calculator) vs per call (his oracle)",

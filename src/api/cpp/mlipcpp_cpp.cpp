@@ -196,6 +196,9 @@ struct Predictor::Impl {
     result.charge_residual = internal_result.charge_residual;
     result.has_charge_residual = internal_result.has_charge_residual;
     result.dipole_flow = std::move(internal_result.dipole_flow);
+    result.dipole_induced = std::move(internal_result.dipole_induced);
+    result.polarisabilities = std::move(internal_result.polarisabilities);
+    result.field_forces = std::move(internal_result.field_forces);
     result.components = std::move(internal_result.components);
     result.component_charges = std::move(internal_result.component_charges);
     result.virial = std::move(internal_result.virial);

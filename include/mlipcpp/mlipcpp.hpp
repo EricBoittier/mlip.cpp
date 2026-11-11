@@ -62,6 +62,11 @@ struct Result {
   bool has_charge_residual = false;
   /// conserving charges: the dipole of the edge flows (e A) [3]; empty otherwise
   std::vector<double> dipole_flow;
+  /// induced dipoles: sum_i mu_i (e A) [3] and alpha_i (A^3) per atom; empty otherwise
+  std::vector<double> dipole_induced;
+  std::vector<float> polarisabilities;
+  /// under a nonzero field: his field force E . Z0 [3 n] (eV/A), already included in `forces`; empty otherwise
+  std::vector<double> field_forces;
   /// conserving charges on several components: each atom's component and their charges Q_c; empty otherwise
   std::vector<int> components;
   std::vector<double> component_charges;

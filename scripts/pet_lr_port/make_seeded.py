@@ -121,6 +121,15 @@ PRESETS.update({
     "cc_fermi_field": dict(_CC, charge_allocation="fermi", polarisation_passes=2, hardness=True,
                            inputs=["charge", "field"]),
     "cc_residual_field": dict(_CC, charge_allocation="residual", polarisation_passes=1, inputs=["charge", "field"]),
+    # induced dipoles (his a98c2f6 induced_dipoles; jax-pme EwaldDipole of lab-cosmo/jax-pme#38 rebased onto 1c26495 by
+    # us): the gate (init -6, softplus 2.5e-3: dipoles all but off) set to 1.0 (softplus 1.31) so alpha_i is O(1) A^3
+    # and the induced terms carry weight. "field" (one-shot, variational) on the fermi preset with 2 passes (the field
+    # of the last pass's charges); "full" (charge + dipole Coulomb with the dipoles as sources) on residual, one pass,
+    # Gaussian charges (smearing 1.0: the smeared-field and dipole-potential corrections on the SR edges)
+    "cc_ind_field": dict(_CC, charge_allocation="fermi", polarisation_passes=2, hardness=True, inputs=["charge", "field"],
+                         induced_dipoles="field", _set={"polarisability_gate": 1.0}),
+    "cc_ind_full": dict(_CC, charge_allocation="residual", polarisation_passes=1, inputs=["charge", "field"],
+                        induced_dipoles="full", smearing=1.0, _set={"polarisability_gate": 1.0}),
 })
 
 # his les-water backbones (ipsum-work play/les-water/backbones.py; iris branch explore/alessandro-strict-local-20261012-v1
