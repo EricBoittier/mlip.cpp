@@ -44,6 +44,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("out"); ap.add_argument("--preset", required=True, choices=sorted(PRESETS))
     ap.add_argument("--seed", type=int, default=0); ap.add_argument("--scale", type=float, default=0.5)
+    ap.add_argument("--config", help="a training config.yaml to copy (Calculator.from_checkpoint reads its sampler)")
     a = ap.parse_args()
     import jax
     import jax.numpy as jnp
@@ -69,6 +70,9 @@ def main():
     write_msgpack(d / "model.msgpack", jax.tree.map(lambda v: jnp.asarray(v), params))
     write_yaml(d / "model.yaml", {"iris.pet.petlr.PETLR": cfg})
     write_yaml(d / "baseline.yaml", {})
+    if a.config:
+        import shutil
+        shutil.copy(a.config, Path(a.out) / "config.yaml")
     print(a.preset, cfg, sum(x.size for x in out), "parameters ->", d)
 
 

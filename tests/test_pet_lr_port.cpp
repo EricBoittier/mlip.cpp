@@ -99,3 +99,102 @@ TEST_CASE("pet_lr_port: spin-only conditioning ignores the charge", "[pet_lr_por
   po.spin_multiplicity = 1;
   CHECK(model.predict(3, x.data(), Z.data(), nullptr, nullptr, po).energy != e0);
 }
+
+// ---- iris PET-LR long-range branch (pet.iris_lr GGUFs: iris_to_gguf.py --lr) ----
+#include "../src/runtime/iris_lr.h"
+
+TEST_CASE("pet_lr_port: iris fermi_level host side (bisection, gapped decision, tie split)", "[pet_lr_port]") {
+  using namespace mlipcpp::runtime::iris;
+  FermiConfig c;
+  std::vector<double> s = {0.31, -1.2, 2.05, 0.77, -0.4, 1.6, -2.3, 0.05, 0.9, -0.66, 1.1, 0.2};
+  for (double Q : {-2.0, 0.0, 1.0, 3.0}) {
+    const FermiHost h = fermi_host(s, Q, c);
+    double q = 0;
+    for (double x : s) q += occupation(x - h.mu, c);
+    CHECK(std::fabs(q - Q) < 1e-9); // 40 halvings of a ~12-wide bracket
+    CHECK_FALSE(h.gapped);          // T = 0.1: the density at any integer filling is >> eps
+    double wt = 0, wb = 0;
+    for (size_t i = 0; i < s.size(); i++) wt += h.top[i], wb += h.bottom[i];
+    CHECK(std::fabs(wt - 1) < 1e-6);
+    CHECK(std::fabs(wb - 1) < 1e-6);
+  }
+  // T = 0.02, scores near integers with a three-way tie at the top: gapped, weights 1/3 on the tie
+  c.temperature = 0.02;
+  const std::vector<double> g = {1.0, 1.0, 1.0, -1.0, 0.0, -1.0};
+  const FermiHost h = fermi_host(g, 1.0, c);
+  CHECK(h.gapped);
+  for (int i = 0; i < 3; i++) CHECK(std::fabs(h.top[i] - 1.0 / 3.0) < 1e-7);
+  CHECK(h.top[4] == 0.f);
+  CHECK(std::fabs(h.bottom[3] - 0.5) < 1e-7);
+  CHECK(std::fabs(h.bottom[5] - 0.5) < 1e-7);
+}
+
+namespace {
+double iris_energy(Predictor &m, const std::vector<float> &x, const std::vector<int32_t> &Z, int Q,
+                   const PredictOptions &base) {
+  PredictOptions po = base;
+  po.compute_forces = false;
+  po.charge = Q;
+  return m.predict(int(Z.size()), x.data(), Z.data(), nullptr, nullptr, po).energy;
+}
+
+// forces = -dE/dx by central differences (h = 2e-3 A); charges sum to Q; the dipole is sum_i q_i (r_i - r0)
+void iris_check(Predictor &m, const std::vector<float> &x, const std::vector<int32_t> &Z, int Q, double ftol) {
+  PredictOptions po;
+  po.compute_forces = true;
+  po.charge = Q;
+  po.spin_multiplicity = 1;
+  po.dipole_origin = {0.1, -0.2, 0.3};
+  const auto r = m.predict(int(Z.size()), x.data(), Z.data(), nullptr, nullptr, po);
+  REQUIRE(r.charges.size() == Z.size());
+  REQUIRE(r.forces.size() == 3 * Z.size());
+  double qs = 0, D[3] = {0, 0, 0};
+  for (size_t i = 0; i < Z.size(); i++) {
+    qs += r.charges[i];
+    for (int a = 0; a < 3; a++) D[a] += r.charges[i] * (x[3 * i + a] - po.dipole_origin[a]);
+  }
+  CHECK(std::fabs(qs - Q) < 2e-4);
+  for (int a = 0; a < 3; a++) CHECK(std::fabs(D[a] - r.dipole[a]) < 2e-4);
+  const double h = 2e-3;
+  double worst = 0, fmax = 0;
+  for (size_t k = 0; k < x.size(); k++) {
+    std::vector<float> xp = x, xm = x;
+    xp[k] += float(h), xm[k] -= float(h);
+    const double hh = double(xp[k]) - double(xm[k]);
+    const double fd = -(iris_energy(m, xp, Z, Q, po) - iris_energy(m, xm, Z, Q, po)) / hh;
+    worst = std::max(worst, std::fabs(fd - r.forces[k]));
+    fmax = std::max(fmax, double(std::fabs(r.forces[k])));
+  }
+  INFO("max |F_FD - F| = " << worst << " eV/A, max |F| = " << fmax);
+  CHECK(worst < ftol);
+  CHECK(fmax > 0.05); // not trivially zero
+}
+} // namespace
+
+TEST_CASE("pet_lr_port: iris PET-LR forces = -dE/dx (FD), charge sum, dipole; several (n, k)", "[pet_lr_port]") {
+  const char *path = std::getenv("MLIPCPP_PETLR_LR_GGUF");
+  if (!path) SKIP("MLIPCPP_PETLR_LR_GGUF not set");
+  ModelOptions mo;
+  Predictor m(path, mo);
+  // H3O+ ... H2O (7 atoms, Q = +1)
+  const std::vector<float> a = {0, 0, 0, 0.98f, 0.1f, 0, -0.35f, 0.92f, 0.05f, -0.33f, -0.5f, 0.8f,
+                                2.55f, 0.2f, 0.1f, 3.1f, 0.95f, 0.2f, 3.05f, -0.55f, -0.1f};
+  iris_check(m, a, {8, 1, 1, 1, 8, 1, 1}, 1, 5e-3);
+  // water trimer (9 atoms, Q = 0)
+  const std::vector<float> b = {0, 0, 0, 0.96f, 0, 0, -0.24f, 0.93f, 0, 2.8f, 0.3f, 0.2f, 3.3f, 1.1f, 0.3f,
+                                3.2f, -0.4f, 0.7f, 1.2f, 2.6f, -0.3f, 0.5f, 3.2f, -0.5f, 1.9f, 3.1f, 0.2f};
+  iris_check(m, b, {8, 1, 1, 8, 1, 1, 8, 1, 1}, 0, 5e-3);
+  // Na+ and Cl- 7 A apart with a water each: two pieces, LR between them (Q = 0)
+  const std::vector<float> c = {0, 0, 0, 2.3f, 0, 0, 2.9f, 0.75f, 0.1f, 2.85f, -0.7f, -0.1f,
+                                7.0f, 0, 0, 10.1f, 0.2f, 0, 10.6f, 0.9f, 0.3f, 10.55f, -0.55f, -0.2f};
+  iris_check(m, c, {11, 8, 1, 1, 17, 8, 1, 1}, 0, 5e-3);
+}
+
+TEST_CASE("pet_lr_port: iris PET-LR on atoms without neighbours keeps the Coulomb forces", "[pet_lr_port]") {
+  const char *path = std::getenv("MLIPCPP_PETLR_LR_GGUF");
+  if (!path) SKIP("MLIPCPP_PETLR_LR_GGUF not set");
+  ModelOptions mo;
+  Predictor m(path, mo);
+  // Na+ and Cl- 8 A apart: no edge within the 5 A cutoff
+  iris_check(m, {0, 0, 0, 8.0f, 0.3f, -0.2f}, {11, 17}, 0, 5e-3);
+}

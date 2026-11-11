@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""Full PETLR parity (after M. Langer, ipsum/PET-LR): mlip.cpp (pet.iris_lr GGUF, mlipcpp-eval JSON) and each of his
+fp32 runs, all against his fp64 (`ref_petlr.py --x64`), per output: energy (|dE| / sum|E_i|), forces
+(max|dF| / max|F|), charges (max|dq|), mu (|dmu|), dipole (max|dD| / max|D|), metallicity (|d|). Max over frames,
+the floor verdict against the max of his runs, and the paired per-frame P(mlip.cpp worse than his run) with its
+z score (n frames, 0.5 = same distribution).
+
+    python lr_parity.py CPP.json REF64.npz RUN32.npz [RUN32.npz ...] [--label NAME]
+"""
+import argparse
+import json
+
+import numpy as np
+
+KEYS = ("E", "F", "q", "mu", "dipole", "metallicity")
+
+
+def per_frame(get, z):
+    ap = z["atom_ptr"]
+    out = {k: [] for k in KEYS}
+    for f in range(len(ap) - 1):
+        A = slice(ap[f], ap[f + 1])
+        g = get(f, A)
+        if g is None:
+            for k in KEYS:
+                out[k].append(np.nan)
+            continue
+        e = z["atom/energy"][A]
+        out["E"].append(abs(g["E"] - e.sum()) / np.abs(e).sum())
+        out["F"].append(np.abs(g["F"] - z["forces"][A]).max() / np.abs(z["forces"][A]).max())
+        if "atom/charges" in z.files:
+            out["q"].append(np.abs(g["q"] - z["atom/charges"][A]).max())
+            D = z["struct/dipole"][f]
+            out["dipole"].append(np.abs(g["dipole"] - D).max() / max(np.abs(D).max(), 1e-12))
+        if "int/fermi_level" in z.files:
+            out["mu"].append(abs(g["mu"] - z["int/fermi_level"][A][0]))
+            out["metallicity"].append(abs(g["metallicity"] - z["struct/metallicity"][f]))
+    return {k: np.asarray(v, float) for k, v in out.items() if len(v)}
+
+
+def from_cpp(path, z):
+    fr = json.load(open(path))["frames"]
+
+    def get(f, A):
+        x = fr[f]
+        if "error" in x:
+            return None
+        return dict(E=x["energy"], F=np.asarray(x["forces"]).reshape(-1, 3), q=np.asarray(x.get("charges", [])),
+                    dipole=np.asarray(x.get("dipole", [np.nan] * 3)), mu=x.get("fermi_level", np.nan),
+                    metallicity=x.get("metallicity", np.nan))
+    return per_frame(get, z)
+
+
+def from_ref(path, z):
+    r = np.load(path)
+
+    def get(f, A):
+        g = dict(E=r["atom/energy"][A].sum(), F=r["forces"][A])
+        if "atom/charges" in r.files:
+            g.update(q=r["atom/charges"][A], dipole=r["struct/dipole"][f])
+        if "int/fermi_level" in r.files:
+            g.update(mu=r["int/fermi_level"][A][0], metallicity=r["struct/metallicity"][f])
+        return g
+    return per_frame(get, z)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("cpp"); ap.add_argument("ref64"); ap.add_argument("runs", nargs="+")
+    ap.add_argument("--label", default="")
+    a = ap.parse_args()
+    z = np.load(a.ref64)
+    c = from_cpp(a.cpp, z)
+    runs = {p.split("/")[-1].replace(".npz", ""): from_ref(p, z) for p in a.runs}
+    nerr = int(np.isnan(c["E"]).sum())
+    print(f"== {a.label or a.cpp}: {len(c['E'])} frames ({nerr} failed); max over frames vs JAX fp64")
+    print(f"  {'':22s} " + " ".join(f"{k:>11s}" for k in KEYS if k in c))
+    print(f"  {'mlip.cpp':22s} " + " ".join(f"{np.nanmax(c[k]):11.2e}" for k in KEYS if k in c))
+    for n, r in runs.items():
+        print(f"  {'JAX ' + n:22s} " + " ".join(f"{np.nanmax(r[k]):11.2e}" if k in r else f"{'-':>11s}"
+                                             for k in KEYS if k in c))
+    for k in KEYS:
+        if k not in c:
+            continue
+        his = [np.nanmax(r[k]) for r in runs.values() if k in r]
+        if not his:
+            continue
+        mx = np.nanmax(c[k])
+        verdict = "within" if mx <= max(his) else "ABOVE"
+        ps = []
+        for r in runs.values():
+            ok = ~np.isnan(c[k]) & ~np.isnan(r[k])
+            n = ok.sum()
+            p = float((c[k][ok] > r[k][ok]).mean())
+            ps.append(f"P {p:.2f} (z {(p - 0.5) / (0.5 / np.sqrt(n)):+.1f})")
+        print(f"  {k:12s} his max {max(his):.2e}; mlip.cpp {mx:.2e} -> {verdict} ({mx / max(his):.2f}x); "
+              f"median {np.nanmedian(c[k]):.2e} vs {np.nanmedian(list(runs.values())[0][k]):.2e}; " + "; ".join(ps))
+
+
+if __name__ == "__main__":
+    main()

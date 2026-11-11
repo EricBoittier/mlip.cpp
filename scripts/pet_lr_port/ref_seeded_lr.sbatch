@@ -18,7 +18,8 @@ PY="/scratch/boittier/ipsum/env/bin/python -I"
 export PYTHONUNBUFFERED=1 JAX_PLATFORMS=cpu
 mkdir -p ref/seeded params
 for p in ${PRESETS:-lr_species lr_both lr_fermi_cold}; do
-  $PY scripts/make_seeded.py seeded/$p --preset $p --seed 3 || continue
+  $PY scripts/make_seeded.py seeded/$p --preset $p --seed 3 \
+    --config /work/cosmo/langer/kuma/argos/checkpoints/omol-4m/finetune/readout-pol/RMSE_F/config.yaml || continue
   $PY scripts/dump_params.py seeded/$p params/seeded_$p.npz
   for s in ${FAMS:-ion cluster}; do
     $PY scripts/ref_petlr.py seeded/$p frames/set_$s.extxyz ref/seeded/${p}_${s}_cpu64.npz --x64 --max ${MAXF:-40} > ref/seeded/${p}_${s}_cpu64.log 2>&1

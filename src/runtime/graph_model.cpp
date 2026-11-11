@@ -1027,7 +1027,9 @@ ModelResult GraphModel::predict_single_impl(
     std::vector<int> canonical(n_in);  // the edge of the pair (i->j, j->i) whose distance decides
     std::iota(canonical.begin(), canonical.end(), 0);
     // iris PET-LR: the grid in double (adaptive::radius, as the cached path), clamped bump as pet-jax
-    const bool grid_double = iris_lr_.enabled && !solver;
+    // (MLIPCPP_GRID_DOUBLE=1: the same for any grid model, diagnostics of the float grid below)
+    static const bool grid_double_env = [] { const char *e = std::getenv("MLIPCPP_GRID_DOUBLE"); return e && *e == '1'; }();
+    const bool grid_double = (iris_lr_.enabled || grid_double_env) && !solver;
     if (solver || grid_double) {
       // as in training (train/dataset.cpp): radii in double from the edges
       // of each centre, one keep decision per edge pair
@@ -1173,7 +1175,9 @@ ModelResult GraphModel::predict_single_impl(
     if (!iris_lr_.enabled) compute_forces = false; // iris PET-LR: the Coulomb energy still moves the atoms
   }
   const bool backward = compute_forces || blend_only;
-  interp_.set_exact_padding_mask(no_edges && !std::getenv("MLIPCPP_PAD_EMPTY"));
+  // iris PET-LR graphs mask padded tokens themselves (-1e30, as pet-jax's flax mask); the exact mask's log(0) = -inf
+  // would meet that WHERE (lowered as c a + (1 - c) b) as 0 * -inf = NaN
+  interp_.set_exact_padding_mask(no_edges && !iris_lr_.enabled && !std::getenv("MLIPCPP_PAD_EMPTY"));
 
   // Set symbolic dimensions for this system
   interp_.set_dimension("n_atoms", n_atoms);
