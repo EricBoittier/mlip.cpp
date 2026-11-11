@@ -26,6 +26,7 @@ typedef struct ggml_gallocr *ggml_gallocr_t;
 namespace mlipcpp::runtime {
 
 struct CachedGraph;
+struct PlainGraph;
 
 /**
  * Model implementation using auto-exported computation graphs.
@@ -273,6 +274,12 @@ private:
     void operator()(CachedGraph *graph) const;
   };
   std::unique_ptr<CachedGraph, CachedGraphDeleter> cached_;
+  // predict_single_impl's graphs by exact shape (graph_cache.h PlainGraph), most recent first; bounded in count and
+  // device bytes. Not used with a capture hook, parameter gradients, PET-LR (Coulomb / P3M) or MLIPCPP_NO_GRAPH_CACHE.
+  struct PlainGraphDeleter {
+    void operator()(PlainGraph *graph) const;
+  };
+  std::vector<std::unique_ptr<PlainGraph, PlainGraphDeleter>> plain_graphs_;
   // allocates g's inputs, constants and compute buffer, then makes it cached_
   void finish_cached_graph(std::unique_ptr<CachedGraph, CachedGraphDeleter> g,
                            const std::vector<ggml_tensor *> &inputs,

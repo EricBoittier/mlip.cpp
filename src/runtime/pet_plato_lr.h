@@ -26,6 +26,8 @@
 #include "lr_combined.h"
 #include "sqe.h"
 
+#include <ggml-backend.h>
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -85,7 +87,8 @@ public:
   void create(ggml_context *ctx, const PetPlatoLRSpec &spec, const std::vector<PetPlatoLRStructure> &structures,
               int n_atoms, bool grad);
   /// writes the host data into the created tensors; positions [n][3]
-  void upload(const float *positions) const;
+  /// (async: asynchronous copies on that backend's stream, the caller synchronises it before the host data changes)
+  void upload(const float *positions, ggml_backend_t async = nullptr) const;
   /// new structures (cells, charges) for the same graph: false if they need other shapes
   /// (another mesh, k set, pair count, structure layout), then nothing is changed
   bool refresh(const std::vector<PetPlatoLRStructure> &structures);

@@ -325,11 +325,14 @@ std::vector<ggml_tensor *> PetPlatoLR::strains() const {
   return out;
 }
 
-void PetPlatoLR::upload(const float *pos) const {
-  auto set = [](ggml_tensor *t, const void *d) { // (reshapes: through their source, which a graph may not use)
-    if (t && t->view_src && ggml_nbytes(t) == ggml_nbytes(t->view_src)) t = t->view_src;
-    if (t && t->buffer) ggml_backend_tensor_set(t, d, 0, ggml_nbytes(t)); // (unused by the graph: not allocated)
+void PetPlatoLR::upload(const float *pos, ggml_backend_t async) const {
+  auto put = [](ggml_tensor *t, const void *d, ggml_backend_t be) { // (reshapes: through their source, which a graph
+    if (t && t->view_src && ggml_nbytes(t) == ggml_nbytes(t->view_src)) t = t->view_src; // may not use)
+    if (!t || !t->buffer) return; // (unused by the graph: not allocated)
+    if (be) ggml_backend_tensor_set_async(be, t, d, 0, ggml_nbytes(t));
+    else ggml_backend_tensor_set(t, d, 0, ggml_nbytes(t));
   };
+  auto set = [&](ggml_tensor *t, const void *d) { put(t, d, async); };
   set(positions, pos);
   set(struct_index_, h_sidx_.data());
   set(onehot_, h_onehot_.data()), set(inv_count_, h_invc_.data()), set(charge_per_atom_, h_qpa_.data());
@@ -345,7 +348,7 @@ void PetPlatoLR::upload(const float *pos) const {
   for (const auto &[t, v] : lazy_f32_) set(t, v.data());
   for (const Group &q : groups_) {
     std::vector<float> z(ggml_nelements(q.strain), 0.0f);
-    set(q.strain, z.data());
+    put(q.strain, z.data(), nullptr); // (synchronous: z is local)
     set(q.bidx, q.h_bidx.data()), set(q.mask, q.h_mask.data()), set(q.inv_count, q.h_invc.data());
     set(q.inv_volume, q.h_invv.data());
     if (q.mesh_k) set(q.mesh_k, q.h_mk.data()), set(q.mesh_k0_pad, q.h_mpad.data()), set(q.mesh_deconv, q.h_mdec.data());
