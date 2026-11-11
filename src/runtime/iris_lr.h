@@ -92,6 +92,24 @@ inline FermiHost fermi_host(const std::vector<double> &s, double Q, const FermiC
   return h;
 }
 
+/// mlip.cpp's R-only component charges for his conserving charges on several components (his code takes them from
+/// fragment labels; mlip.cpp has none): Q_c integer, sum_c Q_c = Q, by the largest-remainder rounding of a real share
+/// qhat_c (floor, then +1 to the largest fractional parts, ties to the lower component index, until the sum is Q).
+/// scripts/pet_lr_port/iris_torch.py component_charges_rule is the same.
+inline std::vector<double> largest_remainder(const std::vector<double> &qhat, double Q) {
+  const int C = int(qhat.size());
+  std::vector<double> base(C);
+  double sum = 0;
+  for (int c = 0; c < C; c++) base[c] = std::floor(qhat[c]), sum += base[c];
+  int rest = int(std::lround(Q - sum));
+  std::vector<int> order(C);
+  for (int c = 0; c < C; c++) order[c] = c;
+  std::stable_sort(order.begin(), order.end(),
+                   [&](int a, int b) { return qhat[a] - base[a] > qhat[b] - base[b]; });
+  for (int k = 0; k < rest && k < C; k++) base[order[k]] += 1.0;
+  return base;
+}
+
 /// jax.scipy.sparse.linalg.cg (jax 0.10.2 _cg_solve, x0 = 0) on the host in double, as his QEq
 /// (iris.pet.charges.qeq_reference, a2658e3) calls it: the same recurrences and stopping rule (iterate while
 /// |r|^2 > max(tol^2 |b|^2, atol^2) and k < maxiter; |r|^2 from r itself), with the preconditioner M. `A` and `M`

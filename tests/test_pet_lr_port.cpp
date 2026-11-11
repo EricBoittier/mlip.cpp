@@ -341,16 +341,46 @@ TEST_CASE("pet_lr_port: iris PET-LR on atoms without neighbours keeps the Coulom
     // Na+ and Cl- 8 A apart: no edge within the 5 A cutoff. The tiny models put |q| 0.01-0.17 e on them (F ~ 1e-5 -
     // 7e-3 eV/A), the gapped one rounds both to 0 (no force: nothing to require)
     const bool gapped = label.rfind("fermi gapped", 0) == 0;
-    if (label.rfind("conserving", 0) == 0) { // two components: raises (his sample prep without fragment labels)
-      const std::vector<float> x2 = {0, 0, 0, 8.0f, 0.3f, -0.2f};
-      const std::vector<int32_t> z2 = {11, 17};
-      PredictOptions p0;
-      p0.charge = 0, p0.spin_multiplicity = 1;
-      CHECK_THROWS(m.predict(2, x2.data(), z2.data(), nullptr, nullptr, p0));
-      continue;
-    }
     // (FD floor of fp32 energies here ~1e-5 eV/A: the Gaussian-charge model's 1.4e-5 eV/A sits at it)
-    iris_check(m, {0, 0, 0, 8.0f, 0.3f, -0.2f}, {11, 17}, 0, 2e-5, gapped ? -1.0 : 5e-6, !no_charge_sum(path));
+    // (conserving: two isolated atoms are two components with integer Q_c; at Q_c = 0 each there is no force)
+    const bool conserving = label.rfind("conserving", 0) == 0;
+    iris_check(m, {0, 0, 0, 8.0f, 0.3f, -0.2f}, {11, 17}, 0, 2e-5, gapped || conserving ? -1.0 : 5e-6,
+               !no_charge_sum(path));
+  }
+}
+
+// his conserving charges on SEVERAL components without fragment labels (mlip.cpp: the connected components of the
+// neighbour graph and the R-only Q_c rule, graph_multi.json): forces = -dE/dx (FD; Q_c is piecewise constant, fixed
+// away from a split), the total charge, and every component's charges summing to its integer Q_c
+TEST_CASE("pet_lr_port: conserving charges on several components (geometric components, R-only Q_c)", "[pet_lr_port]") {
+  // two waters 7 A apart (Q 0); water + Na 7 A apart (Q +1); Na ... Cl 8 A apart (Q 0, two isolated atoms)
+  const std::vector<float> w2 = {0, 0, 0, 0.76f, 0.59f, 0, -0.76f, 0.59f, 0, 7.0f, 0.2f, 0.1f, 7.6f, 0.9f, 0.3f,
+                                 7.5f, -0.6f, -0.3f};
+  const std::vector<float> wna = {0, 0, 0, 0.76f, 0.59f, 0, -0.76f, 0.59f, 0, 7.0f, 0.4f, -0.3f};
+  const std::vector<float> nacl = {0, 0, 0, 8.0f, 0.3f, -0.2f};
+  for (const auto &[label, path] : lr_ggufs()) {
+    if (label.rfind("conserving", 0) != 0) continue;
+    INFO("model: " << label);
+    ModelOptions mo;
+    Predictor m(path, mo);
+    struct Sys { std::vector<float> x; std::vector<int32_t> Z; int Q; };
+    for (const Sys &sy : {Sys{w2, {8, 1, 1, 8, 1, 1}, 0}, Sys{wna, {8, 1, 1, 11}, 1}, Sys{nacl, {11, 17}, 0}}) {
+      iris_check(m, sy.x, sy.Z, sy.Q, 5e-3, -1.0);
+      PredictOptions po;
+      po.charge = sy.Q, po.spin_multiplicity = 1, po.compute_forces = false;
+      const auto r = m.predict(int(sy.Z.size()), sy.x.data(), sy.Z.data(), nullptr, nullptr, po);
+      REQUIRE(r.components.size() == sy.Z.size());
+      REQUIRE(r.component_charges.size() == 2);
+      double sum = 0;
+      for (int c = 0; c < 2; c++) {
+        double qc = 0;
+        for (size_t i = 0; i < sy.Z.size(); i++) qc += r.components[i] == c ? r.charges[i] : 0.0;
+        CHECK(std::fabs(qc - r.component_charges[c]) < 2e-4);
+        CHECK(r.component_charges[c] == std::round(r.component_charges[c]));
+        sum += r.component_charges[c];
+      }
+      CHECK(sum == sy.Q);
+    }
   }
 }
 

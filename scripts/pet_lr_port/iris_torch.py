@@ -569,7 +569,7 @@ class IrisLR(_AuxMixin, nn.Module):
 
     def forward(self, node, species, positions, neighbor_index, padding_mask, reverse_neighbor_index, edge_vectors,
                 env, total_charge, mu_bisect, gapped, m_round, top, bottom, dipole_origin, ewald=None, qeq_z=None,
-                qeq_lambda=None, qeq_apply_x=None, field=None):
+                qeq_lambda=None, qeq_apply_x=None, field=None, comp=None):
         """Per-atom LR energy [n] and the charges. Inputs beyond the trunk's: neighbor_index [n, k] (atom index of
         each slot), positions [n, 3], total_charge [1], the host's frozen-score bisection mu_bisect [1] and gapped
         decision (gapped [1] in {0, 1}, m_round [n] rounded occupations, top / bottom [n] indicator weights of the
@@ -619,7 +619,44 @@ class IrisLR(_AuxMixin, nn.Module):
             return self.qeq_apply(species, potentials, qeq_apply_x)
         # --- reference ---
         aux = {}
-        if self.fermi:
+        if comp is not None:
+            # MULTI-COMPONENT conserving charges (his per-component Fermi level / residual correction, iris.pet.charges
+            # base_charges / residual_charges, a98c2f6), components and Q_c from the host (geometric components of the
+            # neighbour graph and mlip.cpp's R-only Q_c rule, component_charges_rule): comp = (M [n, C] one-hot,
+            # Q_c [C], mu_c [C] host bisection, gapped_c [C]); per-component sums seg(x) = sum_i M_ic x_i
+            M, Qc, mu_c, gap_c = comp
+            seg = lambda v: (M * v[:, None]).sum(dim=0)
+            bc = lambda v: (M * v[None, :]).sum(dim=1)
+            if self.ref == "fermi":
+                s = self.scores(node, species)
+                mub = bc(mu_c)
+                mu_n = mu_c + (seg(self.occupation(s - mub)) - Qc) / torch.clamp(seg(self.density(s - mub)), min=1e-6)
+                d_top, d_bot = seg((s - m_round) * top), seg((s - m_round) * bottom)
+                mu = gap_c * (0.5 * (d_top + d_bot)) + (-gap_c + 1.0) * mu_n
+                if self.frozen:
+                    mu = mu.detach()
+                mua = bc(mu)
+                x = s - mua
+                q = self.occupation(x)
+                aux.update(scores=s, fermi_level=mua, metallicity=self.density(x).sum(),
+                           density_atoms=self.density(x))
+            else:  # residual
+                p_free = self.free_charge(node)[:, 0]
+                aux["free_atoms"] = p_free
+                if self.see_charge:
+                    Qa = bc(Qc)
+                    basis = torch.cat([torch.exp(-2.0 * (Qa - float(m)) ** 2)[:, None]
+                                       for m in range(self.m_min, self.m_max + 1)], dim=-1)  # [n, n_states]
+                    xw = torch.cat([node, basis], dim=-1)
+                    wq = softplus(self.allocation_weight(torch.nn.functional.silu(self.allocation_hidden(xw)))[:, 0])
+                else:
+                    wq = softplus(self.allocation_weight(node)[:, 0])
+                deficit = Qc - seg(p_free)
+                corr = wq / bc(torch.clamp(seg(wq), min=1e-6)) * bc(deficit)
+                q = p_free + (corr.detach() if self.frozen else corr)
+                atoms_c = torch.clamp(seg(torch.ones_like(p_free)), min=1.0)
+                aux["residual_atoms"] = bc(torch.abs(deficit) / atoms_c)
+        elif self.fermi:
             s = self.scores(node, species)
             w = self.weights(species)
             if w is None:
@@ -934,17 +971,19 @@ class IrisPETLRGraph(IrisTrunk):
         # QEq: the host cg's solution z and the cotangent solution lam (QEQ_INPUTS, after dipole_origin)
         qz, qlam = lr_args[9:11] if self.lr.ref == "qeq" else (None, None)
         field = lr_args[9] if self.lr.field else None  # [3] (FIELD_INPUTS, after dipole_origin)
+        # multi-component (IrisPETLRGraphMulti): comp_onehot [n, C], comp_charge [C], comp_mu [C], comp_gapped [C] last
+        comp = tuple(lr_args[-4:]) if getattr(self, "multi", False) else None
         e_sr = IrisTrunk.forward(self, species, neighbor_species, edge_vectors, *trunk_args) * self.energy_scale
         node, env = self._aux["node"], self._aux["env"]
         padding_mask, reverse = args[0], args[1]
         e_lr = self.lr(node, species, positions, neighbor_index, padding_mask, reverse, edge_vectors, env,
                        total_charge, mu_bisect, gapped, m_round, top, bottom, dipole_origin, ewald=ew, qeq_z=qz,
-                       qeq_lambda=qlam, field=field)
+                       qeq_lambda=qlam, field=field, comp=comp)
         aux = self.lr._aux
         q = aux["charges"]
         zero = torch.zeros_like(q)
         mu = aux.get("fermi_level")
-        mu_col = (zero + mu) if mu is not None else zero
+        mu_col = (zero + mu) if mu is not None else zero  # (multi: each atom's component's mu)
         # QEq: column 6 is lam_i r_i, the adjoint term mlip.cpp adds to the loss (not an output)
         s_col = aux["scores"] if "scores" in aux else aux["qeq_adjoint"] if "qeq_adjoint" in aux else zero
         dens = aux["residual_atoms"] if "residual_atoms" in aux else aux["density_atoms"] if "density_atoms" in aux else (
@@ -972,6 +1011,50 @@ class IrisPETLRGraphPBC(IrisPETLRGraph):
         return self._forward(species, neighbor_species, edge_vectors, args[:-len(self.EWALD)], ew)
 
 
+class IrisPETLRGraphMulti(IrisPETLRGraph):
+    """IrisPETLRGraph for conserving charges on structures of SEVERAL components (the connected components of the
+    mutual neighbour graph): extra inputs after the others, MULTI = comp_onehot [n, C] (f32 one-hot), comp_charge [C]
+    (the host's Q_c), comp_mu [C] (the host's per-component bisection), comp_gapped [C]; mu_bisect / gapped unused.
+    A separate graph, so the single-component one stays bit for bit as before."""
+
+    MULTI = ("comp_onehot", "comp_charge", "comp_mu", "comp_gapped")
+    multi = True
+
+
+class IrisPETLRGraphMultiPBC(IrisPETLRGraphMulti):
+    """IrisPETLRGraphMulti on periodic cells (the Ewald inputs after MULTI)."""
+
+    def forward(self, species, neighbor_species, edge_vectors, *args):
+        E = IrisPETLRGraphPBC.EWALD
+        ew = dict(zip(E, args[-len(E):]))
+        return self._forward(species, neighbor_species, edge_vectors, args[:-len(E)], ew)
+
+
+def component_charges_rule(lr, comp, n_comp, Q, s=None, p=None):
+    """mlip.cpp's R-only Q_c (no fragment labels; his code needs them on more than one component): integers summing to
+    Q by the LARGEST-REMAINDER rounding of a real per-component share qhat_c: fermi, qhat_c = sum_{i in c} f(s_i - mu)
+    at the structure's single Fermi level mu (bisect_fermi on the frozen scores, as the one-component reference);
+    residual, qhat_c = sum_{i in c} p_i + (Q - sum p) n_c / n (the free charges, the deficit by atom count).
+    floor(qhat) then +1 to the largest fractional parts (ties: the lower component index) until the sum is Q.
+    numpy in double; the host (graph_model.cpp) is the same."""
+    import numpy as np
+    comp = np.asarray(comp)
+    if s is not None:
+        mu, _, _, _, _ = bisect_fermi(lr, torch.as_tensor(s, dtype=torch.float64), float(Q))
+        f = lr.occupation(torch.as_tensor(s, dtype=torch.float64) - float(mu)).numpy()
+        qhat = np.bincount(comp, weights=f, minlength=n_comp)
+    else:
+        p = np.asarray(p, float)
+        qhat = np.bincount(comp, weights=p, minlength=n_comp) + (Q - p.sum()) * np.bincount(comp, minlength=n_comp) / len(p)
+    base = np.floor(qhat)
+    rest = int(round(Q - base.sum()))
+    frac = qhat - base
+    order = sorted(range(n_comp), key=lambda c: (-frac[c], c))
+    for c in order[:max(rest, 0)]:
+        base[c] += 1
+    return base
+
+
 class IrisScoresGraph(IrisTrunk):
     """The first pass of the two-pass mu: trunk + score head (forward only), output s [n] (fermi / both references)."""
 
@@ -984,6 +1067,8 @@ class IrisScoresGraph(IrisTrunk):
         IrisTrunk.forward(self, species, neighbor_species, edge_vectors, *args)
         if self.lr.ref == "qeq":  # QEq: the electronegativity chi [n] (the host cg's right-hand side)
             return self.lr.electronegativity(self._aux["node"])[:, 0]
+        if self.lr.ref == "residual":  # conserving residual: the free charges p [n] (the multi-component Q_c rule)
+            return self.lr.free_charge(self._aux["node"])[:, 0]
         s = self.lr.scores(self._aux["node"], species)
         w = self.lr.weights(species)
         # species_fill: [n, 2] = (s, c) (the host bisection's weights); else s [n]

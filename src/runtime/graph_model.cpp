@@ -596,6 +596,9 @@ bool GraphModel::load_from_gguf(const std::string &path) {
     iris_lr_.graph_open = graph_json;
     iris_lr_.graph_pbc = loader.get_string("graph_pbc.json", "");
     iris_lr_.pbc_loaded = false;
+    iris_lr_.graph_multi_open = loader.get_string("graph_multi.json", "");
+    iris_lr_.graph_multi_pbc = loader.get_string("graph_multi_pbc.json", "");
+    iris_lr_.loaded_kind = -1;
   }
   qeq_interp_ = GraphInterpreter();
   if (iris_lr_.enabled && iris_lr_.reference == "qeq") {
@@ -616,6 +619,10 @@ bool GraphModel::load_from_gguf(const std::string &path) {
       throw std::runtime_error("pet.iris_lr: the fermi reference needs graph_scores.json");
     }
     scores_interp_.load_graph(sj);
+  } else if (iris_lr_.enabled && iris_lr_.reference == "residual" && iris_lr_.conserving_charges) {
+    // conserving residual: the free charges p (the multi-component Q_c rule), run only on several components
+    const std::string sj = loader.get_string("graph_scores.json", "");
+    if (!sj.empty()) scores_interp_.load_graph(sj);
   }
   if ((interp_.graph().get_input("coulomb_matrix") != nullptr) != long_range_) {
     ggml_free(temp_ctx);
@@ -1312,6 +1319,9 @@ ModelResult GraphModel::predict_single_impl(
     max_neighbors = std::max(max_neighbors, neighbor_counts[i]);
   }
   check_iris_overflow(max_neighbors);
+  // conserving charges on several components: the component of each atom and their count (0: one component)
+  std::vector<int> iris_comp;
+  int iris_n_comp = 0;
   if (iris_lr_.enabled && iris_lr_.conserving_charges) {
     // his conserving-charges branch (iris.pet.sample component_charges): one Fermi level / residual correction per
     // connected component of the mutual edge graph, Q_c from fragment labels, or the structure charge for a structure
@@ -1323,9 +1333,18 @@ ModelResult GraphModel::predict_single_impl(
     for (int e = 0; e < nlist.num_pairs(); e++) parent[root(nlist.centers[e])] = root(nlist.neighbors[e]);
     int comps = 0;
     for (int i = 0; i < n_atoms; i++) comps += root(i) == i;
-    if (comps > 1)
+    if (comps > 1 && iris_lr_.graph_multi_open.empty())
       throw std::runtime_error("iris PET-LR conserving_charges: " + std::to_string(comps) +
-                               " components without fragment labels (his sample prep raises)");
+                               " components and no graph_multi.json (re-export)");
+    if (comps > 1) { // ids numbered by first atom (his connected_components)
+      iris_comp.assign(n_atoms, -1);
+      std::vector<int> id_of(n_atoms, -1);
+      for (int i = 0; i < n_atoms; i++) {
+        const int r = root(i);
+        if (id_of[r] < 0) id_of[r] = iris_n_comp++;
+        iris_comp[i] = id_of[r];
+      }
+    }
     const double Q = system.charge();
     if (Q < double(n_atoms) * iris_lr_.m_min || Q > double(n_atoms) * iris_lr_.m_max)
       throw std::runtime_error("iris PET-LR conserving_charges: charge outside the charge-state range");
@@ -1354,6 +1373,7 @@ ModelResult GraphModel::predict_single_impl(
   interp_.set_dimension("max_neighbors", max_neighbors);
   interp_.set_dimension("n_edges", n_atoms * max_neighbors);
   interp_.set_dimension("max_neighbors_plus_one", max_neighbors + 1);
+  if (iris_n_comp > 1) interp_.set_dimension("n_comp", iris_n_comp);
   const bool iris_qeq = iris_lr_.enabled && iris_lr_.reference == "qeq";
   if (iris_qeq) {
     const Cell *c = system.cell();
@@ -1491,7 +1511,9 @@ ModelResult GraphModel::predict_single_impl(
   // iris PET-LR (pet.iris_lr): the LR branch's own inputs; positions are a gradient input
   ggml_tensor *iris_nbr = nullptr, *iris_pos = nullptr, *iris_Q = nullptr, *iris_mu = nullptr,
               *iris_gapped = nullptr, *iris_mround = nullptr, *iris_top = nullptr, *iris_bottom = nullptr,
-              *iris_r0 = nullptr, *iris_field = nullptr, *zf_w = nullptr, *zf_a = nullptr;
+              *iris_r0 = nullptr, *iris_field = nullptr, *zf_w = nullptr, *zf_a = nullptr, *comp_onehot = nullptr,
+              *comp_charge = nullptr, *comp_mu = nullptr, *comp_gapped = nullptr;
+  std::vector<double> comp_Q; // the component charges Q_c of the R-only rule (several components)
   // iris QEq: the host cg's solution z (a gradient input: d(sum E)/dz is the cotangent), the cotangent's solution
   // lambda (0 in the first pass) and the operator graph's argument x
   ggml_tensor *qeq_z = nullptr, *qeq_lambda = nullptr, *qeq_x = nullptr;
@@ -1513,8 +1535,13 @@ ModelResult GraphModel::predict_single_impl(
     iris_pbc = c && (c->periodic[0] || c->periodic[1] || c->periodic[2]);
     if (iris_pbc && iris_lr_.graph_pbc.empty())
       throw std::runtime_error("iris PET-LR: periodic structure but the GGUF has no graph_pbc.json (re-export)");
-    if (iris_pbc != iris_lr_.pbc_loaded) {
-      interp_.load_graph(iris_pbc ? iris_lr_.graph_pbc : iris_lr_.graph_open);
+    const int kind = (iris_pbc ? 1 : 0) + (iris_n_comp > 1 ? 2 : 0);
+    if (kind != iris_lr_.loaded_kind) {
+      const std::string *gj[4] = {&iris_lr_.graph_open, &iris_lr_.graph_pbc, &iris_lr_.graph_multi_open,
+                                  &iris_lr_.graph_multi_pbc};
+      if (gj[kind]->empty()) throw std::runtime_error("iris PET-LR: the GGUF lacks the graph for this structure");
+      interp_.load_graph(*gj[kind]);
+      iris_lr_.loaded_kind = kind;
       iris_lr_.pbc_loaded = iris_pbc;
     }
     if (iris_pbc) {
@@ -1625,6 +1652,12 @@ ModelResult GraphModel::predict_single_impl(
     iris_bottom = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, n_atoms), "bottom");
     iris_r0 = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, 3), "dipole_origin");
     if (iris_lr_.field) iris_field = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, 3), "field");
+    if (iris_n_comp > 1) {
+      comp_onehot = mk(ggml_new_tensor_2d(input_ctx, GGML_TYPE_F32, iris_n_comp, n_atoms), "comp_onehot");
+      comp_charge = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, iris_n_comp), "comp_charge");
+      comp_mu = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, iris_n_comp), "comp_mu");
+      comp_gapped = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, iris_n_comp), "comp_gapped");
+    }
     // the field force E . Z0 (open structures): the loss is zf_w sum E + sum_i zf_a_i X_i (X the zf_x column);
     // (1, 0) is the energy, (0, a) the gradients of the frozen pass-1 charges the force needs
     const bool has_zf = std::any_of(iris_lr_.columns.begin(), iris_lr_.columns.end(),
@@ -1857,6 +1890,16 @@ ModelResult GraphModel::predict_single_impl(
       ggml_backend_tensor_set(t, zeros.data(), 0, zeros.size() * sizeof(float));
     for (ggml_tensor *t : {iris_nbr, iris_pos, iris_Q, iris_mu, iris_gapped, iris_mround, iris_top, iris_bottom, iris_r0})
       interp_.set_input(ggml_get_name(t), t);
+    if (comp_onehot) { // one-hot membership; Q_c, mu_c, gapped_c are set after the scores pass (zero until then)
+      std::vector<float> M(size_t(iris_n_comp) * n_atoms, 0.f), z(iris_n_comp, 0.f);
+      for (int i = 0; i < n_atoms; i++) M[size_t(i) * iris_n_comp + iris_comp[i]] = 1.f;
+      ggml_backend_tensor_set(comp_onehot, M.data(), 0, M.size() * sizeof(float));
+      for (ggml_tensor *t : {comp_charge, comp_mu, comp_gapped}) {
+        ggml_backend_tensor_set(t, z.data(), 0, z.size() * sizeof(float));
+        interp_.set_input(ggml_get_name(t), t);
+      }
+      interp_.set_input("comp_onehot", comp_onehot);
+    }
     if (iris_field) { // the uniform external field (V/A; his `field` input), zero when the system carries none
       const std::array<double, 3> E = system.has_field() ? system.field() : std::array<double, 3>{0, 0, 0};
       // his forces under a field are -dE/dr PLUS E . Z0 (the exact Born charges of the pass-1 charges at a frozen
@@ -1967,7 +2010,9 @@ ModelResult GraphModel::predict_single_impl(
     throw std::runtime_error("Missing PET-LR charge application");
   ggml_tensor *iris_scores = nullptr, *iris_aux = nullptr, *qeq_apply = nullptr, *qeq_adjoint = nullptr;
   if (iris_lr_.enabled && output) {
-    if (scores_interp_.has_graph()) {
+    if (iris_n_comp > 1 && !scores_interp_.has_graph())
+      throw std::runtime_error("iris PET-LR: several components need the scores graph (re-export)");
+    if (scores_interp_.has_graph() && (iris_lr_.reference != "residual" || iris_n_comp > 1)) {
       iris_scores = scores_interp_.build(compute_ctx);
       if (!iris_scores) throw std::runtime_error("iris PET-LR: scores graph failed to build");
       ggml_set_output(iris_scores);
@@ -2183,6 +2228,50 @@ ModelResult GraphModel::predict_single_impl(
         iris_qeq_stats_.forward_iterations = z.iterations, iris_qeq_stats_.forward_ratio = z.final_ratio;
         const std::vector<float> zf(z.x.begin(), z.x.end());
         ggml_backend_tensor_set(qeq_z, zf.data(), 0, zf.size() * sizeof(float));
+      } else if (iris_n_comp > 1) {
+        // several components (his conserving charges with Q_c per component): Q_c from mlip.cpp's R-only rule, then
+        // (fermi) one bisection per component on its own atoms at its Q_c
+        if (ggml_nelements(iris_scores) != n_atoms) throw std::runtime_error("iris PET-LR: scores graph output size");
+        std::vector<float> sf(n_atoms);
+        ggml_backend_tensor_get(iris_scores, sf.data(), 0, sf.size() * sizeof(float));
+        const int C = iris_n_comp;
+        const double Q = double(system.charge());
+        iris::FermiConfig fc;
+        fc.m_min = iris_lr_.m_min, fc.m_max = iris_lr_.m_max, fc.temperature = iris_lr_.temperature;
+        fc.iterations = iris_lr_.iterations, fc.eps = iris_lr_.eps;
+        std::vector<double> qhat(C, 0.0), sd(sf.begin(), sf.end());
+        std::vector<int> size(C, 0);
+        for (int i = 0; i < n_atoms; i++) size[iris_comp[i]]++;
+        if (iris_lr_.reference == "fermi") { // the share at the structure's single (bisected) Fermi level
+          const iris::FermiHost h = iris::fermi_host(sd, Q, fc);
+          for (int i = 0; i < n_atoms; i++) qhat[iris_comp[i]] += iris::occupation(sd[i] - h.mu, fc);
+        } else { // residual: the free charges, the deficit spread by atom count
+          double psum = 0;
+          for (int i = 0; i < n_atoms; i++) qhat[iris_comp[i]] += sd[i], psum += sd[i];
+          for (int c = 0; c < C; c++) qhat[c] += (Q - psum) * size[c] / n_atoms;
+        }
+        comp_Q = iris::largest_remainder(qhat, Q);
+        for (int c = 0; c < C; c++) // his range check per component
+          if (comp_Q[c] < double(size[c]) * iris_lr_.m_min || comp_Q[c] > double(size[c]) * iris_lr_.m_max)
+            throw std::runtime_error("iris PET-LR conserving_charges: component charge outside its charge-state range");
+        std::vector<float> qf(comp_Q.begin(), comp_Q.end()), muf(C, 0.f), gf(C, 0.f);
+        std::vector<float> mr(n_atoms, 0.f), tp(n_atoms, 0.f), bt(n_atoms, 0.f);
+        if (iris_lr_.reference == "fermi")
+          for (int c = 0; c < C; c++) {
+            std::vector<int> idx;
+            std::vector<double> sc;
+            for (int i = 0; i < n_atoms; i++)
+              if (iris_comp[i] == c) idx.push_back(i), sc.push_back(sd[i]);
+            const iris::FermiHost h = iris::fermi_host(sc, comp_Q[c], fc);
+            muf[c] = float(h.mu), gf[c] = h.gapped ? 1.f : 0.f;
+            for (size_t k = 0; k < idx.size(); k++) mr[idx[k]] = h.m_round[k], tp[idx[k]] = h.top[k], bt[idx[k]] = h.bottom[k];
+          }
+        ggml_backend_tensor_set(comp_charge, qf.data(), 0, qf.size() * sizeof(float));
+        ggml_backend_tensor_set(comp_mu, muf.data(), 0, muf.size() * sizeof(float));
+        ggml_backend_tensor_set(comp_gapped, gf.data(), 0, gf.size() * sizeof(float));
+        ggml_backend_tensor_set(iris_mround, mr.data(), 0, n_atoms * sizeof(float));
+        ggml_backend_tensor_set(iris_top, tp.data(), 0, n_atoms * sizeof(float));
+        ggml_backend_tensor_set(iris_bottom, bt.data(), 0, n_atoms * sizeof(float));
       } else {
         // species_fill: the scores graph returns [n, 2] = (s, c), c the Fermi level's weights
         const bool weighted = iris_lr_.reference == "species_fill";
@@ -2738,6 +2827,10 @@ ModelResult GraphModel::predict_single_impl(
       col += width;
     }
     result.fermi_level = n_atoms ? aux[5] : 0.0;
+    if (iris_n_comp > 1) { // several components: each atom's component and the Q_c of mlip.cpp's rule
+      result.components.assign(iris_comp.begin(), iris_comp.end());
+      result.component_charges = comp_Q;
+    }
     result.has_charges = true;
   }
 

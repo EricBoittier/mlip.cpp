@@ -55,7 +55,12 @@ def main():
     # the uniform external field (his `field` input, atoms.info["field"] [3], V/A) when the model reads it
     inputs = ("charge", "field") if "field" in (getattr(model, "inputs", None) or ()) else ("charge",)
     props = {**DEFAULT_PROPERTIES, "charge": {"shape": (1,), "storage": "atoms.info"},
-             "field": {"shape": (3,), "storage": "atoms.info"}}
+             "field": {"shape": (3,), "storage": "atoms.info"},
+             "fragment": {"shape": ("atom",), "storage": "atoms.arrays"},
+             "fragment_charge": {"shape": ("atom",), "storage": "atoms.arrays"}}
+    # fragment labels when the frames carry them (multi_comp.py label: the geometric components and mlip.cpp's Q_c)
+    if "fragment" in read(a.frames, "0").arrays:
+        inputs = inputs + ("fragment", "fragment_charge")
     keys = ("energy", "forces")
     prep = KnnToSample(cutoff=model.cutoff, num_neighbors=width, inputs=inputs, keys=keys, properties=props,
                        with_lr=True, num_k=a.num_k, conserving_charges=True,
