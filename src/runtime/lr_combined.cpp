@@ -1393,6 +1393,44 @@ std::vector<double> lrc_blend_rows(const LrcSpec &L, const SqeSpec &S, const Lrc
   return rows;
 }
 
+std::vector<double> lrc_q0_rows(const LrcSpec &L, const SqeSpec &S, const LrcCondition &c, int n, const int32_t *Z,
+                                const double *x) {
+  const int s = c.cl.s;
+  std::vector<double> rows(size_t(s) * 3 * n, 0.0);
+  if (s == 1 || L.cond_global) return rows;
+  std::vector<double> w(n);
+  for (int b = 0; b < s; b++) {
+    for (int i = 0; i < n; i++) w[i] = c.cl.sn[i] == b ? 1.0 : 0.0;
+    lrc_q0_vjp(L, S, n, Z, x, c.q0, w.data(), rows.data() + size_t(b) * 3 * n, nullptr);
+  }
+  return rows;
+}
+
+std::vector<double> lrc_blend_rows_q0(const LrcSpec &L, const LrcCondition &c, int n, const double *x,
+                                      const std::vector<double> &q0rows) {
+  const int s = c.cl.s;
+  std::vector<double> rows(size_t(s) * 3 * n, 0.0);
+  if (s == 1 || L.cond_global) return rows;
+  if (q0rows.size() != rows.size()) throw std::logic_error("lrc_blend_rows_q0: q0 rows of another clustering");
+  for (int a = 0; a < s; a++) {
+    if (c.dS[a] == 0) continue;
+    double *r = rows.data() + size_t(a) * 3 * n;
+    // dQloc_a/dx = sum_b R_ab dQ0_b/dx + sum_{b != a} Q0_b dR_ab/dx
+    for (int b = 0; b < s; b++) {
+      const double R = c.cl.R[size_t(a) * s + b];
+      if (R == 0) continue;
+      const double *qb = q0rows.data() + size_t(b) * 3 * n;
+      for (int k = 0; k < 3 * n; k++) r[k] += R * qb[k];
+    }
+    std::vector<double> W(size_t(s) * s, 0.0);
+    for (int b = 0; b < s; b++)
+      if (b != a) W[size_t(a) * s + b] = c.Q0[b];
+    lrc_clusters_vjp(L, c.cl, n, x, W, r, nullptr);
+    for (int k = 0; k < 3 * n; k++) r[k] *= c.dS[a];
+  }
+  return rows;
+}
+
 // ---- backbone link states (LrcSpec::states) ------------------------------------------------------------------------
 std::vector<int32_t> LrcStates::drop_groups(const LrcClusters &c, size_t v) const {
   const int n = static_cast<int>(c.sn.size());

@@ -349,6 +349,13 @@ LrcCondition lrc_condition(const LrcSpec &L, const SqeSpec &sqe, int n, const in
 /// the rows dS_a/dx [3n] of every super-node a with dS_a != 0 (zero rows otherwise), s x 3n
 std::vector<double> lrc_blend_rows(const LrcSpec &L, const SqeSpec &sqe, const LrcCondition &c, int n, const int32_t *Z,
                                    const double *x);
+/// dQ0_b/dx [3n] of every super-node b (rows, s x 3n; one charge-pass VJP each), and the blend rows of c built from
+/// them: identical to lrc_blend_rows (the q0 VJP is linear in its weights), so one set of q0 rows serves every
+/// lrc_states copy of a structure (their super-nodes and q0 are the parent's)
+std::vector<double> lrc_q0_rows(const LrcSpec &L, const SqeSpec &sqe, const LrcCondition &c, int n, const int32_t *Z,
+                                const double *x);
+std::vector<double> lrc_blend_rows_q0(const LrcSpec &L, const LrcCondition &c, int n, const double *x,
+                                      const std::vector<double> &q0rows);
 /// forces (-dE/dx, added into F) of the conditioning's position dependence, G_a = dE/dS_a per super-node; vir
 /// (periodic, may be null) += dE/d strain
 void lrc_condition_forces(const LrcSpec &L, const SqeSpec &sqe, const LrcCondition &c, int n, const int32_t *Z,

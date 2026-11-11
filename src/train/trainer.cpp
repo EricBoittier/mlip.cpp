@@ -1072,6 +1072,7 @@ void Worker::lrc_prepare(const Batch &b, bool forces) {
   lrc_cond_.assign(b.n_real_systems, {}), lrc_a0_.assign(b.n_real_systems, 0), lrc_key_.assign(b.n_real_systems, 0);
   const int maxq = model_.conditioning().max_charge;
   vs_.clear(), vs_aw_.clear(), vs_rows_.assign(b.n_real_systems, {}), vs_member_.assign(b.n_real_systems, 0);
+  vs_index_.assign(b.n_real_systems, -1);
   vs_sys_a0_.assign(b.n_real_systems + 1, 0);
   for (int k = 0; k < b.n_real_systems; k++) vs_sys_a0_[k + 1] = vs_sys_a0_[k] + b.n_per_system[k];
   int a0 = 0;
@@ -1148,7 +1149,7 @@ void Worker::lrc_prepare(const Batch &b, bool forces) {
         for (int i = 0; i < ns; i++)
           lrc_lo_[aj + i] = h.row_charge[i], lrc_hi_[aj + i] = h.row_charge_hi[i], lrc_blend_[aj + i] = h.blend[i];
         if (lrc_exact) lrc_cond_[j] = std::move(h);
-        vs_member_[j] = 1;
+        vs_member_[j] = 1, vs_index_[j] = static_cast<int>(vs_.size());
       }
       lrc_multi++;
       vs_structs++, vs_evals += int64_t(vs.sys.size()), vs_max = std::max<int64_t>(vs_max, int64_t(vs.sys.size()));
@@ -1380,9 +1381,10 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
       if (c.cl.s <= 1 || !c.needs_cond_forces()) continue;
       const int a0 = vs_member_[k] ? vs_sys_a0_[k] : lrc_a0_[k], ns = b.n_per_system[k];
       std::vector<double> x(b.positions.begin() + 3 * size_t(a0), b.positions.begin() + 3 * size_t(a0 + ns));
-      if (vs_member_[k]) { // a copy's own conditioning (lrc_states)
-        if (vs_rows_[k].empty())
-          vs_rows_[k] = runtime::lrc_blend_rows(*lrc, *lrc_sqe, c, ns, b.atomic_number.data() + a0, x.data());
+      if (vs_member_[k]) { // a copy's own conditioning (lrc_states), from the structure's shared q0 rows
+        VsStruct &vs = vs_.at(vs_index_[k]);
+        if (vs.q0rows.empty()) vs.q0rows = runtime::lrc_q0_rows(*lrc, *lrc_sqe, c, ns, b.atomic_number.data() + a0, x.data());
+        if (vs_rows_[k].empty()) vs_rows_[k] = runtime::lrc_blend_rows_q0(*lrc, c, ns, x.data(), vs.q0rows);
         lrc_rows[k] = vs_rows_[k];
       } else {
         LrcCacheEntry &ce = lrc_cache_.at(lrc_key_[k]);

@@ -430,10 +430,12 @@ private:
     std::vector<int> sys;
     runtime::LrcClusters cl;
     runtime::LrcStates st;
+    std::vector<double> q0rows; // dQ0_b/dx per super-node (lazy; shared by every copy's blend rows)
   };
   std::vector<VsStruct> vs_;
   std::vector<int> vs_sys_a0_;                  // first atom of every system
   std::vector<char> vs_member_;                 // per system: part of a multi-state structure
+  std::vector<int> vs_index_;                   // per system: its entry in vs_ (-1: none)
   std::vector<float> vs_aw_, vs_acot_;          // atom weights with the copies; MIXED atom cotangent
   std::vector<std::vector<double>> vs_rows_;    // per system: dS/dx rows of its conditioning (lazy)
   std::vector<float> ecot_;           // run_tail: the cotangent of this batch

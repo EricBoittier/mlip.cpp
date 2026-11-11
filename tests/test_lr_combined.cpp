@@ -2934,3 +2934,29 @@ TEST_CASE("lrc states: full model forces match central differences (GGUF)", "[lr
     }
   }
 }
+
+TEST_CASE("lrc states: blend rows from shared per-super-node q0 rows equal lrc_blend_rows (fix 3 and every copy)",
+          "[lrc][states]") {
+  SqeSpec S = sqe_spec();
+  S.lr_R = 10.0, S.lr_t = 2.0;
+  const LrcSpec L = states_spec();
+  for (double Q : {0.0, 1.0})
+    for (double d2 : {5.6, 6.3}) {
+      const std::vector<double> x = two_fragments(d2);
+      const LrcCondition c = lrc_condition(L, S, 10, ZB2, x.data(), Q, 10, 1);
+      const LrcStates st = lrc_states(L, c.cl);
+      REQUIRE(st.active);
+      const std::vector<double> q0r = lrc_q0_rows(L, S, c, 10, ZB2, x.data());
+      double err = 0, mag = 0;
+      auto cmp = [&](const LrcCondition &h) {
+        const std::vector<double> a = lrc_blend_rows(L, S, h, 10, ZB2, x.data()), b = lrc_blend_rows_q0(L, h, 10, x.data(), q0r);
+        REQUIRE(a.size() == b.size());
+        for (size_t k = 0; k < a.size(); k++) err = std::max(err, std::abs(a[k] - b[k])), mag = std::max(mag, std::abs(a[k]));
+      };
+      cmp(c);
+      for (size_t v = 0; v < st.copies.size(); v++) cmp(lrc_state_condition(L, c, st, v, Q, 10));
+      INFO("Q " << Q << " d2 " << d2 << ": max |row| " << mag << ", max difference " << err);
+      CHECK(mag > 1e-4);
+      CHECK(err < 1e-12 * std::max(1.0, mag));
+    }
+}
