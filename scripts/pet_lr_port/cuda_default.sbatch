@@ -13,6 +13,7 @@
 # mol_z18... the 512-wide checkpoint: bulk set_bulk_60, molecules set_mol_chunked; --repeat 5, median seconds per
 # structure); CUDA parity runs at the new default: periodic (6 ckpts x bulk / slab 60) -> out/pbc/cuda_mmdef, open
 # (6 ckpts x ion / cluster / mol) -> out/lr/cuda_mmdef; the new presets (field, ladder-LR) -> out/new_cuda.
+# Also the multi-component conserving presets (frames/multi) and the field presets (re-exported with graph_multi).
 # Evaluation only; FP32, no TF32.
 set -uo pipefail
 unset NVIDIA_TF32_OVERRIDE MLIPCPP_TF32 MLIPCPP_PRECISE_SIGMOID MLIPCPP_PRECISE_MATH_SKIP MLIPCPP_PRECISE_SUM \
@@ -50,9 +51,13 @@ for g in readout-pol control readout readout-1m readout-2m readout-4m; do for s 
 done; done
 O=$W/out/new_cuda; mkdir -p $O
 for p in cc_fermi_field cc_residual_field; do
-  $B/mlipcpp-eval $W/gguf_extra/$p.gguf $F/set_mol_z18_field.extxyz $O/${p}_mol_z18_field_cuda.json --backend cuda > /dev/null 2>&1; echo "$p mol rc=$?"
-  MLIPCPP_FIELD_CONSERVATIVE_ONLY=1 $B/mlipcpp-eval $W/gguf_extra/$p.gguf $F/set_bulk_f32_field.extxyz $O/${p}_bulk_f32_field_cuda.json --backend cuda > /dev/null 2>&1; echo "$p bulk rc=$?"
+  $B/mlipcpp-eval $W/gguf_extra/${p}_mc.gguf $F/set_mol_z18_field.extxyz $O/${p}_mol_z18_field_cuda.json --backend cuda > /dev/null 2>&1; echo "$p mol rc=$?"
+  MLIPCPP_FIELD_CONSERVATIVE_ONLY=1 $B/mlipcpp-eval $W/gguf_extra/${p}_mc.gguf $F/set_bulk_f32_field.extxyz $O/${p}_bulk_f32_field_cuda.json --backend cuda > /dev/null 2>&1; echo "$p bulk rc=$?"
 done
+for p in cc_fermi_mc cc_residual_mc; do for s in multi scan_nacl; do  # several components (the multi graph)
+  q=${p%_mc}; $B/mlipcpp-eval $W/gguf_extra/$p.gguf $F/multi/${q}_$s.extxyz $O/${q}_${s}_cuda.json --backend cuda > /dev/null 2>&1; echo "$p $s rc=$?"
+done; done
+for p in thr thr_cold_lrt; do :; done
 for p in les_ladder_lr les_ladder_lr_c0; do for s in mol_z18 bulk_f32_12; do
   $B/mlipcpp-eval $W/gguf_extra/$p.gguf $F/set_$s.extxyz $O/${p}_${s}_cuda.json --backend cuda > /dev/null 2>&1; echo "$p $s rc=$?"
 done; done
