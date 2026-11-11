@@ -75,6 +75,12 @@ PRESETS.update({
     "lrt_species_weighted": dict(_LRT, charge_reference="species_weighted", long_range_transfer=True, smearing=1.0,
                                  transfer_passes=2, polarisation_passes=2, polarisation_shared=False,
                                  conductance_form="softplus", hardness=True),
+    # one feature at a time (2026-11-11, sixth session): the two new references WITHOUT the long-range transfer
+    "lrt_weighted": dict(_LRT, charge_reference="species_weighted", transfer_passes=1, polarisation_passes=2,
+                         polarisation_shared=True, conductance_form="layerscale", hardness=False),
+    "lrt_fill": dict(_LRT, charge_reference="species_fill", transfer_passes=1, polarisation_passes=1),
+    "lrt_fill_cold": dict(_LRT, charge_reference="species_fill", charge_temperature=0.02, transfer_passes=1,
+                          polarisation_passes=1),
 })
 
 

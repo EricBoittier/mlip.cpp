@@ -110,8 +110,11 @@ def main():
             node, env = trunk._aux["node"], trunk._aux["env"]
             z0 = torch.zeros(n, dtype=torch.float64)
             mu_b, gapped, m_round, top, bottom = 0.0, False, z0, z0, z0
-            if lr.ref in ("fermi", "both"):
-                mu_b, gapped, m_round, top, bottom = bisect_fermi(lr, lr.scores(node), Q)
+            if lr.fermi:
+                Zl = t(Z, torch.long)
+                w = lr.weights(Zl)
+                mu_b, gapped, m_round, top, bottom = bisect_fermi(lr, lr.scores(node, Zl), Q,
+                                                                  w=None if w is None else w.detach())
             e_lr = lr(node, t(Z, torch.long), t(atoms.get_positions()), t(ni.reshape(n, k), torch.long),
                       t(pad.reshape(n, k), torch.bool), t(rev, torch.long), t(ev.reshape(n, k, 3)), env,
                       t(Q), t(mu_b), t(float(gapped)), m_round, top, bottom, t(r0))

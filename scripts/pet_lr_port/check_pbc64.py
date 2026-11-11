@@ -51,8 +51,10 @@ def energy(cfg, trunk, lr, scale, pos, cell, Z, spin, Q, prm, hard=False, lr_on=
     node, env = trunk._aux["node"], trunk._aux["env"]
     z0 = torch.zeros(n, dtype=torch.float64)
     mu_b, gapped, m_round, top, bottom = 0.0, False, z0, z0, z0
-    if lr.ref in ("fermi", "both"):
-        mu_b, gapped, m_round, top, bottom = bisect_fermi(lr, lr.scores(node).detach(), Q)
+    if lr.fermi:
+        w = lr.weights(Zt)
+        mu_b, gapped, m_round, top, bottom = bisect_fermi(lr, lr.scores(node, Zt).detach(), Q,
+                                                          w=None if w is None else w.detach())
     e_lr = lr(node, Zt, pos, g["neighbor_index"], g["padding_mask"], g["reverse"], ev, env,
               t(Q), t(mu_b), t(float(gapped)), m_round, top, bottom, torch.zeros(3, dtype=torch.float64), ewald=e)
     return (e_sr + e_lr).sum(), lr._aux

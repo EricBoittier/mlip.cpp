@@ -448,7 +448,9 @@ bool GraphModel::load_from_gguf(const std::string &path) {
     iris_lr_.slab_margin = loader.get_float32("pet.iris_lr.slab_margin", 2.0f);
     if (loader.get_int32("pet.iris_lr.halfspace", 1) != 1)
       throw std::runtime_error("pet.iris_lr.halfspace = 0: only his default halfspace k grid is ported");
-    if (iris_lr_.reference != "fermi" && iris_lr_.reference != "species" && iris_lr_.reference != "both")
+    // species_weighted / species_fill: his branch feat/long-range-transfer (3ed96b0)
+    if (iris_lr_.reference != "fermi" && iris_lr_.reference != "species" && iris_lr_.reference != "both" &&
+        iris_lr_.reference != "species_weighted" && iris_lr_.reference != "species_fill")
       throw std::runtime_error("pet.iris_lr.reference: " + iris_lr_.reference);
     if (iris_lr_.n_out != 8) throw std::runtime_error("pet.iris_lr.n_out != 8");
   }
@@ -547,7 +549,7 @@ bool GraphModel::load_from_gguf(const std::string &path) {
     iris_lr_.pbc_loaded = false;
   }
   scores_interp_ = GraphInterpreter();
-  if (iris_lr_.enabled && iris_lr_.reference != "species") {
+  if (iris_lr_.enabled && iris_lr_.reference != "species" && iris_lr_.reference != "species_weighted") {
     const std::string sj = loader.get_string("graph_scores.json", "");
     if (sj.empty()) {
       ggml_free(temp_ctx);
@@ -1939,13 +1941,22 @@ ModelResult GraphModel::predict_single_impl(
       if (precise_math()) mark_precise_math(sg);
       if (backend_provider_->compute(sg) != GGML_STATUS_SUCCESS)
         throw std::runtime_error("iris PET-LR: scores graph failed");
-      std::vector<float> sf(n_atoms);
-      ggml_backend_tensor_get(iris_scores, sf.data(), 0, n_atoms * sizeof(float));
-      std::vector<double> sd(sf.begin(), sf.end());
+      // species_fill: the scores graph returns [n, 2] = (s, c), c the Fermi level's weights
+      const bool weighted = iris_lr_.reference == "species_fill";
+      const int sc = weighted ? 2 : 1;
+      if (ggml_nelements(iris_scores) != int64_t(sc) * n_atoms)
+        throw std::runtime_error("iris PET-LR: scores graph output size");
+      std::vector<float> sf(size_t(sc) * n_atoms);
+      ggml_backend_tensor_get(iris_scores, sf.data(), 0, sf.size() * sizeof(float));
+      std::vector<double> sd(n_atoms), wd(weighted ? n_atoms : 0);
+      for (int i = 0; i < n_atoms; i++) {
+        sd[i] = sf[size_t(i) * sc];
+        if (weighted) wd[i] = sf[size_t(i) * sc + 1];
+      }
       iris::FermiConfig fc;
       fc.m_min = iris_lr_.m_min, fc.m_max = iris_lr_.m_max, fc.temperature = iris_lr_.temperature;
       fc.iterations = iris_lr_.iterations, fc.eps = iris_lr_.eps;
-      const iris::FermiHost h = iris::fermi_host(sd, double(system.charge()), fc);
+      const iris::FermiHost h = iris::fermi_host(sd, double(system.charge()), fc, weighted ? &wd : nullptr);
       const float mu = float(h.mu), gap = h.gapped ? 1.f : 0.f;
       ggml_backend_tensor_set(iris_mu, &mu, 0, sizeof(float));
       ggml_backend_tensor_set(iris_gapped, &gap, 0, sizeof(float));

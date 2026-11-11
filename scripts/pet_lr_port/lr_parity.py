@@ -39,6 +39,7 @@ def per_frame(get, z):
             out["dipole_abs"].append(np.nan if periodic else np.abs(g["dipole"] - D).max())
         if "int/fermi_level" in z.files:
             out["mu"].append(abs(g["mu"] - z["int/fermi_level"][A][0]))
+        if "struct/metallicity" in z.files:  # (ref_branch.py refs: metallicity without the Fermi level)
             out["metallicity"].append(abs(g["metallicity"] - z["struct/metallicity"][f]))
     return {k: np.asarray(v, float) for k, v in out.items() if len(v)}
 
@@ -67,7 +68,9 @@ def from_ref(path, z):
         if "atom/charges" in r.files:
             g.update(q=r["atom/charges"][A], dipole=r["struct/dipole"][f])
         if "int/fermi_level" in r.files:
-            g.update(mu=r["int/fermi_level"][A][0], metallicity=r["struct/metallicity"][f])
+            g.update(mu=r["int/fermi_level"][A][0])
+        if "struct/metallicity" in r.files:
+            g.update(metallicity=r["struct/metallicity"][f])
         return g
     return per_frame(get, z)
 

@@ -172,7 +172,7 @@ def main():
         from check_lr64 import load_lr
         lr = IrisLR(cfg).eval()
         load_lr(lr, flat)
-        if lr.ref in ("fermi", "both"):
+        if lr.fermi:
             sgraph, sweights = export_checked(export_torch_model, IrisScoresGraph(model, lr).eval(), inputs, output_path=None,
                                                   input_names=names, input_dtypes=dtypes, dynamic_shapes=shapes,
                                                   strict=False)

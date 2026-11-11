@@ -47,7 +47,11 @@ struct FermiHost {
   std::vector<float> top, bottom; // indicator weights of max / min of s - m, divided by their tie counts
 };
 
-inline FermiHost fermi_host(const std::vector<double> &s, double Q, const FermiConfig &c) {
+/// `w` (optional, [n]): the positive weights of his species_fill reference (feat/long-range-transfer 3ed96b0,
+/// iris.pet.charges.fermi_level(weights=)): the root of sum_i w_i f(s_i - mu) = Q, the gapped test's integer
+/// condition |sum_i w_i m_i - Q| < eps (0.5 unweighted) and density sum_i w_i f'.
+inline FermiHost fermi_host(const std::vector<double> &s, double Q, const FermiConfig &c,
+                            const std::vector<double> *w = nullptr) {
   FermiHost h;
   const size_t n = s.size();
   h.m_round.assign(n, 0.f), h.top.assign(n, 0.f), h.bottom.assign(n, 0.f);
@@ -55,9 +59,10 @@ inline FermiHost fermi_host(const std::vector<double> &s, double Q, const FermiC
   const double margin = 1.0 + 40.0 * c.temperature;
   double lo = *std::min_element(s.begin(), s.end()) - c.m_max - margin;
   double hi = *std::max_element(s.begin(), s.end()) - c.m_min + margin;
+  auto wt = [&](size_t i) { return w ? (*w)[i] : 1.0; };
   auto residual = [&](double mu) {
     double q = 0;
-    for (double x : s) q += occupation(x - mu, c);
+    for (size_t i = 0; i < n; i++) q += w ? occupation(s[i] - mu, c) * wt(i) : occupation(s[i] - mu, c);
     return q - Q;
   };
   for (int it = 0; it < c.iterations; it++) {
@@ -70,7 +75,7 @@ inline FermiHost fermi_host(const std::vector<double> &s, double Q, const FermiC
   for (size_t i = 0; i < n; i++) {
     const double m = std::nearbyint(occupation(s[i] - h.mu, c)); // round half to even, as jnp.round
     h.m_round[i] = static_cast<float>(m);
-    msum += m;
+    msum += w ? m * wt(i) : m;
     d[i] = s[i] - m;
   }
   const double dmax = *std::max_element(d.begin(), d.end()), dmin = *std::min_element(d.begin(), d.end());
@@ -82,8 +87,8 @@ inline FermiHost fermi_host(const std::vector<double> &s, double Q, const FermiC
   }
   const double mid = 0.5 * (dmax + dmin);
   double dens = 0;
-  for (double x : s) dens += density(x - mid, c);
-  h.gapped = std::fabs(msum - Q) < 0.5 && dmax - dmin < 1.0 && dens < c.eps;
+  for (size_t i = 0; i < n; i++) dens += w ? density(s[i] - mid, c) * wt(i) : density(s[i] - mid, c);
+  h.gapped = std::fabs(msum - Q) < (w ? c.eps : 0.5) && dmax - dmin < 1.0 && dens < c.eps;
   return h;
 }
 

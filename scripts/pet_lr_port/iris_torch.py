@@ -279,16 +279,26 @@ class IrisLR(_AuxMixin, nn.Module):
         self.ref = cfg.get("charge_reference", "species")
         if cfg.get("charge_allocation") != "flows" or not cfg.get("physical_charges") or cfg.get("num_charges", 1) != 1:
             raise ValueError("IrisLR: physical charges, charge_allocation=flows and num_charges=1 only")
-        if self.ref not in ("fermi", "species", "both"):
+        # species_weighted / species_fill: his branch feat/long-range-transfer (3ed96b0, iris.pet.charges)
+        if self.ref not in ("fermi", "species", "both", "species_weighted", "species_fill"):
             raise ValueError(f"IrisLR: charge_reference {self.ref!r} not yet ported")
+        if cfg.get("long_range_transfer"):
+            raise ValueError("IrisLR: long_range_transfer not yet ported")
         self.m_min, self.m_max, self.T = cfg.get("charge_state_min", -3), cfg.get("charge_state_max", 3), \
             cfg.get("charge_temperature", 0.1)
         self.cutoff, self.width, self.num_rbf = float(cfg["cutoff"]), float(cfg["cutoff_width"]), 8
         self.sigma = cfg.get("smearing")
         if self.ref in ("fermi", "both"):
             self.score = nn.Linear(d, 1)
-        if self.ref in ("species", "both"):
+        if self.ref in ("species", "both", "species_weighted"):
             self.species_charge = nn.Parameter(torch.zeros(cfg["max_atomic_number"] + 1))
+        if self.ref == "species_weighted":  # softplus per species, the share of the excess
+            self.species_weight = nn.Parameter(torch.zeros(cfg["max_atomic_number"] + 1))
+        if self.ref == "species_fill":  # one score and one softplus prefactor per species
+            self.species_score = nn.Parameter(torch.zeros(cfg["max_atomic_number"] + 1))
+            self.species_scale = nn.Parameter(torch.zeros(cfg["max_atomic_number"] + 1))
+        self.weighted = self.ref == "species_fill"
+        self.fermi = self.ref in ("fermi", "both", "species_fill")
         self.transfer_passes = int(cfg.get("transfer_passes", 1))
         for k in range(1, self.transfer_passes + 1):
             setattr(self, f"transfer_embed_{k}", nn.Linear(d, dh))
@@ -336,9 +346,15 @@ class IrisLR(_AuxMixin, nn.Module):
             out = out + s * (-s + 1.0)  # not 1.0 - s: rsub is not in the FX converter (bitwise the same)
         return out / self.T
 
-    def scores(self, node):
+    def scores(self, node, species=None):
         bound = 0.5 * (self.m_max - self.m_min) + 2.0
+        if self.ref == "species_fill":  # (bound tanh(score / bound))[Z], as species_fill_reference
+            return (bound * torch.tanh(self.species_score / bound))[species]
         return bound * torch.tanh(self.score(node)[:, 0] / bound)
+
+    def weights(self, species):
+        """species_fill: the prefactor c_Z = softplus(species_scale)[Z] (the Fermi level's weights); else None."""
+        return softplus(self.species_scale)[species] if self.weighted else None
 
     def forward(self, node, species, positions, neighbor_index, padding_mask, reverse_neighbor_index, edge_vectors,
                 env, total_charge, mu_bisect, gapped, m_round, top, bottom, dipole_origin, ewald=None):
@@ -368,20 +384,34 @@ class IrisLR(_AuxMixin, nn.Module):
 
         # --- reference ---
         aux = {}
-        if self.ref in ("fermi", "both"):
-            s = self.scores(node)
-            mu_n = mu_bisect + ((self.occupation(s - mu_bisect)).sum() - total_charge) / torch.clamp(
-                self.density(s - mu_bisect).sum(), min=1e-6)
+        if self.fermi:
+            s = self.scores(node, species)
+            w = self.weights(species)
+            if w is None:
+                mu_n = mu_bisect + ((self.occupation(s - mu_bisect)).sum() - total_charge) / torch.clamp(
+                    self.density(s - mu_bisect).sum(), min=1e-6)
+            else:  # fermi_level with weights: sum_i w_i f(s_i - mu) = Q, density sum_i w_i f'
+                mu_n = mu_bisect + ((self.occupation(s - mu_bisect) * w).sum() - total_charge) / torch.clamp(
+                    (self.density(s - mu_bisect) * w).sum(), min=1e-6)
             # top / bottom: indicator weights of the extremes of s - m, divided by the tie count, as JAX's max / min
             # derivative splits over ties
             d_top, d_bot = ((s - m_round) * top).sum(), ((s - m_round) * bottom).sum()
             mu = gapped * (0.5 * (d_top + d_bot)) + (-gapped + 1.0) * mu_n
             x = s - mu
             q = self.occupation(x)
-            aux.update(scores=s, fermi_level=mu, metallicity=self.density(x).sum())
+            if w is None:
+                aux.update(scores=s, fermi_level=mu, metallicity=self.density(x).sum())
+            else:  # q0 = c f(x), metallicity sum_i c_i f'(x_i)
+                q = w * q
+                dens_atoms = w * self.density(x)
+                aux.update(scores=s, fermi_level=mu, metallicity=dens_atoms.sum(), density_atoms=dens_atoms)
             if self.ref == "both":
                 c = self.species_charge[species]
                 q = q + c - c.sum() / torch.ones_like(c).sum()  # / n as a tensor (a symbolic size traced as a species DIV)
+        elif self.ref == "species_weighted":  # q0 = c_Z - w_Z (sum_j c_Z_j - Q) / sum_j w_Z_j
+            c = self.species_charge[species]
+            wz = softplus(self.species_weight)[species]
+            q = c - wz * ((c.sum() - total_charge) / torch.clamp(wz.sum(), min=1e-12))
         else:
             c = self.species_charge[species]
             q = c - (c.sum() - total_charge) / torch.ones_like(c).sum()  # / n as a tensor, as above
@@ -512,16 +542,18 @@ def ewald_potentials(positions, e):
     return phi
 
 
-def bisect_fermi(lr, s, total, iterations=40, eps=1e-6):
+def bisect_fermi(lr, s, total, iterations=40, eps=1e-6, w=None):
     """Host side of iris `fermi_level` on frozen scores s [n] (numpy / torch double): (mu_bisect, gapped, m_round,
-    top, bottom). The in-graph part (Newton step, gapped midpoint) is IrisLR.forward."""
+    top, bottom). The in-graph part (Newton step, gapped midpoint) is IrisLR.forward. `w` [n]: the weights of
+    species_fill (sum_i w_i f(s_i - mu) = Q; integers within eps)."""
     s = torch.as_tensor(s, dtype=torch.float64)
+    wt = torch.ones_like(s) if w is None else torch.as_tensor(w, dtype=torch.float64)
     margin = 1.0 + 40.0 * lr.T
     lo, hi = float(s.min()) - lr.m_max - margin, float(s.max()) - lr.m_min + margin
     lo, hi = torch.tensor(lo, dtype=s.dtype), torch.tensor(hi, dtype=s.dtype)
     for _ in range(iterations):
         mid = 0.5 * (lo + hi)
-        above = (lr.occupation(s - mid).sum() - total) > 0
+        above = ((lr.occupation(s - mid) * wt).sum() - total) > 0
         lo, hi = (mid, hi) if above else (lo, mid)
     mu = 0.5 * (lo + hi)
     m = torch.round(lr.occupation(s - mu))
@@ -529,8 +561,8 @@ def bisect_fermi(lr, s, total, iterations=40, eps=1e-6):
     top = (d == d.max()).to(s.dtype); top = top / top.sum()
     bottom = (d == d.min()).to(s.dtype); bottom = bottom / bottom.sum()
     mid = 0.5 * float(d.max() + d.min())
-    gapped = (abs(float(m.sum()) - total) < 0.5) and float(d.max() - d.min()) < 1.0 and \
-        float(lr.density(s - mid).sum()) < eps
+    gapped = (abs(float((m * wt).sum()) - total) < (0.5 if w is None else eps)) and float(d.max() - d.min()) < 1.0 \
+        and float((lr.density(s - mid) * wt).sum()) < eps
     return float(mu), gapped, m, top, bottom
 
 
@@ -568,7 +600,8 @@ class IrisPETLRGraph(IrisTrunk):
         mu = aux.get("fermi_level")
         mu_col = (zero + mu) if mu is not None else zero
         s_col = aux["scores"] if "scores" in aux else zero
-        dens = self.lr.density(s_col - mu) if mu is not None else zero
+        dens = aux["density_atoms"] if "density_atoms" in aux else (
+            self.lr.density(s_col - mu) if mu is not None else zero)
         dip = (positions - dipole_origin[None, :]) * q[:, None]
         return torch.cat([(e_sr + e_lr)[:, None], q[:, None], dip, mu_col[:, None], s_col[:, None], dens[:, None]],
                          dim=-1)
@@ -600,7 +633,8 @@ class IrisPETLRGraphPBC(IrisPETLRGraph):
         mu = aux.get("fermi_level")
         mu_col = (zero + mu) if mu is not None else zero
         s_col = aux["scores"] if "scores" in aux else zero
-        dens = self.lr.density(s_col - mu) if mu is not None else zero
+        dens = aux["density_atoms"] if "density_atoms" in aux else (
+            self.lr.density(s_col - mu) if mu is not None else zero)
         dip = (positions - dipole_origin[None, :]) * q[:, None]
         return torch.cat([(e_sr + e_lr)[:, None], q[:, None], dip, mu_col[:, None], s_col[:, None], dens[:, None]],
                          dim=-1)
@@ -616,4 +650,7 @@ class IrisScoresGraph(IrisTrunk):
 
     def forward(self, species, neighbor_species, edge_vectors, *args):
         IrisTrunk.forward(self, species, neighbor_species, edge_vectors, *args)
-        return self.lr.scores(self._aux["node"])
+        s = self.lr.scores(self._aux["node"], species)
+        w = self.lr.weights(species)
+        # species_fill: [n, 2] = (s, c) (the host bisection's weights); else s [n]
+        return s if w is None else torch.cat([s[:, None], w[:, None]], dim=-1)

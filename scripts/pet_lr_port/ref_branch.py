@@ -58,6 +58,8 @@ def main():
                     properties=props, with_lr=True, num_k=16,
                     **({"num_neighbors_adaptive": nna} if a.cutoffs != "hard" else {}))
     from petjax.utils import cast_floats
+    # device arrays: a numpy leaf indexed by a traced array fails under jit (the species tables; as ref_petlr.py)
+    params = jax.tree.map(jnp.asarray, params)
     run = jax.jit(lambda b: predict(model, params, b))
     frames = read(a.frames, ":")
     if a.max:

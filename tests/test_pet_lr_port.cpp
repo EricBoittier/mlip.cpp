@@ -32,7 +32,10 @@ std::vector<std::pair<std::string, std::string>> lr_ggufs() {
   return {{"fermi (T 0.1, 1 pass, readout)", resource("petlr_tiny_fermi.gguf")},
           {"fermi gapped (T 0.02)", resource("petlr_tiny_cold.gguf")},
           {"species (softplus, 3 unshared passes, hardness, 2 transfers)", resource("petlr_tiny_species.gguf")},
-          {"both (Gaussian charges, 2 shared passes)", resource("petlr_tiny_both.gguf")}};
+          {"both (Gaussian charges, 2 shared passes)", resource("petlr_tiny_both.gguf")},
+          // his branch feat/long-range-transfer (3ed96b0): make_seeded.py lrt_weighted / lrt_fill
+          {"species_weighted (2 shared passes)", resource("petlr_tiny_weighted.gguf")},
+          {"species_fill (weighted Fermi level)", resource("petlr_tiny_fill.gguf")}};
 }
 
 // 24 water molecules in a 9.0 A cube, a fixed jittered lattice (deterministic)
@@ -144,6 +147,26 @@ TEST_CASE("pet_lr_port: iris fermi_level host side (bisection, gapped decision, 
   CHECK(h.top[4] == 0.f);
   CHECK(std::fabs(h.bottom[3] - 0.5) < 1e-7);
   CHECK(std::fabs(h.bottom[5] - 0.5) < 1e-7);
+}
+
+TEST_CASE("pet_lr_port: iris fermi_level with weights (species_fill): sum_i w_i f(s_i - mu) = Q", "[pet_lr_port]") {
+  using namespace mlipcpp::runtime::iris;
+  FermiConfig c;
+  const std::vector<double> s = {0.31, -1.2, 2.05, 0.77, -0.4, 1.6, -2.3, 0.05, 0.9, -0.66, 1.1, 0.2};
+  const std::vector<double> w = {0.7, 1.3, 0.45, 2.1, 1.0, 0.9, 1.6, 0.33, 1.2, 0.8, 1.05, 0.6};
+  const std::vector<double> ones(s.size(), 1.0);
+  for (double Q : {-2.0, 0.0, 1.0, 3.0}) {
+    const FermiHost h = fermi_host(s, Q, c, &w);
+    double q = 0;
+    for (size_t i = 0; i < s.size(); i++) q += w[i] * occupation(s[i] - h.mu, c);
+    CHECK(std::fabs(q - Q) < 1e-9);
+    CHECK(fermi_host(s, Q, c, &ones).mu == fermi_host(s, Q, c).mu); // unit weights: the unweighted bisection
+  }
+  // gapped with weights: |sum_i w_i m_i - Q| < eps (not 0.5): two atoms on m = 1 with w = 0.5, 1.5 at Q = 2
+  c.temperature = 0.02;
+  const std::vector<double> g = {1.2, 1.15}, wg = {0.5, 1.5};
+  CHECK(fermi_host(g, 2.0, c, &wg).gapped);
+  CHECK_FALSE(fermi_host(g, 2.0 + 1e-3, c, &wg).gapped);
 }
 
 namespace {
