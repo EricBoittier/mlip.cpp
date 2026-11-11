@@ -1197,64 +1197,73 @@ LrcClusters clusters_periodic_bb(const LrcSpec &L, int n, const double *x, const
     if (p.r <= lo) u.unite(p.i, p.j, p.s, &wr);
     else if (p.r < cij) weak.push_back(&p);
   }
+  // a weak component that reaches its own images (a cycle of weak links through the cell boundary, a weak link to its
+  // own image, or two percolating clusters) is taken as one percolating cluster: its weak links are united like strong
+  // ones and the classification is redone (not smooth where such a cycle first appears; counted in c.fallback, the
+  // periodic analogue of the max_super_edges fallback)
   std::vector<int> root(n);
   std::vector<I3> phi(n);
-  for (int i = 0; i < n; i++) std::tie(root[i], phi[i]) = u.find(i);
-  c.sn.resize(n);
-  std::vector<int> lab(n, -1);
-  c.s = 0;
-  for (int i = 0; i < n; i++) { // numbered by first atom
-    if (lab[root[i]] < 0) lab[root[i]] = c.s++;
-    c.sn[i] = lab[root[i]];
-  }
-  c.perc.assign(c.s, 0);
-  for (int i = 0; i < n; i++) {
-    const Wraps &w = wr[root[i]];
-    if (w.none()) continue;
-    if (!w.full())
-      throw std::runtime_error("lrc_links backbone: a strongly linked cluster percolates through the periodic cell in "
-                               "only one or two directions, or reaches only some of its images (a wire, a slab or an "
-                               "interface in a 3D cell); not supported (only finite clusters and fully percolating bulk)");
-    c.perc[c.sn[i]] = 1;
-  }
-  c.pnode.assign(c.s, -1), c.fcomp.assign(c.s, -1);
-  if (c.s == 1 && c.perc[0]) { // bulk: one cluster through every image, the plain model
-    c.bulk = true, c.xh.assign(x, x + 3 * size_t(n)), c.R.assign(1, 1.0), c.pnode[0] = 0;
-    return c;
-  }
-  // weak links between super-nodes: finite-finite ones with a consistent cell offset between the two frames
-  OffsetUF v(c.s);
-  std::vector<int> wc(c.s); // weak components (all super-nodes)
-  std::iota(wc.begin(), wc.end(), 0);
+  OffsetUF v(1);
+  std::vector<int> wc;
   std::vector<std::pair<int, int>> wk;
   std::vector<std::array<double, 3>> disp;
-  for (const Pr *pp : weak) {
-    const Pr &lk = *pp;
-    const int a = c.sn[lk.i], b = c.sn[lk.j];
-    I3 d;
-    for (int k = 0; k < 3; k++) d[k] = lk.s[k] - phi[lk.j][k] + phi[lk.i][k];
-    if (a == b) {
-      if (c.perc[a] || !nonzero(d)) continue; // inside one cluster
-      throw std::runtime_error("lrc_links backbone: a finite cluster is weakly linked to one of its own periodic images "
-                               "(an infinite chain of link states); use a larger cell");
+  for (int pass = 0;; pass++) {
+    if (pass > 8) throw std::logic_error("lrc_links backbone: wrapping weak components did not settle");
+    for (int i = 0; i < n; i++) std::tie(root[i], phi[i]) = u.find(i);
+    c.sn.assign(n, 0);
+    std::vector<int> lab(n, -1);
+    c.s = 0;
+    for (int i = 0; i < n; i++) { // numbered by first atom
+      if (lab[root[i]] < 0) lab[root[i]] = c.s++;
+      c.sn[i] = lab[root[i]];
     }
-    if (!c.perc[a] && !c.perc[b] && nonzero(v.unite(a, b, d)))
-      throw std::runtime_error("lrc_links backbone: weak links between finite clusters close a cycle through the cell "
-                               "boundary (an infinite chain of link states); use a larger cell");
-    const int ra = uf_find(wc, a), rb = uf_find(wc, b);
-    if (ra != rb) wc[std::max(ra, rb)] = std::min(ra, rb);
-    wk.push_back({lk.i, lk.j}), disp.push_back(lk.d);
+    // percolating: connected to any of its own images (rank 1 - 3: bulk, a slab / interface or a wire in a 3D cell);
+    // one super-node per cell whose pairs with all its images are intra (no interpolation across its own images)
+    c.perc.assign(c.s, 0);
+    for (int i = 0; i < n; i++)
+      if (!wr[root[i]].none()) c.perc[c.sn[i]] = 1;
+    v = OffsetUF(c.s);
+    wc.resize(c.s);
+    std::iota(wc.begin(), wc.end(), 0);
+    wk.clear(), disp.clear();
+    std::vector<int> bad; // super-nodes in a wrapping weak component
+    std::vector<const Pr *> used;
+    for (const Pr *pp : weak) {
+      const Pr &lk = *pp;
+      const int a = c.sn[lk.i], b = c.sn[lk.j];
+      I3 d;
+      for (int k = 0; k < 3; k++) d[k] = lk.s[k] - phi[lk.j][k] + phi[lk.i][k];
+      if (a == b) {
+        if (c.perc[a] || !nonzero(d)) continue; // inside one cluster
+        bad.push_back(a);                        // a finite cluster weakly linked to its own image
+      } else if (!c.perc[a] && !c.perc[b] && nonzero(v.unite(a, b, d))) {
+        bad.push_back(a); // a cycle of weak links through the cell boundary
+      }
+      const int ra = uf_find(wc, a), rb = uf_find(wc, b);
+      if (ra != rb) wc[std::max(ra, rb)] = std::min(ra, rb);
+      if (a != b) wk.push_back({lk.i, lk.j}), disp.push_back(lk.d);
+      used.push_back(pp);
+    }
+    std::vector<int> np(c.s, 0); // percolating super-nodes per weak component
+    for (int a = 0; a < c.s; a++)
+      if (c.perc[a] && ++np[uf_find(wc, a)] > 1) bad.push_back(a);
+    if (bad.empty()) break;
+    std::vector<char> badc(c.s, 0);
+    for (int a : bad) badc[uf_find(wc, a)] = 1;
+    for (const Pr *pp : used)
+      if (badc[uf_find(wc, c.sn[pp->i])]) u.unite(pp->i, pp->j, pp->s, &wr);
+    c.fallback = true;
+  }
+  c.pnode.assign(c.s, -1), c.fcomp.assign(c.s, -1);
+  if (c.s == 1 && c.perc[0]) { // bulk: one cluster through its images, the plain model
+    c.bulk = true, c.xh.assign(x, x + 3 * size_t(n)), c.R.assign(1, 1.0), c.pnode[0] = 0;
+    return c;
   }
   for (int a = 0; a < c.s; a++)
     if (c.perc[a]) {
       const int r = uf_find(wc, a);
       for (int b = 0; b < c.s; b++)
-        if (uf_find(wc, b) == r) {
-          if (c.pnode[b] >= 0 && c.pnode[b] != a)
-            throw std::runtime_error("lrc_links backbone: two percolating clusters are weakly linked (interpenetrating "
-                                     "networks); not supported");
-          c.pnode[b] = a;
-        }
+        if (uf_find(wc, b) == r) c.pnode[b] = a;
     }
   for (int a = 0; a < c.s; a++)
     if (!c.perc[a]) c.fcomp[a] = v.find(a).first;

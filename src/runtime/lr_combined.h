@@ -60,10 +60,10 @@
 // over the pairs of a and b in the unwrapped frame of their finite component. Limits: without a percolating super-node
 // this is Ewald(q) minus the linked pairs weighted R (the open model's (1 - R) up to the images' term KE [Ewald(q) -
 // direct(q)], exactly); one bulk super-node gives 0 (no charge pass: the plain model); a finite super-node whose link to
-// P becomes strong (r -> 1) joins P continuously. Refused (throw): strong components percolating in one or two
-// directions only (wires, slabs or interfaces in a 3D cell) or connected to only some of their images; a weak link
-// from a finite cluster to one of its own images, or a cycle of weak links through the cell boundary (an infinite chain
-// of independent link states); two percolating super-nodes in one weak component; lrc_slab.
+// P becomes strong (r -> 1) joins P continuously. A weak component that reaches its own images (a cycle of weak links
+// through the cell boundary, a weak link to its own image, or two percolating clusters: an infinite chain of link
+// states) is taken as one percolating cluster (fallback, like max_super_edges: not smooth where it first forms; counted
+// in LrcClusters::fallback). Slab cells (a zero cell row, lrc_slab) throw.
 //
 // Intra-cluster long range (pet.plato_lr.lrc_intra = "ewald"; absent key or "none" = everything above, bit for bit):
 // the reliability mask leaves the energy (R = 0 there, consistently, open and periodic), so the Coulomb term of the

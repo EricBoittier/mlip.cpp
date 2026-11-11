@@ -5,6 +5,8 @@
 #include "core/adaptive_cutoff.h"
 #include "runtime/graph_model.h"
 #include "runtime/lr_combined.h"
+#include "mlipcpp/io.h"
+#include <fstream>
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
@@ -3678,27 +3680,62 @@ TEST_CASE("lrc pbc: continuous through a link disconnect and a strong join in a 
     }
 }
 
-TEST_CASE("lrc pbc: unsupported periodic structures throw; a bulk cell is the plain model", "[lrc][pbc]") {
+TEST_CASE("lrc pbc: partly percolating clusters, wrapping weak components (fallback), slabs; a bulk cell is the plain model",
+          "[lrc][pbc]") {
   SqeSpec S = sqe_spec();
   S.lr_R = 10.0, S.lr_t = 2.0;
   LrcSpec L = pbc_links_spec();
-  // a wire: one line of O 2 A apart along x in a 12 x 20 x 20 cell (percolates in one direction)
+  // a wire (one line of O 2 A apart along x in a 12 x 20 x 20 cell) and an ion far from it: the wire percolates (one
+  // super-node, no long range with its own images), the ion is a finite cluster; forces and virial exact
   {
-    std::vector<double> x;
-    std::vector<int32_t> Z;
-    for (int k = 0; k < 6; k++) x.insert(x.end(), {2.0 * k, 0, 0}), Z.push_back(8);
-    x.insert(x.end(), {5.0, 10.0, 10.0}), Z.push_back(3);
-    const std::vector<double> h = {12, 0, 0, 0, 20, 0, 0, 0, 20};
-    CHECK_THROWS_WITH(lrc_condition(L, S, 7, Z.data(), x.data(), 0.0, 10, 1, h.data()),
-                      Catch::Matchers::ContainsSubstring("one or two directions"));
+    PbcSys w;
+    for (int k = 0; k < 6; k++) w.x.insert(w.x.end(), {2.0 * k, 0, 0}), w.Z.push_back(8);
+    w.x.insert(w.x.end(), {5.0, 10.0, 10.0}), w.Z.push_back(3);
+    w.h = {12, 0, 0, 0, 20, 0, 0, 0, 20};
+    const LrcCondition c = lrc_condition(L, S, 7, w.Z.data(), w.x.data(), 0.0, 10, 1, w.h.data());
+    REQUIRE(c.cl.s == 2);
+    CHECK(c.cl.perc[0] == 1);
+    CHECK(c.cl.perc[1] == 0);
+    CHECK(!c.cl.fallback);
+    const LrcEnergy e = lrc_energy(L, S, c, 7, w.Z.data(), w.x.data(), 0.0, true);
+    auto energy = [&](const std::vector<double> &x, const std::vector<double> &h) {
+      const LrcCondition cc = lrc_condition(L, S, 7, w.Z.data(), x.data(), 0.0, 10, 1, h.data());
+      return lrc_energy(L, S, cc, 7, w.Z.data(), x.data(), 0.0, false).energy;
+    };
+    const auto r = fd_check(energy, w.x, w.h, e.forces, e.virial);
+    INFO("wire + ion: E_lr " << e.energy << ", max |F| " << r[0] << " err " << r[1] << ", max |vir| " << r[2] << " err " << r[3]);
+    CHECK(r[0] > 1e-4);
+    CHECK(r[2] > 1e-2);
+    CHECK(r[1] < 1e-6 * std::max(1.0, r[0]));
+    CHECK(r[3] < 1e-6 * std::max(1.0, r[2]));
   }
-  // a bare ion weakly linked to its own image (7 A cell)
+  // a bare ion weakly linked to its own image (7 A cell): the weak component wraps, so it is one percolating cluster
+  // (the fallback): rows at Q, no long range
   {
     const int32_t Z1[] = {11};
     const double x1[] = {1, 2, 3};
     const std::vector<double> h = {7, 0, 0, 0, 30, 0, 0, 0, 30};
-    CHECK_THROWS_WITH(lrc_condition(L, S, 1, Z1, x1, 1.0, 10, 1, h.data()),
-                      Catch::Matchers::ContainsSubstring("own periodic images"));
+    const LrcCondition c = lrc_condition(L, S, 1, Z1, x1, 1.0, 10, 1, h.data());
+    CHECK(c.cl.fallback);
+    CHECK(c.cl.bulk);
+    CHECK(lrc_energy(L, S, c, 1, Z1, x1, 1.0, true).energy == 0.0);
+  }
+  // a ring of three ions weakly linked through the boundary (cycle with a cell offset): one percolating cluster
+  {
+    const int32_t Z3[] = {11, 17, 11};
+    const double x3[] = {0, 0, 0, 6.5, 0.3, 0, 13.0, -0.2, 0.4};
+    const std::vector<double> h = {19.5, 0, 0, 0, 30, 0, 0, 0, 30};
+    const LrcCondition c = lrc_condition(L, S, 3, Z3, x3, 1.0, 10, 1, h.data());
+    INFO("ring: super-nodes " << c.cl.s << ", fallback " << c.cl.fallback);
+    CHECK(c.cl.fallback);
+    CHECK(c.cl.s == 1);
+  }
+  // a slab cell (zero row) is refused
+  {
+    const int32_t Z1[] = {11};
+    const double x1[] = {1, 2, 3};
+    const std::vector<double> h = {20, 0, 0, 0, 20, 0, 0, 0, 0};
+    CHECK_THROWS(lrc_clusters(L, 1, x1, h.data()));
   }
   // lrc_slab with backbone links
   {
@@ -3876,4 +3913,66 @@ TEST_CASE("lrc pbc: full model (GGUF) forces and stress vs differences, large-bo
       CHECK(fd_ < 0.05);
     }
   }
+}
+
+// diagnostics for the periodic smoke (not a test): per frame of MLIPCPP_DIAG_XYZ (extxyz, any number of frames) with the
+// model MLIPCPP_DIAG_GGUF, one JSON line to MLIPCPP_DIAG_OUT: super-nodes (sizes, percolating), weak links (A and
+// super-edge p), cluster charge totals Q0 and Q_loc, the states (copies, M, lambda), fallbacks
+TEST_CASE("lrc pbc: cluster diagnostics of periodic frames", "[.pbc_diag]") {
+  const char *gp = std::getenv("MLIPCPP_DIAG_GGUF"), *xp = std::getenv("MLIPCPP_DIAG_XYZ"), *op = std::getenv("MLIPCPP_DIAG_OUT");
+  if (!gp || !xp || !op) SKIP("MLIPCPP_DIAG_GGUF / _XYZ / _OUT not set");
+  mlipcpp::runtime::GraphModel m;
+  m.set_backend_preference(mlipcpp::BackendPreference::CPU);
+  REQUIRE(m.load_from_gguf(gp));
+  const LrcSpec &L = m.plato_lr().lrc;
+  std::ifstream in(xp);
+  std::FILE *out = std::fopen(op, "w");
+  REQUIRE(out);
+  for (int f = 0;; f++) {
+    in >> std::ws;
+    if (!in.good() || in.peek() == EOF) break;
+    const mlipcpp::AtomicSystem sys = mlipcpp::io::read_xyz(in);
+    const int n = sys.num_atoms();
+    std::vector<double> x(sys.positions(), sys.positions() + 3 * size_t(n)), h;
+    if (const mlipcpp::Cell *c = sys.cell())
+      for (int a = 0; a < 9; a++) h.push_back(double(c->matrix[a / 3][a % 3]));
+    std::string err;
+    LrcCondition c;
+    try {
+      c = lrc_condition(L, m.plato_lr().sqe, n, sys.atomic_numbers(), x.data(), double(sys.charge()), 10,
+                        sys.spin_multiplicity(), h.empty() ? nullptr : h.data());
+    } catch (const std::exception &e) {
+      err = e.what();
+    }
+    std::fprintf(out, "{\"frame\": %d, \"n\": %d", f, n);
+    if (!err.empty()) {
+      for (char &ch : err)
+        if (ch == '"') ch = '\'';
+      std::fprintf(out, ", \"error\": \"%s\"}\n", err.c_str());
+      continue;
+    }
+    const LrcClusters &cl = c.cl;
+    std::vector<int> size(cl.s, 0);
+    for (int i = 0; i < n; i++) size[cl.sn[i]]++;
+    std::fprintf(out, ", \"s\": %d, \"bulk\": %d, \"fallback\": %d, \"sizes\": [", cl.s, int(cl.bulk), int(cl.fallback));
+    for (int a = 0; a < cl.s; a++) std::fprintf(out, "%s%d", a ? ", " : "", size[a]);
+    std::fprintf(out, "], \"perc\": [");
+    for (size_t a = 0; a < cl.perc.size(); a++) std::fprintf(out, "%s%d", a ? ", " : "", cl.perc[a]);
+    std::fprintf(out, "], \"Q0\": [");
+    for (int a = 0; a < cl.s; a++) std::fprintf(out, "%s%.5f", a ? ", " : "", c.Q0[a]);
+    std::fprintf(out, "], \"Qloc\": [");
+    for (int a = 0; a < cl.s; a++) std::fprintf(out, "%s%.5f", a ? ", " : "", c.Qloc[a]);
+    std::fprintf(out, "], \"p\": [");
+    for (size_t e = 0; e < cl.p.size(); e++) std::fprintf(out, "%s%.5g", e ? ", " : "", cl.p[e]);
+    std::fprintf(out, "], \"A\": [");
+    for (size_t w = 0; w < cl.weak.size(); w++) std::fprintf(out, "%s%.4g", w ? ", " : "", cl.weak[w].A);
+    double rmin = 1e9, rmax = 0;
+    for (double r : cl.rad) rmin = std::min(rmin, r), rmax = std::max(rmax, r);
+    std::fprintf(out, "], \"rad_min\": %.4f, \"rad_max\": %.4f", cl.rad.empty() ? 0.0 : rmin, rmax);
+    const LrcStates st = lrc_states(L, cl);
+    std::fprintf(out, ", \"states\": %d, \"copies\": %zu, \"M\": %.4f, \"lambda\": %.4f, \"fix3_comps\": %d}\n",
+                 int(st.active), st.active ? st.copies.size() : size_t(1), st.M, st.lambda, st.fix3_comps);
+    std::fflush(out);
+  }
+  std::fclose(out);
 }
