@@ -165,6 +165,20 @@ public:
   const CoulombParameters &coulomb_parameters() const { return coulomb_parameters_; }
   bool long_range() const { return long_range_; }
   bool nc_forces() const { return nc_forces_; }
+  /// iris PET-LR (GGUF pet.iris_lr, scripts/pet_lr_port/iris_to_gguf.py --lr): trunk + LR branch in one graph with
+  /// the extra inputs neighbor_index, positions (a gradient input), total_charge, dipole_origin and the host side
+  /// of his fermi_level (mu_bisect, gapped, m_round, top, bottom); output [n, n_out] = energy | charge | dipole
+  /// contribution (3) | mu | score | f'(s - mu). The scores graph (graph_scores.json) is the first pass of mu.
+  struct IrisLRSpec {
+    bool enabled = false;
+    int n_out = 8;
+    std::string reference;          // fermi / species / both
+    int m_min = -3, m_max = 3;
+    double temperature = 0.1;
+    int iterations = 40;
+    double eps = 1e-6;
+  };
+  const IrisLRSpec &iris_lr() const { return iris_lr_; }
   /// Plato-PET-LR components (GGUF pet.plato_lr.*; enabled false: a plain PET)
   const PetPlatoLRSpec &plato_lr() const { return plato_lr_; }
   const std::string &gguf_path() const { return gguf_path_; }
@@ -199,6 +213,8 @@ private:
   std::string cutoff_function_ = "cosine";
   bool forces_mode_ = false;
   bool nc_forces_ = false;
+  IrisLRSpec iris_lr_;
+  GraphInterpreter scores_interp_; // iris PET-LR: trunk + score head (fermi / both references)
   PetPlatoLRSpec plato_lr_;
   std::vector<PetPlatoLRStructure> plato_st_; // the cached path's structure (set before fit_cached_graph)
   float plato_charge_unit_ = 0.0f;             // plato_les_charge_unit (read on first use)

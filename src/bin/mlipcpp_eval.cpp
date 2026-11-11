@@ -96,6 +96,7 @@ int main(int argc, char *argv[]) {
       po.compute_stress = sys.is_periodic();
       po.charge = sys.charge();
       po.spin_multiplicity = sys.spin_multiplicity();
+      if (sys.has_dipole_origin()) po.dipole_origin.assign(sys.dipole_origin().begin(), sys.dipole_origin().end());
       po.formal_charges = sys.formal_charges(); // per-atom formal_charges array (fragment-constrained charges)
       nlohmann::json f;
       f["charge"] = sys.charge();
@@ -129,6 +130,12 @@ int main(int argc, char *argv[]) {
         if (!r.virial.empty()) f["virial"] = r.virial; // full dE/d strain, row-major (eV), before symmetrisation
         if (!r.latent_charges.empty()) f["latent_charges"] = r.latent_charges; // Plato-PET-LR LES (e)
         if (!r.sqe_charges.empty()) f["sqe_charges"] = r.sqe_charges;           // pet.plato_lr.sqe (e)
+        if (!r.charges.empty()) { // iris PET-LR (pet.iris_lr)
+          f["charges"] = r.charges;
+          f["dipole"] = r.dipole;
+          f["fermi_level"] = r.fermi_level;
+          f["metallicity"] = r.metallicity;
+        }
       } catch (const std::exception &e) {
         f["error"] = e.what();
       }

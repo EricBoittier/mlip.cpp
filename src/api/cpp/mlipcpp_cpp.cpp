@@ -186,6 +186,10 @@ struct Predictor::Impl {
     }
     result.latent_charges = std::move(internal_result.latent_charges);
     result.sqe_charges = std::move(internal_result.sqe_charges);
+    result.charges = std::move(internal_result.charges);
+    result.dipole = std::move(internal_result.dipole);
+    result.fermi_level = internal_result.fermi_level;
+    result.metallicity = internal_result.metallicity;
     result.virial = std::move(internal_result.virial);
     return result;
   }
@@ -284,6 +288,10 @@ struct Predictor::Impl {
     AtomicSystem system = system_in;
     system.set_charge(options.charge);
     system.set_spin_multiplicity(options.spin_multiplicity);
+    if (options.dipole_origin.size() == 3)
+      system.set_dipole_origin({options.dipole_origin[0], options.dipole_origin[1], options.dipole_origin[2]});
+    else if (!options.dipole_origin.empty())
+      throw std::invalid_argument("dipole_origin: three values");
     if (!options.formal_charges.empty()) {
       if (options.formal_charges.size() != static_cast<size_t>(system.num_atoms()))
         throw std::invalid_argument("formal_charges: one value per atom");

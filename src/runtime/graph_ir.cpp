@@ -67,7 +67,9 @@ double parse_number(const std::string &s, size_t &pos) {
     ++pos;
   }
   while (pos < s.size() && (std::isdigit(s[pos]) || s[pos] == '.' ||
-                            s[pos] == 'e' || s[pos] == 'E' || s[pos] == '-')) {
+                            s[pos] == 'e' || s[pos] == 'E' || s[pos] == '-' ||
+                            // the exponent's sign (Python writes 1e+30)
+                            (s[pos] == '+' && (s[pos - 1] == 'e' || s[pos - 1] == 'E')))) {
     ++pos;
   }
   return std::stod(s.substr(start, pos - start));

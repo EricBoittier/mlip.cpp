@@ -25,6 +25,21 @@ import torch
 from torch import nn
 
 
+class _Box:
+    """Opaque holder of forward-time scratch (torch.export snapshots module attributes as a pytree: a dict
+    attribute that gains keys during forward fails its check, an opaque object does not)."""
+
+
+class _AuxMixin:
+    @property
+    def _aux(self):
+        return self.__dict__.setdefault("_box", _Box()).__dict__.get("aux")
+
+    @_aux.setter
+    def _aux(self, v):
+        self.__dict__.setdefault("_box", _Box()).aux = v
+
+
 class SwiGLU(nn.Module):
     def __init__(self, d_in, d_hidden, d_out):
         super().__init__()
@@ -118,11 +133,12 @@ def _mlp2(d_in, d_hidden):
     return nn.Sequential(nn.Linear(d_in, d_hidden), nn.SiLU(), nn.Linear(d_hidden, d_hidden), nn.SiLU())
 
 
-class IrisTrunk(nn.Module):
+class IrisTrunk(_AuxMixin, nn.Module):
     """The iris PET trunk as an mlip.cpp pet-graph (forces mode: distances and cutoff factors in-graph)."""
 
     def __init__(self, cfg):
         super().__init__()
+        self._box = _Box()
         self.cfg = cfg
         d, dn, dh, Z = cfg["d_pet"], cfg["d_node"], cfg["d_head"], cfg["max_atomic_number"] + 1
         L = cfg["num_gnn_layers"]
@@ -175,7 +191,9 @@ class IrisTrunk(nn.Module):
         # pet-jax masks padded tokens out of the softmax entirely (flax mask), not by the log(1e-15) bias alone
         # (metatrain): their weight is then exactly 0 instead of 1e-15 exp(logit), which is visible beyond fp32
         tok_pad = torch.cat([torch.zeros_like(padding_mask[:, :1]), padding_mask], dim=1)
-        log_cut = torch.where(tok_pad, torch.full_like(log_cut, -1e30), log_cut)[:, None, None, :]
+        # zeros_like - 1e30, not full_like: the FX converter has no full_like (it passed log_cut through, so the
+        # traced graph used the -34.5 bias; invisible in fp32, 1e-15 relative)
+        log_cut = torch.where(tok_pad, torch.zeros_like(log_cut) - 1e30, log_cut)[:, None, None, :]
         cond = None
         if self.conditioning:
             sc = self.system_conditioning
@@ -233,13 +251,14 @@ def _flax_mlp(sizes):
     return nn.Sequential(*layers[:-1])
 
 
-class IrisLR(nn.Module):
+class IrisLR(_AuxMixin, nn.Module):
     """`_PhysicalLRModuleTiled` for the configurations of his flows runs: num_charges = 1, charge_reference fermi /
     species / both, transfer passes with the edge-MLP drive, polarisation passes (shared or not, layerscale or softplus
     conductance, hardness), readout_charges / readout_phi0, point or Gaussian (smearing) charges, open boundaries."""
 
     def __init__(self, cfg):
         super().__init__()
+        self._box = _Box()
         self.cfg = cfg
         d = cfg["d_node"]
         dh = d if cfg.get("d_lr") is None else cfg["d_lr"]
@@ -301,7 +320,7 @@ class IrisLR(nn.Module):
         out = 0
         for c in self.steps():
             s = torch.sigmoid((x - c) / self.T)
-            out = out + s * (1.0 - s)
+            out = out + s * (-s + 1.0)  # not 1.0 - s: rsub is not in the FX converter (bitwise the same)
         return out / self.T
 
     def scores(self, node):
@@ -315,7 +334,8 @@ class IrisLR(nn.Module):
         decision (gapped [1] in {0, 1}, m_round [n] rounded occupations, top / bottom [n] indicator weights of the
         extremes of s - m divided by their tie counts), dipole_origin [3]. `env` is the trunk's cutoff_bump at the pair cutoffs (padded slots 0)."""
         n, k = neighbor_index.shape
-        keep = (~padding_mask).to(node.dtype)
+        zero_e = torch.zeros_like(edge_vectors[..., 0])
+        keep = torch.where(padding_mask, zero_e, zero_e + 1.0)  # (~mask).to(dtype), in mapped ops
         rev_flat = reverse_neighbor_index
         r = torch.sqrt((edge_vectors * edge_vectors).sum(dim=-1) + 1e-15)  # pet-jax safe_norm
         # _edge_geometry: symmetric taper, zero where the reverse slot is padded
@@ -323,7 +343,8 @@ class IrisLR(nn.Module):
         env_rev = env.reshape(n * k)[rev_flat].reshape(n, k)
         weight = 0.5 * (env + env_rev) * keep * keep_rev
         mus = [self.cutoff * i / (self.num_rbf - 1) for i in range(self.num_rbf)]
-        rbf = torch.stack([torch.exp(-(((r - m) * self.num_rbf / self.cutoff) ** 2)) for m in mus], dim=-1)
+        # cat of [..., 1] slices, not torch.stack (the FX exporter has no stack)
+        rbf = torch.cat([torch.exp(-(((r - m) * self.num_rbf / self.cutoff) ** 2))[..., None] for m in mus], dim=-1)
 
         def gather_atoms(x):  # x [n, ...] at each slot's neighbour -> [n, k, ...]
             return x[neighbor_index.reshape(n * k)].reshape((n, k) + tuple(x.shape[1:]))
@@ -341,7 +362,7 @@ class IrisLR(nn.Module):
             # top / bottom: indicator weights of the extremes of s - m, divided by the tie count, as JAX's max / min
             # derivative splits over ties
             d_top, d_bot = ((s - m_round) * top).sum(), ((s - m_round) * bottom).sum()
-            mu = gapped * (0.5 * (d_top + d_bot)) + (1.0 - gapped) * mu_n
+            mu = gapped * (0.5 * (d_top + d_bot)) + (-gapped + 1.0) * mu_n
             x = s - mu
             q = self.occupation(x)
             aux.update(scores=s, fermi_level=mu, metallicity=self.density(x).sum())
@@ -371,12 +392,13 @@ class IrisLR(nn.Module):
             moved = moved + step
         aux["transfers"] = moved
         # --- open-boundary potentials (jax-pme: prefactor * 1/2 sum_{j != i} q_j / r_ij) ---
-        D = positions[None, :, :] - positions[:, None, :]
-        R = torch.sqrt((D * D).sum(dim=-1) + 1e-15)
-        eye = torch.eye(n, dtype=positions.dtype)
-        K = (1.0 - eye) / (R + eye)
-        if self.sigma is not None:  # Gaussian charges: minus erfc(r / sqrt2 sigma) / r over the SR edges
-            pass  # handled per edge below
+        # one-sided broadcasts only (ggml binary ops repeat the second operand into the first)
+        D = positions[None, :, :].expand(n, n, 3) - positions[:, None, :]
+        D2 = (D * D).sum(dim=-1)
+        R = torch.sqrt(D2 + 1e-15)
+        # the self term out: D2 is exactly 0 on the diagonal only (bitwise the (1 - I) / (R + I) of before, and
+        # traceable: no eye of a dynamic size)
+        K = torch.where(D2 <= 0.0, torch.zeros_like(R), torch.ones_like(R) / R)  # no reciprocal op in the converter
 
         def potentials(qq):
             phi = 0.5 * EV_A * (K @ qq)
@@ -413,7 +435,7 @@ class IrisLR(nn.Module):
                 phi = potentials(q)
             aux["delta_charges"] = delta
         aux["charges"] = q
-        aux["dipole"] = (q[:, None] * (positions - dipole_origin[None, :])).sum(dim=0)
+        aux["dipole"] = ((positions - dipole_origin[None, :]) * q[:, None]).sum(dim=0)
         energy = q * phi + extra
         if self.readout:
             h = node + self.MLP_0(q[:, None])
@@ -445,3 +467,56 @@ def bisect_fermi(lr, s, total, iterations=40, eps=1e-6):
     gapped = (abs(float(m.sum()) - total) < 0.5) and float(d.max() - d.min()) < 1.0 and \
         float(lr.density(s - mid).sum()) < eps
     return float(mu), gapped, m, top, bottom
+
+
+class IrisPETLRGraph(IrisTrunk):
+    """Trunk + LR branch as ONE mlip.cpp graph (after M. Langer, ipsum/PET-LR). Inputs: the trunk's (species,
+    neighbor_species, edge_vectors, padding_mask, reverse_neighbor_index, cutoff_values[, charge_index, spin_index]),
+    then neighbor_index [n, k] (atom of each slot), positions [n, 3], total_charge [1], the host side of fermi_level
+    (mu_bisect [1], gapped [1], m_round [n], top [n], bottom [n]) and dipole_origin [3].
+    Output [n, 8]: per-atom energy (energy_scale applied in-graph to the trunk, not to the LR energy, as his PETLR),
+    charge, the dipole contribution q_i (r_i - r_0) [3], mu (every row), score s_i, occupation density f'(s_i - mu).
+    The energy column alone is differentiated for forces / virial."""
+
+    N_OUT = 8
+
+    def __init__(self, trunk, lr, energy_scale):
+        # an IrisTrunk itself (trunk parameter names as in the trunk-only GGUF, within GGUF's 64-char limit)
+        super().__init__(trunk.cfg)
+        self.load_state_dict(trunk.state_dict())
+        self.lr = lr
+        self.energy_scale = nn.Parameter(torch.tensor([float(energy_scale)]))
+        self.n_cond = 2 if trunk.conditioning else 0
+
+    def forward(self, species, neighbor_species, edge_vectors, *args):
+        trunk_args = args[:3 + self.n_cond]
+        (neighbor_index, positions, total_charge, mu_bisect, gapped, m_round, top, bottom,
+         dipole_origin) = args[3 + self.n_cond:]
+        e_sr = IrisTrunk.forward(self, species, neighbor_species, edge_vectors, *trunk_args) * self.energy_scale
+        node, env = self._aux["node"], self._aux["env"]
+        padding_mask, reverse = args[0], args[1]
+        e_lr = self.lr(node, species, positions, neighbor_index, padding_mask, reverse, edge_vectors, env,
+                       total_charge, mu_bisect, gapped, m_round, top, bottom, dipole_origin)
+        aux = self.lr._aux
+        q = aux["charges"]
+        zero = torch.zeros_like(q)
+        mu = aux.get("fermi_level")
+        mu_col = (zero + mu) if mu is not None else zero
+        s_col = aux["scores"] if "scores" in aux else zero
+        dens = self.lr.density(s_col - mu) if mu is not None else zero
+        dip = (positions - dipole_origin[None, :]) * q[:, None]
+        return torch.cat([(e_sr + e_lr)[:, None], q[:, None], dip, mu_col[:, None], s_col[:, None], dens[:, None]],
+                         dim=-1)
+
+
+class IrisScoresGraph(IrisTrunk):
+    """The first pass of the two-pass mu: trunk + score head (forward only), output s [n] (fermi / both references)."""
+
+    def __init__(self, trunk, lr):
+        super().__init__(trunk.cfg)
+        self.load_state_dict(trunk.state_dict())
+        self.lr = lr
+
+    def forward(self, species, neighbor_species, edge_vectors, *args):
+        IrisTrunk.forward(self, species, neighbor_species, edge_vectors, *args)
+        return self.lr.scores(self._aux["node"])

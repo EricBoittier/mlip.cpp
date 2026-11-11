@@ -29,7 +29,7 @@ import yaml
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent))
 from petjax_convert import PETJAX_CONVERT, load_petjax_convert  # noqa: E402
-from iris_torch import IrisTrunk  # noqa: E402
+from iris_torch import IrisLR, IrisPETLRGraph, IrisScoresGraph, IrisTrunk  # noqa: E402
 
 SUPPORTED = {"d_pet", "d_node", "d_head", "d_feedforward", "num_heads", "num_attention_layers", "num_gnn_layers",
              "cutoff", "cutoff_width", "cutoff_width_adaptive", "adaptive_cutoff_method", "num_neighbors_adaptive",
@@ -109,12 +109,33 @@ def round_trip(mt, sr, cfg, conv):
     return len(back)
 
 
+def export_checked(export_torch_model, *a, **kw):
+    """export_torch_model, failing on any op the FX converter does not map (it otherwise warns and passes the
+    node's first input through, or drops it: torch.stack vanished from a concat that way)."""
+    import contextlib
+    import io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        out = export_torch_model(*a, **kw)
+    text = buf.getvalue()
+    # symbolic-size arithmetic (python add / mul on SymInts, sym_size) is shape bookkeeping, not graph maths
+    benign = ("<built-in function add>", "<built-in function mul>", "<built-in function floordiv>",
+              "aten.sym_size.int")
+    bad = [l for l in text.splitlines() if ("Unhandled" in l or "Warning" in l) and not l.strip().endswith(benign)]
+    if bad:
+        raise ValueError("FX export: " + "; ".join(sorted(set(bad))[:8]))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("params"); ap.add_argument("ckpt")
     ap.add_argument("-o", "--output", required=True)
     ap.add_argument("--no-baseline", action="store_true")
     ap.add_argument("--n-atoms", type=int, default=7); ap.add_argument("--max-neighbors", type=int, default=11)
+    ap.add_argument("--dump-json", help="also write the graph JSON(s) to this path prefix (inspection)")
+    ap.add_argument("--lr", action="store_true",
+                    help="trunk + LR branch as one graph (IrisPETLRGraph) plus the scores graph of the two-pass mu")
     a = ap.parse_args()
 
     (name, cfg), = yaml.safe_load(open(f"{a.ckpt}/model/model.yaml")).items()
@@ -141,19 +162,69 @@ def main():
     inputs, names, shapes = example_export_args(a.n_atoms, a.max_neighbors, cfg["cutoff"], forces=True)
     if model.conditioning:
         inputs, names, shapes = add_conditioning_inputs(inputs, names, shapes, a.n_atoms)
-    graph, weights = export_torch_model(
-        model, inputs, output_path=None, input_names=names,
-        input_dtypes={"species": "i32", "neighbor_species": "i32", "reverse_neighbor_index": "i32",
-                      "charge_index": "i32", "spin_index": "i32"},
-        dynamic_shapes=shapes, strict=False)
-    param_names = [p.replace(".", "_") for p, _ in model.named_parameters() if p.replace(".", "_") in weights]
+    dtypes = {"species": "i32", "neighbor_species": "i32", "reverse_neighbor_index": "i32",
+              "charge_index": "i32", "spin_index": "i32", "neighbor_index": "i32"}
     energy_scale = float(np.asarray(sr["energy_scale"]).reshape(()))
+    graph_scores = None
+    if a.lr:
+        if not cfg.get("lr"):
+            raise ValueError("--lr: the checkpoint has no LR branch (lr: false)")
+        from check_lr64 import load_lr
+        lr = IrisLR(cfg).eval()
+        load_lr(lr, flat)
+        if lr.sigma is not None:
+            raise ValueError("--lr: Gaussian charges (erf) need the FX erf mapping: not yet exported")
+        if lr.ref in ("fermi", "both"):
+            sgraph, sweights = export_checked(export_torch_model, IrisScoresGraph(model, lr).eval(), inputs, output_path=None,
+                                                  input_names=names, input_dtypes=dtypes, dynamic_shapes=shapes,
+                                                  strict=False)
+            graph_scores = sgraph
+        export = IrisPETLRGraph(model, lr, energy_scale).eval()
+        n = a.n_atoms
+        atom = shapes[0][0]
+        nk = shapes[1]
+        g = torch.Generator().manual_seed(0)
+        extra = (torch.zeros(n, a.max_neighbors, dtype=torch.long), torch.randn(n, 3, generator=g),
+                 torch.zeros(1), torch.zeros(1), torch.zeros(1), torch.zeros(n), torch.zeros(n), torch.zeros(n),
+                 torch.zeros(3))
+        inputs = inputs + extra
+        names = names + ["neighbor_index", "positions", "total_charge", "mu_bisect", "gapped", "m_round", "top",
+                         "bottom", "dipole_origin"]
+        shapes = shapes[:3] + (shapes[3] + (dict(nk), {0: atom}, None, None, None, {0: atom}, {0: atom}, {0: atom},
+                                            None),)
+        model_export = export
+    else:
+        model_export = model
+    graph, weights = export_checked(
+        export_torch_model, model_export, inputs, output_path=None, input_names=names, input_dtypes=dtypes,
+        dynamic_shapes=shapes, strict=False)
+    # the converter writes graph weight refs lower-cased (his flax names MLP_0 / LayerNorm_0 keep their case in
+    # the state dict): store the tensors under the names the graph reads
+    refs = {x[7:] for nd in graph.to_dict()["nodes"] for x in nd["inputs"] if x.startswith("weight:")}
+    lowered = {k.lower(): k for k in weights}
+    if len(lowered) != len(weights):
+        raise ValueError("weight names collide when lower-cased")
+    weights = {(k.lower() if k not in refs and k.lower() in refs else k): v for k, v in weights.items()}
+    unresolved = refs - set(weights)
+    if unresolved:
+        raise ValueError(f"graph reads weights that are not written: {sorted(unresolved)[:5]}")
+    if graph_scores is not None:
+        sweights = {(k.lower() if k.lower() in weights and k not in weights else k): v for k, v in sweights.items()}
+        missing = set(sweights) - set(weights)
+        if missing:
+            raise ValueError(f"scores graph weights not in the full graph: {sorted(missing)[:5]}")
+    pname = lambda p: p.replace(".", "_") if p.replace(".", "_") in weights else p.replace(".", "_").lower()
+    param_names = [pname(p) for p, _ in model_export.named_parameters() if pname(p) in weights]
     baseline = {}
     if not a.no_baseline:
         b = yaml.safe_load(open(f"{a.ckpt}/model/baseline.yaml")) or {}
         baseline = {int(z): float(v) for z, v in (b.get("elemental") or {}).items()}
     nna = cfg.get("num_neighbors_adaptive")
 
+    if a.dump_json:
+        json.dump(graph.to_dict(), open(a.dump_json + ".graph.json", "w"))
+        if graph_scores is not None:
+            json.dump(graph_scores.to_dict(), open(a.dump_json + ".scores.json", "w"))
     w = GGUFWriter()
     w.add_string("general.architecture", "pet-graph")
     w.add_string("general.name", f"iris-petlr:{Path(a.ckpt).resolve()}")
@@ -163,7 +234,20 @@ def main():
     w.add_float32("pet.cutoff_width", float(cfg["cutoff_width"]))
     w.add_int32("pet.d_pet", int(cfg["d_pet"]))
     w.add_int32("pet.num_heads", int(cfg["num_heads"]))
-    w.add_float32("pet.energy_scale", energy_scale)
+    # with --lr the scale is a graph parameter (trunk energy only, as his PETLR): the C++ side applies 1
+    w.add_float32("pet.energy_scale", 1.0 if a.lr else energy_scale)
+    if a.lr:
+        w.add_int32("pet.iris_lr", 1)
+        w.add_int32("pet.iris_lr.n_out", IrisPETLRGraph.N_OUT)
+        w.add_string("pet.iris_lr.reference", lr.ref)
+        w.add_int32("pet.iris_lr.charge_state_min", int(lr.m_min))
+        w.add_int32("pet.iris_lr.charge_state_max", int(lr.m_max))
+        w.add_float32("pet.iris_lr.charge_temperature", float(lr.T))
+        w.add_int32("pet.iris_lr.fermi_iterations", 40)
+        w.add_float32("pet.iris_lr.fermi_eps", 1e-6)
+        w.add_string("pet.iris_lr.dipole_origin", "center_of_mass")
+        if graph_scores is not None:
+            w.add_string("graph_scores.json", json.dumps(graph_scores.to_dict()))
     w.add_string("pet.cutoff_function", "bump")
     w.add_int32("pet.forces_mode", 1)
     w.add_int32("pet.nc_forces", 0)
@@ -186,7 +270,7 @@ def main():
     w.add_string("graph.json", json.dumps(graph.to_dict()))
     w.add_string("train.param_names", json.dumps(param_names))
     w.add_string("train.state_dict_names",
-                 json.dumps({p.replace(".", "_"): metatrain_key(p) for p, _ in model.named_parameters()}))
+                 json.dumps({pname(p): metatrain_key(p) for p, _ in model_export.named_parameters()}))
     w.add_string("graph.weight_shapes", json.dumps({k: list(t.shape) for k, t in weights.items()}))
     for k, t in weights.items():
         w.add_tensor(k, t, transpose_2d=False)

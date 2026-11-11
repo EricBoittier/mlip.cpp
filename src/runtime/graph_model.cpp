@@ -4,6 +4,8 @@
 #include "core/gguf_loader.h"
 #include "core/padding.h"
 #include "core/p3m.h"
+#include "core/masses.h"
+#include "iris_lr.h"
 
 #include <nlohmann/json.hpp>
 
@@ -386,6 +388,20 @@ bool GraphModel::load_from_gguf(const std::string &path) {
   cutoff_function_ = loader.get_string("pet.cutoff_function", "cosine");
   forces_mode_ = (loader.get_int32("pet.forces_mode", 0) != 0);
   nc_forces_ = (loader.get_int32("pet.nc_forces", 0) != 0);
+  iris_lr_ = {};
+  iris_lr_.enabled = loader.get_int32("pet.iris_lr", 0) != 0;
+  if (iris_lr_.enabled) {
+    iris_lr_.n_out = loader.get_int32("pet.iris_lr.n_out", 8);
+    iris_lr_.reference = loader.get_string("pet.iris_lr.reference", "");
+    iris_lr_.m_min = loader.get_int32("pet.iris_lr.charge_state_min", -3);
+    iris_lr_.m_max = loader.get_int32("pet.iris_lr.charge_state_max", 3);
+    iris_lr_.temperature = loader.get_float32("pet.iris_lr.charge_temperature", 0.1f);
+    iris_lr_.iterations = loader.get_int32("pet.iris_lr.fermi_iterations", 40);
+    iris_lr_.eps = loader.get_float32("pet.iris_lr.fermi_eps", 1e-6f);
+    if (iris_lr_.reference != "fermi" && iris_lr_.reference != "species" && iris_lr_.reference != "both")
+      throw std::runtime_error("pet.iris_lr.reference: " + iris_lr_.reference);
+    if (iris_lr_.n_out != 8) throw std::runtime_error("pet.iris_lr.n_out != 8");
+  }
   param_names_ = json::parse(loader.get_string("train.param_names", "[]"))
                      .get<std::vector<std::string>>();
   gguf_path_ = path;
@@ -475,6 +491,15 @@ bool GraphModel::load_from_gguf(const std::string &path) {
     throw std::runtime_error("No graph.json found in GGUF file");
   }
   interp_.load_graph(graph_json);
+  scores_interp_ = GraphInterpreter();
+  if (iris_lr_.enabled && iris_lr_.reference != "species") {
+    const std::string sj = loader.get_string("graph_scores.json", "");
+    if (sj.empty()) {
+      ggml_free(temp_ctx);
+      throw std::runtime_error("pet.iris_lr: the fermi reference needs graph_scores.json");
+    }
+    scores_interp_.load_graph(sj);
+  }
   if ((interp_.graph().get_input("coulomb_matrix") != nullptr) != long_range_) {
     ggml_free(temp_ctx);
     throw std::runtime_error("PET-LR graph input and solver metadata disagree");
@@ -575,6 +600,7 @@ bool GraphModel::load_from_gguf(const std::string &path) {
     if (temp && weight) {
       ggml_backend_tensor_set(weight, temp->data, 0, ggml_nbytes(weight));
       interp_.set_weight(name, weight);
+      if (scores_interp_.has_graph()) scores_interp_.set_weight(name, weight);
     }
   }
 
@@ -583,6 +609,7 @@ bool GraphModel::load_from_gguf(const std::string &path) {
   // Use primary backend (may be GPU) for compute; owned by BackendProvider.
   compute_backend_ = backend_provider_->primary();
   interp_.set_backend(compute_backend_);
+  scores_interp_.set_backend(compute_backend_);
   if (!compute_backend_) {
     throw std::runtime_error("Failed to get compute backend");
   }
@@ -999,7 +1026,9 @@ ModelResult GraphModel::predict_single_impl(
     std::vector<float> atomic_cutoffs;
     std::vector<int> canonical(n_in);  // the edge of the pair (i->j, j->i) whose distance decides
     std::iota(canonical.begin(), canonical.end(), 0);
-    if (solver) {
+    // iris PET-LR: the grid in double (adaptive::radius, as the cached path), clamped bump as pet-jax
+    const bool grid_double = iris_lr_.enabled && !solver;
+    if (solver || grid_double) {
       // as in training (train/dataset.cpp): radii in double from the edges
       // of each centre, one keep decision per edge pair
       std::vector<std::vector<int>> by_center(n_atoms);
@@ -1022,15 +1051,28 @@ ModelResult GraphModel::predict_single_impl(
       };
       std::vector<adaptive::Radius> radii(n_atoms);
       atomic_cutoffs.resize(n_atoms);
+      std::vector<size_t> grid_off(n_atoms + 1, 0);
+      for (int i = 0; i < n_atoms; i++) grid_off[i + 1] = grid_off[i] + by_center[i].size();
+      std::vector<double> grid_jac(grid_double ? grid_off.back() : 0);
       for (int i = 0; i < n_atoms; i++) {
         const auto &es = by_center[i];
-        radii[i] = adaptive::solve(static_cast<int>(es.size()), [&](int k) { return dist(es[k]); },
-                                   cutoff_, num_neighbors_adaptive_, cutoff_width_adaptive_);
+        if (grid_double)
+          radii[i].r = adaptive::radius(true, static_cast<int>(es.size()), [&](int k) { return dist(es[k]); },
+                                        cutoff_, num_neighbors_adaptive_, cutoff_width_adaptive_,
+                                        grid_jac.data() + grid_off[i]);
+        else
+          radii[i] = adaptive::solve(static_cast<int>(es.size()), [&](int k) { return dist(es[k]); },
+                                     cutoff_, num_neighbors_adaptive_, cutoff_width_adaptive_);
         atomic_cutoffs[i] = static_cast<float>(radii[i].r);
       }
       cutoff_jacobian.resize(n_in);
-      for (int e = 0; e < n_in; e++)
-        cutoff_jacobian[e] = adaptive::ddist(dist(e), radii[nlist.centers[e]], cutoff_width_adaptive_);
+      if (grid_double) {
+        for (int i = 0; i < n_atoms; i++)
+          for (size_t k = 0; k < by_center[i].size(); k++) cutoff_jacobian[by_center[i][k]] = grid_jac[grid_off[i] + k];
+      } else {
+        for (int e = 0; e < n_in; e++)
+          cutoff_jacobian[e] = adaptive::ddist(dist(e), radii[nlist.centers[e]], cutoff_width_adaptive_);
+      }
       // the keep test and pair cutoff in double, as training caches them
       std::vector<double> pc(n_in), d(n_in);
       for (int e = 0; e < n_in; e++)
@@ -1128,7 +1170,7 @@ ModelResult GraphModel::predict_single_impl(
   const bool blend_only = no_edges && forces_requested && lrc_want_blend_grad_;
   if (no_edges) {
     max_neighbors = 1;
-    compute_forces = false;
+    if (!iris_lr_.enabled) compute_forces = false; // iris PET-LR: the Coulomb energy still moves the atoms
   }
   const bool backward = compute_forces || blend_only;
   interp_.set_exact_padding_mask(no_edges && !std::getenv("MLIPCPP_PAD_EMPTY"));
@@ -1138,6 +1180,12 @@ ModelResult GraphModel::predict_single_impl(
   interp_.set_dimension("max_neighbors", max_neighbors);
   interp_.set_dimension("n_edges", n_atoms * max_neighbors);
   interp_.set_dimension("max_neighbors_plus_one", max_neighbors + 1);
+  if (iris_lr_.enabled && scores_interp_.has_graph()) {
+    scores_interp_.set_dimension("n_atoms", n_atoms);
+    scores_interp_.set_dimension("max_neighbors", max_neighbors);
+    scores_interp_.set_dimension("n_edges", n_atoms * max_neighbors);
+    scores_interp_.set_dimension("max_neighbors_plus_one", max_neighbors + 1);
+  }
 
   const int total_slots = n_atoms * max_neighbors;
 
@@ -1248,6 +1296,27 @@ ModelResult GraphModel::predict_single_impl(
     st.charge = system.charge();
     plato = std::make_unique<PetPlatoLR>();
     plato->create(input_ctx, plato_lr_, {st}, n_atoms, compute_forces && plato_lr_.long_range());
+  }
+
+  // iris PET-LR (pet.iris_lr): the LR branch's own inputs; positions are a gradient input
+  ggml_tensor *iris_nbr = nullptr, *iris_pos = nullptr, *iris_Q = nullptr, *iris_mu = nullptr,
+              *iris_gapped = nullptr, *iris_mround = nullptr, *iris_top = nullptr, *iris_bottom = nullptr,
+              *iris_r0 = nullptr;
+  if (iris_lr_.enabled) {
+    if (const Cell *c = system.cell())
+      if (c->periodic[0] || c->periodic[1] || c->periodic[2])
+        throw std::runtime_error("iris PET-LR: periodic structures are not yet ported (open boundaries only)");
+    auto mk = [&](ggml_tensor *t, const char *name) { ggml_set_name(t, name); return t; };
+    iris_nbr = mk(ggml_new_tensor_2d(input_ctx, GGML_TYPE_I32, max_neighbors, n_atoms), "neighbor_index");
+    iris_pos = mk(ggml_new_tensor_2d(input_ctx, GGML_TYPE_F32, 3, n_atoms), "positions");
+    if (compute_forces) ggml_set_param(iris_pos);
+    iris_Q = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, 1), "total_charge");
+    iris_mu = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, 1), "mu_bisect");
+    iris_gapped = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, 1), "gapped");
+    iris_mround = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, n_atoms), "m_round");
+    iris_top = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, n_atoms), "top");
+    iris_bottom = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, n_atoms), "bottom");
+    iris_r0 = mk(ggml_new_tensor_1d(input_ctx, GGML_TYPE_F32, 3), "dipole_origin");
   }
 
   // Allocate input buffer
@@ -1423,6 +1492,43 @@ ModelResult GraphModel::predict_single_impl(
     interp_.set_input("cutoff_values", cutoff_values_t);
   }
 
+  if (iris_lr_.enabled) {
+    std::vector<int32_t> nbr(total_slots);
+    for (int f = 0; f < total_slots; f++) nbr[f] = std::max(neighbor_atoms_vec[f], 0); // padded: weight 0
+    ggml_backend_tensor_set(iris_nbr, nbr.data(), 0, nbr.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(iris_pos, system.positions(), 0, 3 * size_t(n_atoms) * sizeof(float));
+    const float Q = static_cast<float>(system.charge());
+    ggml_backend_tensor_set(iris_Q, &Q, 0, sizeof(float));
+    std::array<double, 3> r0{0, 0, 0};
+    if (system.has_dipole_origin()) {
+      r0 = system.dipole_origin();
+    } else { // his calculator: atoms.get_center_of_mass() (ASE masses)
+      double M = 0;
+      for (int i = 0; i < n_atoms; i++) {
+        const double m = ASE_MASSES[std::clamp(atomic_numbers[i], 0, 118)];
+        M += m;
+        for (int a = 0; a < 3; a++) r0[a] += m * system.positions()[3 * i + a];
+      }
+      for (auto &x : r0) x /= M;
+    }
+    const float r0f[3] = {float(r0[0]), float(r0[1]), float(r0[2])};
+    ggml_backend_tensor_set(iris_r0, r0f, 0, sizeof(r0f));
+    std::vector<float> zeros(n_atoms, 0.f);
+    const float z1 = 0.f;
+    for (ggml_tensor *t : {iris_mu, iris_gapped}) ggml_backend_tensor_set(t, &z1, 0, sizeof(float));
+    for (ggml_tensor *t : {iris_mround, iris_top, iris_bottom})
+      ggml_backend_tensor_set(t, zeros.data(), 0, zeros.size() * sizeof(float));
+    for (ggml_tensor *t : {iris_nbr, iris_pos, iris_Q, iris_mu, iris_gapped, iris_mround, iris_top, iris_bottom, iris_r0})
+      interp_.set_input(ggml_get_name(t), t);
+    // the scores graph reads the trunk's inputs, by name
+    if (scores_interp_.has_graph())
+      for (const auto &in : scores_interp_.graph().inputs) {
+        ggml_tensor *t = ggml_get_tensor(input_ctx, in.name.c_str());
+        if (!t) throw std::runtime_error("iris PET-LR scores graph: no input " + in.name);
+        scores_interp_.set_input(in.name, t);
+      }
+  }
+
   profile.mark("inputs");
   // --- Build and compute ---
   ggml_context *compute_ctx = ggml_init({COMPUTE_CTX_SIZE, nullptr, true});
@@ -1469,6 +1575,20 @@ ModelResult GraphModel::predict_single_impl(
   interp_.set_input_gradients(false);
   if (p3m_ && !lr_charges)
     throw std::runtime_error("Missing PET-LR charge application");
+  ggml_tensor *iris_scores = nullptr, *iris_aux = nullptr;
+  if (iris_lr_.enabled && output) {
+    if (scores_interp_.has_graph()) {
+      iris_scores = scores_interp_.build(compute_ctx);
+      if (!iris_scores) throw std::runtime_error("iris PET-LR: scores graph failed to build");
+      ggml_set_output(iris_scores);
+    }
+    // output [n, n_out]: column 0 is the energy (the only column differentiated), the rest is read back
+    if (output->ne[0] != iris_lr_.n_out || output->ne[1] != n_atoms)
+      throw std::runtime_error("iris PET-LR: graph output is not [n_atoms, n_out]");
+    iris_aux = ggml_cont(compute_ctx, output);
+    ggml_set_output(iris_aux);
+    output = ggml_cont(compute_ctx, ggml_view_2d(compute_ctx, iris_aux, 1, n_atoms, iris_aux->nb[1], 0));
+  }
   if (!output) {
     throw std::runtime_error("Failed to build computation graph");
   }
@@ -1520,9 +1640,11 @@ ModelResult GraphModel::predict_single_impl(
         ggml_set_output(lr_grad);
     }
     ggml_tensor *grad = ggml_graph_get_grad(cgraph, edge_vectors_t);
+    ggml_tensor *pos_grad = iris_pos ? ggml_graph_get_grad(cgraph, iris_pos) : nullptr;
+    if (pos_grad) ggml_set_output(pos_grad);
     if (grad) {
       ggml_set_output(grad);
-    } else {
+    } else if (!pos_grad) {
       compute_forces = false;
     }
     if (plato)
@@ -1551,6 +1673,7 @@ ModelResult GraphModel::predict_single_impl(
   }
 
   interp_.init_constants();
+  if (iris_scores) scores_interp_.init_constants();
   if (plato && plato->needs_neighbor_index()) {
     std::vector<int32_t> nbr(neighbor_atoms_vec.begin(), neighbor_atoms_vec.end());
     for (auto &j : nbr) j = std::max(j, 0);
@@ -1578,6 +1701,29 @@ ModelResult GraphModel::predict_single_impl(
                                  ggml_nbytes(lr_charge_adjoint));
   }
   profile.mark("p3m_forward");
+  if (iris_lr_.enabled) {
+    // two-pass mu: the scores graph forward, the bisection on the host (his stop_gradient), then the full graph
+    if (iris_scores) {
+      ggml_cgraph *sg = ggml_new_graph_custom(compute_ctx, 32768, false);
+      ggml_build_forward_expand(sg, iris_scores);
+      if (backend_provider_->compute(sg) != GGML_STATUS_SUCCESS)
+        throw std::runtime_error("iris PET-LR: scores graph failed");
+      std::vector<float> sf(n_atoms);
+      ggml_backend_tensor_get(iris_scores, sf.data(), 0, n_atoms * sizeof(float));
+      std::vector<double> sd(sf.begin(), sf.end());
+      iris::FermiConfig fc;
+      fc.m_min = iris_lr_.m_min, fc.m_max = iris_lr_.m_max, fc.temperature = iris_lr_.temperature;
+      fc.iterations = iris_lr_.iterations, fc.eps = iris_lr_.eps;
+      const iris::FermiHost h = iris::fermi_host(sd, double(system.charge()), fc);
+      const float mu = float(h.mu), gap = h.gapped ? 1.f : 0.f;
+      ggml_backend_tensor_set(iris_mu, &mu, 0, sizeof(float));
+      ggml_backend_tensor_set(iris_gapped, &gap, 0, sizeof(float));
+      ggml_backend_tensor_set(iris_mround, h.m_round.data(), 0, n_atoms * sizeof(float));
+      ggml_backend_tensor_set(iris_top, h.top.data(), 0, n_atoms * sizeof(float));
+      ggml_backend_tensor_set(iris_bottom, h.bottom.data(), 0, n_atoms * sizeof(float));
+    }
+    profile.mark("iris_scores");
+  }
   if (backward) {
     ggml_graph_reset(cgraph);
   }
@@ -1760,6 +1906,13 @@ ModelResult GraphModel::predict_single_impl(
         }
       }
 
+      if (iris_pos) // iris PET-LR: the explicit positions dependence (Coulomb, SR kernel, dipole lever)
+        if (ggml_tensor *g = ggml_graph_get_grad(cgraph, iris_pos)) {
+          std::vector<float> gp(3 * size_t(n_atoms));
+          ggml_backend_tensor_get(g, gp.data(), 0, gp.size() * sizeof(float));
+          for (int i = 0; i < n_atoms * 3; i++) result.forces[i] -= gp[i];
+        }
+
       // Apply energy scale
       for (int i = 0; i < n_atoms * 3; i++) {
         result.forces[i] *= energy_scale_;
@@ -1860,7 +2013,23 @@ ModelResult GraphModel::predict_single_impl(
       result.stress[i] += energy_scale_ * correction.stress[i];
   }
 
-  if (no_edges && forces_requested) { // energy independent of the positions
+  if (iris_aux) {
+    std::vector<float> aux(size_t(n_atoms) * iris_lr_.n_out);
+    ggml_backend_tensor_get(iris_aux, aux.data(), 0, aux.size() * sizeof(float));
+    const int C = iris_lr_.n_out;
+    result.charges.resize(n_atoms);
+    result.dipole.assign(3, 0.0);
+    result.metallicity = 0;
+    for (int i = 0; i < n_atoms; i++) {
+      result.charges[i] = aux[size_t(i) * C + 1];
+      for (int a = 0; a < 3; a++) result.dipole[a] += aux[size_t(i) * C + 2 + a];
+      result.metallicity += aux[size_t(i) * C + 7];
+    }
+    result.fermi_level = n_atoms ? aux[5] : 0.0;
+    result.has_charges = true;
+  }
+
+  if (no_edges && forces_requested && !iris_lr_.enabled) { // energy independent of the positions
     result.forces.assign(3 * static_cast<size_t>(n_atoms), 0.0f);
     result.has_forces = true;
     if (system.cell()) {

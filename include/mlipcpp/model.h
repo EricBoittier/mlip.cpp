@@ -25,6 +25,13 @@ struct ModelResult {
   // graph models: the per-atom model outputs (scaled to eV, without the composition energies)
   std::vector<float> atomic_energies;
 
+  /// iris PET-LR (pet.iris_lr): physical charges (e) [n_atoms], dipole (e A) about the dipole origin,
+  /// Fermi level mu and metallicity sum_i f'(s_i - mu) (fermi / both references; 0 otherwise)
+  std::vector<float> charges;
+  std::vector<double> dipole;
+  double fermi_level = 0.0, metallicity = 0.0;
+  bool has_charges = false;
+
   bool has_forces = false;
   bool has_stress = false;
   bool has_nc_forces = false;

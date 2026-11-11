@@ -52,6 +52,10 @@ struct Result {
   std::vector<float> latent_charges;
   // split-charge equilibration charges (e), pet.plato_lr.sqe models; empty otherwise
   std::vector<float> sqe_charges;
+  /// iris PET-LR (pet.iris_lr): physical charges (e) per atom, dipole (e A) [3], Fermi level and metallicity
+  std::vector<float> charges;
+  std::vector<double> dipole;
+  double fermi_level = 0.0, metallicity = 0.0;
   // periodic graph models: the full virial dE/d(strain) [9], row-major, eV, before symmetrisation; empty otherwise
   std::vector<double> virial;
 
@@ -128,6 +132,8 @@ struct PredictOptions {
   /// (pet.plato_lr.frag_charges; only their sums over each bonded fragment matter); empty: none,
   /// the model is then exactly the plain one. Other models ignore them.
   std::vector<float> formal_charges;
+  /// Dipole origin (A) for models that output a dipole (iris PET-LR); empty: the model's default (centre of mass)
+  std::vector<double> dipole_origin;
 };
 
 /**
