@@ -243,6 +243,19 @@ class IrisTrunk(_AuxMixin, nn.Module):
 EV_A = 14.399645478425667  # jaxpme.prefactors.eV_A
 
 
+def softplus(z):
+    """jax.nn.softplus = logaddexp(z, 0) = relu(z) + log1p(exp(-|z|)), with log1p by Goldberg's trick
+    (log1p(u) = log(1 + u) u / ((1 + u) - 1), u where 1 + u rounds to 1): ggml has no log1p, and the plain
+    log(1 + u) loses all relative accuracy of the tiny conductances at strongly negative z (in fp32: absolute 6e-8,
+    times potentials of 1e5 in the seeded presets), where JAX's log1p keeps it."""
+    u = torch.exp(-torch.abs(z))
+    w = u + 1.0
+    d = w - 1.0
+    tiny = d <= 0.0
+    l1p = torch.where(tiny, u, torch.log(w) * u / torch.where(tiny, torch.ones_like(d), d))
+    return l1p + torch.relu(z)
+
+
 def _flax_mlp(sizes):
     """flax petjax.MLP: Dense -> SiLU -> ... -> Dense (no activation on the last)."""
     layers = []
@@ -424,12 +437,12 @@ class IrisLR(_AuxMixin, nn.Module):
                     sigma_c = self.cscale * getattr(self, f"pol_gate{sx}")(hidden)[..., 0]
                 else:
                     z = getattr(self, f"pol_conductance{sx}")(sym)[..., 0] + self.cinit
-                    sigma_c = torch.log(1.0 + torch.exp(-torch.abs(z))) + torch.relu(z)  # softplus
+                    sigma_c = softplus(z)
                 drive = sigma_c * (gather_atoms(phi) - phi[:, None])
                 step = flow_sum(drive)
                 if self.hard:
                     zh = getattr(self, f"hardness_head{sx}")(node)[:, 0] + 2.0
-                    eta = torch.log(1.0 + torch.exp(-torch.abs(zh))) + torch.relu(zh)
+                    eta = softplus(zh)
                     extra = extra + 0.5 * eta * step * step
                 delta = delta + step
                 q = q + step
