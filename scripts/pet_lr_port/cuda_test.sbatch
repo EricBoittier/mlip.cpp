@@ -16,6 +16,6 @@ module load gcc/13.2.0 cmake/3.27.9 && module load nvhpc/24.7-mpi && module load
 export CC=$(which gcc) CXX=$(which g++) CUDAHOSTCXX=$(which g++)
 W=/scratch/boittier/pet_lr_port/cuda
 cmake --build $W/build_lr -j 16 > $W/build_test.log 2>&1; echo "build rc=$?"; grep -m10 -E " error|error:" $W/build_test.log
-$W/build_lr/tests/test_pet_lr_interp 2>&1 | tail -1
+$W/build_lr/tests/test_pet_lr_interp "*precise*" -s 2>&1 | grep -E "log\(1 \+ u\)|passed|FAILED" | tail -3; $W/build_lr/tests/test_pet_lr_interp 2>&1 | tail -3
 $W/build_lr/tests/test_pet_lr_port -s 2>&1 | grep -E -B2 -A10 "FAILED" | head -80
 $W/build_lr/tests/test_pet_lr_port 2>&1 | tail -2
