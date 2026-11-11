@@ -9,6 +9,7 @@
 // Selection: MLIPCPP_EXEC=fp64 (GraphModel on any caller: float positions promoted exactly, results rounded to the
 // API's float), or mlipcpp-eval --fp64 (double positions / cell from the extxyz text, double JSON).
 
+#include "gir64.h"
 #include "graph_model.h"
 
 #include <array>
@@ -40,6 +41,19 @@ struct Result64 {
   double fermi_level = 0, metallicity = 0, charge_residual = 0;
   bool has_charge_residual = false;
   int qeq_forward_iterations = -1, qeq_cotangent_iterations = -1;
+  /// the requested column gradients (IrisFp64::request_column_gradient): d(sum_i w_i out[i, column])/d r [n, 3]
+  /// (edge scatter, explicit positions and the adaptive-cutoff chain), one per request
+  std::vector<std::vector<double>> column_gradients;
+  /// conserving charges on several components: each atom's component and the Q_c of mlip.cpp's R-only rule
+  std::vector<int> components;
+  std::vector<double> component_charges;
+};
+
+/// the full graph, its inputs and dimensions of the last predict (tests: forward mode on the real graphs)
+struct Snapshot {
+  const GIRGraph *graph = nullptr;
+  std::map<std::string, Tensor<double>> inputs;
+  std::map<std::string, int64_t> dims;
 };
 
 class IrisDriver;
@@ -53,6 +67,12 @@ public:
   Result64 predict(const System64 &s, bool compute_forces);
   /// RMS_NORM eps substitution (default true: finfo(float64).eps; false keeps the trace's finfo(float32).eps)
   void set_fp64_rms_eps(bool on);
+  /// with forces: also d(sum_i w_i out[i, column])/d r (column 1 = charges, 0 = energies; not for QEq, whose
+  /// charges need the implicit cg term), in Result64::column_gradients
+  void request_column_gradient(int column, std::vector<double> w);
+  void clear_column_gradients();
+  const Snapshot &last() const;
+  const std::map<std::string, Tensor<double>> &weights() const;
 
 private:
   std::unique_ptr<IrisDriver> d_;

@@ -223,6 +223,7 @@ int main(int argc, char *argv[]) {
             f["metallicity"] = r.metallicity;
             if (r.has_charge_residual) f["charge_residual"] = r.charge_residual;
             if (!r.dipole_flow.empty()) f["dipole_flow"] = r.dipole_flow;
+            if (!r.components.empty()) f["components"] = r.components, f["component_charges"] = r.component_charges;
           }
           f["atomic_energies"] = r.atomic_energies;
           frames.push_back(f);

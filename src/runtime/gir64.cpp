@@ -199,6 +199,10 @@ void bcast3(const std::vector<int64_t> &os, const std::vector<int64_t> &as, cons
   BIdx A(as), B(bs), C(cs);
   const int64_t N = numel(os);
   const int64_t inner = on[3];
+  // innermost dim: a stride of 0 (broadcast) or 1 (full) without the modulo of a tiling operand
+  auto ok = [inner](const BIdx &X) { return X.n[3] == 1 || X.n[3] == inner; };
+  const bool fast = ok(A) && ok(B) && ok(C);
+  const int64_t sa = A.n[3] == 1 ? 0 : 1, sb = B.n[3] == 1 ? 0 : 1, sc = C.n[3] == 1 ? 0 : 1;
 #pragma omp parallel for collapse(3) schedule(static) if (parallel && par_ok(N))
   for (int64_t i0 = 0; i0 < on[0]; i0++)
     for (int64_t i1 = 0; i1 < on[1]; i1++)
@@ -207,7 +211,11 @@ void bcast3(const std::vector<int64_t> &os, const std::vector<int64_t> &as, cons
         const int64_t a0 = A.at(0, i0) + A.at(1, i1) + A.at(2, i2);
         const int64_t b0 = B.at(0, i0) + B.at(1, i1) + B.at(2, i2);
         const int64_t c0 = C.at(0, i0) + C.at(1, i1) + C.at(2, i2);
-        for (int64_t i3 = 0; i3 < inner; i3++) f(o + i3, a0 + A.at(3, i3), b0 + B.at(3, i3), c0 + C.at(3, i3));
+        if (fast) {
+          for (int64_t i3 = 0; i3 < inner; i3++) f(o + i3, a0 + sa * i3, b0 + sb * i3, c0 + sc * i3);
+        } else {
+          for (int64_t i3 = 0; i3 < inner; i3++) f(o + i3, a0 + A.at(3, i3), b0 + B.at(3, i3), c0 + C.at(3, i3));
+        }
       }
 }
 
@@ -239,6 +247,13 @@ void gemm(int64_t m, int64_t n, int64_t k, const T *A, bool ta, const T *B, bool
         for (int64_t j = 0; j < n; j++) c[j] += a * b[j];
       }
     }
+  } else if (!ta && tb && m >= 16) {
+    // B [n, k] transposed once to [k, n]: the axpy form above vectorises over n (a dot product over k does not
+    // without reassociation)
+    std::vector<T> Bt(size_t(n) * k);
+    for (int64_t j = 0; j < n; j++)
+      for (int64_t p = 0; p < k; p++) Bt[p * n + j] = B[j * k + p];
+    gemm<T>(m, n, k, A, false, Bt.data(), false, C, parallel);
   } else if (!ta && tb) {
 #pragma omp parallel for schedule(static) if (parallel && m * n * k > 65536)
     for (int64_t i = 0; i < m; i++) {

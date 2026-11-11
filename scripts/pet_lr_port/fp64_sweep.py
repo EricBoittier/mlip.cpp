@@ -76,6 +76,8 @@ def locate(root, ref):
     if sub is None:
         sub = "les_lr" if "_lr" in p else "les"
     gg = g / sub / f"{p}.gguf"
+    if fam == "multi" and (g / sub / f"{p}_mc.gguf").exists():  # several components: the re-export with graph_multi
+        gg = g / sub / f"{p}_mc.gguf"
     if "frames" in meta:
         fr = root / meta["frames"]
     else:

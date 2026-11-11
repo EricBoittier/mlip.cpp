@@ -62,6 +62,7 @@ ModelResult to_model_result(const Result64 &r) {
     m.has_charges = true;
     m.charge_residual = r.charge_residual, m.has_charge_residual = r.has_charge_residual;
     m.dipole_flow = r.dipole_flow;
+    m.components = r.components, m.component_charges = r.component_charges;
   }
   return m;
 }
@@ -71,10 +72,13 @@ using T64 = Tensor<double>;
 class IrisDriver {
 public:
   const GraphModel &m;
-  GIRGraph g_open, g_pbc, g_scores, g_qeq_open, g_qeq_pbc;
-  bool has_pbc = false, has_scores = false, has_qeq_open = false, has_qeq_pbc = false;
+  GIRGraph g_open, g_pbc, g_scores, g_qeq_open, g_qeq_pbc, g_multi_open, g_multi_pbc;
+  bool has_pbc = false, has_scores = false, has_qeq_open = false, has_qeq_pbc = false, has_multi_open = false,
+       has_multi_pbc = false;
   std::map<std::string, T64> weights;
   double rms_eps = 2.220446049250313e-16;
+  std::vector<std::pair<int, std::vector<double>>> col_req;
+  Snapshot snap;
   // frozen Ewald parameters (his calculator, ModelOptions::iris_freeze_ewald)
   struct Frozen {
     bool valid = false;
@@ -98,7 +102,9 @@ public:
     has_scores = parse("graph_scores.json", g_scores);
     has_qeq_open = parse("graph_qeq_apply.json", g_qeq_open);
     has_qeq_pbc = parse("graph_qeq_apply_pbc.json", g_qeq_pbc);
-    for (const GIRGraph *g : {&g_open, &g_pbc, &g_scores, &g_qeq_open, &g_qeq_pbc})
+    has_multi_open = parse("graph_multi.json", g_multi_open);
+    has_multi_pbc = parse("graph_multi_pbc.json", g_multi_pbc);
+    for (const GIRGraph *g : {&g_open, &g_pbc, &g_scores, &g_qeq_open, &g_qeq_pbc, &g_multi_open, &g_multi_pbc})
       for (const auto &n : g->nodes)
         if (n.op.rfind("MLIPCPP_", 0) == 0) throw std::runtime_error("fp64: graph op " + n.op + " is not supported");
     if (m.plato_lr().enabled) throw std::runtime_error("fp64: Plato-PET-LR models are not supported");
@@ -148,6 +154,10 @@ IrisFp64::IrisFp64(const GraphModel &model) : d_(std::make_unique<IrisDriver>(mo
 IrisFp64::~IrisFp64() = default;
 Result64 IrisFp64::predict(const System64 &s, bool compute_forces) { return d_->predict(s, compute_forces); }
 void IrisFp64::set_fp64_rms_eps(bool on) { d_->rms_eps = on ? 2.220446049250313e-16 : kF32Eps; }
+void IrisFp64::request_column_gradient(int column, std::vector<double> w) { d_->col_req.emplace_back(column, std::move(w)); }
+void IrisFp64::clear_column_gradients() { d_->col_req.clear(); }
+const Snapshot &IrisFp64::last() const { return d_->snap; }
+const std::map<std::string, Tensor<double>> &IrisFp64::weights() const { return d_->weights; }
 
 namespace {
 double det3(const double h[3][3]) {
@@ -265,6 +275,8 @@ Result64 IrisDriver::predict(const System64 &s, bool compute_forces) {
   for (int c : P.c) cnt[c]++;
   int max_nb = *std::max_element(cnt.begin(), cnt.end());
   m.check_iris_overflow(max_nb);
+  std::vector<int> comp; // conserving charges on several components: each atom's component (n_comp > 1)
+  int n_comp = 0;
   if (L.enabled && L.conserving_charges) {
     std::vector<int> parent(n);
     std::iota(parent.begin(), parent.end(), 0);
@@ -272,9 +284,18 @@ Result64 IrisDriver::predict(const System64 &s, bool compute_forces) {
     for (size_t e = 0; e < P.c.size(); e++) parent[root(P.c[e])] = root(P.j[e]);
     int comps = 0;
     for (int i = 0; i < n; i++) comps += root(i) == i;
-    if (comps > 1)
+    if (comps > 1 && !has_multi_open)
       throw std::runtime_error("iris PET-LR conserving_charges: " + std::to_string(comps) +
-                               " components without fragment labels (his sample prep raises)");
+                               " components and no graph_multi.json (re-export)");
+    if (comps > 1) { // ids numbered by first atom (his connected_components), as graph_model.cpp
+      comp.assign(n, -1);
+      std::vector<int> id_of(n, -1);
+      for (int i = 0; i < n; i++) {
+        const int r = root(i);
+        if (id_of[r] < 0) id_of[r] = n_comp++;
+        comp[i] = id_of[r];
+      }
+    }
     if (s.charge < double(n) * L.m_min || s.charge > double(n) * L.m_max)
       throw std::runtime_error("iris PET-LR conserving_charges: charge outside the charge-state range");
   }
@@ -362,6 +383,13 @@ Result64 IrisDriver::predict(const System64 &s, bool compute_forces) {
     in["gapped"] = T64::from({1}, {0.0});
     for (const char *k : {"m_round", "top", "bottom", "qeq_z", "qeq_lambda", "qeq_x"})
       in[k] = T64::from({n}, std::vector<double>(n, 0.0));
+    if (n_comp > 1) {
+      std::vector<double> oh(size_t(n) * n_comp, 0.0);
+      for (int i = 0; i < n; i++) oh[size_t(i) * n_comp + comp[i]] = 1.0;
+      in["comp_onehot"] = T64::from({n, n_comp}, oh);
+      for (const char *k : {"comp_charge", "comp_mu", "comp_gapped"})
+        in[k] = T64::from({n_comp}, std::vector<double>(n_comp, 0.0));
+    }
     if (L.field) {
       if (s.field) field_E = *s.field;
       field_on = field_E[0] != 0 || field_E[1] != 0 || field_E[2] != 0;
@@ -466,9 +494,12 @@ Result64 IrisDriver::predict(const System64 &s, bool compute_forces) {
       ex.set_dimension("n_lr", kl);
       ex.set_dimension("n_kvec", int64_t(ew_kgrid.size()));
     }
+    if (n_comp > 1) ex.set_dimension("n_comp", n_comp);
   };
   const bool iris_qeq = L.enabled && L.reference == "qeq";
-  const GIRGraph &G = L.enabled && periodic ? g_pbc : g_open;
+  if (n_comp > 1 && (periodic ? !has_multi_pbc : !has_multi_open))
+    throw std::runtime_error("iris PET-LR: the GGUF lacks the graph for this structure");
+  const GIRGraph &G = !L.enabled ? g_open : n_comp > 1 ? (periodic ? g_multi_pbc : g_multi_open) : periodic ? g_pbc : g_open;
   Result64 R;
 
   // --- scores pass, host bisection / QEq stage 1 ---
@@ -502,8 +533,11 @@ Result64 IrisDriver::predict(const System64 &s, bool compute_forces) {
     return qeq_project(v);
   };
   // the scores graph runs for the references that need mu / chi (as GraphModel::load_from_gguf decides)
-  const bool needs_scores = L.enabled && L.reference != "species" && L.reference != "species_weighted" &&
-                            L.reference != "residual" && L.reference != "threshold" && L.reference != "head";
+  // (conserving residual: the free charges p of the multi-component Q_c rule, on several components only)
+  const bool needs_scores = L.enabled && ((L.reference != "species" && L.reference != "species_weighted" &&
+                                           L.reference != "residual" && L.reference != "threshold" &&
+                                           L.reference != "head") ||
+                                          (L.reference == "residual" && n_comp > 1));
   if (needs_scores && !has_scores) throw std::runtime_error("iris PET-LR: the GGUF has no graph_scores.json");
   if (needs_scores) {
     Executor<double> sx(g_scores);
@@ -527,6 +561,54 @@ Result64 IrisDriver::predict(const System64 &s, bool compute_forces) {
       const iris::CGResult z = iris::cg_host(qeq_A, b, qeq_M, L.qeq_maxiter, f32_intent(float(L.qeq_tol)));
       R.qeq_forward_iterations = z.iterations;
       in["qeq_z"] = T64::from({n}, z.x);
+    } else if (n_comp > 1) {
+      // several components (graph_model.cpp): Q_c from mlip.cpp's R-only rule, then (fermi) one bisection per
+      // component on its own atoms at its Q_c; mu_c and the tie weights in double
+      if (so.numel() != n) throw std::runtime_error("iris PET-LR: scores graph output size");
+      const int Cc = n_comp;
+      const double Q = double(s.charge);
+      iris::FermiConfig fc;
+      fc.m_min = L.m_min, fc.m_max = L.m_max, fc.temperature = f32_intent(float(L.temperature));
+      fc.iterations = L.iterations, fc.eps = f32_intent(float(L.eps));
+      std::vector<double> qhat(Cc, 0.0), sd(so.ptr(), so.ptr() + n);
+      std::vector<int> size(Cc, 0);
+      for (int i = 0; i < n; i++) size[comp[i]]++;
+      if (L.reference == "fermi") {
+        const iris::FermiHost h = iris::fermi_host(sd, Q, fc);
+        for (int i = 0; i < n; i++) qhat[comp[i]] += iris::occupation(sd[i] - h.mu, fc);
+      } else {
+        double psum = 0;
+        for (int i = 0; i < n; i++) qhat[comp[i]] += sd[i], psum += sd[i];
+        for (int c = 0; c < Cc; c++) qhat[c] += (Q - psum) * size[c] / n;
+      }
+      const std::vector<double> Qc = iris::largest_remainder(qhat, Q);
+      for (int c = 0; c < Cc; c++)
+        if (Qc[c] < double(size[c]) * L.m_min || Qc[c] > double(size[c]) * L.m_max)
+          throw std::runtime_error("iris PET-LR conserving_charges: component charge outside its charge-state range");
+      std::vector<double> mu(Cc, 0.0), gp(Cc, 0.0), mr(n, 0.0), tp(n, 0.0), bt(n, 0.0);
+      if (L.reference == "fermi")
+        for (int c = 0; c < Cc; c++) {
+          std::vector<int> idx;
+          std::vector<double> sc;
+          for (int i = 0; i < n; i++)
+            if (comp[i] == c) idx.push_back(i), sc.push_back(sd[i]);
+          const iris::FermiHost h = iris::fermi_host(sc, Qc[c], fc);
+          mu[c] = h.mu, gp[c] = h.gapped ? 1.0 : 0.0;
+          int nt = 0, nb = 0;
+          for (size_t k = 0; k < idx.size(); k++) nt += h.top[k] != 0, nb += h.bottom[k] != 0;
+          for (size_t k = 0; k < idx.size(); k++) {
+            mr[idx[k]] = h.m_round[k];
+            tp[idx[k]] = h.top[k] != 0 ? 1.0 / nt : 0.0;
+            bt[idx[k]] = h.bottom[k] != 0 ? 1.0 / nb : 0.0;
+          }
+        }
+      in["comp_charge"] = T64::from({Cc}, Qc);
+      in["comp_mu"] = T64::from({Cc}, mu);
+      in["comp_gapped"] = T64::from({Cc}, gp);
+      in["m_round"] = T64::from({n}, mr);
+      in["top"] = T64::from({n}, tp);
+      in["bottom"] = T64::from({n}, bt);
+      R.components = comp, R.component_charges = Qc;
     } else {
       const bool weighted = L.reference == "species_fill";
       const int sc = weighted ? 2 : 1;
@@ -578,6 +660,11 @@ Result64 IrisDriver::predict(const System64 &s, bool compute_forces) {
   load_weights(ex);
   dims(ex);
   set_inputs(ex, G, in);
+  snap.graph = &G;
+  snap.inputs.clear();
+  for (const auto &i : G.inputs) snap.inputs[i.name] = in.at(i.name);
+  snap.dims = {{"n_atoms", n}, {"max_neighbors", M}, {"n_edges", int64_t(n) * M}, {"max_neighbors_plus_one", M + 1}};
+  if (periodic && L.enabled) snap.dims["n_lr"] = kl, snap.dims["n_kvec"] = int64_t(ew_kgrid.size());
   ex.forward(compute_forces);
   const T64 &out = ex.output();
   const int C = L.enabled ? L.n_out : 1;
@@ -613,8 +700,12 @@ Result64 IrisDriver::predict(const System64 &s, bool compute_forces) {
     if (field_on) { // his E . Z0 (see graph_model.cpp): two sweeps of sum_j a_j X_j
       const bool fermi = L.reference == "fermi";
       std::vector<double> c(n), w(n);
+      double ctr[3] = {0, 0, 0}; // about the centroid, as graph_model.cpp (the force is origin-free)
+      for (int i = 0; i < n; i++)
+        for (int k = 0; k < 3; k++) ctr[k] += s.positions[3 * i + k] / n;
       for (int i = 0; i < n; i++) {
-        c[i] = field_E[0] * s.positions[3 * i] + field_E[1] * s.positions[3 * i + 1] + field_E[2] * s.positions[3 * i + 2];
+        c[i] = field_E[0] * (s.positions[3 * i] - ctr[0]) + field_E[1] * (s.positions[3 * i + 1] - ctr[1]) +
+               field_E[2] * (s.positions[3 * i + 2] - ctr[2]);
         w[i] = fermi ? aux[size_t(i) * C + 7] : 1.0;
       }
       auto pass = [&](const std::vector<double> &a) {
@@ -631,6 +722,34 @@ Result64 IrisDriver::predict(const System64 &s, bool compute_forces) {
       for (int i = 0; i < n; i++)
         for (int k = 0; k < 3; k++)
           field_force[3 * i + k] = field_E[k] * aux[size_t(i) * C + cq] - FG[3 * i + k] + c[i] * FQ[3 * i + k];
+    }
+    // -d(<cot, out>)/dr including the adaptive cutoffs' chain (for the column gradients; the energy's below keeps
+    // its own pieces for the virial)
+    auto minus_dr_full = [&]() {
+      std::vector<double> F = minus_dr();
+      const auto &Cg = ex.input_grad("cutoff_values");
+      if (have_adaptive && !Cg.empty()) {
+        std::vector<double> Sk(n, 0.0);
+        for (int f = 0; f < slots; f++) {
+          if (pm[f] > 0.5 || nb_atom[f] < 0) continue;
+          Sk[f / M] += 0.5 * Cg[f], Sk[nb_atom[f]] += 0.5 * Cg[f];
+        }
+        for (size_t e = 0; e < full.c.size(); e++) {
+          const double coef = full.d[e] > 0.0 ? Sk[full.c[e]] * cut_jac[e] / full.d[e] : 0.0;
+          for (int c = 0; c < 3; c++) F[3 * full.c[e] + c] += coef * full.v[e][c], F[3 * full.j[e] + c] -= coef * full.v[e][c];
+        }
+      }
+      return F;
+    };
+    for (const auto &[col, w] : col_req) {
+      if (iris_qeq) throw std::runtime_error("fp64: column gradients of a QEq model are not supported");
+      if (col < 0 || col >= C || int(w.size()) != n) throw std::runtime_error("fp64: column gradient request");
+      std::vector<double> c(out.numel(), 0.0);
+      for (int i = 0; i < n; i++) c[size_t(i) * C + col] = w[i];
+      sweep(c);
+      std::vector<double> g = minus_dr_full();
+      for (auto &x : g) x = -x;
+      R.column_gradients.push_back(std::move(g));
     }
     std::vector<double> cot(out.numel(), 0.0);
     for (int i = 0; i < n; i++) cot[size_t(i) * C] = 1.0;
