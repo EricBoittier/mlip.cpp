@@ -227,6 +227,32 @@ struct LrcSpec {
   // Open structures, graph q0 mode without lrc_mp / lrc_pol / lrc_intra only (others throw).
   bool links_backbone = false;
   double link_a = 0.5, link_b = 1.0;
+  // backbone link states (pet.plato_lr.lrc_states = "mix", needs lrc_links = backbone; absent key or "none" = the
+  // conditioning-only links above, bit for bit). The link states sigma of the weak super-edges (the states of R_ab and
+  // lrc_qproj) also weight the backbone energy:
+  //   E = sum_sigma w_sigma E_bb(G_sigma, rows_sigma) + E_lr,
+  // G_sigma the backbone graph without the edges between clusters that sigma separates (radii, pair cutoffs and the
+  // radius chain stay those of the full structure), rows_sigma every cluster of sigma on its own Q0 total (the usual
+  // two-row blend of the fractional part). Per weak component c the edge states e (P_e = prod p^on (1 - p)^off) get the
+  // smooth cut w_e = P_e s((P_e / eps - 1/2) * 2) (s the smootherstep; 0 below eps / 2, P_e above eps), summed per
+  // partition and renormalised; a mass guard (kept weight W_c below 0.9 -> 0.5) blends in that component's fix-3
+  // treatment (one graph, blended rows), so the renormalisation never divides by a small number. Components combine as
+  // a product (size consistent); a smooth count of the kept partitions, M = prod_c (N_c + lam_c), N_c = sum over the
+  // partitions of 1 - prod_e (1 - s(4 P_e / eps - 1)), lam_c the mass guard's fix-3 weight (each factor -> 1 where a
+  // component appears or vanishes), blends in the whole structure's fix-3 evaluation from
+  // M = states_cap_lo to states_cap (then no state is evaluated), which bounds the backbone evaluations by
+  // about states_cap. Forces: sum_sigma w_sigma F_sigma - sum_sigma E_sigma grad w_sigma - grad E_lr, exact (the second
+  // term through the links' gradient with the radius chain).
+  bool states = false;
+  double states_eps = 1e-3, states_cap = 16, states_cap_lo = 8;
+  // neutral receivers (pet.plato_lr.lrc_cond_receiver = "neutral"; absent key or "all" = Q_loc_a = sum_b R_ab Q0_b, bit
+  // for bit): a super-node takes its linked partners' charge in proportion to how charged it is itself,
+  //   Q_loc_a = Q0_a + h(|Q0_a|) sum_{b != a} R_ab Q0_b,   h = smootherstep((|Q0_a| - receiver_lo) / (receiver_hi - receiver_lo))
+  // (defaults 0.3, 0.7 e), so a near-neutral molecule beside a cation keeps its own (~0) row instead of a fraction of
+  // the cation's charge, and charged-charged links (ion pairs) are unchanged. A fixed function of the predicted charges,
+  // not a learned gate; the forces carry h' through Q0_a. Also in each lrc_states state (R binary there).
+  bool receiver_neutral = false;
+  double receiver_lo = 0.3, receiver_hi = 0.7;
   // the backbone's cutoff (pet.cutoff, pet.num_neighbors_adaptive, pet.cutoff_width_adaptive, pet.adaptive_cutoff_method;
   // read from the model's GGUF, not written by to_gguf)
   double bb_cutoff = 0, bb_nadapt = 0, bb_width = 0.5;
@@ -331,6 +357,13 @@ LrcCondition lrc_condition(const LrcSpec &L, const SqeSpec &sqe, int n, const in
 /// the rows dS_a/dx [3n] of every super-node a with dS_a != 0 (zero rows otherwise), s x 3n
 std::vector<double> lrc_blend_rows(const LrcSpec &L, const SqeSpec &sqe, const LrcCondition &c, int n, const int32_t *Z,
                                    const double *x);
+/// dQ0_b/dx [3n] of every super-node b (rows, s x 3n; one charge-pass VJP each), and the blend rows of c built from
+/// them: identical to lrc_blend_rows (the q0 VJP is linear in its weights), so one set of q0 rows serves every
+/// lrc_states copy of a structure (their super-nodes and q0 are the parent's)
+std::vector<double> lrc_q0_rows(const LrcSpec &L, const SqeSpec &sqe, const LrcCondition &c, int n, const int32_t *Z,
+                                const double *x);
+std::vector<double> lrc_blend_rows_q0(const LrcSpec &L, const LrcCondition &c, int n, const double *x,
+                                      const std::vector<double> &q0rows);
 /// forces (-dE/dx, added into F) of the conditioning's position dependence, G_a = dE/dS_a per super-node; vir
 /// (periodic, may be null) += dE/d strain
 void lrc_condition_forces(const LrcSpec &L, const SqeSpec &sqe, const LrcCondition &c, int n, const int32_t *Z,
@@ -342,6 +375,39 @@ void lrc_moments(const LrcSpec &L, int n, const int32_t *Z, const double *x, std
 /// g [3n] += d(sum_i G_i . mu_i + H_i : Theta_i)/dx, G [3n], H [9n]
 void lrc_moments_vjp(const LrcSpec &L, int n, const int32_t *Z, const double *x, const double *G, const double *H,
                      double *g);
+
+/// lrc_states: the backbone evaluations ("copies") of a structure and their weights (LrcSpec::states)
+struct LrcStateCopy {
+  std::vector<int32_t> choice; // per weak component: its partition index, or -1 = fix 3 (joint graph, blended rows)
+  double w = 0;                // weight (sum over the copies = 1)
+  std::vector<double> dw;      // dw / dp_e per super-edge of the clusters
+};
+struct LrcStates {
+  bool active = false;                    // anything but the plain fix-3 evaluation
+  std::vector<std::vector<int>> comps;    // weak components: their super-edges
+  std::vector<std::vector<int>> comp_nodes; // and super-nodes
+  // per component, per partition: the group label of every super-node of the component (the smallest super-node index
+  // of its group)
+  std::vector<std::vector<std::vector<int32_t>>> parts;
+  std::vector<LrcStateCopy> copies;
+  double lambda = 0;   // weight of the whole-structure fix-3 copy from the cap
+  double M = 0;        // the smooth count of kept partitions
+  int fix3_comps = 0;  // components whose mass guard is active (or that exceed max_super_edges)
+  std::vector<int32_t> comp_of; // per super-node: its weak component (-1: none)
+  /// per atom: the edge-drop group of copy v; edges i-j are dropped iff group_i >= 0, group_j >= 0, group_i != group_j
+  /// and both lie in the same weak component (encoded: component * 2^20 + label)
+  std::vector<int32_t> drop_groups(const LrcClusters &c, size_t v) const;
+};
+LrcStates lrc_states(const LrcSpec &L, const LrcClusters &c);
+/// the conditioning of copy v: state-mode components on their partition (binary R, no link gradient), fix-3-mode
+/// components and everything else as c (returns c itself for the all-fix-3 copy)
+LrcCondition lrc_state_condition(const LrcSpec &L, const LrcCondition &c, const LrcStates &st, size_t v, double Q,
+                                 int max_charge);
+/// g [3n] += d/dx sum_v E_v w_v(x) (the copies' energies E held fixed)
+void lrc_states_vjp(const LrcSpec &L, const LrcClusters &c, const LrcStates &st, const std::vector<double> &E,
+                    double *g);
+/// grad p_e for every super-edge e (rows, E x 3n)
+std::vector<double> lrc_superedge_grads(const LrcSpec &L, const LrcClusters &c, int n);
 
 /// lrc_qproj: the projected charges of charges q at positions x (diagnostics / parity with rdelta/neutralise)
 std::vector<double> lrc_project_charges(const LrcSpec &L, int n, const int32_t *Z, const double *x, const double *q,

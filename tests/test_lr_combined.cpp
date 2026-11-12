@@ -10,6 +10,8 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdio>
+#include <cstring>
+#include <string>
 #include <cstdlib>
 #include <filesystem>
 
@@ -17,6 +19,7 @@
 #include <cmath>
 #include <functional>
 #include <map>
+#include <set>
 #include <memory>
 #include <numeric>
 #include <vector>
@@ -2644,4 +2647,447 @@ TEST_CASE("lrc links backbone: unsupported settings throw; key absent keeps the 
   const LrcSpec Lw = graph_spec(); // default: window links
   CHECK(!Lw.links_backbone);
   CHECK(lrc_clusters(Lw, 8, XB.data()).rad.empty());
+}
+
+// ---- PET's bump cutoff in fp32: 0.5 (1 + tanh y) vs the identical sigmoid(2 y) (pet.cutoff_bump_stable) ----------------
+TEST_CASE("pet stable bump: no fp32 staircase in the attention bias near the pair cutoff; elsewhere unchanged",
+          "[pet][gguf]") {
+  const char *path = std::getenv("MLIPCPP_TEST_PET_GGUF"); // PET-OMol-S (bump cutoff, adaptive grid radii)
+  if (!path || !*path || !std::filesystem::exists(path)) SKIP("MLIPCPP_TEST_PET_GGUF not set");
+  auto load = [&](bool stable) {
+    setenv("MLIPCPP_PET_STABLE_BUMP", stable ? "1" : "0", 1);
+    auto m = std::make_unique<mlipcpp::runtime::GraphModel>();
+    m->set_backend_preference(mlipcpp::BackendPreference::CPU);
+    REQUIRE(m->load_from_gguf(path));
+    unsetenv("MLIPCPP_PET_STABLE_BUMP");
+    return m;
+  };
+  auto off = load(false), on = load(true);
+  const int32_t Z[2] = {3, 11};
+  auto e2 = [&](mlipcpp::runtime::GraphModel &m, double d) {
+    const float x[6] = {0, 0, 0, float(d), 0, 0};
+    mlipcpp::AtomicSystem s(2, x, Z, nullptr);
+    s.set_charge(2), s.set_spin_multiplicity(1);
+    return double(m.predict(s, false).energy);
+  };
+  // Li+...Na+ (Q = +2): pair cutoff 7.8127 A; in fp32 the factor 0.5 (1 + tanh y) underflows to 0 at about 7.795 A
+  // (the attention bias jumps from -17.3 to log 1e-15 = -34.5), sigmoid(2 y) is still 2.6e-8 there
+  double jump_off = 0, jump_on = 0;
+  for (double d = 7.7900; d < 7.8000; d += 2e-4) {
+    jump_off = std::max(jump_off, std::abs(e2(*off, d + 2e-4) - e2(*off, d)));
+    jump_on = std::max(jump_on, std::abs(e2(*on, d + 2e-4) - e2(*on, d)));
+  }
+  INFO("largest 0.0002 A energy step on 7.79-7.80 A: off " << jump_off << " eV, stable " << jump_on << " eV");
+  CHECK(jump_off > 0.05);  // the staircase (+121 meV at the underflow)
+  CHECK(jump_on < 0.015);  // smooth: |dE/dd| <= ~60 eV/A x 0.0002 A
+  // far inside the cutoff (no factor in the tail) and a water molecule: the same energies to fp32 noise
+  CHECK(std::abs(e2(*off, 5.0) - e2(*on, 5.0)) < 2e-4);
+  const int32_t Zw[3] = {8, 1, 1};
+  const float xw[9] = {0, 0, 0, 0.757f, 0.586f, 0, -0.757f, 0.586f, 0};
+  mlipcpp::AtomicSystem w(3, xw, Zw, nullptr);
+  w.set_charge(0), w.set_spin_multiplicity(1);
+  CHECK(std::abs(double(off->predict(w, false).energy) - double(on->predict(w, false).energy)) < 2e-4);
+}
+
+// ---- backbone link states (lrc_states = mix) -------------------------------------------------------------------------
+namespace {
+LrcSpec states_spec(double eps = 1e-3, double cap = 16, double cap_lo = 8) {
+  LrcSpec L = links_spec();
+  L.states = true, L.states_eps = eps, L.states_cap = cap, L.states_cap_lo = cap_lo;
+  return L;
+}
+// a double-precision stand-in for the backbone: per copy v, a pair term over the copy's graph (pairs inside the
+// backbone pair cutoff and not dropped by the copy's link state) plus a conditioning term sum_a kappa_a S_a^v
+struct ToyMix {
+  LrcSpec L;
+  SqeSpec S;
+  int n;
+  const int32_t *Z;
+  double Q;
+  double kappa_scale = 1.0;
+  // switched off over 6.5 - 7.5 A (before the bare ions' pair cutoff, 7.81 A: as PET's edges, zero at the cutoff)
+  static double phi(double r, double &dphi) {
+    const double t = (r - 6.5), sw = 1.0 - (t <= 0 ? 0.0 : t >= 1 ? 1.0 : t * t * t * (t * (6 * t - 15) + 10));
+    const double dsw = t <= 0 || t >= 1 ? 0.0 : -30.0 * t * t * (t - 1) * (t - 1);
+    dphi = (-0.15 * sw + 0.3 * dsw) * std::exp(-r / 2);
+    return 0.3 * std::exp(-r / 2) * sw;
+  }
+  // E (and F if non-null): sum_v w_v E_v (+ nothing else); copies (out) the number of backbone evaluations
+  double operator()(const std::vector<double> &x, std::vector<double> *F = nullptr, size_t *copies = nullptr,
+                    LrcStates *out = nullptr) const {
+    const LrcCondition c = lrc_condition(L, S, n, Z, x.data(), Q, 10, 1);
+    const LrcStates st = lrc_states(L, c.cl);
+    if (out) *out = st;
+    const size_t V = st.active ? st.copies.size() : 1;
+    if (copies) *copies = V;
+    std::vector<double> E(V, 0.0);
+    if (F) F->assign(3 * size_t(n), 0.0);
+    for (size_t v = 0; v < V; v++) {
+      const LrcCondition h = st.active ? lrc_state_condition(L, c, st, v, Q, 10) : c;
+      const std::vector<int32_t> g = st.active ? st.drop_groups(c.cl, v) : std::vector<int32_t>(n, -1);
+      const double w = st.active ? st.copies[v].w : 1.0;
+      std::vector<double> Fv(3 * size_t(n), 0.0);
+      for (int i = 0; i < n; i++)
+        for (int j = i + 1; j < n; j++) {
+          double d[3], r2 = 0;
+          for (int k = 0; k < 3; k++) d[k] = x[3 * j + k] - x[3 * i + k], r2 += d[k] * d[k];
+          const double r = std::sqrt(r2);
+          const bool drop = g[i] >= 0 && g[j] >= 0 && g[i] != g[j] && (g[i] >> 20) == (g[j] >> 20);
+          if (drop || r >= 0.5 * (c.cl.rad[i] + c.cl.rad[j])) continue;
+          double dp;
+          E[v] += phi(r, dp);
+          for (int k = 0; k < 3; k++) Fv[3 * i + k] += dp * d[k] / r, Fv[3 * j + k] -= dp * d[k] / r;
+        }
+      // per atom kappa_i times its super-node's blended row charge k + S (continuous where Q_loc crosses an integer)
+      std::vector<double> G(h.cl.s, 0.0);
+      for (int i = 0; i < n; i++) {
+        const int a = h.cl.sn[i];
+        const double kap = kappa_scale * (0.3 - 0.1 * (i % 5));
+        G[a] += kap, E[v] += kap * (h.k[a] + h.S[a]);
+      }
+      if (h.cl.s > 1) lrc_condition_forces(L, S, h, n, Z, x.data(), G, Fv.data());
+      if (F)
+        for (size_t k = 0; k < Fv.size(); k++) (*F)[k] += w * Fv[k];
+    }
+    double Em = 0;
+    for (size_t v = 0; v < V; v++) Em += (st.active ? st.copies[v].w : 1.0) * E[v];
+    if (F && st.active) {
+      std::vector<double> gw(3 * size_t(n), 0.0);
+      lrc_states_vjp(L, c.cl, st, E, gw.data());
+      for (size_t k = 0; k < gw.size(); k++) (*F)[k] -= gw[k];
+    }
+    return Em;
+  }
+};
+// XB (Na+, two waters, Cl- weakly linked) plus a far Na+ ... Cl- pair inside its link taper (a second weak component)
+std::vector<double> two_fragments(double d2, double far = 30.0) {
+  std::vector<double> x = XB;
+  const double u[3] = {0.48, 0.6, 0.64};
+  x.insert(x.end(), {far, 0.0, 0.0, far + d2 * u[0], d2 * u[1], d2 * u[2]});
+  return x;
+}
+const int32_t ZB2[] = {11, 8, 1, 1, 8, 1, 1, 17, 11, 17};
+} // namespace
+
+TEST_CASE("lrc states: weights sum to 1, product over components, forces of the full mixture exact (toy)", "[lrc][states]") {
+  SqeSpec S = sqe_spec();
+  S.lr_R = 10.0, S.lr_t = 2.0;
+  for (double Q : {0.0, 1.0}) {
+    ToyMix T{states_spec(), S, 10, ZB2, Q};
+    for (double d2 : {5.6, 6.3, 7.0}) {
+      const std::vector<double> x = two_fragments(d2);
+      std::vector<double> F;
+      size_t V = 0;
+      LrcStates st;
+      T(x, &F, &V, &st);
+      REQUIRE(st.active);
+      REQUIRE(st.comps.size() == 2);
+      double sw = 0;
+      for (const auto &cp : st.copies) sw += cp.w;
+      CHECK(sw == Approx(1.0).margin(1e-12));
+      // the product: every combination of the components' kept partitions appears
+      std::vector<std::set<int32_t>> seen(2);
+      for (const auto &cp : st.copies) seen[0].insert(cp.choice[0]), seen[1].insert(cp.choice[1]);
+      CHECK(st.copies.size() == seen[0].size() * seen[1].size());
+      auto E = [&](const std::vector<double> &y) { return T(y); };
+      double fm = 0, err = 0;
+      for (size_t k = 0; k < x.size(); k++) {
+        const double num = -fd(E, x, k, 1e-5);
+        fm = std::max(fm, std::abs(num)), err = std::max(err, std::abs(num - F[k]));
+      }
+      INFO("Q " << Q << " d2 " << d2 << ": copies " << V << ", M " << st.M << ", max |F| " << fm << ", error " << err);
+      CHECK(V >= 2);
+      CHECK(fm > 1e-3);
+      CHECK(err < 1e-7 * std::max(1.0, fm));
+    }
+  }
+}
+
+TEST_CASE("lrc states: size consistent (far apart = sum of the fragments, each with its own weak link) (toy)",
+          "[lrc][states]") {
+  SqeSpec S = sqe_spec();
+  S.lr_R = 10.0, S.lr_t = 2.0;
+  // the pair term only (the toy charge pass equilibrates Q over all atoms, so the conditioning term couples fragments)
+  ToyMix AB{states_spec(), S, 10, ZB2, 0.0, 0.0}, A{states_spec(), S, 8, ZB2, 0.0, 0.0},
+      B{states_spec(), S, 2, ZB2 + 8, 0.0, 0.0};
+  for (double d2 : {5.6, 6.3, 7.0, 7.6}) {
+    const std::vector<double> x = two_fragments(d2, 40.0);
+    std::vector<double> xa(x.begin(), x.begin() + 24), xb(x.begin() + 24, x.end());
+    size_t Vab = 0, Va = 0, Vb = 0;
+    std::vector<double> Fab, Fa, Fb;
+    const double eab = AB(x, &Fab, &Vab), ea = A(xa, &Fa, &Va), eb = B(xb, &Fb, &Vb);
+    INFO("d2 " << d2 << ": E(AB) " << eab << " = " << ea << " + " << eb << "; copies " << Vab << " = " << Va << " x " << Vb);
+    CHECK(eab == Approx(ea + eb).margin(1e-12));
+    CHECK(Vab == Va * Vb);
+    double ferr = 0;
+    for (int k = 0; k < 24; k++) ferr = std::max(ferr, std::abs(Fab[k] - Fa[k]));
+    for (int k = 0; k < 6; k++) ferr = std::max(ferr, std::abs(Fab[24 + k] - Fb[k]));
+    CHECK(ferr < 1e-12);
+  }
+}
+
+TEST_CASE("lrc states: continuous through the eps cut and the cap (toy, double, fine scans)", "[lrc][states]") {
+  SqeSpec S = sqe_spec();
+  S.lr_R = 10.0, S.lr_t = 2.0;
+  // a pair of bare ions through the whole taper (states appear and vanish through the eps cut at both ends) with a
+  // fragment in a weak link elsewhere; then a small cap (2.2 -> 3.5) that the scan crosses both ways. Continuity: the
+  // energy step departs from the trapezoid work by O(h^3) (a jump would not shrink with h)
+  for (auto [cap_lo, cap] : std::vector<std::pair<double, double>>{{8, 16}, {2.2, 3.5}}) {
+    ToyMix T{states_spec(1e-3, cap, cap_lo), S, 10, ZB2, 0.0};
+    const double u[3] = {0.48, 0.6, 0.64};
+    double worst[2] = {0, 0}, fmax = 0, lam_min = 1, lam_max = 0;
+    size_t vmin = 99, vmax = 0;
+    for (int pass = 0; pass < 2; pass++) {
+      const double h = pass ? 1e-4 : 2e-4;
+      double Ep = 0, Fp = 0;
+      bool first = true;
+      for (double d = 4.5; d <= 8.2 + 1e-9; d += h) {
+        std::vector<double> F;
+        size_t V = 0;
+        LrcStates st;
+        const double E = T(two_fragments(d), &F, &V, &st);
+        double Fu = 0; // force on the moving ion along u
+        for (int k = 0; k < 3; k++) Fu += F[27 + k] * u[k];
+        if (!first) worst[pass] = std::max(worst[pass], std::abs(E - Ep + 0.5 * (Fu + Fp) * h));
+        fmax = std::max(fmax, std::abs(Fu)), vmin = std::min(vmin, V), vmax = std::max(vmax, V);
+        lam_min = std::min(lam_min, st.lambda), lam_max = std::max(lam_max, st.lambda);
+        Ep = E, Fp = Fu, first = false;
+      }
+    }
+    INFO("cap " << cap_lo << " -> " << cap << ": max |dE - trapezoid| " << worst[0] << " (h 2e-4), " << worst[1]
+                << " (h 1e-4) eV; max |F| " << fmax << "; copies " << vmin << " - " << vmax << "; lambda " << lam_min
+                << " - " << lam_max);
+    CHECK(worst[0] < 1e-6);
+    CHECK((worst[0] < 1e-9 || worst[0] / worst[1] > 6.0));
+    if (cap < 4) CHECK(lam_max == 1.0);
+    if (cap < 4) CHECK(lam_min == 0.0);
+  }
+}
+
+TEST_CASE("lrc states: key absent is fix 3, a structure without weak links has one evaluation", "[lrc][states]") {
+  SqeSpec S = sqe_spec();
+  LrcSpec L = links_spec();
+  const LrcCondition c = lrc_condition(L, S, 8, ZB, XB.data(), 0.0, 10, 1);
+  CHECK(!lrc_states(L, c.cl).active); // states off
+  L.states = true;
+  CHECK(lrc_states(L, c.cl).active);
+  const std::vector<double> far = two_fragments(9.5); // the second pair beyond its pair cutoff: no second component
+  const LrcCondition c2 = lrc_condition(L, S, 10, ZB2, far.data(), 0.0, 10, 1);
+  CHECK(lrc_states(L, c2.cl).comps.size() == 1);
+  LrcSpec Lw = graph_spec();
+  Lw.states = true;
+  CHECK_THROWS(Lw.links_check()); // states need backbone links
+}
+
+// with MLIPCPP_TEST_STATES_GGUF (a combined model with lrc_links = backbone and lrc_states = mix, e.g. FTq13 + the
+// keys): forces of the full mixture against central differences (fp32: tolerance 0.05 eV/A or 2 %), and equality with
+// the key-off model beyond the taper
+TEST_CASE("lrc states: full model forces match central differences (GGUF)", "[lrc][states][gguf]") {
+  const char *path = std::getenv("MLIPCPP_TEST_STATES_GGUF");
+  if (!path || !*path || !std::filesystem::exists(path)) SKIP("MLIPCPP_TEST_STATES_GGUF not set");
+  mlipcpp::runtime::GraphModel m;
+  m.set_backend_preference(mlipcpp::BackendPreference::CPU);
+  REQUIRE(m.load_from_gguf(path));
+  REQUIRE(m.plato_lr().lrc.states);
+  const double u[3] = {0.92031, 0.34051, -0.19327};
+  const double un = std::sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]);
+  struct Case {
+    std::vector<int32_t> Z;
+    std::vector<double> x; // the last atom moves along u
+    int Q;
+    std::vector<double> d;
+  };
+  const std::vector<Case> cases = {
+      {{3, 11}, {0, 0, 0, 0, 0, 0}, 2, {5.8, 6.6, 7.2, 7.6}},
+      // Na+ (H2O) and Cl-: the anion in the water's taper
+      {{11, 8, 1, 1, 17}, {0, 0, 0, 2.3, 0, 0, 2.9, 0.75, 0, 2.9, -0.75, 0, 0, 0, 0}, 0, {5.9, 6.2}},
+  };
+  for (const Case &cs : cases) {
+    const int n = static_cast<int>(cs.Z.size());
+    for (double d0 : cs.d) {
+      auto run = [&](double d, bool forces) {
+        std::vector<float> x(cs.x.begin(), cs.x.end());
+        const float base[3] = {n > 2 ? 2.3f : 0.0f, 0.0f, 0.0f};
+        for (int k = 0; k < 3; k++) x[3 * (n - 1) + k] = base[k] + float(d * u[k] / un);
+        mlipcpp::AtomicSystem sys(n, x.data(), cs.Z.data(), nullptr);
+        sys.set_charge(cs.Q), sys.set_spin_multiplicity(1);
+        return m.predict(sys, forces);
+      };
+      const mlipcpp::ModelResult r = run(d0, true);
+      REQUIRE(r.forces.size() == 3 * size_t(n));
+      double Fu = 0;
+      for (int k = 0; k < 3; k++) Fu += double(r.forces[3 * (n - 1) + k]) * u[k] / un;
+      { // the geometry is a multi-state structure
+        std::vector<double> xd(cs.x.begin(), cs.x.end());
+        const double base[3] = {n > 2 ? 2.3 : 0.0, 0.0, 0.0};
+        for (int k = 0; k < 3; k++) xd[3 * (n - 1) + k] = double(float(base[k] + d0 * u[k] / un));
+        const LrcStates st = lrc_states(m.plato_lr().lrc, lrc_clusters(m.plato_lr().lrc, n, xd.data()));
+        INFO("copies " << st.copies.size());
+        CHECK(st.active);
+        CHECK(st.copies.size() >= 2);
+      }
+      double best = 1e30;
+      for (double h : {2e-3, 1e-3, 5e-4}) {
+        const double Fc = -(double(run(d0 + h, false).energy) - double(run(d0 - h, false).energy)) / (2 * h);
+        best = std::min(best, std::abs(Fc - Fu));
+      }
+      INFO("n " << n << " d " << d0 << ": F.u " << Fu << " eV/A, |F_c - F.u| " << best);
+      CHECK(best < std::max(0.05, 0.02 * std::abs(Fu)));
+    }
+  }
+}
+
+TEST_CASE("lrc states: blend rows from shared per-super-node q0 rows equal lrc_blend_rows (fix 3 and every copy)",
+          "[lrc][states]") {
+  SqeSpec S = sqe_spec();
+  S.lr_R = 10.0, S.lr_t = 2.0;
+  const LrcSpec L = states_spec();
+  for (double Q : {0.0, 1.0})
+    for (double d2 : {5.6, 6.3}) {
+      const std::vector<double> x = two_fragments(d2);
+      const LrcCondition c = lrc_condition(L, S, 10, ZB2, x.data(), Q, 10, 1);
+      const LrcStates st = lrc_states(L, c.cl);
+      REQUIRE(st.active);
+      const std::vector<double> q0r = lrc_q0_rows(L, S, c, 10, ZB2, x.data());
+      double err = 0, mag = 0;
+      auto cmp = [&](const LrcCondition &h) {
+        const std::vector<double> a = lrc_blend_rows(L, S, h, 10, ZB2, x.data()), b = lrc_blend_rows_q0(L, h, 10, x.data(), q0r);
+        REQUIRE(a.size() == b.size());
+        for (size_t k = 0; k < a.size(); k++) err = std::max(err, std::abs(a[k] - b[k])), mag = std::max(mag, std::abs(a[k]));
+      };
+      cmp(c);
+      for (size_t v = 0; v < st.copies.size(); v++) cmp(lrc_state_condition(L, c, st, v, Q, 10));
+      INFO("Q " << Q << " d2 " << d2 << ": max |row| " << mag << ", max difference " << err);
+      CHECK(mag > 1e-4);
+      CHECK(err < 1e-12 * std::max(1.0, mag));
+    }
+}
+
+// diagnostics (hidden): per structure of MLIPCPP_QLOC_XYZ (extended XYZ with charge=), the conditioning of the model
+// MLIPCPP_QLOC_GGUF: super-nodes, Q_loc, S, dS per super-node and the fallback flag, as JSON lines on stdout
+TEST_CASE("lrc diagnostics: Q_loc dump", "[.qloc_dump]") {
+  const char *path = std::getenv("MLIPCPP_QLOC_GGUF"), *xyz = std::getenv("MLIPCPP_QLOC_XYZ");
+  if (!path || !xyz) SKIP("MLIPCPP_QLOC_GGUF / MLIPCPP_QLOC_XYZ not set");
+  mlipcpp::runtime::GraphModel m;
+  m.set_backend_preference(mlipcpp::BackendPreference::CPU);
+  REQUIRE(m.load_from_gguf(path));
+  const LrcSpec &L = m.plato_lr().lrc;
+  const SqeSpec &S = m.plato_lr().sqe;
+  std::FILE *f = std::fopen(xyz, "r");
+  REQUIRE(f);
+  static const std::map<std::string, int> el = {{"H", 1}, {"Li", 3}, {"B", 5}, {"C", 6}, {"N", 7}, {"O", 8}, {"F", 9},
+      {"Na", 11}, {"Mg", 12}, {"Al", 13}, {"Si", 14}, {"P", 15}, {"S", 16}, {"Cl", 17}, {"K", 19}, {"Ca", 20}, {"Br", 35},
+      {"I", 53}};
+  char line[4096];
+  int idx = 0;
+  while (std::fgets(line, sizeof line, f)) {
+    const int n = std::atoi(line);
+    if (n <= 0) break;
+    REQUIRE(std::fgets(line, sizeof line, f));
+    const char *q = std::strstr(line, "charge=");
+    const int Q = q ? std::atoi(q + 7) : 0;
+    std::vector<int32_t> Z(n);
+    std::vector<double> x(3 * size_t(n));
+    for (int i = 0; i < n; i++) {
+      REQUIRE(std::fgets(line, sizeof line, f));
+      char sym[8];
+      std::sscanf(line, "%7s %lf %lf %lf", sym, &x[3 * i], &x[3 * i + 1], &x[3 * i + 2]);
+      auto it = el.find(sym);
+      Z[i] = it != el.end() ? it->second : 0;
+      if (!Z[i]) { // atomic number by symbol table of the model's species? fall back to periodic order via a scan
+        static const char *tab[] = {"", "H", "He", "Li", "Be", "B", "C", "N", "O", "F", "Ne", "Na", "Mg", "Al", "Si", "P", "S", "Cl", "Ar", "K", "Ca", "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu", "Zn", "Ga", "Ge", "As", "Se", "Br", "Kr", "Rb", "Sr", "Y", "Zr", "Nb", "Mo", "Tc", "Ru", "Rh", "Pd", "Ag", "Cd", "In", "Sn", "Sb", "Te", "I", "Xe", "Cs", "Ba", "La", "Ce", "Pr", "Nd", "Pm", "Sm", "Eu", "Gd", "Tb", "Dy", "Ho", "Er", "Tm", "Yb", "Lu", "Hf", "Ta", "W", "Re", "Os", "Ir", "Pt", "Au", "Hg", "Tl", "Pb", "Bi"};
+        for (int k = 1; k < int(sizeof tab / sizeof tab[0]); k++)
+          if (std::string(tab[k]) == sym) Z[i] = k;
+      }
+    }
+    const LrcCondition c = lrc_condition(L, S, n, Z.data(), x.data(), double(Q), 10, 1);
+    std::printf("{\"i\": %d, \"Q\": %d, \"s\": %d, \"weak\": %zu, \"superedges\": %zu, \"fallback\": %d, \"Qloc\": [", idx, Q,
+                c.cl.s, c.cl.weak.size(), c.cl.se.size(), int(c.cl.fallback));
+    for (int a = 0; a < c.cl.s; a++) std::printf("%s%.5f", a ? ", " : "", c.Qloc[a]);
+    std::printf("], \"Q0\": [");
+    for (int a = 0; a < c.cl.s; a++) std::printf("%s%.5f", a ? ", " : "", c.Q0[a]);
+    std::printf("], \"dS\": [");
+    for (int a = 0; a < c.cl.s; a++) std::printf("%s%.5f", a ? ", " : "", c.dS[a]);
+    std::printf("], \"size\": [");
+    std::vector<int> sz(c.cl.s, 0);
+    for (int i = 0; i < n; i++) sz[c.cl.sn[i]]++;
+    for (int a = 0; a < c.cl.s; a++) std::printf("%s%d", a ? ", " : "", sz[a]);
+    std::printf("]");
+    { // the 3b states of the same clusters (eps 1e-3, cap 8 -> 16)
+      LrcSpec L2 = L;
+      L2.states = true, L2.states_eps = 1e-3, L2.states_cap = 16, L2.states_cap_lo = 8;
+      const LrcStates st = lrc_states(L2, c.cl);
+      std::printf(", \"copies\": %zu, \"lambda\": %.4f, \"M\": %.2f, \"fix3_comps\": %d, \"comps\": %zu", st.copies.size(), st.lambda,
+                  st.M, st.fix3_comps, st.comps.size());
+    }
+    std::printf("}\n");
+    std::fflush(stdout);
+    idx++;
+  }
+  std::fclose(f);
+}
+
+TEST_CASE("lrc neutral receivers: Q_loc rule, conditioning forces and blend rows exact (h' included), mixture FD",
+          "[lrc][states][receiver]") {
+  SqeSpec S = sqe_spec();
+  S.lr_R = 10.0, S.lr_t = 2.0;
+  for (double Q : {0.0, 1.0}) {
+    LrcSpec L = links_spec();
+    L.receiver_neutral = true, L.receiver_lo = 0.05, L.receiver_hi = 0.95; // a wide ramp: every super-node on its slope
+    const int n = 8;
+    const LrcCondition c0 = lrc_condition(L, S, n, ZB, XB.data(), Q, 10, 1);
+    REQUIRE(c0.cl.s >= 2);
+    // the rule itself: Q_loc_a = Q0_a + h(|Q0_a|) sum_{b != a} R_ab Q0_b
+    double hmin = 1, hmax = 0;
+    for (int a = 0; a < c0.cl.s; a++) {
+      double t = 0;
+      for (int b = 0; b < c0.cl.s; b++)
+        if (b != a) t += c0.cl.R[size_t(a) * c0.cl.s + b] * c0.Q0[b];
+      const double u = (std::abs(c0.Q0[a]) - 0.05) / 0.9, h = u <= 0 ? 0 : u >= 1 ? 1 : u * u * u * (u * (6 * u - 15) + 10);
+      hmin = std::min(hmin, h), hmax = std::max(hmax, h);
+      CHECK(c0.Qloc[a] == Approx(c0.Q0[a] + h * t).margin(1e-12));
+    }
+    INFO("Q " << Q << ": h in [" << hmin << ", " << hmax << "]");
+    CHECK(hmax > 0);
+    CHECK(hmin < 1);
+    auto fS = [&](const std::vector<double> &x) {
+      const LrcCondition c = lrc_condition(L, S, n, ZB, x.data(), Q, 10, 1);
+      double v = 0;
+      for (int a = 0; a < c.cl.s; a++) v += (0.7 - 0.4 * a) * c.Qloc[a];
+      return v;
+    };
+    std::vector<double> G(c0.cl.s, 0.0), F(3 * n, 0.0);
+    for (int a = 0; a < c0.cl.s; a++) G[a] = c0.dS[a] != 0 ? (0.7 - 0.4 * a) / c0.dS[a] : 0.0;
+    lrc_condition_forces(L, S, c0, n, ZB, XB.data(), G, F.data());
+    const std::vector<double> rows = lrc_blend_rows(L, S, c0, n, ZB, XB.data());
+    const std::vector<double> rows_q0 = lrc_blend_rows_q0(L, c0, n, XB.data(), lrc_q0_rows(L, S, c0, n, ZB, XB.data()));
+    double err = 0, fm = 0, rq = 0;
+    for (size_t k = 0; k < XB.size(); k++) {
+      const double num = -fd(fS, XB, k, 1e-5);
+      fm = std::max(fm, std::abs(num)), err = std::max(err, std::abs(num - F[k]));
+    }
+    for (size_t k = 0; k < rows.size(); k++) rq = std::max(rq, std::abs(rows[k] - rows_q0[k]));
+    INFO("conditioning forces: max |F| " << fm << ", error " << err << "; rows vs q0 rows " << rq);
+    for (int a = 0; a < c0.cl.s; a++) REQUIRE(c0.dS[a] != 0);
+    CHECK(fm > 1e-4);
+    CHECK(err < 1e-8 * std::max(1.0, fm));
+    CHECK(rq < 1e-12 * std::max(1.0, fm));
+    // the full toy mixture (states + receivers) against central differences
+    LrcSpec Ls = states_spec();
+    Ls.receiver_neutral = true, Ls.receiver_lo = 0.05, Ls.receiver_hi = 0.95;
+    ToyMix T{Ls, S, 10, ZB2, Q};
+    for (double d2 : {5.6, 6.3}) {
+      const std::vector<double> x = two_fragments(d2);
+      std::vector<double> Fm;
+      T(x, &Fm);
+      auto E = [&](const std::vector<double> &y) { return T(y); };
+      double e2 = 0, f2 = 0;
+      for (size_t k = 0; k < x.size(); k++) {
+        const double num = -fd(E, x, k, 1e-5);
+        f2 = std::max(f2, std::abs(num)), e2 = std::max(e2, std::abs(num - Fm[k]));
+      }
+      INFO("mixture d2 " << d2 << ": max |F| " << f2 << ", error " << e2);
+      CHECK(e2 < 1e-7 * std::max(1.0, f2));
+    }
+  }
 }

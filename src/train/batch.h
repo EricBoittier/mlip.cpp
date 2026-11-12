@@ -1,6 +1,7 @@
 #pragma once
 
 #include "train/dataset.h"
+#include "runtime/lr_combined.h"
 
 #include <array>
 #include <cstdint>
@@ -94,6 +95,35 @@ struct Batch {
   // Loss normalisation: 1/S and 1/(3N) of the *whole* step batch, so that
   // micro-batch losses (and gradients) sum to the full-batch ones.
   float energy_norm = 0.0f, force_norm = 0.0f;
+
+  // lrc_states (runtime/lr_combined.h): the real structures are the systems 0 .. structures() - 1, in the order of
+  // `ids`; every further system is a copy of one of them (another link state: the same atoms and positions, its own
+  // edges and conditioning). vs_of[k]: the structure system k belongs to (k itself for a structure); vs_drop: per atom
+  // the copy's edge-drop group (LrcStates::drop_groups; -1 everywhere for a structure without states); vs_active: per
+  // structure, whether it is a multi-state structure. Copies have no loss rows (atom_weight 0, force_mask 0); the
+  // trainer weights them into their structure's row. Empty / 0 without lrc_states.
+  int n_primary = 0;
+  std::vector<int32_t> vs_of, vs_drop;
+  std::vector<uint8_t> vs_active;
+  int structures() const { return n_primary ? n_primary : n_real_systems; }
+  int copies() const { return n_real_systems - structures(); }
+  // lrc_states, a part of a split structure (one structure whose copies do not fit one micro-batch): every system is a
+  // copy of the same structure (vs_copy: its index in LrcStates::copies), there are no loss rows (no atom weights, no
+  // force mask); the parts of a group are consecutive in a worker's list and run together (Worker::run_parts), which
+  // combines the copies and takes the loss once. part_group -1: an ordinary batch.
+  int part_group = -1, part_count = 0, part_index = 0;
+  std::vector<int32_t> vs_copy;
+  float part_energy_target = 0.0f; // the structure's energy target (scaled, per atom)
+};
+
+/// lrc_states: the edge-drop groups of each backbone evaluation of a structure (positions as packed, float, rotated);
+/// empty for a structure that is evaluated once without states. Deterministic in (Z, x): the trainer's worker
+/// recomputes the same list from the batch positions.
+struct StatePlanner {
+  const runtime::LrcSpec *lrc = nullptr;
+  std::vector<std::vector<int32_t>> groups(int n, const float *x) const;
+  /// the number of evaluations of structure s of `split` under rotation R (null: none), for the packer's cost
+  int count(const MemmapSplit &split, int64_t s, const float *R) const;
 };
 
 /// Fixed-shape tiles: every micro-batch is padded up to a point of a
@@ -110,6 +140,16 @@ struct Tiling {
   static int bucket(int x, int lo, double ratio);
 };
 
+/// lrc_states: a part batch of structure `id` holding its copies `copies` (indices into its LrcStates copies, in the
+/// planner's order); group bookkeeping as Batch::part_*. Positions rotated by R (null: none).
+Batch make_part_batch(const MemmapSplit &split, const NeighborCache &nl, int64_t id, const float *R,
+                      const std::vector<int> &copies, const std::map<int, int> &species_to_index,
+                      const TargetScaling &scaling, float cutoff, const StatePlanner &planner);
+/// lrc_states: whether a structure with `c` copies of n atoms and m neighbours is split into parts (budget: the
+/// micro-batch attention budget; MLIPCPP_VS_SPLIT_COPIES=k > 0 forces parts of at most k copies, for tests), and the
+/// copies per part
+int part_copies(int c, int n, int m, double budget);
+
 /// Pack `ids` of `split`. `rotations` is empty (no augmentation) or holds one
 /// 3x3 row-major matrix per structure, applied to edge vectors and forces.
 /// Shapes are padded up to `pad_atoms` / `pad_neighbors` / `pad_systems` (0:
@@ -119,7 +159,7 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
                  const std::vector<std::array<float, 9>> &rotations,
                  const std::map<int, int> &species_to_index,
                  const TargetScaling &scaling, float cutoff, int pad_atoms = 0,
-                 int pad_neighbors = 0, int pad_systems = 0);
+                 int pad_neighbors = 0, int pad_systems = 0, const StatePlanner *planner = nullptr);
 
 /// The batch `ids` as micro-batches of structures with similar neighbour
 /// counts (all atoms of a micro-batch are padded to its largest count). A
@@ -133,7 +173,7 @@ std::vector<Batch> make_microbatches(const MemmapSplit &split, const NeighborCac
                                      const std::map<int, int> &species_to_index,
                                      const TargetScaling &scaling, float cutoff,
                                      double budget = 5e7, double growth = 1.5,
-                                     const Tiling &tiling = {});
+                                     const Tiling &tiling = {}, const StatePlanner *planner = nullptr);
 
 /// Modelled compute time (ms) of a micro-batch of n atoms padded to m
 /// neighbours: per micro-batch overhead, attention ~ n (m+1)^2, edges ~ n (m+1).
@@ -164,6 +204,6 @@ std::vector<std::vector<Batch>> make_step_batches(const MemmapSplit &split, cons
                                                   const TargetScaling &scaling, float cutoff,
                                                   int n_workers, const CostModel &cost,
                                                   double budget = 5e7,
-                                                  const Tiling &tiling = {});
+                                                  const Tiling &tiling = {}, const StatePlanner *planner = nullptr);
 
 } // namespace mlipcpp::train

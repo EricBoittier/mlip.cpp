@@ -6,6 +6,7 @@
 //                       [--conservative 1 --energy-weight W --force-weight W --nc-force-weight W]
 #include "train/crash.h"
 #include "train/trainer.h"
+#include "train/tail_loss.h"
 
 #include <cstdlib>
 #include <fmt/core.h>
@@ -30,7 +31,7 @@ int main(int argc, char **argv) {
   mlipcpp::train::install_crash_backtrace();
   std::string data, init, out, cache_dir;
   int n = 64, gpus = 1, first = 0;
-  bool node_grads_on = false, mb_failed = false, profile = false, sweep = false;
+  bool node_grads_on = false, mb_failed = false, profile = false, sweep = false, states_fd = false;
   Worker::Conservative cons;
   Worker::ChargeCorr qcorr;
   std::string qtarget = "mulliken";
@@ -59,6 +60,7 @@ int main(int argc, char **argv) {
     else if (a == "--charge-corr-min") qcorr.r_min = std::stod(v);
     else if (a == "--charge-corr-target") qtarget = v;
     else if (a == "--loss") huber = v == "huber";
+    else if (a == "--states-fd") states_fd = v == "1";
     else if (a == "--huber-delta-e") de = std::stod(v);
     else if (a == "--huber-delta-f") df = std::stod(v);
   }
@@ -77,14 +79,205 @@ int main(int argc, char **argv) {
   worker.loss.huber = huber, worker.loss.delta_e = de, worker.loss.delta_f = df;
   if (qcorr.weight > 0 && !split.load_partial_charges(qtarget))
     throw std::runtime_error(data + "/train/" + qtarget + "_charge.bin: not found");
-  const TargetScaling sc = TargetScaling::fit(split);
+  // --states-fd: the model's composition and scales (the FT recipe's --model-baselines), so that the trainer's energies
+  // are comparable with inference (the host long-range energy is in eV; a refitted energy scale would rescale only the
+  // backbone part)
+  TargetScaling sc;
+  if (states_fd) {
+    for (auto [Z, c] : worker.model().composition_energies()) sc.composition[Z] = c;
+    for (auto [Z, f] : worker.model().nc_force_scales()) sc.force_scale[Z] = f;
+    sc.energy_scale = worker.model().energy_scale();
+  } else {
+    sc = TargetScaling::fit(split);
+  }
   const AdaptiveCutoff adaptive = adaptive_cutoff(worker.model());
   NeighborCache nl = NeighborCache::load_or_build(
       split, worker.model().cutoff(), cache_path(cache_dir, split, worker.model().cutoff(), adaptive), 8, adaptive);
   nl.taper = cons.on && adaptive.enabled();
   std::vector<int64_t> ids(n);
   std::iota(ids.begin(), ids.end(), first);
-  Batch b = make_batch(split, nl, ids, {}, worker.model().species_to_index(), sc, worker.model().cutoff());
+  // a combined (lrc) model as mlipcpp-train sets it up: exact conditioning forces; lrc_states: the copies
+  StatePlanner planner;
+  if (worker.model().plato_lr().lrc.enabled) {
+    worker.lrc = &worker.model().plato_lr().lrc, worker.lrc_sqe = &worker.model().plato_lr().sqe;
+    worker.lrc_exact = worker.lrc->graph;
+    if (worker.lrc->states) planner.lrc = worker.lrc, worker.vs_on = true;
+  }
+  Batch b = make_batch(split, nl, ids, {}, worker.model().species_to_index(), sc, worker.model().cutoff(), 0, 0, 0,
+                       &planner);
+  if (states_fd) {
+    // --states-fd 1: the loss gradient of the batch (lrc_states copies included) against central differences of the
+    // loss along g / |g|: (L(p + h g/|g|) - L(p - h g/|g|)) / 2h -> |g|; then per structure the same for the energy
+    // loss alone (energy weight only), so the force-loss path (tangents w_v u, cotangents -u . grad w_v) is checked too
+    fmt::print("states-fd: {} structures, {} copies ({} atoms packed)\n", b.structures(), b.copies(), b.n_atoms);
+    const std::vector<float> p0 = worker.get_params();
+    auto check = [&](const char *what) {
+      worker.zero_grads();
+      const StepStats s0 = worker.run(b, sc.energy_scale, true);
+      const std::vector<float> g = worker.get_grads();
+      double gn = 0;
+      for (float x : g) gn += double(x) * x;
+      gn = std::sqrt(gn);
+      double best = 1e30;
+      std::string line;
+      for (double h : {1e-2, 3e-3, 1e-3, 3e-4}) {
+        auto loss_at = [&](double sgn) {
+          std::vector<float> p = p0;
+          for (size_t q = 0; q < p.size(); q++) p[q] += static_cast<float>(sgn * h / gn * g[q]);
+          worker.set_params(p);
+          return double(worker.run(b, sc.energy_scale, false).loss);
+        };
+        const double fdv = (loss_at(+1) - loss_at(-1)) / (2 * h), rel = std::abs(fdv - gn) / gn;
+        best = std::min(best, rel);
+        line += fmt::format(" h {:.0e}: FD {:.6g} (rel {:.2e})", h, fdv, rel);
+      }
+      worker.set_params(p0);
+      fmt::print("states-fd {}: L {:.6g}, |g| {:.6g};{} -> {}\n", what, s0.loss, gn, line, best < 2e-2 ? "PASS" : "FAIL");
+      return best < 2e-2;
+    };
+    bool ok = true;
+    // the tail-loss path (energies() and run_tail: FORWARD / BACKWARD graphs, copies through the weighted energy rows)
+    // on the first 7 structures (tdata: the Li+...Na+ series), pairs (k, 6): energy differences against the split's
+    // labels (inference energies for tdata/exact*) and the run_tail gradient against FD along g / |g|
+    if (n >= 7) {
+      std::vector<int64_t> tids(7);
+      std::iota(tids.begin(), tids.end(), first);
+      const Batch bt = make_batch(split, nl, tids, {}, worker.model().species_to_index(), sc, worker.model().cutoff(), 0, 0, 0,
+                                  &planner);
+      fmt::print("states-fd tail: {} structures, {} copies\n", bt.structures(), bt.copies());
+      const std::vector<double> Et = worker.energies(bt, sc.energy_scale);
+      double emax = 0;
+      std::vector<TailPair> pairs;
+      for (int k = 0; k < 6; k++) {
+        const double dl = double(split.energy(tids[k])) - double(split.energy(tids[6]));
+        emax = std::max(emax, std::abs((Et[k] - Et[6]) - dl));
+        fmt::print("  tail k {}: dE trainer {:.6f}, labels {:.6f} eV\n", k, Et[k] - Et[6], dl);
+        TailPair tp;
+        tp.k = k, tp.l = 6, tp.de_dft = dl + 0.05 * (k - 2.5), tp.de_ref = 0.3, tp.d = 5.0;
+        pairs.push_back(tp);
+      }
+      fmt::print("states-fd tail: max |dE(trainer energies()) - dE(labels)| {:.3e} eV (labels = inference: parity)\n", emax);
+      {
+        std::vector<SystemError> se;
+        worker.system_errors = &se;
+        worker.run(bt, sc.energy_scale, false);
+        worker.system_errors = nullptr;
+        for (const SystemError &r : se) fmt::print("  run_conservative on the tail batch: id {} dE {:.6f} eV\n", r.id, r.de * r.n);
+        for (int64_t id : tids) { // each structure alone
+          const Batch b1 = make_batch(split, nl, {id}, {}, worker.model().species_to_index(), sc, worker.model().cutoff(), 0, 0,
+                                      0, &planner);
+          std::vector<SystemError> s1;
+          worker.system_errors = &s1;
+          worker.run(b1, sc.energy_scale, false);
+          worker.system_errors = nullptr;
+          fmt::print("  alone: id {} copies {} dE {:.6f} eV; energies() {:.6f}\n", id, b1.copies(), s1[0].de * s1[0].n,
+                     worker.energies(b1, sc.energy_scale)[0]);
+        }
+      }
+      TailLoss tl;
+      tl.weight = 1.0;
+      worker.tail_cotangent = true;
+      worker.zero_grads();
+      const double L0 = worker.run_tail(bt, sc.energy_scale, pairs, tl, 1.0);
+      const std::vector<float> g = worker.get_grads();
+      double gn = 0;
+      for (float x : g) gn += double(x) * x;
+      gn = std::sqrt(gn);
+      double best = 1e30;
+      std::string line;
+      for (double h : {1e-2, 3e-3, 1e-3}) {
+        auto loss_at = [&](double sgn) {
+          std::vector<float> p = p0;
+          for (size_t q = 0; q < p.size(); q++) p[q] += static_cast<float>(sgn * h / gn * g[q]);
+          worker.set_params(p);
+          return tl.eval(pairs, worker.energies(bt, sc.energy_scale), nullptr);
+        };
+        const double fdv = (loss_at(+1) - loss_at(-1)) / (2 * h), rel = std::abs(fdv - gn) / gn;
+        best = std::min(best, rel), line += fmt::format(" h {:.0e}: FD {:.6g} (rel {:.2e})", h, fdv, rel);
+      }
+      worker.set_params(p0), worker.zero_grads();
+      { // the same group in parts of 3 structures (MLIPCPP_TAIL_CHUNK): same loss and gradient
+        std::vector<Batch> parts;
+        for (size_t a = 0; a < tids.size(); a += 3) {
+          const std::vector<int64_t> ids(tids.begin() + a, tids.begin() + std::min(tids.size(), a + 3));
+          parts.push_back(make_batch(split, nl, ids, {}, worker.model().species_to_index(), sc, worker.model().cutoff(), 0, 0,
+                                     0, &planner));
+        }
+        const double Lp = worker.run_tail(parts, sc.energy_scale, pairs, tl, 1.0);
+        const std::vector<float> gp = worker.get_grads();
+        double dg = 0, gm = 0;
+        for (size_t q = 0; q < g.size(); q++) dg = std::max(dg, double(std::abs(gp[q] - g[q]))), gm = std::max(gm, double(std::abs(g[q])));
+        fmt::print("states-fd tail in parts of 3: L {:.8g} vs {:.8g}, max |dg| {:.3e} (max |g| {:.3e}) -> {}\n", Lp, L0, dg, gm,
+                   std::abs(Lp - L0) <= 1e-6 * std::abs(L0) && dg <= 1e-4 * gm ? "PASS" : "FAIL");
+        ok = ok && std::abs(Lp - L0) <= 1e-6 * std::abs(L0) && dg <= 1e-4 * gm;
+        worker.zero_grads();
+      }
+      worker.tail_cotangent = false;
+      fmt::print("states-fd tail loss: L {:.6g}, |g| {:.6g};{} -> {}\n", L0, gn, line, best < 2e-2 ? "PASS" : "FAIL");
+      ok = ok && best < 2e-2;
+    }
+    // split structures (Worker::run_parts): every multi-state structure of the first n as one-copy parts against the
+    // same structure in one batch: same loss and gradient (fp32 graphs: to accumulation order)
+    for (int64_t id : ids) {
+      const Batch whole = make_batch(split, nl, {id}, {}, worker.model().species_to_index(), sc, worker.model().cutoff(), 0,
+                                     0, 0, &planner);
+      if (whole.n_real_systems < 2) continue; // (only structures with >= 2 copies are ever split)
+      const int V = whole.n_real_systems;
+      std::vector<Batch> parts;
+      for (int v = 0; v < V; v++) {
+        parts.push_back(make_part_batch(split, nl, id, nullptr, {v}, worker.model().species_to_index(), sc,
+                                        worker.model().cutoff(), planner));
+        parts.back().part_group = 0, parts.back().part_count = V, parts.back().part_index = v;
+        parts.back().energy_norm = whole.energy_norm, parts.back().force_norm = whole.force_norm;
+      }
+      std::vector<const Batch *> pp;
+      for (const Batch &x : parts) pp.push_back(&x);
+      worker.zero_grads();
+      const StepStats sa = worker.run(whole, sc.energy_scale, true);
+      const std::vector<float> ga = worker.get_grads();
+      worker.zero_grads();
+      const StepStats sb = worker.run_parts(pp, sc.energy_scale, true);
+      const std::vector<float> gb = worker.get_grads();
+      worker.zero_grads();
+      double dg = 0, gm = 0;
+      bool finite = std::isfinite(sb.loss);
+      for (size_t q = 0; q < ga.size(); q++) {
+        finite = finite && std::isfinite(gb[q]);
+        dg = std::max(dg, double(std::abs(ga[q] - gb[q]))), gm = std::max(gm, double(std::abs(ga[q])));
+      }
+      const double dl = std::abs(sa.loss - sb.loss) / std::max(1e-30, std::abs(sa.loss));
+      const bool pass = finite && dl < 1e-6 && dg <= 1e-5 * gm;
+      fmt::print("states-fd parts: id {} ({} copies): loss {:.10g} vs {:.10g} (rel {:.2e}), max |dg| {:.3e} of {:.3e} (rel "
+                 "{:.2e}) -> {}\n", id, V, sa.loss, sb.loss, dl, dg, gm, dg / std::max(1e-30, gm), pass ? "PASS" : "FAIL");
+      ok = ok && pass;
+    }
+    { // the fp32 floor of the comparison above, in the existing path: one batch {a, b} vs a and b alone, summed
+      const int64_t a = ids.front(), c = ids.back();
+      auto grads_of = [&](const std::vector<int64_t> &g_ids) {
+        Batch bb = make_batch(split, nl, g_ids, {}, worker.model().species_to_index(), sc, worker.model().cutoff(), 0, 0, 0,
+                              &planner);
+        bb.energy_norm = 1.0f, bb.force_norm = 1.0f / (3.0f * split.n_atoms(a));
+        worker.zero_grads();
+        worker.run(bb, sc.energy_scale, true);
+        return worker.get_grads();
+      };
+      const std::vector<float> gab = grads_of({a, c}), ga1 = grads_of({a}), gb1 = grads_of({c});
+      double dg = 0, gm = 0;
+      for (size_t q = 0; q < gab.size(); q++)
+        dg = std::max(dg, double(std::abs(gab[q] - ga1[q] - gb1[q]))), gm = std::max(gm, double(std::abs(gab[q])));
+      worker.zero_grads();
+      fmt::print("states-fd floor: one batch of ids {} and {} vs each alone, summed: max |dg| {:.3e} of {:.3e} (rel {:.2e})\n",
+                 a, c, dg, gm, dg / std::max(1e-30, gm));
+    }
+    ok = check("energy + force loss") && ok;
+    const Worker::Conservative keep = worker.conservative;
+    worker.conservative.energy = 0, worker.conservative.nc_force = 0;
+    ok = check("force loss alone") && ok;
+    worker.conservative = keep;
+    worker.conservative.force = 0, worker.conservative.nc_force = 0;
+    ok = check("energy loss alone") && ok;
+    return ok ? 0 : 1;
+  }
 
   // gradient of every IR node output, for scripts/train/compare_node_grads.py
   // grad points into the compute context, which run() frees: copy ne and data in after_compute

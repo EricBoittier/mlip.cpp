@@ -392,6 +392,10 @@ bool GraphModel::load_from_gguf(const std::string &path) {
   num_neighbors_adaptive_ = loader.get_float32("pet.num_neighbors_adaptive", 0.0f);
   cutoff_width_adaptive_ = loader.get_float32("pet.cutoff_width_adaptive", cutoff_width_);
   adaptive_cutoff_method_ = loader.get_string("pet.adaptive_cutoff_method", "grid");
+  // stable bump (graph_interpreter.h: stable_bump): GGUF pet.cutoff_bump_stable (absent = 0), MLIPCPP_PET_STABLE_BUMP=0|1
+  // overrides; default off, bit-identical
+  interp_.stable_bump = loader.get_int32("pet.cutoff_bump_stable", 0) != 0;
+  if (const char *e = std::getenv("MLIPCPP_PET_STABLE_BUMP"); e && *e) interp_.stable_bump = *e != '0';
   num_heads_ = loader.get_int32("pet.num_heads", 0);
   conditioning_.enabled = loader.get_int32("pet.system_conditioning", 0) != 0;
   plato_lr_ = PetPlatoLRSpec::from_gguf(loader);
@@ -803,12 +807,81 @@ ModelResult GraphModel::predict_single_lrc(const AtomicSystem &system, bool comp
                                           cell.empty() ? nullptr : cell.data());
   struct Reset {
     GraphModel &m;
-    ~Reset() { m.frag_cond_.clear(), m.lrc_hi_.clear(), m.lrc_blend_.clear(); }
+    ~Reset() { m.frag_cond_.clear(), m.lrc_hi_.clear(), m.lrc_blend_.clear(), m.lrc_drop_.clear(); }
   } reset{*this};
-  if (cond.cl.s > 1) frag_cond_ = cond.row_charge, lrc_hi_ = cond.row_charge_hi, lrc_blend_ = cond.blend;
   // exact dE/dS (graph gradient w.r.t. the blend input) for structures in a transition / with a fractional cluster
   // charge; MLIPCPP_LRC_FD_DS=1: the earlier central differences in S (h = 0.05), for checks
   static const bool fd_ds = [] { const char *e = std::getenv("MLIPCPP_LRC_FD_DS"); return e && *e == '1'; }();
+  // lrc_states: the backbone energy as the weighted sum over the link states' graphs (lr_combined.h)
+  if (L.states && cond.cl.s > 1 && cell.empty()) {
+    const LrcStates st = lrc_states(L, cond.cl);
+    if (st.active) {
+      if (post_compute_hook) throw std::runtime_error("lrc_states: no capture hook on a multi-state structure");
+      if (fd_ds) throw std::runtime_error("lrc_states: MLIPCPP_LRC_FD_DS is not supported");
+      const size_t V = st.copies.size();
+      std::vector<double> E(V), F(compute_forces ? 3 * size_t(n) : 0, 0.0), Ea(n, 0.0), Fnc, pg;
+      ModelResult first;
+      for (size_t v = 0; v < V; v++) {
+        const double w = st.copies[v].w;
+        const LrcCondition hc = lrc_state_condition(L, cond, st, v, double(system.charge()), conditioning_.max_charge);
+        frag_cond_ = hc.row_charge, lrc_hi_ = hc.row_charge_hi, lrc_blend_ = hc.blend;
+        lrc_drop_ = st.drop_groups(cond.cl, v);
+        lrc_want_blend_grad_ = compute_forces && hc.needs_cond_forces();
+        std::vector<float> pgv;
+        ModelResult rv = predict_single_impl(system, compute_forces, nullptr, parameter_gradients ? &pgv : nullptr);
+        lrc_want_blend_grad_ = false;
+        E[v] = double(rv.energy);
+        for (int i = 0; i < n && size_t(i) < rv.atomic_energies.size(); i++) Ea[i] += w * double(rv.atomic_energies[i]);
+        if (parameter_gradients) {
+          if (pg.empty()) pg.assign(pgv.size(), 0.0);
+          for (size_t k = 0; k < pgv.size(); k++) pg[k] += w * double(pgv[k]);
+        }
+        if (rv.has_nc_forces) {
+          if (Fnc.empty()) Fnc.assign(rv.nc_forces.size(), 0.0);
+          for (size_t k = 0; k < Fnc.size(); k++) Fnc[k] += w * double(rv.nc_forces[k]);
+        }
+        if (compute_forces) {
+          std::vector<double> Fv(3 * size_t(n), 0.0);
+          if (rv.forces.size() == Fv.size())
+            for (size_t k = 0; k < Fv.size(); k++) Fv[k] = double(rv.forces[k]);
+          static const bool no_cf = [] { const char *e = std::getenv("MLIPCPP_LRC_NO_CONDF"); return e && *e == '1'; }();
+          if (hc.needs_cond_forces() && !no_cf) {
+            if (lrc_blend_grad_.size() != static_cast<size_t>(n)) throw std::runtime_error("lrc_states: no dE/dS");
+            std::vector<double> G(hc.cl.s, 0.0);
+            for (int i = 0; i < n; i++) G[hc.cl.sn[i]] += lrc_blend_grad_[i];
+            lrc_condition_forces(L, sq, hc, n, system.atomic_numbers(), x.data(), G, Fv.data(), nullptr);
+          }
+          for (size_t k = 0; k < Fv.size(); k++) F[k] += w * Fv[k];
+        }
+        if (v == 0) first = std::move(rv);
+      }
+      // sum_v w_v E_v about a common reference (sum_v w_v = 1; the copies' energies are close)
+      const double Eref = E[0];
+      double Emix = 0;
+      std::vector<double> dE(V);
+      for (size_t v = 0; v < V; v++) dE[v] = E[v] - Eref, Emix += st.copies[v].w * dE[v];
+      ModelResult r = std::move(first);
+      r.atomic_energies.assign(Ea.begin(), Ea.end());
+      if (!Fnc.empty()) r.nc_forces.assign(Fnc.begin(), Fnc.end());
+      if (parameter_gradients) parameter_gradients->assign(pg.begin(), pg.end());
+      LrcEnergy le = lrc_energy(L, sq, cond, n, system.atomic_numbers(), x.data(), double(system.charge()),
+                                compute_forces);
+      static const bool no_lr = [] { const char *e = std::getenv("MLIPCPP_LRC_NO_LR"); return e && *e == '1'; }();
+      if (no_lr) le.energy = 0, std::fill(le.forces.begin(), le.forces.end(), 0.0);
+      r.energy = static_cast<float>(Eref + Emix + le.energy);
+      r.sqe_charges.assign(le.q.begin(), le.q.end());
+      if (compute_forces) {
+        std::vector<double> g(3 * size_t(n), 0.0); // d/dx sum_v E_v w_v
+        lrc_states_vjp(L, cond.cl, st, dE, g.data());
+        r.forces.assign(3 * size_t(n), 0.0f);
+        for (size_t k = 0; k < F.size(); k++)
+          r.forces[k] = static_cast<float>(F[k] - g[k] + (k < le.forces.size() ? le.forces[k] : 0.0));
+        r.has_forces = true;
+      }
+      return r;
+    }
+  }
+  if (cond.cl.s > 1) frag_cond_ = cond.row_charge, lrc_hi_ = cond.row_charge_hi, lrc_blend_ = cond.blend;
   lrc_want_blend_grad_ = compute_forces && cond.cl.s > 1 && cond.needs_cond_forces() && !fd_ds;
   struct WantReset {
     bool &f;
@@ -819,8 +892,10 @@ ModelResult GraphModel::predict_single_lrc(const AtomicSystem &system, bool comp
   const std::vector<double> blend_grad = lrc_blend_grad_;
   // one open cluster or a bulk cell: the plain model (lrc_intra: the long range still acts inside)
   if (cond.cl.s == 1 && !cond.cl.images() && !L.intra) return r;
-  const LrcEnergy le = lrc_energy(L, sq, cond, n, system.atomic_numbers(), x.data(), double(system.charge()),
-                                  compute_forces);
+  LrcEnergy le = lrc_energy(L, sq, cond, n, system.atomic_numbers(), x.data(), double(system.charge()), compute_forces);
+  // MLIPCPP_LRC_NO_LR=1: drop the long-range energy and forces (diagnostics only: ablations on fixed weights)
+  static const bool no_lr = [] { const char *e = std::getenv("MLIPCPP_LRC_NO_LR"); return e && *e == '1'; }();
+  if (no_lr) le.energy = 0, std::fill(le.forces.begin(), le.forces.end(), 0.0);
   r.energy = static_cast<float>(double(r.energy) + le.energy);
   r.sqe_charges.assign(le.q.begin(), le.q.end());
   if (!compute_forces || r.forces.size() != le.forces.size()) return r;
@@ -828,7 +903,10 @@ ModelResult GraphModel::predict_single_lrc(const AtomicSystem &system, bool comp
   vir.resize(9, 0.0);
   // dE/dS from the graph, also for a structure without any edge (a backward pass for the blend alone there); the
   // central differences in S (h = 0.05) only on request: their truncation error was ~3 eV/A on bare ions (E04)
-  if (cond.needs_cond_forces() && !fd_ds) {
+  // MLIPCPP_LRC_NO_CONDF=1: drop the conditioning forces (diagnostics only: force attribution on fixed weights)
+  static const bool no_cf = [] { const char *e = std::getenv("MLIPCPP_LRC_NO_CONDF"); return e && *e == '1'; }();
+  if (no_cf) {
+  } else if (cond.needs_cond_forces() && !fd_ds) {
     if (blend_grad.size() != static_cast<size_t>(n)) throw std::runtime_error("lrc: no dE/dS from the graph");
     std::vector<double> G(cond.cl.s, 0.0);
     for (int i = 0; i < n; i++) G[cond.cl.sn[i]] += blend_grad[i];
@@ -912,7 +990,7 @@ ModelResult GraphModel::predict_single_impl(
   }();
   // per-atom outputs / weights and dE/d(blend) come from the plain graph only
   if (!no_cache && !post_compute_hook && !parameter_gradients && cached_path_supported() &&
-      system.num_atoms() > 0 && !force_uncached_ && atom_w_.empty() && !lrc_want_blend_grad_)
+      system.num_atoms() > 0 && !force_uncached_ && atom_w_.empty() && !lrc_want_blend_grad_ && lrc_drop_.empty())
     return predict_cached(system, compute_forces);
   GraphProfile profile;
   if (compute_forces && !forces_mode_) {
@@ -1093,6 +1171,34 @@ ModelResult GraphModel::predict_single_impl(
     }
     }
     have_adaptive = true;
+  }
+
+  // lrc_states: the copy's graph has no edge between groups its link state separates (the radii, pair cutoffs and the
+  // radius chain above stay those of the full structure)
+  if (!lrc_drop_.empty()) {
+    if (lrc_drop_.size() != static_cast<size_t>(n_atoms)) throw std::logic_error("lrc_states: drop groups");
+    auto dropped = [&](int i, int j) {
+      const int32_t a = lrc_drop_[i], b = lrc_drop_[j];
+      return a >= 0 && b >= 0 && a != b && (a >> 20) == (b >> 20);
+    };
+    const bool shifts = !nlist.cell_shifts.empty();
+    int n_out = 0;
+    for (int e = 0; e < nlist.num_pairs(); e++) {
+      if (dropped(nlist.centers[e], nlist.neighbors[e])) continue;
+      nlist.centers[n_out] = nlist.centers[e];
+      nlist.neighbors[n_out] = nlist.neighbors[e];
+      nlist.edge_vectors[n_out] = nlist.edge_vectors[e];
+      nlist.distances[n_out] = nlist.distances[e];
+      if (shifts) nlist.cell_shifts[n_out] = nlist.cell_shifts[e];
+      pair_cutoffs[n_out] = pair_cutoffs[e];
+      ++n_out;
+    }
+    nlist.centers.resize(n_out);
+    nlist.neighbors.resize(n_out);
+    nlist.edge_vectors.resize(n_out);
+    nlist.distances.resize(n_out);
+    if (shifts) nlist.cell_shifts.resize(n_out);
+    pair_cutoffs.resize(n_out);
   }
 
   // Count max neighbors after any adaptive filtering

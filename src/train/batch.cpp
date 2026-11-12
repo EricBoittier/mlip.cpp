@@ -2,6 +2,7 @@
 #include "core/padding.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <future>
 #include <limits>
@@ -119,23 +120,132 @@ int Tiling::bucket(int x, int lo, double ratio) {
   return v;
 }
 
+std::vector<std::vector<int32_t>> StatePlanner::groups(int n, const float *x) const {
+  if (!lrc || !lrc->states || n < 2) return {};
+  const std::vector<double> xd(x, x + 3 * size_t(n));
+  const runtime::LrcClusters cl = runtime::lrc_clusters(*lrc, n, xd.data());
+  const runtime::LrcStates st = runtime::lrc_states(*lrc, cl);
+  std::vector<std::vector<int32_t>> out;
+  for (size_t v = 0; v < st.copies.size(); v++) out.push_back(st.drop_groups(cl, v));
+  return out;
+}
+
+int StatePlanner::count(const MemmapSplit &split, int64_t s, const float *R) const {
+  if (!lrc || !lrc->states) return 1;
+  const int n = split.n_atoms(s);
+  const float *X = split.positions(s), *C = split.cell(s);
+  for (int r = 0; r < 3; r++)
+    if (C[3 * r] != 0 || C[3 * r + 1] != 0 || C[3 * r + 2] != 0) return 1; // open structures only
+  std::vector<float> x(3 * size_t(n));
+  for (int i = 0; i < n; i++)
+    for (int r = 0; r < 3; r++)
+      x[3 * i + r] = R ? R[3 * r] * X[3 * i] + R[3 * r + 1] * X[3 * i + 1] + R[3 * r + 2] * X[3 * i + 2] : X[3 * i + r];
+  return std::max<int>(1, static_cast<int>(groups(n, x.data()).size()));
+}
+
+namespace {
+Batch make_batch_impl(const MemmapSplit &split, const NeighborCache &nl, const std::vector<int64_t> &ids,
+                      const std::vector<std::array<float, 9>> &rotations, const std::map<int, int> &species_to_index,
+                      const TargetScaling &scaling, float cutoff, int pad_atoms, int pad_neighbors, int pad_systems,
+                      const StatePlanner *planner, const std::vector<int> *part);
+} // namespace
+
 Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
                  const std::vector<int64_t> &ids,
                  const std::vector<std::array<float, 9>> &rotations,
                  const std::map<int, int> &species_to_index,
                  const TargetScaling &scaling, float cutoff, int pad_atoms,
-                 int pad_neighbors, int pad_systems) {
+                 int pad_neighbors, int pad_systems, const StatePlanner *planner) {
+  return make_batch_impl(split, nl, ids, rotations, species_to_index, scaling, cutoff, pad_atoms, pad_neighbors,
+                         pad_systems, planner, nullptr);
+}
+
+Batch make_part_batch(const MemmapSplit &split, const NeighborCache &nl, int64_t id, const float *R,
+                      const std::vector<int> &copies, const std::map<int, int> &species_to_index,
+                      const TargetScaling &scaling, float cutoff, const StatePlanner &planner) {
+  std::vector<std::array<float, 9>> rot;
+  if (R) rot.push_back({}), std::copy(R, R + 9, rot[0].begin());
+  return make_batch_impl(split, nl, {id}, rot, species_to_index, scaling, cutoff, 0, 0, 0, &planner, &copies);
+}
+
+// MLIPCPP_MB_MAX_ATOMS=A > 0: at most A packed atoms per micro-batch (besides the attention budget; a single unit is
+// always allowed). The Plato-LR open-boundary terms grow with the square of a micro-batch's atoms, which the attention
+// budget n (m+1)^2 does not see for sparse structures (few neighbours). Unset: no cap.
+static int mb_max_atoms() {
+  static const int v = [] { const char *e = std::getenv("MLIPCPP_MB_MAX_ATOMS"); return e && *e ? std::atoi(e) : 0; }();
+  return v;
+}
+
+int part_copies(int c, int n, int m, double budget) {
+  static const int forced = [] { const char *e = std::getenv("MLIPCPP_VS_SPLIT_COPIES"); return e && *e ? std::atoi(e) : 0; }();
+  if (c <= 1) return c;
+  if (forced > 0) return std::min(c, forced);
+  const double one = double(n) * (m + 1.0) * (m + 1.0);
+  int pc = c * one <= budget ? c : std::max(1, static_cast<int>(budget / one));
+  if (mb_max_atoms() > 0 && pc * n > mb_max_atoms()) pc = std::max(1, mb_max_atoms() / n);
+  return pc;
+}
+
+namespace {
+Batch make_batch_impl(const MemmapSplit &split, const NeighborCache &nl, const std::vector<int64_t> &ids,
+                      const std::vector<std::array<float, 9>> &rotations, const std::map<int, int> &species_to_index,
+                      const TargetScaling &scaling, float cutoff, int pad_atoms, int pad_neighbors, int pad_systems,
+                      const StatePlanner *planner, const std::vector<int> *part) {
   Batch b;
-  b.n_real_systems = static_cast<int>(ids.size());
+  if (part && (ids.size() != 1 || part->empty())) throw std::logic_error("make_part_batch: one structure, some copies");
+  const int K = static_cast<int>(ids.size());
+  // rotated positions of every structure; lrc_states: the evaluations of each from them (copies after all structures)
+  std::vector<std::vector<float>> xr(K);
+  std::vector<std::vector<std::vector<int32_t>>> plan(K);
+  int n_copies = 0, copy_atoms = 0;
+  for (int k = 0; k < K; k++) {
+    const int64_t s = ids[k];
+    const int ns = split.n_atoms(s);
+    const float *R = rotations.empty() ? nullptr : rotations[k].data();
+    const float *X = split.positions(s);
+    xr[k].resize(3 * size_t(ns));
+    for (int i = 0; i < ns; i++) {
+      const float *v = X + 3 * i;
+      float *out = &xr[k][3 * size_t(i)];
+      if (!R) std::copy(v, v + 3, out);
+      else
+        for (int r = 0; r < 3; r++) out[r] = R[3 * r] * v[0] + R[3 * r + 1] * v[1] + R[3 * r + 2] * v[2];
+    }
+    if (planner && planner->lrc && planner->lrc->states) {
+      const float *C = split.cell(s);
+      bool open = true;
+      for (int r = 0; r < 3; r++) open = open && C[3 * r] == 0 && C[3 * r + 1] == 0 && C[3 * r + 2] == 0;
+      if (open) plan[k] = planner->groups(ns, xr[k].data());
+      if (plan[k].size() > 1) n_copies += int(plan[k].size()) - 1, copy_atoms += (int(plan[k].size()) - 1) * ns;
+    }
+  }
+  const bool states = planner && planner->lrc && planner->lrc->states;
+  if (part) { // the listed copies of the one structure only
+    if (plan[0].size() < 2) throw std::logic_error("make_part_batch: not a multi-state structure");
+    for (int v : *part)
+      if (v < 0 || size_t(v) >= plan[0].size()) throw std::logic_error("make_part_batch: copy index");
+    n_copies = int(part->size()) - 1, copy_atoms = n_copies * split.n_atoms(ids[0]);
+  }
+  b.n_real_systems = K + n_copies;
+  b.n_primary = states ? K : 0;
   b.ids.assign(ids.begin(), ids.end());
-  int n_real = 0;
+  if (part) {
+    for (int c = 0; c < n_copies; c++) b.ids.push_back(ids[0]);
+  } else {
+    for (int k = 0; k < K; k++)
+      for (size_t v = 1; v < plan[k].size(); v++) b.ids.push_back(ids[k]);
+  }
+  int n_real = copy_atoms;
   for (int64_t s : ids) {
     n_real += split.n_atoms(s);
     b.max_neighbors = std::max(b.max_neighbors, nl.max_neighbors[s]);
   }
   b.max_neighbors = std::max({b.max_neighbors, 1, pad_neighbors});
   b.n_atoms = std::max(n_real, pad_atoms);
+  // copies beyond the tile's systems: the next multiple of it (few graph shapes)
   b.n_systems = std::max(b.n_real_systems, pad_systems);
+  if (pad_systems > 0 && b.n_real_systems > pad_systems)
+    b.n_systems = (b.n_real_systems + pad_systems - 1) / pad_systems * pad_systems;
   const int n = b.n_atoms, m = b.max_neighbors;
 
   auto index_of = [&](int Z) {
@@ -170,21 +280,30 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
   b.cells.assign(b.n_real_systems, {});
   b.periodic.assign(b.n_real_systems, 0);
   b.system_charge.assign(b.n_real_systems, 0);
+  if (states) b.vs_of.assign(b.n_real_systems, 0), b.vs_drop.assign(n, -1), b.vs_active.assign(K, 0);
   // padding atoms: no neighbours, so every slot is padded and points to itself
   for (int a = n_real; a < n; a++)
     for (int j = 0; j < m; j++) b.reverse_neighbor_index[a * m + j] = a * m + j;
 
-  int offset = 0;
-  for (int k = 0; k < b.n_real_systems; k++) {
+  // one system: structure k (copy v of it: no loss rows, its own edge drops) at batch system `sys`, atoms from `offset`
+  auto emit = [&](int k, int sys, int offset, size_t v) {
     const int64_t s = ids[k];
     const int ns = split.n_atoms(s);
     const int32_t *Z = split.numbers(s);
     const float *F = split.forces(s);
     const float *R = rotations.empty() ? nullptr : rotations[k].data();
+    const bool copy = v > 0 || part; // a part: no system has loss rows
+    const std::vector<int32_t> *drop = plan[k].empty() ? nullptr : &plan[k][v];
     auto rotate = [R](const float *v, float *out) {
       if (!R) return void(std::copy(v, v + 3, out));
       for (int r = 0; r < 3; r++) out[r] = R[3 * r] * v[0] + R[3 * r + 1] * v[1] + R[3 * r + 2] * v[2];
     };
+    if (states) {
+      b.vs_of[sys] = k;
+      if (sys == k) b.vs_active[k] = !plan[k].empty();
+      if (!b.vs_copy.empty()) b.vs_copy[sys] = static_cast<int32_t>(v);
+      if (drop) std::copy(drop->begin(), drop->end(), b.vs_drop.begin() + offset);
+    }
 
     for (int i = 0; i < ns; i++) {
       const int a = offset + i;
@@ -193,54 +312,60 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
       b.atom_charge[a] = split.sqe_backbone_neutral() ? 0 : split.charge(s);
       if (!b.atom_unit_charge.empty()) b.atom_unit_charge[a] = split.charge(s);
       b.atom_spin[a] = split.spin_multiplicity(s);
-      b.atom_weight[static_cast<size_t>(k) * n + a] = 1.0f / ns;
+      if (!copy) b.atom_weight[static_cast<size_t>(sys) * n + a] = 1.0f / ns;
       const double fs = scaling.fscale(Z[i]);
-      b.force_scale[a] = static_cast<float>(fs);
-      b.force_mask[a] = 1.0f;
       float f[3];
       rotate(F + 3 * i, f);
       for (int r = 0; r < 3; r++) b.force_target[3 * a + r] = static_cast<float>(f[r] / fs);
+      if (part) b.force_scale[a] = static_cast<float>(fs); // (the host loss of run_parts)
+      if (copy) continue; // no force loss and no metrics on a copy's atoms
+      b.force_scale[a] = static_cast<float>(fs);
+      b.force_mask[a] = 1.0f;
     }
     {
-      const float *X = split.positions(s), *C = split.cell(s);
-      for (int i = 0; i < ns; i++) rotate(X + 3 * i, &b.positions[3 * size_t(offset + i)]);
+      const float *C = split.cell(s);
+      std::copy(xr[k].begin(), xr[k].end(), b.positions.begin() + 3 * size_t(offset));
       int np = 0;
       for (int r = 0; r < 3; r++) {
-        rotate(C + 3 * r, &b.cells[k][3 * r]);
+        rotate(C + 3 * r, &b.cells[sys][3 * r]);
         np += C[3 * r] != 0 || C[3 * r + 1] != 0 || C[3 * r + 2] != 0;
       }
-      b.periodic[k] = np == 3;
-      b.system_charge[k] = split.charge(s);
-      if (split.has_partial_charges()) {
+      b.periodic[sys] = np == 3;
+      b.system_charge[sys] = split.charge(s);
+      if (!copy && split.has_partial_charges()) {
         if (b.ref_charge.empty()) b.ref_charge.assign(n, 0.0f), b.ref_ok.assign(b.n_real_systems, 0.0f);
-        b.ref_ok[k] = split.partial_charges_ok(s) ? 1.0f : 0.0f;
-        b.n_ref_skipped += b.ref_ok[k] == 0.0f;
-        if (b.ref_ok[k] != 0.0f)
+        b.ref_ok[sys] = split.partial_charges_ok(s) ? 1.0f : 0.0f;
+        b.n_ref_skipped += b.ref_ok[sys] == 0.0f;
+        if (b.ref_ok[sys] != 0.0f)
           std::copy(split.partial_charges(s), split.partial_charges(s) + ns, b.ref_charge.begin() + offset);
       }
-      if (split.has_fragments()) {
+      if (!copy && split.has_fragments()) {
         if (b.frag_col.empty()) b.frag_col.assign(n, -1), b.frag_target.assign(size_t(b.n_systems) * Batch::kFragCap, 0.0f);
         if (const int cols = split.fragment_columns(s, Batch::kFragCap)) {
           const int32_t *fr = split.fragments(s);
           const float *pq = split.partial_charges(s);
           for (int i = 0; i < ns; i++) {
-            const int c = k * Batch::kFragCap + std::min(fr[i], cols - 1);
+            const int c = sys * Batch::kFragCap + std::min(fr[i], cols - 1);
             b.frag_col[offset + i] = c, b.frag_target[c] += pq[i];
           }
           b.n_frag += cols;
         }
       }
     }
-    b.energy_target[k] = static_cast<float>(
-        (split.energy(s) - scaling.comp(Z, ns)) / (scaling.energy_scale * ns));
+    if (!copy)
+      b.energy_target[sys] = static_cast<float>(
+          (split.energy(s) - scaling.comp(Z, ns)) / (scaling.energy_scale * ns));
+    if (part && sys == 0)
+      b.part_energy_target = static_cast<float>((split.energy(s) - scaling.comp(Z, ns)) / (scaling.energy_scale * ns));
     if (split.sqe_q0_labels() && split.has_frag_charges() && split.frag_ok(s)) {
       const std::vector<double> q = runtime::frag_atom_charges(ns, split.frag_units(s), split.frag_unit_charge(s));
       std::copy(q.begin(), q.end(), b.sqe_q0.begin() + offset);
       std::copy_n(split.frag_units(s), ns, b.sqe_unit.begin() + offset);
       std::copy_n(split.frag_unit_charge(s), ns, b.sqe_unitq.begin() + offset);
-      b.sqe_q0_ok[k] = 1;
+      b.sqe_q0_ok[sys] = 1;
     }
     if (split.has_frag_charges() && split.frag_spec().enabled && split.frag_ok(s)) {
+      if (states) throw std::runtime_error("lrc_states: fragment-constrained charges are not supported");
       // fragment-constrained charges: each atom conditioned on its bonded unit's charge, and the
       // beyond-R Coulomb term of the unit charges (no weights) taken out of the targets, i.e. the
       // model's prediction plus the term is fitted (same residuals, loss and gradients)
@@ -250,7 +375,7 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
       std::vector<double> FF(3 * size_t(ns));
       const double Ef = runtime::frag_coulomb(split.frag_spec(), ns, split.positions(s), q.data(), FF.data());
       if (Ef != 0) {
-        b.energy_target[k] = static_cast<float>((double(split.energy(s)) - scaling.comp(Z, ns) - Ef) / (scaling.energy_scale * ns));
+        b.energy_target[sys] = static_cast<float>((double(split.energy(s)) - scaling.comp(Z, ns) - Ef) / (scaling.energy_scale * ns));
         for (int i = 0; i < ns; i++) {
           const float f[3] = {float(FF[3 * i]), float(FF[3 * i + 1]), float(FF[3 * i + 2])};
           float fr[3];
@@ -260,10 +385,17 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
         }
       }
     }
-    b.n_per_system[k] = ns;
+    b.n_per_system[sys] = ns;
 
+    // edges; a copy drops those between groups its link state separates (same weak component, different group)
+    auto dropped = [&](int i, int j) {
+      if (!drop) return false;
+      const int32_t ga = (*drop)[i], gb = (*drop)[j];
+      return ga >= 0 && gb >= 0 && ga != gb && (ga >> 20) == (gb >> 20);
+    };
     const int64_t e0 = nl.edge_offset[s], e1 = nl.edge_offset[s + 1];
     for (int64_t e = e0; e < e1; e++) {
+      if (dropped(nl.center[e], nl.neighbor[e])) continue;
       const int flat = (offset + nl.center[e]) * m + nl.slot[e];
       b.neighbor_species[flat] = index_of(Z[nl.neighbor[e]]);
       rotate(nl.vector[e].data(), &b.edge_vectors[3 * flat]);
@@ -274,7 +406,8 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
       b.reverse_neighbor_index[flat] =
           r >= 0 ? (offset + nl.center[e0 + r]) * m + nl.slot[e0 + r] : flat;
     }
-    if (nl.taper) {
+    // (a dropped edge's slot stays as every unused slot of a real atom: padded, reverse index 0)
+    if (nl.taper) { // the radius chain: every edge of the full structure (the radii are those of the full structure)
       const TaperEdges t = taper_edges(split, s, nl.cutoff, nl.adaptive);
       for (size_t e = 0; e < t.center.size(); e++) {
         b.taper_center.push_back(offset + t.center[e]);
@@ -285,17 +418,29 @@ Batch make_batch(const MemmapSplit &split, const NeighborCache &nl,
         b.taper_jacobian.push_back(t.jacobian[e]);
       }
     }
-    offset += ns;
+  };
+  int offset = 0, sys = 0;
+  if (states && part) b.vs_copy.assign(b.n_real_systems, 0);
+  if (part) {
+    for (int v : *part) emit(0, sys++, offset, size_t(v)), offset += split.n_atoms(ids[0]);
+    return b;
   }
+  if (states) {
+    b.vs_copy.assign(b.n_real_systems, 0);
+  }
+  for (int k = 0; k < K; k++) emit(k, sys++, offset, 0), offset += split.n_atoms(ids[k]);
+  for (int k = 0; k < K; k++)
+    for (size_t v = 1; v < plan[k].size(); v++) emit(k, sys++, offset, v), offset += split.n_atoms(ids[k]);
   return b;
 }
+} // namespace
 
 std::vector<Batch> make_microbatches(const MemmapSplit &split, const NeighborCache &nl,
                                      const std::vector<int64_t> &ids,
                                      const std::vector<std::array<float, 9>> &rotations,
                                      const std::map<int, int> &species_to_index,
                                      const TargetScaling &scaling, float cutoff, double budget,
-                                     double growth, const Tiling &tiling) {
+                                     double growth, const Tiling &tiling, const StatePlanner *planner) {
   int n_ok = 0;
   for (int64_t s : ids) n_ok += split.partial_charges_ok(s);
   const float charge_norm = n_ok ? 1.0f / n_ok : 0.0f;
@@ -313,38 +458,65 @@ std::vector<Batch> make_microbatches(const MemmapSplit &split, const NeighborCac
   std::vector<Batch> out;
   std::vector<int64_t> g_ids;
   std::vector<std::array<float, 9>> g_rot;
-  int64_t g_atoms = 0;
+  int64_t g_atoms = 0, g_packed = 0; // real atoms; packed atoms (lrc_states copies included)
   double g_min = 0;
+  // lrc_states: the evaluations of each structure (its packed size is that many copies)
+  std::vector<int> copies(ids.size(), 1);
+  if (planner)
+    for (size_t k = 0; k < ids.size(); k++) copies[k] = planner->count(split, ids[k], rotations.empty() ? nullptr : rotations[k].data());
   auto flush = [&] {
     if (g_ids.empty()) return;
     int pad_atoms = 0, pad_nb = 0;
     if (tiling.enabled()) {
-      int atoms = 0, nb = 1;
-      for (int64_t s : g_ids) atoms += split.n_atoms(s), nb = std::max(nb, nl.max_neighbors[s]);
-      pad_atoms = Tiling::bucket(atoms, 32, tiling.atom_ratio);
+      int nb = 1;
+      for (int64_t s : g_ids) nb = std::max(nb, nl.max_neighbors[s]);
+      pad_atoms = Tiling::bucket(static_cast<int>(g_packed), 32, tiling.atom_ratio);
       pad_nb = Tiling::bucket(nb, 8, tiling.nb_ratio);
     }
     out.push_back(make_batch(split, nl, g_ids, g_rot, species_to_index, scaling, cutoff, pad_atoms,
-                             pad_nb, tiling.enabled() ? tiling.systems : 0));
+                             pad_nb, tiling.enabled() ? tiling.systems : 0, planner));
     out.back().energy_norm = 1.0f / ids.size();
     out.back().force_norm = 1.0f / (3.0f * n_total);
     out.back().charge_norm = charge_norm;
     out.back().frag_norm = frag_norm;
-    g_ids.clear(), g_rot.clear(), g_atoms = 0;
+    g_ids.clear(), g_rot.clear(), g_atoms = 0, g_packed = 0;
   };
+  const int max_atoms = mb_max_atoms();
+  std::vector<size_t> splits; // lrc_states: structures whose copies exceed the budget, packed as parts below
   for (size_t k : order) {
     const int64_t s = ids[k];
+    if (planner && part_copies(copies[k], split.n_atoms(s), nl.max_neighbors[s], budget) < copies[k]) {
+      splits.push_back(k);
+      continue;
+    }
     const double m1 = nl.max_neighbors[s] + 1.0; // sorted: the group's largest so far
-    const int64_t atoms = g_atoms + split.n_atoms(s);
+    const int64_t atoms = g_packed + int64_t(copies[k]) * split.n_atoms(s);
     // never close a single-atom micro-batch: a leading PyTorch dim of 1 is
     // invisible to ggml_n_dims, which some interpreter ops rely on
-    if (g_atoms >= 2 && (m1 > growth * g_min || atoms * m1 * m1 > budget)) flush();
+    if (g_atoms >= 2 && (m1 > growth * g_min || atoms * m1 * m1 > budget || (max_atoms > 0 && atoms > max_atoms))) flush();
     if (g_ids.empty()) g_min = m1;
     g_ids.push_back(s);
     if (!rotations.empty()) g_rot.push_back(rotations[k]);
-    g_atoms += split.n_atoms(s);
+    g_atoms += split.n_atoms(s), g_packed += int64_t(copies[k]) * split.n_atoms(s);
   }
   flush();
+  static std::atomic<int> next_group{1 << 20}; // (distinct from make_step_batches' group ids)
+  for (size_t k : splits) {
+    const int64_t s = ids[k];
+    const int c = copies[k], pc = part_copies(c, split.n_atoms(s), nl.max_neighbors[s], budget);
+    const int n_parts = (c + pc - 1) / pc, gid = next_group++;
+    for (int p = 0; p < n_parts; p++) {
+      std::vector<int> cp;
+      for (int v = p * pc; v < std::min(c, (p + 1) * pc); v++) cp.push_back(v);
+      out.push_back(make_part_batch(split, nl, s, rotations.empty() ? nullptr : rotations[k].data(), cp, species_to_index,
+                                    scaling, cutoff, *planner));
+      Batch &b = out.back();
+      b.energy_norm = 1.0f / ids.size();
+      b.force_norm = 1.0f / (3.0f * n_total);
+      b.charge_norm = charge_norm, b.frag_norm = frag_norm;
+      b.part_group = gid, b.part_count = n_parts, b.part_index = p;
+    }
+  }
   return out;
 }
 
@@ -355,8 +527,8 @@ std::vector<std::vector<Batch>> make_step_batches(const MemmapSplit &split, cons
                                                   const TargetScaling &scaling, float cutoff,
                                                   int n_workers, const CostModel &cost,
                                                   double budget,
-                                                  const Tiling &tiling) {
-  const size_t K = ids.size();
+                                                  const Tiling &tiling, const StatePlanner *planner) {
+  const size_t K_all = ids.size();
   const int W = std::max(1, n_workers);
   int n_ok = 0;
   for (int64_t s : ids) n_ok += split.partial_charges_ok(s);
@@ -364,13 +536,31 @@ std::vector<std::vector<Batch>> make_step_batches(const MemmapSplit &split, cons
   int n_cols = 0;
   for (int64_t s : ids) n_cols += split.fragment_columns(s, Batch::kFragCap);
   const float frag_norm = n_cols ? static_cast<float>(W) / n_cols : 0.0f;
-  std::vector<size_t> order(K);
-  std::iota(order.begin(), order.end(), 0);
+  std::vector<size_t> order;
+  // lrc_states: the evaluations of each structure; a structure whose copies exceed the budget goes into parts (a group
+  // of part batches, run together on one worker) instead of the packing below
+  std::vector<int> copies(K_all, 1);
+  struct SplitUnit {
+    size_t q;
+    int c, pc;
+  };
+  std::vector<SplitUnit> splits;
+  int64_t real_atoms = 0;
+  for (size_t q = 0; q < K_all; q++) {
+    real_atoms += split.n_atoms(ids[q]);
+    if (planner) copies[q] = planner->count(split, ids[q], rotations.empty() ? nullptr : rotations[q].data());
+    const int pc = planner ? part_copies(copies[q], split.n_atoms(ids[q]), nl.max_neighbors[ids[q]], budget) : copies[q];
+    if (pc < copies[q]) splits.push_back({q, copies[q], pc});
+    else order.push_back(q);
+  }
+  const size_t K = order.size();
   std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
     return nl.max_neighbors[ids[a]] < nl.max_neighbors[ids[b]];
   });
-  std::vector<int64_t> atoms(K + 1, 0); // prefix sums in sorted order
-  for (size_t k = 0; k < K; k++) atoms[k + 1] = atoms[k] + split.n_atoms(ids[order[k]]);
+  // prefix sums in sorted order of the packed atoms (lrc_states: every evaluation of a structure counts); the
+  // force-loss normalisation counts the real atoms of the whole step
+  std::vector<int64_t> atoms(K + 1, 0);
+  for (size_t k = 0; k < K; k++) atoms[k + 1] = atoms[k] + int64_t(copies[order[k]]) * split.n_atoms(ids[order[k]]);
   // group = sorted structures [i, j): its largest neighbour count is the last one's
   auto nb = [&](size_t j) { return std::max(1, nl.max_neighbors[ids[order[j - 1]]]); };
   auto group_cost = [&](size_t i, size_t j) {
@@ -380,6 +570,7 @@ std::vector<std::vector<Batch>> make_step_batches(const MemmapSplit &split, cons
     return cost(n, m);
   };
 
+  const int max_atoms = mb_max_atoms();
   using Groups = std::vector<std::pair<size_t, size_t>>;
   auto plan = [&](double cap) -> Groups {
     const double inf = std::numeric_limits<double>::infinity();
@@ -392,7 +583,7 @@ std::vector<std::vector<Batch>> make_step_batches(const MemmapSplit &split, cons
         const int64_t n = atoms[j] - atoms[i];
         const double c = group_cost(i, j);
         // a single structure is always allowed; groups grow monotonically in n and cost
-        if (j - i > 1 && (n * m1 * m1 > budget || c > cap)) break;
+        if (j - i > 1 && (n * m1 * m1 > budget || c > cap || (max_atoms > 0 && n > max_atoms))) break;
         // never a single-atom micro-batch (see make_microbatches)
         if (n >= 2 && best[i] + c < best[j]) best[j] = best[i] + c, cut[j] = i;
       }
@@ -418,11 +609,11 @@ std::vector<std::vector<Batch>> make_step_batches(const MemmapSplit &split, cons
 
   // the cap on a micro-batch's cost trades balance (small caps) against the
   // fixed cost of each extra micro-batch: keep the plan that ends first
-  Groups groups = plan(std::numeric_limits<double>::infinity());
-  if (groups.empty()) groups = {{0, K}};
+  Groups groups = K ? plan(std::numeric_limits<double>::infinity()) : Groups{};
+  if (groups.empty() && K) groups = {{0, K}};
   std::vector<int> owner;
   double best = deal(groups, owner);
-  if (W > 1) {
+  if (W > 1 && K) {
     double total = 0;
     for (auto [i, j] : groups) total += group_cost(i, j);
     for (double f : {1.0, 1.05, 1.15, 1.3, 1.5, 1.75}) {
@@ -447,15 +638,35 @@ std::vector<std::vector<Batch>> make_step_batches(const MemmapSplit &split, cons
         pad_atoms = Tiling::bucket(static_cast<int>(atoms[j] - atoms[i]), 32, tiling.atom_ratio),
         pad_nb = Tiling::bucket(nb(j), 8, tiling.nb_ratio);
       Batch b = make_batch(split, nl, g_ids, g_rot, species_to_index, scaling, cutoff, pad_atoms,
-                           pad_nb, tiling.enabled() ? tiling.systems : 0);
-      b.energy_norm = static_cast<float>(W) / K;
-      b.force_norm = static_cast<float>(W) / (3.0f * atoms[K]);
+                           pad_nb, tiling.enabled() ? tiling.systems : 0, planner);
+      b.energy_norm = static_cast<float>(W) / K_all;
+      b.force_norm = static_cast<float>(W) / (3.0f * real_atoms);
       b.charge_norm = charge_norm;
       b.frag_norm = frag_norm;
       return b;
     }));
   std::vector<std::vector<Batch>> out(W);
-  for (size_t g = 0; g < groups.size(); g++) out[owner[g]].push_back(built[g].get());
+  std::vector<double> load(W, 0.0);
+  for (size_t g = 0; g < groups.size(); g++)
+    out[owner[g]].push_back(built[g].get()), load[owner[g]] += group_cost(groups[g].first, groups[g].second);
+  // the split structures: each a group of consecutive parts, on the least loaded worker
+  static std::atomic<int> next_group{0};
+  for (const SplitUnit &u : splits) {
+    const int wk = static_cast<int>(std::min_element(load.begin(), load.end()) - load.begin());
+    const int n_parts = (u.c + u.pc - 1) / u.pc, gid = next_group++;
+    for (int p = 0; p < n_parts; p++) {
+      std::vector<int> cp;
+      for (int v = p * u.pc; v < std::min(u.c, (p + 1) * u.pc); v++) cp.push_back(v);
+      Batch b = make_part_batch(split, nl, ids[u.q], rotations.empty() ? nullptr : rotations[u.q].data(), cp,
+                                species_to_index, scaling, cutoff, *planner);
+      b.energy_norm = static_cast<float>(W) / K_all;
+      b.force_norm = static_cast<float>(W) / (3.0f * real_atoms);
+      b.charge_norm = charge_norm, b.frag_norm = frag_norm;
+      b.part_group = gid, b.part_count = n_parts, b.part_index = p;
+      load[wk] += cost(double(b.n_atoms), double(b.max_neighbors));
+      out[wk].push_back(std::move(b));
+    }
+  }
   return out;
 }
 

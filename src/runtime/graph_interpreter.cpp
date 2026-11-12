@@ -558,6 +558,15 @@ ggml_tensor *GraphInterpreter::build_mul(ggml_context *ctx,
   // Check for scalar multiplication (tensor * scalar)
   if (node.inputs.size() == 1 && has_param(node, "scalar")) {
     float scalar = static_cast<float>(get_param<double>(node, "scalar", 1.0));
+    if (stable_bump && scalar == 0.5f) { // 0.5 (1 + tanh(y)) = sigmoid(2 y), exactly (header: stable_bump)
+      const GIRNode *add = find_node(node.inputs[0]);
+      const GIRNode *th = add && add->op == "ADD" && add->inputs.size() == 1 && has_param(*add, "scalar") &&
+                                  get_param<double>(*add, "scalar", 0.0) == 1.0
+                              ? find_node(add->inputs[0])
+                              : nullptr;
+      if (th && th->op == "UNARY_TANH" && th->inputs.size() == 1)
+        return ggml_sigmoid(ctx, ggml_scale(ctx, resolve_input(ctx, th->inputs[0]), 2.0f));
+    }
     return ggml_scale(ctx, a, scalar);
   }
 

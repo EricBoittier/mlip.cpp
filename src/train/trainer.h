@@ -302,6 +302,17 @@ public:
   double lrc_cond_force_sum = 0; // sum over structures of max |F_cond| (eV/A), for the log
   int64_t lrc_cond_n = 0;
   void lrc_prepare(const Batch &b, bool forces);
+  // lrc_states (runtime/lr_combined.h): batches carry each multi-state structure's copies (Batch::vs_*); the energy
+  // row of a structure weights its copies (w_v / N), the forces combine as sum_v w_v F_v - sum_v E_v grad w_v, and the
+  // MIXED pass gets per-copy tangents w_v u and the per-copy energy cotangent -u . grad w_v (input atom_cotangent).
+  // vs_on: the planner is on (MIXED graphs carry the input); counters for the log.
+  bool vs_on = false;
+  /// lrc_states: free the shared compute buffer (graphs are built per batch for Plato models, none is cached) so that
+  /// the frozen charge pass, which allocates its own, has the device memory; the next graph allocates it again
+  void release_compute_buffer();
+  /// lrc_states: one structure whose copies are spread over consecutive part batches (Batch::part_*), run as one
+  StepStats run_parts(const std::vector<const Batch *> &parts, double energy_scale, bool backward);
+  int64_t vs_structs = 0, vs_evals = 0, vs_fix3 = 0, vs_real_atoms = 0, vs_packed_atoms = 0, vs_max = 0;
   std::vector<double> sqe_grad;
   double sqe_abs_energy = 0;
   int64_t sqe_n = 0;
@@ -315,6 +326,12 @@ public:
   /// pairs: local indices into the batch; returns the loss, the normalised residuals in `r` (optional).
   double run_tail(const Batch &b, double energy_scale, const std::vector<TailPair> &pairs, const TailLoss &tl,
                   double mult, std::vector<double> *r = nullptr);
+  /// The same over a group split into parts (consecutive structures of the group, each part a batch of whole
+  /// structures with their lrc_states copies): the energies of every part, the loss once over the group, then one
+  /// backward pass per part with its slice of dL/dE (identical loss and gradient; bounds the graph of a long scan whose
+  /// copies multiply its size; MLIPCPP_TAIL_CHUNK). Not with SQE.
+  double run_tail(const std::vector<Batch> &parts, double energy_scale, const std::vector<TailPair> &pairs,
+                  const TailLoss &tl, double mult, std::vector<double> *r = nullptr);
   /// The model energies (eV, without the composition baseline; host lrc / SQE energies included) of the batch's
   /// real structures: one FORWARD pass, no gradient (run_tail's first half; the held-out pair errors).
   std::vector<double> energies(const Batch &b, double energy_scale);
@@ -387,6 +404,7 @@ private:
     ggml_tensor *ecot = nullptr; // tail loss: dL/d(d_energy) per structure [S, 1]
     // lrc exact conditioning forces: the blend input, FORCES its gradient, MIXED its tangent
     ggml_tensor *blend = nullptr, *grad_blend = nullptr, *dblend = nullptr;
+    ggml_tensor *acot = nullptr; // lrc_states, MIXED: the per-atom energy cotangent [n, 1]
     ~StepGraph();
   };
   /// graph kinds: the loss (FORWARD / BACKWARD to the weights); conservative
@@ -417,6 +435,21 @@ private:
   void frag_charge_stats(StepGraph &g, const Batch &b, StepStats &st);
   float plato_jvp_scale_ = 1.0f;
   bool zero_norms_ = false;           // run_tail: energy and force loss norms 0
+  // lrc_states, per multi-state structure of the batch: its systems (copy order), clusters (batch positions), states
+  struct VsStruct {
+    int k = 0;
+    std::vector<int> sys;
+    runtime::LrcClusters cl;
+    runtime::LrcStates st;
+    std::vector<double> q0rows; // dQ0_b/dx per super-node (lazy; shared by every copy's blend rows)
+    std::vector<int> copy;      // per entry of sys: its index in st.copies
+  };
+  std::vector<VsStruct> vs_;
+  std::vector<int> vs_sys_a0_;                  // first atom of every system
+  std::vector<char> vs_member_;                 // per system: part of a multi-state structure
+  std::vector<int> vs_index_;                   // per system: its entry in vs_ (-1: none)
+  std::vector<float> vs_aw_, vs_acot_;          // atom weights with the copies; MIXED atom cotangent
+  std::vector<std::vector<double>> vs_rows_;    // per system: dS/dx rows of its conditioning (lazy)
   std::vector<float> ecot_;           // run_tail: the cotangent of this batch
   void plato_create(StepGraph &g, ggml_context *ctx, int n, bool grad);
 

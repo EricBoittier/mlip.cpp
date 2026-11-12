@@ -418,6 +418,12 @@ Worker::StepGraph::~StepGraph() {
 
 size_t Worker::compute_buffer_bytes() const { return ggml_gallocr_get_buffer_size(galloc_, 0); }
 
+void Worker::release_compute_buffer() {
+  if (!cache_.empty() || !galloc_ || ggml_gallocr_get_buffer_size(galloc_, 0) == 0) return;
+  ggml_gallocr_free(galloc_);
+  galloc_ = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model_.backend()));
+}
+
 namespace {
 void fill_constants(const std::vector<std::pair<ggml_tensor *, float>> &cs) {
   std::vector<float> staging;
@@ -431,7 +437,7 @@ void fill_constants(const std::vector<std::pair<ggml_tensor *, float>> &cs) {
 /// The targets' sums for R^2: physical energies per atom after the
 /// composition (eV/atom) and force components (eV/A) of the real structures.
 void add_target_sums(const Batch &b, double energy_scale, StepStats &st) {
-  for (int k = 0; k < b.n_real_systems; k++) {
+  for (int k = 0; k < b.structures(); k++) {
     const double y = double(b.energy_target[k]) * energy_scale;
     st.sum_e += y, st.sum2_e += y * y;
   }
@@ -446,11 +452,14 @@ void add_target_sums(const Batch &b, double energy_scale, StepStats &st) {
 
 /// Loss normalisations of a micro-batch: (1/S, 1/3N) of the whole step batch.
 std::pair<float, float> loss_norms(const Batch &b) {
-  const float e_norm = b.energy_norm > 0 ? b.energy_norm : 1.0f / b.n_real_systems;
+  // (fallbacks for a batch made outside the packer: per real structure / atom; lrc_states copies and parts carry no
+  // loss rows of their own)
+  const float e_norm = b.energy_norm > 0 ? b.energy_norm : 1.0f / b.structures();
   float f_norm = b.force_norm;
   if (!(f_norm > 0)) {
     double n_real = 0;
     for (float w : b.force_mask) n_real += w;
+    if (b.part_group >= 0) n_real = b.n_per_system[0];
     f_norm = static_cast<float>(1.0 / (3.0 * n_real));
   }
   return {e_norm, f_norm};
@@ -746,6 +755,10 @@ std::unique_ptr<Worker::StepGraph> Worker::build_graph(int n, int m, int S, Mode
       if (!J) throw std::runtime_error("conservative forces: E has no tangent");
       if (g->jvp_scale) J = ggml_mul(ctx, J, g->jvp_scale); // the tangents were normalised
       loss = ggml_sub(ctx, loss, J);
+      if (vs_on) { // lrc_states: sum_i c_i e_i, c the copy's -u . grad w_v (the link term of the forces)
+        g->acot = input(ctx, GGML_TYPE_F32, {n, 1}, "atom_cotangent");
+        loss = ggml_add(ctx, loss, ggml_sum(ctx, ggml_mul(ctx, energy, g->acot)));
+      }
     }
     // physical force squared error, for the metrics (not differentiated)
     ggml_tensor *se_f = ggml_sum(ctx, ggml_sqr(ctx, ggml_mul(ctx, d_force, force_scale)));
@@ -864,7 +877,9 @@ void Worker::upload_inputs(StepGraph &g, const Batch &b, const std::vector<float
   }
   if (g.inputs.size() > src.size()) {
     const bool ov = dv && !et_override_.empty(); // MIXED step of run_conservative: shifted / weighted energy residual
-    src.insert(src.end(), {ov ? span(aw_override_) : span(b.atom_weight), ov ? span(et_override_) : span(b.energy_target),
+    const bool vs = !vs_aw_.empty() && lrc_batch_ == &b && vs_aw_.size() == b.atom_weight.size();
+    src.insert(src.end(), {ov ? span(aw_override_) : vs ? span(vs_aw_) : span(b.atom_weight),
+                           ov ? span(et_override_) : span(b.energy_target),
                            span(b.force_target), span(b.force_mask), span(b.force_scale), {norms, sizeof norms}});
   }
   if (dv) src.insert(src.end(), {span(*dv), span(*dc)});
@@ -873,6 +888,11 @@ void Worker::upload_inputs(StepGraph &g, const Batch &b, const std::vector<float
     src.insert(src.end(), {span(lrc_dblend_)});
   }
   if (src.size() != g.inputs.size()) throw std::logic_error("upload_inputs: input count");
+  if (g.acot) { // lrc_states: the MIXED pass's per-atom energy cotangent (zeros without multi-state structures)
+    std::vector<float> c(ggml_nelements(g.acot), 0.0f);
+    if (dv && lrc_batch_ == &b) std::copy_n(vs_acot_.begin(), std::min(c.size(), vs_acot_.size()), c.begin());
+    ggml_backend_tensor_set(g.acot, c.data(), 0, ggml_nbytes(g.acot));
+  }
   if (g.ecot) {
     std::vector<float> c(ggml_nelements(g.ecot), 0.0f);
     std::copy_n(ecot_.begin(), std::min(c.size(), ecot_.size()), c.begin());
@@ -1002,6 +1022,7 @@ void Worker::compute(StepGraph &g) {
 }
 
 StepStats Worker::run(const Batch &b, double energy_scale, bool backward) {
+  if (b.part_group >= 0) return run_parts({&b}, energy_scale, backward); // (a lone part must hold every copy)
   t_build = t_alloc = t_upload = t_compute = t_download = t_cpu = 0;
   plato_batch_ = &b;
   if (conservative.on) return run_conservative(b, energy_scale, backward);
@@ -1054,14 +1075,19 @@ StepStats Worker::run(const Batch &b, double energy_scale, bool backward) {
 // the training forces; it is nonzero only inside a cluster transition (counted in lrc_transition).
 void Worker::lrc_prepare(const Batch &b, bool forces) {
   const int n = b.n_atoms, S = b.n_systems;
+  if (vs_on) release_compute_buffer(); // the charge pass below (q0, long-range forces) allocates its own
   lrc_lo_.assign(b.atom_charge.begin(), b.atom_charge.end());
   lrc_hi_ = lrc_lo_;
   lrc_blend_.assign(n, 0.0f);
   lrc_e_.assign(S, 0.0), lrc_f_.assign(forces ? 3 * size_t(n) : 0, 0.0);
   lrc_cond_.assign(b.n_real_systems, {}), lrc_a0_.assign(b.n_real_systems, 0), lrc_key_.assign(b.n_real_systems, 0);
   const int maxq = model_.conditioning().max_charge;
+  vs_.clear(), vs_aw_.clear(), vs_rows_.assign(b.n_real_systems, {}), vs_member_.assign(b.n_real_systems, 0);
+  vs_index_.assign(b.n_real_systems, -1);
+  vs_sys_a0_.assign(b.n_real_systems + 1, 0);
+  for (int k = 0; k < b.n_real_systems; k++) vs_sys_a0_[k + 1] = vs_sys_a0_[k] + b.n_per_system[k];
   int a0 = 0;
-  for (int k = 0; k < b.n_real_systems; k++) {
+  for (int k = 0; k < b.structures(); k++) {
     const int ns = b.n_per_system[k];
     // periodic structures only with lrc_intra (fully periodic cells: bulk, or separated clusters; no stress loss here);
     // slabs (one zero cell row) only with lrc_slab (absent: taken as open structures, as before)
@@ -1112,7 +1138,44 @@ void Worker::lrc_prepare(const Batch &b, bool forces) {
     const LrcCacheEntry &e = it->second;
     const runtime::LrcCondition &c = e.c;
     if (c.cl.fallback) lrc_fallback++;
-    if (c.cl.s > 1) {
+    if (!b.vs_active.empty() && b.vs_active[k]) {
+      // lrc_states: the copies of structure k (k first, then its copies in batch order) from the same positions
+      VsStruct vs;
+      vs.k = k, vs.sys.push_back(k);
+      for (int j = b.structures(); j < b.n_real_systems; j++)
+        if (b.vs_of[j] == k) vs.sys.push_back(j);
+      vs.cl = c.cl;
+      vs.st = runtime::lrc_states(*lrc, c.cl);
+      const bool part = b.part_group >= 0;
+      if (!vs.st.active || (!part && vs.st.copies.size() != vs.sys.size()))
+        throw std::logic_error(fmt::format("lrc_states: structure {} packed with {} copies, the worker finds {}", b.ids[k],
+                                           vs.sys.size(), vs.st.active ? vs.st.copies.size() : 0));
+      for (size_t q = 0; q < vs.sys.size(); q++) {
+        const int j = vs.sys[q], aj = vs_sys_a0_[j];
+        const size_t v = b.vs_copy.empty() ? q : size_t(b.vs_copy[j]); // the copy index (a part holds some copies)
+        if (v >= vs.st.copies.size()) throw std::logic_error("lrc_states: copy index of a part");
+        vs.copy.push_back(static_cast<int>(v));
+        if (b.n_per_system[j] != ns) throw std::logic_error("lrc_states: copy size");
+        const std::vector<int32_t> g = vs.st.drop_groups(c.cl, v);
+        if (!std::equal(g.begin(), g.end(), b.vs_drop.begin() + aj))
+          throw std::logic_error(fmt::format("lrc_states: structure {} copy {}: edge groups differ from the packed ones",
+                                             b.ids[k], v));
+        runtime::LrcCondition h = runtime::lrc_state_condition(*lrc, c, vs.st, v, double(b.system_charge[k]), maxq);
+        for (int i = 0; i < ns; i++)
+          lrc_lo_[aj + i] = h.row_charge[i], lrc_hi_[aj + i] = h.row_charge_hi[i], lrc_blend_[aj + i] = h.blend[i];
+        if (lrc_exact) lrc_cond_[j] = std::move(h);
+        vs_member_[j] = 1, vs_index_[j] = static_cast<int>(vs_.size());
+      }
+      if (!part || b.part_index == 0) {
+        lrc_multi++;
+        vs_structs++, vs_evals += int64_t(vs.st.copies.size());
+        vs_max = std::max<int64_t>(vs_max, int64_t(vs.st.copies.size()));
+        vs_fix3 += vs.st.lambda > 0 || vs.st.fix3_comps > 0;
+      }
+      lrc_e_[k] = e.e;
+      if (forces) std::copy(e.f.begin(), e.f.end(), lrc_f_.begin() + 3 * size_t(a0));
+      vs_.push_back(std::move(vs));
+    } else if (c.cl.s > 1) {
       lrc_multi++;
       if (c.needs_cond_forces()) lrc_transition++;
       for (int i = 0; i < ns; i++)
@@ -1125,6 +1188,22 @@ void Worker::lrc_prepare(const Batch &b, bool forces) {
       if (forces) std::copy(e.f.begin(), e.f.end(), lrc_f_.begin() + 3 * size_t(a0));
     }
     a0 += ns;
+  }
+  // the structures' energy rows weight their copies: w_v / N on every copy's atoms
+  if (!vs_.empty()) {
+    const int n = b.n_atoms;
+    vs_aw_ = b.atom_weight;
+    for (const VsStruct &vs : vs_) {
+      if (b.part_group >= 0) continue; // a part has no energy row (run_parts takes the loss)
+      const int ns = b.n_per_system[vs.k];
+      for (size_t v = 0; v < vs.sys.size(); v++)
+        for (int i = 0; i < ns; i++)
+          vs_aw_[size_t(vs.k) * n + vs_sys_a0_[vs.sys[v]] + i] = static_cast<float>(vs.st.copies[v].w / ns);
+    }
+  }
+  if (b.n_primary) {
+    for (int k = 0; k < b.structures(); k++) vs_real_atoms += b.n_per_system[k];
+    for (int k = 0; k < b.n_real_systems; k++) vs_packed_atoms += b.n_per_system[k];
   }
   lrc_batch_ = &b;
 }
@@ -1206,6 +1285,296 @@ double Worker::run_tail(const Batch &b, double energy_scale, const std::vector<T
   zero_norms_ = false;
   compute(g);
   return L;
+}
+
+double Worker::run_tail(const std::vector<Batch> &parts, double energy_scale, const std::vector<TailPair> &pairs,
+                        const TailLoss &tl, double mult, std::vector<double> *r) {
+  if (parts.size() == 1) return run_tail(parts[0], energy_scale, pairs, tl, mult, r);
+  if (!tail_cotangent) throw std::logic_error("run_tail: tail_cotangent is off");
+  if (sqe) throw std::runtime_error("run_tail: a split tail group is not supported with SQE");
+  std::vector<double> E;
+  std::vector<int> off(parts.size() + 1, 0), npk;
+  for (size_t q = 0; q < parts.size(); q++) {
+    const std::vector<double> Eq = energies(parts[q], energy_scale);
+    const int K = parts[q].structures();
+    E.insert(E.end(), Eq.begin(), Eq.begin() + K);
+    for (int k = 0; k < K; k++) npk.push_back(parts[q].n_per_system[k]);
+    off[q + 1] = off[q] + K;
+  }
+  for (const TailPair &p : pairs)
+    if (npk.at(p.k) != npk.at(p.l)) throw std::runtime_error("tail pair of different sizes");
+  std::vector<double> dLdE;
+  const double L = tl.eval(pairs, E, &dLdE);
+  if (r) {
+    r->clear();
+    for (const TailPair &p : pairs) r->push_back(tl.residual(p, E));
+  }
+  for (size_t q = 0; q < parts.size(); q++) {
+    const Batch &b = parts[q];
+    bool any = false;
+    for (int k = off[q]; k < off[q + 1]; k++) any = any || dLdE[k] != 0.0;
+    if (!any) continue;
+    if (lrc) lrc_prepare(b, false); // (energies() of the last part left another batch prepared)
+    plato_batch_ = &b;
+    ecot_.assign(b.n_systems, 0.0f);
+    for (int k = 0; k < b.structures(); k++)
+      ecot_[k] = static_cast<float>(mult * dLdE[off[q] + k] * energy_scale * b.n_per_system[k]);
+    std::unique_ptr<StepGraph> once;
+    zero_norms_ = true;
+    StepGraph &g = graph(b.n_atoms, b.max_neighbors, b.n_systems, BACKWARD, once);
+    upload_inputs(g, b);
+    zero_norms_ = false;
+    compute(g);
+  }
+  return L;
+}
+
+// lrc_states: one structure whose copies are spread over several part batches (Batch::part_*). Phase 1 per part: the
+// FORCES pass and each copy's forces and energy (as run_conservative, without the combination). Then, once: the
+// combination F = sum_v w_v F_v - sum_v E_v grad w_v + the long-range forces, the energy (and its long-range term) and
+// the losses, u = dL/dF. Phase 2 per part: the MIXED pass with each copy's tangent w_v u and its energy cotangent
+// (the link term -u . grad w_v plus the energy loss's dL/dE_v, since a part has no energy row of its own). The same loss
+// and gradient as the copies in one batch.
+StepStats Worker::run_parts(const std::vector<const Batch *> &parts, double energy_scale, bool backward) {
+  if (parts.empty()) return {};
+  t_build = t_alloc = t_upload = t_compute = t_download = t_cpu = 0;
+  if (!lrc || !vs_on || !lrc_exact) throw std::logic_error("run_parts: lrc_states only");
+  const Conservative &w = conservative;
+  const bool nc = model_.nc_forces();
+  const int ow = nc ? 4 : 1;
+  const Batch &b0 = *parts[0];
+  const int N = b0.n_per_system[0];
+  struct Part {
+    std::vector<int> copy, a0;                 // per system: copy index, first atom
+    std::vector<std::vector<double>> rows;     // per system: blend rows (empty: none)
+  };
+  std::vector<Part> P(parts.size());
+  runtime::LrcStates st_full;
+  runtime::LrcClusters cl_full;
+  std::vector<double> q0rows;
+  size_t V = 0;
+  std::vector<std::vector<double>> Fv;
+  std::vector<double> Ev;
+  std::vector<char> seen;
+  double lrc_e = 0;
+  std::vector<double> lrc_f(3 * size_t(N), 0.0);
+  StepStats st;
+  for (size_t p = 0; p < parts.size(); p++) {
+    const Batch &b = *parts[p];
+    if (b.ids[0] != b0.ids[0] || b.n_per_system[0] != N) throw std::logic_error("run_parts: parts of different structures");
+    const int n = b.n_atoms, m = b.max_neighbors, S = b.n_systems;
+    lrc_prepare(b, true);
+    if (vs_.size() != 1) throw std::logic_error("run_parts: a part holds one multi-state structure");
+    VsStruct &vs = vs_[0];
+    if (p == 0) {
+      st_full = vs.st, cl_full = vs.cl, V = st_full.copies.size();
+      Fv.assign(V, {}), Ev.assign(V, 0.0), seen.assign(V, 0);
+      lrc_e = lrc_e_[0];
+      for (int c = 0; c < 3 * N; c++) lrc_f[c] = lrc_f_.empty() ? 0.0 : lrc_f_[3 * size_t(vs_sys_a0_[0]) + c] / energy_scale;
+    } else if (vs.st.copies.size() != V) {
+      throw std::logic_error("run_parts: the parts see different states");
+    }
+    if (!q0rows.empty()) vs.q0rows = q0rows;
+    plato_batch_ = &b;
+    std::unique_ptr<StepGraph> once;
+    StepGraph &gf = graph(n, m, S, FORCES, once);
+    upload_inputs(gf, b);
+    compute(gf);
+    std::vector<float> out(ow * static_cast<size_t>(n)), gv(3 * static_cast<size_t>(n) * m), gc, gx, gblend;
+    ggml_backend_tensor_get(gf.out, out.data(), 0, out.size() * sizeof(float));
+    ggml_backend_tensor_get(gf.grad_v, gv.data(), 0, gv.size() * sizeof(float));
+    const bool taper = !b.taper_center.empty();
+    if (taper) {
+      gc.resize(static_cast<size_t>(n) * m);
+      ggml_backend_tensor_get(gf.grad_c, gc.data(), 0, gc.size() * sizeof(float));
+    }
+    if (gf.grad_blend) gblend.resize(n), ggml_backend_tensor_get(gf.grad_blend, gblend.data(), 0, n * sizeof(float));
+    if (gf.grad_x) gx.resize(3 * size_t(n)), ggml_backend_tensor_get(gf.grad_x, gx.data(), 0, gx.size() * sizeof(float));
+    once.reset();
+    auto real = [&](int f) { return b.padding_mask[f] < 0.5f && b.neighbor_atom[f] >= 0; };
+    std::vector<double> F(3 * static_cast<size_t>(n), 0.0);
+    for (int f = 0; f < n * m; f++) {
+      if (!real(f)) continue;
+      const int i = f / m, k = b.neighbor_atom[f];
+      for (int c = 0; c < 3; c++) F[3 * i + c] += gv[3 * f + c], F[3 * k + c] -= gv[3 * f + c];
+    }
+    for (size_t k = 0; k < gx.size(); k++) F[k] -= gx[k];
+    if (taper) {
+      std::vector<double> Sk(n, 0.0);
+      for (int f = 0; f < n * m; f++)
+        if (real(f)) Sk[f / m] += 0.5 * gc[f], Sk[b.neighbor_atom[f]] += 0.5 * gc[f];
+      for (size_t t = 0; t < b.taper_center.size(); t++) {
+        const int k = b.taper_center[t], l = b.taper_neighbor[t];
+        const float *v = &b.taper_vector[3 * t];
+        const double d = std::sqrt(double(v[0]) * v[0] + double(v[1]) * v[1] + double(v[2]) * v[2]);
+        const double coef = d > 0 ? Sk[k] * b.taper_jacobian[t] / d : 0.0;
+        for (int c = 0; c < 3; c++) F[3 * k + c] += coef * v[c], F[3 * l + c] -= coef * v[c];
+      }
+    }
+    // each copy's conditioning forces (rows from the structure's shared q0 rows)
+    Part &pt = P[p];
+    pt.rows.assign(b.n_real_systems, {});
+    if (!gblend.empty()) release_compute_buffer();
+    for (int j = 0; j < b.n_real_systems; j++) {
+      const runtime::LrcCondition &c = lrc_cond_[j];
+      const int a0 = vs_sys_a0_[j];
+      pt.copy.push_back(vs.copy.at(size_t(j))), pt.a0.push_back(a0);
+      if (gblend.empty() || c.cl.s <= 1 || !c.needs_cond_forces()) continue;
+      std::vector<double> x(b.positions.begin() + 3 * size_t(a0), b.positions.begin() + 3 * size_t(a0 + N));
+      if (vs.q0rows.empty()) vs.q0rows = runtime::lrc_q0_rows(*lrc, *lrc_sqe, c, N, b.atomic_number.data() + a0, x.data());
+      pt.rows[j] = runtime::lrc_blend_rows_q0(*lrc, c, N, x.data(), vs.q0rows);
+      std::vector<double> G(c.cl.s, 0.0);
+      for (int i = 0; i < N; i++) G[c.cl.sn[i]] += gblend[a0 + i];
+      double fmax = 0;
+      for (int q = 0; q < 3 * N; q++) {
+        double f = 0;
+        for (int a = 0; a < c.cl.s; a++) f -= G[a] * pt.rows[j][size_t(a) * 3 * N + q];
+        F[3 * size_t(a0) + q] += f, fmax = std::max(fmax, std::abs(f) * energy_scale);
+      }
+      lrc_cond_force_sum += fmax, lrc_cond_n++;
+    }
+    if (q0rows.empty()) q0rows = vs.q0rows;
+    // (the long-range forces are not in F: taken once, from part 0, into the combination)
+    for (int j = 0; j < b.n_real_systems; j++) {
+      const int v = pt.copy[j], a0 = pt.a0[j];
+      if (seen[v]) throw std::logic_error("run_parts: a copy in two parts");
+      seen[v] = 1;
+      double e = 0;
+      for (int i = 0; i < N; i++) e += double(out[ow * size_t(a0 + i)]);
+      Ev[v] = e, Fv[v].assign(F.begin() + 3 * size_t(a0), F.begin() + 3 * size_t(a0 + N));
+    }
+  }
+  for (size_t v = 0; v < V; v++)
+    if (!seen[v]) throw std::logic_error("run_parts: a copy is missing from the parts");
+  // the combination (scaled units)
+  std::vector<double> dE(V), Fc(3 * size_t(N), 0.0), g(3 * size_t(N), 0.0);
+  double Emix = 0;
+  for (size_t v = 0; v < V; v++) {
+    dE[v] = Ev[v] - Ev[0], Emix += st_full.copies[v].w * dE[v];
+    for (int c = 0; c < 3 * N; c++) Fc[c] += st_full.copies[v].w * Fv[v][c];
+  }
+  runtime::lrc_states_vjp(*lrc, cl_full, st_full, dE, g.data());
+  for (int c = 0; c < 3 * N; c++) Fc[c] += lrc_f[c] - g[c];
+  // losses (the structure's row; the norms of the step)
+  const auto [e_norm, f_norm] = loss_norms(b0);
+  const double sw = backward && energy_sw ? double((*energy_sw)[b0.ids[0]]) : 1.0;
+  const double d = (Ev[0] + Emix) / N - b0.part_energy_target + lrc_e / (energy_scale * N);
+  st.n_systems = 1;
+  st.loss_energy = w.energy * e_norm * loss.value(std::sqrt(sw) * d, loss.delta_e);
+  st.se_energy_per_atom = d * d * energy_scale * energy_scale, st.ae_energy_per_atom = std::abs(d) * energy_scale;
+  {
+    const double y = double(b0.part_energy_target) * energy_scale;
+    st.sum_e += y, st.sum2_e += y * y;
+  }
+  std::vector<double> u(3 * size_t(N), 0.0);
+  const int a00 = 0; // system 0 of part 0 starts at atom 0
+  double fse = 0;
+  std::vector<float> per_atom(N, 0.0f);
+  for (int i = 0; i < N; i++) {
+    const int a = a00 + i;
+    st.n_force_components += 3;
+    double e2 = 0;
+    for (int c = 0; c < 3; c++) {
+      const double target = double(b0.force_target[3 * a + c]) * b0.force_scale[a];
+      const double r = Fc[3 * i + c] - target / energy_scale;
+      st.sum_f += target, st.sum2_f += target * target;
+      st.loss_force += w.force * f_norm * loss.value(r, loss.delta_f);
+      e2 += std::pow(r * energy_scale, 2), st.ae_force += std::abs(r) * energy_scale;
+      u[3 * i + c] = w.force * f_norm * loss.slope(r, loss.delta_f);
+    }
+    st.se_force += e2, fse += e2, per_atom[i] = static_cast<float>(e2);
+  }
+  st.loss = st.loss_energy + st.loss_force;
+  if (system_errors) {
+    system_errors->push_back({b0.ids[0], -1, N, static_cast<float>(d * energy_scale), static_cast<float>(fse)});
+    if (atom_errors) atom_errors->insert(atom_errors->end(), per_atom.begin(), per_atom.end());
+  }
+  if (!backward) return st;
+  // the cotangents of every copy: the link term -u . grad w_v and the energy loss dL/dE_v = dL/dd w_v / N
+  const std::vector<double> gp = runtime::lrc_superedge_grads(*lrc, cl_full, N);
+  const size_t E = cl_full.se.size();
+  std::vector<double> t(E, 0.0);
+  for (size_t e = 0; e < E; e++)
+    for (int c = 0; c < 3 * N; c++) t[e] += gp[e * 3 * N + c] * u[c];
+  const double dLdd = w.energy * e_norm * std::sqrt(sw) * loss.slope(std::sqrt(sw) * d, loss.delta_e);
+  std::vector<double> cot(V);
+  for (size_t v = 0; v < V; v++) {
+    double cv = 0;
+    for (size_t e = 0; e < E; e++) cv -= st_full.copies[v].dw[e] * t[e];
+    cot[v] = cv + dLdd * st_full.copies[v].w / N;
+  }
+  for (size_t p = 0; p < parts.size(); p++) {
+    const Batch &b = *parts[p];
+    const int n = b.n_atoms, m = b.max_neighbors, S = b.n_systems;
+    lrc_prepare(b, false); // the part's conditioning inputs again (cached charge pass)
+    plato_batch_ = &b;
+    const Part &pt = P[p];
+    std::vector<double> uf(3 * size_t(n), 0.0);
+    vs_acot_.assign(n, 0.0f);
+    for (int j = 0; j < b.n_real_systems; j++) {
+      const int v = pt.copy[j], a0 = pt.a0[j];
+      const double wv = st_full.copies[v].w;
+      for (int c = 0; c < 3 * N; c++) uf[3 * size_t(a0) + c] = wv * u[c];
+      for (int i = 0; i < N; i++) vs_acot_[a0 + i] = static_cast<float>(cot[v]);
+    }
+    auto real = [&](int f) { return b.padding_mask[f] < 0.5f && b.neighbor_atom[f] >= 0; };
+    std::vector<float> dv(3 * static_cast<size_t>(n) * m, 0.0f), dc(static_cast<size_t>(n) * m, 0.0f);
+    for (int f = 0; f < n * m; f++) {
+      if (!real(f)) continue;
+      const int i = f / m, k = b.neighbor_atom[f];
+      for (int c = 0; c < 3; c++) dv[3 * f + c] = static_cast<float>(uf[3 * k + c] - uf[3 * i + c]);
+    }
+    if (!b.taper_center.empty()) {
+      std::vector<double> dr(n, 0.0);
+      for (size_t tt = 0; tt < b.taper_center.size(); tt++) {
+        const int k = b.taper_center[tt], l = b.taper_neighbor[tt];
+        const float *v = &b.taper_vector[3 * tt];
+        const double dd = std::sqrt(double(v[0]) * v[0] + double(v[1]) * v[1] + double(v[2]) * v[2]);
+        if (!(dd > 0)) continue;
+        double proj = 0;
+        for (int c = 0; c < 3; c++) proj += v[c] * (uf[3 * l + c] - uf[3 * k + c]);
+        dr[k] += b.taper_jacobian[tt] * proj / dd;
+      }
+      for (int f = 0; f < n * m; f++)
+        if (real(f)) dc[f] = static_cast<float>(0.5 * (dr[f / m] + dr[b.neighbor_atom[f]]));
+    }
+    if (model_.plato_lr().enabled) {
+      // the long-range ops' tangents are central differences in units of the largest tangent: the structure's
+      // (max_v w_v max |u|, as for its copies in one batch), not the part's, so the parts take the same steps
+      double umax = 0, wmax = 0, um = 0;
+      for (const auto &cp : st_full.copies) wmax = std::max(wmax, cp.w);
+      for (double x : u) um = std::max(um, std::abs(x));
+      umax = wmax * um;
+      if (!(umax > 0)) umax = 1;
+      const float inv = static_cast<float>(1.0 / umax);
+      for (float &x : dv) x *= inv;
+      for (float &x : dc) x *= inv;
+      plato_dx_.resize(uf.size());
+      for (size_t k = 0; k < uf.size(); k++) plato_dx_[k] = static_cast<float>(uf[k] / umax);
+      plato_jvp_scale_ = static_cast<float>(umax);
+    }
+    lrc_dblend_.assign(n, 0.0f);
+    const double inv = model_.plato_lr().enabled ? 1.0 / plato_jvp_scale_ : 1.0;
+    for (int j = 0; j < b.n_real_systems; j++) {
+      if (pt.rows[j].empty()) continue;
+      const runtime::LrcCondition &c = lrc_cond_[j];
+      const int a0 = pt.a0[j];
+      for (int a = 0; a < c.cl.s; a++) {
+        double tt = 0;
+        for (int q = 0; q < 3 * N; q++) tt += pt.rows[j][size_t(a) * 3 * N + q] * uf[3 * size_t(a0) + q];
+        for (int i = 0; i < N; i++)
+          if (c.cl.sn[i] == a) lrc_dblend_[a0 + i] = static_cast<float>(tt * inv);
+      }
+    }
+    // no energy rows in a part (atom weights 0, targets 0): the energy loss enters through the cotangent above
+    aw_override_.clear(), et_override_.clear();
+    vs_aw_.clear();
+    std::unique_ptr<StepGraph> once;
+    StepGraph &gm = graph(n, m, S, MIXED, once);
+    upload_inputs(gm, b, &dv, &dc);
+    compute(gm);
+  }
+  return st;
 }
 
 StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool backward) {
@@ -1301,19 +1670,39 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
 
   if (lrc) // the combined model's long-range term (frozen): forces join the model's, in scaled units
     for (size_t k = 0; k < lrc_f_.size(); k++) F[k] += lrc_f_[k] / energy_scale;
+  // lrc_states: the copies' energies (scaled, about the first copy's)
+  std::vector<std::vector<double>> vs_dE(vs_.size());
+  for (size_t q = 0; q < vs_.size(); q++) {
+    const VsStruct &vs = vs_[q];
+    for (int j : vs.sys) {
+      double e = 0;
+      for (int i = 0; i < b.n_per_system[j]; i++) e += double(out[ow * size_t(vs_sys_a0_[j] + i)]);
+      vs_dE[q].push_back(e);
+    }
+    for (size_t v = vs_dE[q].size(); v-- > 0;) vs_dE[q][v] -= vs_dE[q][0];
+  }
   // exact conditioning forces: F -= sum_a G_a dS_a/dx, G_a = sum over the super-node of dE/d(blend) (scaled units);
   // the rows are kept for the blend tangent of the MIXED pass
   std::vector<std::vector<double>> lrc_rows(lrc_exact ? lrc_cond_.size() : 0);
-  if (lrc_exact && gf.grad_blend) {
+  // (gblend holds dE/d(blend) when the FORCES graph had it; that graph is released above)
+  if (vs_on && lrc_exact && !gblend.empty()) release_compute_buffer(); // the blend rows run the charge pass
+  if (lrc_exact && !gblend.empty()) {
     for (size_t k = 0; k < lrc_cond_.size(); k++) {
       const runtime::LrcCondition &c = lrc_cond_[k];
       if (c.cl.s <= 1 || !c.needs_cond_forces()) continue;
-      const int a0 = lrc_a0_[k], ns = b.n_per_system[k];
+      const int a0 = vs_member_[k] ? vs_sys_a0_[k] : lrc_a0_[k], ns = b.n_per_system[k];
       std::vector<double> x(b.positions.begin() + 3 * size_t(a0), b.positions.begin() + 3 * size_t(a0 + ns));
-      LrcCacheEntry &ce = lrc_cache_.at(lrc_key_[k]);
-      if (!ce.has_rows)
-        ce.rows = runtime::lrc_blend_rows(*lrc, *lrc_sqe, c, ns, b.atomic_number.data() + a0, x.data()), ce.has_rows = true;
-      lrc_rows[k] = ce.rows;
+      if (vs_member_[k]) { // a copy's own conditioning (lrc_states), from the structure's shared q0 rows
+        VsStruct &vs = vs_.at(vs_index_[k]);
+        if (vs.q0rows.empty()) vs.q0rows = runtime::lrc_q0_rows(*lrc, *lrc_sqe, c, ns, b.atomic_number.data() + a0, x.data());
+        if (vs_rows_[k].empty()) vs_rows_[k] = runtime::lrc_blend_rows_q0(*lrc, c, ns, x.data(), vs.q0rows);
+        lrc_rows[k] = vs_rows_[k];
+      } else {
+        LrcCacheEntry &ce = lrc_cache_.at(lrc_key_[k]);
+        if (!ce.has_rows)
+          ce.rows = runtime::lrc_blend_rows(*lrc, *lrc_sqe, c, ns, b.atomic_number.data() + a0, x.data()), ce.has_rows = true;
+        lrc_rows[k] = ce.rows;
+      }
       std::vector<double> G(c.cl.s, 0.0);
       for (int i = 0; i < ns; i++) G[c.cl.sn[i]] += gblend[a0 + i];
       double fmax = 0;
@@ -1325,20 +1714,40 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
       lrc_cond_force_sum += fmax, lrc_cond_n++;
     }
   }
+  // lrc_states: F = sum_v w_v F_v - sum_v E_v grad w_v (+ the long-range forces once) on the structure's atoms
+  for (size_t q = 0; q < vs_.size(); q++) {
+    const VsStruct &vs = vs_[q];
+    const int ns = b.n_per_system[vs.k], a0 = vs_sys_a0_[vs.k];
+    std::vector<double> Fc(3 * size_t(ns), 0.0), g(3 * size_t(ns), 0.0);
+    for (size_t v = 0; v < vs.sys.size(); v++) {
+      const double w = vs.st.copies[v].w;
+      const int aj = vs_sys_a0_[vs.sys[v]];
+      for (int c = 0; c < 3 * ns; c++) Fc[c] += w * F[3 * size_t(aj) + c];
+    }
+    runtime::lrc_states_vjp(*lrc, vs.cl, vs.st, vs_dE[q], g.data());
+    const double w0 = vs.st.copies[0].w;
+    for (int c = 0; c < 3 * ns; c++) {
+      const double flr = lrc_f_.empty() ? 0.0 : lrc_f_[3 * size_t(a0) + c] / energy_scale; // counted once
+      F[3 * size_t(a0) + c] = Fc[c] - g[c] + (1.0 - w0) * flr;
+    }
+    for (size_t v = 1; v < vs.sys.size(); v++)
+      std::fill_n(F.begin() + 3 * size_t(vs_sys_a0_[vs.sys[v]]), 3 * size_t(ns), 0.0);
+  }
 
   // the loss terms and metrics; force targets are physical F / s_Z, the
   // conservative ones F / s_E (the gradient of the scaled energy)
-  st.n_systems = b.n_real_systems;
+  st.n_systems = b.structures();
   std::vector<double> d_e(S, 0.0), u(3 * static_cast<size_t>(n), 0.0), fse(S, 0.0);
+  const std::vector<float> &aw = vs_aw_.empty() ? b.atom_weight : vs_aw_;
   for (int k = 0; k < S; k++) {
-    for (int a = 0; a < n; a++) d_e[k] += double(b.atom_weight[static_cast<size_t>(k) * n + a]) * out[ow * a];
+    for (int a = 0; a < n; a++) d_e[k] += double(aw[static_cast<size_t>(k) * n + a]) * out[ow * a];
     d_e[k] -= b.energy_target[k];
     if (sqe && k < b.n_real_systems) d_e[k] += sqe_e[k] / (energy_scale * b.n_per_system[k]);
     if (lrc && k < b.n_real_systems) d_e[k] += lrc_e_[k] / (energy_scale * b.n_per_system[k]);
     const double swk = backward && energy_sw && k < b.n_real_systems ? double((*energy_sw)[b.ids[k]]) : 1.0;
     st.loss_energy += w.energy * e_norm * loss.value(std::sqrt(swk) * d_e[k], loss.delta_e);
     st.se_energy_per_atom += d_e[k] * d_e[k] * energy_scale * energy_scale;
-    if (k < b.n_real_systems) st.ae_energy_per_atom += std::abs(d_e[k]) * energy_scale;
+    if (k < b.structures()) st.ae_energy_per_atom += std::abs(d_e[k]) * energy_scale;
   }
   add_target_sums(b, energy_scale, st);
   std::vector<float> per_atom(n, 0.0f);
@@ -1364,11 +1773,11 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
   }
   st.loss = st.loss_energy + st.loss_force + st.loss_nc + st.loss_charge + st.loss_frag;
   if (system_errors) {
-    for (int k = 0; k < b.n_real_systems; k++)
+    for (int k = 0; k < b.structures(); k++)
       system_errors->push_back({b.ids[k], -1, b.n_per_system[k], static_cast<float>(d_e[k] * energy_scale),
                                 static_cast<float>(fse[k])});
     if (atom_errors) { // real atoms come first, structure by structure
-      const int n_real = std::accumulate(b.n_per_system.begin(), b.n_per_system.begin() + b.n_real_systems, 0);
+      const int n_real = std::accumulate(b.n_per_system.begin(), b.n_per_system.begin() + b.structures(), 0);
       atom_errors->insert(atom_errors->end(), per_atom.begin(), per_atom.begin() + n_real);
     }
   }
@@ -1399,6 +1808,29 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
                                                             double(b.system_charge[k]), q0, dLdE, dLdF.data(), sqe_grad,
                                                             sup.unit ? &sup : nullptr);
       if (sup.unit) sqe_q0_loss += so.q0_loss, sqe_q0_n++;
+    }
+  }
+
+  // lrc_states: the link term's energy cotangent per copy, c_v = -u . grad w_v (u on the structure's atoms), and the
+  // tangents: copy v moves along w_v u
+  vs_acot_.assign(vs_on ? n : 0, 0.0f);
+  for (const VsStruct &vs : vs_) {
+    const int ns = b.n_per_system[vs.k], a0 = vs_sys_a0_[vs.k];
+    const std::vector<double> gp = runtime::lrc_superedge_grads(*lrc, vs.cl, ns);
+    const size_t E = vs.cl.se.size();
+    std::vector<double> t(E, 0.0); // grad p_e . u
+    for (size_t e = 0; e < E; e++)
+      for (int c = 0; c < 3 * ns; c++) t[e] += gp[e * 3 * ns + c] * u[3 * size_t(a0) + c];
+    for (size_t v = 0; v < vs.sys.size(); v++) {
+      double cv = 0;
+      for (size_t e = 0; e < E; e++) cv -= vs.st.copies[v].dw[e] * t[e];
+      const int aj = vs_sys_a0_[vs.sys[v]];
+      for (int i = 0; i < ns; i++) vs_acot_[aj + i] = static_cast<float>(cv);
+    }
+    for (size_t v = vs.sys.size(); v-- > 0;) { // copies from the structure's u first, then the structure itself
+      const double w = vs.st.copies[v].w;
+      const int aj = vs_sys_a0_[vs.sys[v]];
+      for (int c = 0; c < 3 * ns; c++) u[3 * size_t(aj) + c] = w * u[3 * size_t(a0) + c];
     }
   }
 
@@ -1444,7 +1876,7 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
     for (size_t k = 0; k < lrc_rows.size(); k++) {
       if (lrc_rows[k].empty()) continue;
       const runtime::LrcCondition &c = lrc_cond_[k];
-      const int a0 = lrc_a0_[k], ns = b.n_per_system[k];
+      const int a0 = vs_member_[k] ? vs_sys_a0_[k] : lrc_a0_[k], ns = b.n_per_system[k];
       for (int a = 0; a < c.cl.s; a++) {
         double t = 0;
         for (int q = 0; q < 3 * ns; q++) t += lrc_rows[k][size_t(a) * 3 * ns + q] * u[3 * size_t(a0) + q];
@@ -1456,8 +1888,8 @@ StepStats Worker::run_conservative(const Batch &b, double energy_scale, bool bac
   // the MIXED graph's energy residual: host energies (lrc / SQE) in the target (exact), per-structure weights
   aw_override_.clear(), et_override_.clear();
   const bool shift = host_energy_in_grad && (lrc || sqe), weigh = energy_sw != nullptr;
-  if (shift || weigh) {
-    aw_override_ = b.atom_weight, et_override_ = b.energy_target;
+  if (shift || weigh || !vs_aw_.empty()) {
+    aw_override_ = vs_aw_.empty() ? b.atom_weight : vs_aw_, et_override_ = b.energy_target;
     for (int k = 0; k < b.n_real_systems; k++) {
       if (shift)
         et_override_[k] -= static_cast<float>(((sqe ? sqe_e[k] : 0.0) + (lrc ? lrc_e_[k] : 0.0)) /
@@ -2403,6 +2835,8 @@ void train(const TrainOptions &o) {
     if (fs.enabled && fs.cond_gate)
       fmt::print("fragment charges: gated unit conditioning c(Q_s) + g (c(Q_u) - c(Q_s)), g = plato_frag_cond_gate\n");
   }
+  // lrc_states: the packer expands multi-state structures into their backbone evaluations (Batch::vs_*)
+  StatePlanner planner;
   // split-charge equilibration (a pet.plato_lr.sqe model): the term in every step, its parameters trained with --sqe
   bool sqe_train = false;
   {
@@ -2430,6 +2864,16 @@ void train(const TrainOptions &o) {
                    "{} neighbours, {}), taper from {} c + {} A to c; inter-cluster Coulomb on 1 - R without the distance "
                    "switch (the a_on / a_off and switch values above are not used)\n",
                    L.bb_cutoff, L.bb_nadapt, L.bb_grid ? "grid" : "solver", L.link_a, L.link_b);
+      if (L.states) {
+        if (!workers[0]->lrc_exact) throw std::runtime_error("lrc_states: needs the exact conditioning forces (MLIPCPP_LRC_EXACT)");
+        planner.lrc = &L;
+        for (auto &w : workers) w->vs_on = true;
+        fmt::print("lrc: lrc_states = mix: the backbone energy is the weighted sum over the link states' graphs "
+                   "(eps {}, cap {} -> {}); multi-state structures are packed as one copy per state (edges between "
+                   "the clusters a state separates dropped, each cluster on its own Q0), forces sum_v w_v F_v - "
+                   "sum_v E_v grad w_v\n",
+                   L.states_eps, L.states_cap_lo, L.states_cap);
+      }
       if (L.slab != runtime::LrcSpec::Slab::None)
         fmt::print("lrc: lrc_slab = {}: slabs (a zero cell row{}) as 2D-periodic tilings, {}\n",
                    L.slab == runtime::LrcSpec::Slab::YB ? "yb" : "ewald2d",
@@ -2654,9 +3098,17 @@ void train(const TrainOptions &o) {
     for_workers(workers, [&](size_t w) {
       for (int64_t k = w; k < n_batches; k += W) {
         std::vector<int64_t> ids(use.begin() + k * B, use.begin() + std::min<int64_t>(n_use, (k + 1) * B));
-        for (const Batch &b : make_microbatches(split, cache, ids, {}, species, scaling, cutoff,
-                                                    o.mb_budget, o.mb_growth, tiling))
-          per[w] += workers[w]->run(b, scaling.energy_scale, false);
+        const std::vector<Batch> mbs = make_microbatches(split, cache, ids, {}, species, scaling, cutoff, o.mb_budget,
+                                                         o.mb_growth, tiling, &planner);
+        for (size_t i = 0; i < mbs.size();) {
+          if (mbs[i].part_group < 0) {
+            per[w] += workers[w]->run(mbs[i++], scaling.energy_scale, false);
+            continue;
+          }
+          std::vector<const Batch *> parts; // lrc_states: a split structure's parts, run as one
+          for (const int gid = mbs[i].part_group; i < mbs.size() && mbs[i].part_group == gid; i++) parts.push_back(&mbs[i]);
+          per[w] += workers[w]->run_parts(parts, scaling.energy_scale, false);
+        }
       }
     });
     StepStats total;
@@ -2730,7 +3182,7 @@ void train(const TrainOptions &o) {
         cost = plan_cost;
       }
       return make_step_batches(train_split, nl_train, ids, rot, species, scaling, cutoff, W, cost,
-                               o.mb_budget, step_tiling);
+                               o.mb_budget, step_tiling, &planner);
     }
     std::vector<std::future<std::vector<Batch>>> fs;
     for (int w = 0; w < W; w++) {
@@ -2740,7 +3192,7 @@ void train(const TrainOptions &o) {
         std::vector<std::array<float, 9>> rot(B);
         for (auto &r : rot) r = random_o3(rng);
         return make_microbatches(train_split, nl_train, ids, rot, species, scaling, cutoff,
-                                 o.mb_budget, o.mb_growth, tiling);
+                                 o.mb_budget, o.mb_growth, tiling, &planner);
       }));
     }
     std::vector<std::vector<Batch>> out;
@@ -2791,7 +3243,20 @@ void train(const TrainOptions &o) {
     const TailGroup &g = tail_set.groups[gs[std::uniform_int_distribution<size_t>(0, gs.size() - 1)(rng)]];
     const auto R = random_o3(rng);
     std::vector<std::array<float, 9>> rot(g.ids.size(), R);
-    return std::make_pair(&g, make_batch(*tail_split, nl_tail, g.ids, rot, species, scaling, cutoff));
+    // MLIPCPP_TAIL_CHUNK=C > 0: the group as parts of C structures (Worker::run_tail over parts: same loss and gradient)
+    static const int chunk = [] { const char *e = std::getenv("MLIPCPP_TAIL_CHUNK"); return e && *e ? std::atoi(e) : 0; }();
+    std::vector<Batch> parts;
+    if (chunk <= 0 || g.ids.size() <= size_t(chunk)) {
+      parts.push_back(make_batch(*tail_split, nl_tail, g.ids, rot, species, scaling, cutoff, 0, 0, 0, &planner));
+    } else {
+      for (size_t a = 0; a < g.ids.size(); a += chunk) {
+        const size_t e = std::min(g.ids.size(), a + chunk);
+        const std::vector<int64_t> ids(g.ids.begin() + a, g.ids.begin() + e);
+        parts.push_back(make_batch(*tail_split, nl_tail, ids, std::vector<std::array<float, 9>>(ids.size(), R), species,
+                                   scaling, cutoff, 0, 0, 0, &planner));
+      }
+    }
+    return std::make_pair(&g, std::move(parts));
   };
 
   // --pair-data: same-geometry charge / spin-state groups (a MemmapSplit + pairs.tsv); one group per pair_every-th
@@ -2881,7 +3346,7 @@ void train(const TrainOptions &o) {
     const TailGroup &g = pair_set.groups[gs[std::uniform_int_distribution<size_t>(0, gs.size() - 1)(rng)]];
     const auto R = random_o3(rng);
     std::vector<std::array<float, 9>> rot(g.ids.size(), R);
-    return std::make_pair(&g, make_batch(*pair_split, nl_pair, g.ids, rot, species, scaling, cutoff));
+    return std::make_pair(&g, make_batch(*pair_split, nl_pair, g.ids, rot, species, scaling, cutoff, 0, 0, 0, &planner));
   };
   // held-out pairs: dE_model - dE_DFT (eV) per pair, by class; no rotation, forward only
   // and, with --pair-val-dump PREFIX, every pair's error to PREFIX.<tag>.epochNNNNN.tsv (group class k l dE_DFT err)
@@ -2894,7 +3359,7 @@ void train(const TrainOptions &o) {
         dump.reset(std::fopen(fmt::format("{}.{}.epoch{:05d}.tsv", o.pair_val_dump, pv.tag, epoch_done).c_str(), "w"));
       if (dump) std::fprintf(dump.get(), "group\tclass\tk\tl\tdE_dft_eV\terr_eV\n");
       for (const TailGroup &g : pv.set.groups) {
-        const Batch b = make_batch(*pv.split, pv.nl, g.ids, {}, species, scaling, cutoff);
+        const Batch b = make_batch(*pv.split, pv.nl, g.ids, {}, species, scaling, cutoff, 0, 0, 0, &planner);
         const std::vector<double> E = w0.energies(b, scaling.energy_scale);
         for (const TailPair &p : g.pairs) {
           const double e = E[p.k] - E[p.l] - p.de_dft;
@@ -2936,20 +3401,20 @@ void train(const TrainOptions &o) {
     int checked = 0, bad = 0, bad_batch = 0;
     for (size_t gi = 0; gi < pair_set.groups.size() && checked < o.pair_grad_check; gi++) {
       const TailGroup &g = pair_set.groups[gi];
-      const Batch b = make_batch(*pair_split, nl_pair, g.ids, {}, species, scaling, cutoff);
+      const Batch b = make_batch(*pair_split, nl_pair, g.ids, {}, species, scaling, cutoff, 0, 0, 0, &planner);
       // co-batching: the group's energies in one batch (states of different Q / M side by side) against each
       // structure alone, and against a randomly rotated batch
       const std::vector<double> Eg = w0.energies(b, scaling.energy_scale);
       double dmax = 0, drot = 0;
       for (size_t q = 0; q < g.ids.size(); q++) {
-        const Batch b1 = make_batch(*pair_split, nl_pair, {g.ids[q]}, {}, species, scaling, cutoff);
+        const Batch b1 = make_batch(*pair_split, nl_pair, {g.ids[q]}, {}, species, scaling, cutoff, 0, 0, 0, &planner);
         dmax = std::max(dmax, std::abs(w0.energies(b1, scaling.energy_scale)[0] - Eg[q]));
       }
       {
         std::mt19937_64 rng(uint64_t(gi) + 17);
         const auto R = random_o3(rng);
         const Batch br = make_batch(*pair_split, nl_pair, g.ids, std::vector<std::array<float, 9>>(g.ids.size(), R),
-                                    species, scaling, cutoff);
+                                    species, scaling, cutoff, 0, 0, 0, &planner);
         const std::vector<double> Er = w0.energies(br, scaling.energy_scale);
         // PET is not exactly rotation invariant: report the pair differences' change (a model property, no gate)
         for (const TailPair &p : g.pairs) drot = std::max(drot, std::abs((Er[p.k] - Er[p.l]) - (Eg[p.k] - Eg[p.l])));
@@ -3052,7 +3517,15 @@ void train(const TrainOptions &o) {
       std::vector<double> wb(W, 0.0), wc(W, 0.0);
       std::vector<std::vector<std::array<double, 4>>> samples(W); // (n, m, ms, fixed ms) per micro-batch
       for_workers(workers, [&](size_t w) {
-        for (const Batch &mb : batches[w]) {
+        for (size_t i = 0; i < batches[w].size();) {
+          if (batches[w][i].part_group >= 0) { // lrc_states: a split structure's parts, run as one (not in the cost fit)
+            std::vector<const Batch *> parts;
+            for (const int gid = batches[w][i].part_group; i < batches[w].size() && batches[w][i].part_group == gid; i++)
+              parts.push_back(&batches[w][i]);
+            st[w] += workers[w]->run_parts(parts, scaling.energy_scale, true);
+            continue;
+          }
+          const Batch &mb = batches[w][i++];
           // the cost model is fitted to the whole call, not just the GPU
           // compute: graph builds, allocation, transfers and (conservative)
           // the force assembly on the CPU are per micro-batch costs too
@@ -3216,6 +3689,15 @@ void train(const TrainOptions &o) {
                                                 w0.lrc_cond_force_sum / std::max<int64_t>(1, w0.lrc_cond_n), w0.lrc_cond_n)
                                   : std::string("no dE/dS dS/dx in the training forces"),
                      w0.lrc_fallback);
+        if (w0.vs_on && w0.lrc_seen > 0) {
+          int64_t ns = 0, ne = 0, nf = 0, ra = 0, pa = 0, mx = 0;
+          for (auto &w : workers)
+            ns += w->vs_structs, ne += w->vs_evals, nf += w->vs_fix3, ra += w->vs_real_atoms, pa += w->vs_packed_atoms,
+                mx = std::max(mx, w->vs_max);
+          fmt::print("  lrc_states: {} multi-state structures ({} evaluations, mean {:.2f}, max {}), {} with a fix-3 "
+                     "blend (cap or mass guard); packed / real atoms {:.4f} (all workers)\n",
+                     ns, ne, ns ? double(ne) / ns : 0.0, mx, nf, ra ? double(pa) / ra : 1.0);
+        }
         // MLIPCPP_LOG_PARAMS=a,b: mean |x| and max |x| of those tensors (GGUF names) at each log line
         if (const char *lp = std::getenv("MLIPCPP_LOG_PARAMS"); lp && *lp) {
           std::string names = lp, out;
