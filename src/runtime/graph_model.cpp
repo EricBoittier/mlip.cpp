@@ -1910,10 +1910,10 @@ ModelResult GraphModel::predict_single_impl(
     }
   }
 
-  // Sum and scale. MLIPCPP_ENERGY_SUM_F64=1: in double, as the cached path (read_cached_outputs) does; the fp32 sum
-  // below differs from it by up to ~0.1 meV/atom at a few thousand atoms (0.19 eV at 3000), which an MD run sees as a
-  // jump of E_tot whenever a structure moves between the cached path (one cluster) and this one (split clusters).
-  static const bool sum_f64 = [] { const char *e = std::getenv("MLIPCPP_ENERGY_SUM_F64"); return e && *e == '1'; }();
+  // Sum and scale in double, as the cached path (read_cached_outputs) does. The earlier fp32 sum (MLIPCPP_ENERGY_SUM_F64=0)
+  // differs from it by up to ~0.1 meV/atom at a few thousand atoms (0.19 eV at 3000), which an MD run sees as a jump of
+  // E_tot whenever a structure moves between the cached path (one cluster) and this one (split clusters).
+  static const bool sum_f64 = [] { const char *e = std::getenv("MLIPCPP_ENERGY_SUM_F64"); return !(e && *e == '0'); }();
   if (sum_f64) {
     double model = 0, composition = 0;
     for (int i = 0; i < n_atoms; i++) {
