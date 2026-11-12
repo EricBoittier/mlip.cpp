@@ -152,4 +152,49 @@ void install_lrc_blend(GraphInterpreter &interp, ggml_tensor *blend) {
   };
 }
 
+void install_lrc_readout(GraphInterpreter &interp, ggml_tensor *q) {
+  const GIRGraph &G = interp.graph();
+  auto node_id = [](const std::string &ref) { return ref.rfind("node:", 0) == 0 ? std::stoi(ref.substr(5)) : -1; };
+  // the per-atom energy: the output node, or its first input when the output concatenates [E, non-conservative F]
+  if (G.outputs.empty()) throw std::runtime_error("lrc readout: the graph has no output");
+  int e_id = node_id(G.outputs[0].node_ref);
+  if (const GIRNode *o = G.get_node(e_id); o && o->op == "CONCAT") e_id = node_id(o->inputs[0]);
+  // h: the input of the last node-energy head's first LINEAR (node_energy_heads_K_0_weight, largest K)
+  int h_id = -1, best = -1;
+  for (const auto &nd : G.nodes) {
+    if (nd.op != "LINEAR") continue;
+    for (const auto &r : nd.inputs) {
+      const std::string pre = "weight:node_energy_heads_";
+      if (r.rfind(pre, 0) != 0 || r.size() < pre.size() + 9 || r.substr(r.size() - 9) != "_0_weight") continue;
+      const int k = std::stoi(r.substr(pre.size()));
+      if (k > best) best = k, h_id = node_id(nd.inputs[0]);
+    }
+  }
+  if (e_id < 0 || h_id < 0) throw std::runtime_error("lrc readout: cannot find the per-atom energy / node features");
+  auto prev = interp.post_node;
+  interp.post_node = [&interp, q, e_id, h_id, prev](ggml_context *ctx, const GIRNode &node, ggml_tensor *out) {
+    if (prev) out = prev(ctx, node, out);
+    if (node.id != e_id) return out;
+    ggml_tensor *W = interp.find_weight("lrc_readout_weight"), *beta = interp.find_weight("lrc_readout_bias");
+    if (!W || !beta) throw std::runtime_error("lrc readout: the GGUF has no lrc_readout_weight / lrc_readout_bias");
+    ggml_tensor *h = interp.node_outputs().at(h_id);
+    const int64_t n = ggml_nelements(q);
+    if (!ggml_is_contiguous(h)) h = ggml_cont(ctx, h);
+    h = ggml_reshape_2d(ctx, h, h->ne[0], ggml_nelements(h) / h->ne[0]);
+    if (h->ne[1] != n || W->ne[0] != h->ne[0] || W->ne[1] != 2 || ggml_nelements(beta) != 2)
+      throw std::runtime_error("lrc readout: shapes (W [2, d], beta [2], h [n, d], q [n]) do not match");
+    ggml_tensor *ab = ggml_mul_mat(ctx, W, h); // [2, n]
+    ab = ggml_add(ctx, ab, ggml_repeat(ctx, ggml_reshape_2d(ctx, beta, 2, 1), ab));
+    ggml_tensor *a = ggml_cont(ctx, ggml_view_2d(ctx, ab, 1, n, ab->nb[1], 0));
+    ggml_tensor *b = ggml_cont(ctx, ggml_view_2d(ctx, ab, 1, n, ab->nb[1], sizeof(float)));
+    // softplus(b) = relu(b) + log(1 + exp(-|b|)): finite for any b (-log sigmoid(-b) overflows for b > ~88)
+    ggml_tensor *sp = ggml_add(ctx, ggml_relu(ctx, b),
+                               ggml_log(ctx, ggml_scale_bias(ctx, ggml_exp(ctx, ggml_neg(ctx, ggml_abs(ctx, b))), 1.0f, 1.0f)));
+    ggml_tensor *qq = ggml_reshape_2d(ctx, q, 1, n);
+    ggml_tensor *e = ggml_add(ctx, ggml_mul(ctx, a, qq), ggml_scale(ctx, ggml_mul(ctx, sp, ggml_sqr(ctx, qq)), 0.5f));
+    if (ggml_nelements(out) != n) throw std::runtime_error("lrc readout: per-atom energy of the wrong size");
+    return ggml_add(ctx, out, ggml_reshape(ctx, e, out));
+  };
+}
+
 } // namespace mlipcpp::runtime

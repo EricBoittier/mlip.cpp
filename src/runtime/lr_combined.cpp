@@ -122,8 +122,9 @@ LrcSpec LrcSpec::from_gguf(const GGUFLoader &G, const SqeSpec &S) {
   }
   {
     const std::string cm = G.get_string("pet.plato_lr.lrc_cond", "cluster");
-    if (cm != "cluster" && cm != "global") throw std::runtime_error("lrc: lrc_cond must be cluster or global");
-    L.cond_global = cm == "global";
+    if (cm != "cluster" && cm != "global" && cm != "neutral")
+      throw std::runtime_error("lrc: lrc_cond must be cluster, global or neutral");
+    L.cond_global = cm == "global", L.cond_neutral = cm == "neutral";
     scalar("cond_w", L.cond_w);
     if (G.get_int32("pet.plato_lr.lrc_qplateau", 0) != 0)
       throw std::runtime_error("lrc_qplateau was removed (it lost sum q = Q and double-counted partly linked partners); "
@@ -176,6 +177,28 @@ LrcSpec LrcSpec::from_gguf(const GGUFLoader &G, const SqeSpec &S) {
       if (L.pol_Z.empty() || L.pol_Z.size() != L.pol_alpha.size())
         throw std::runtime_error("lrc pol: needs lrc_pol_Z and lrc_pol_alpha of equal length");
     }
+    { // combo components (SPEC.md)
+      const std::string ref = G.get_string("pet.plato_lr.lrc_q0_ref", "fukui");
+      if (ref == "fukui") L.q0_ref = LrcSpec::Q0Ref::Fukui;
+      else if (ref == "fermi") L.q0_ref = LrcSpec::Q0Ref::Fermi;
+      else if (ref == "threshold") L.q0_ref = LrcSpec::Q0Ref::Threshold;
+      else if (ref == "species_fill") L.q0_ref = LrcSpec::Q0Ref::SpeciesFill;
+      else if (ref == "qeq") L.q0_ref = LrcSpec::Q0Ref::Qeq;
+      else throw std::runtime_error("lrc graph: lrc_q0_ref must be fukui, fermi, threshold, species_fill or qeq");
+      L.fermi_K = G.get_int32("pet.plato_lr.lrc_fermi_K", 3);
+      scalar("fermi_T", L.fermi_T), scalar("smear", L.smear), scalar("flow_rc", L.flow_rc);
+      L.smodel = G.get_string("pet.plato_lr.lrc_smodel", "");
+      L.thr_theta = get_f64(G, "pet.plato_lr.lrc_thr_theta");
+      L.sf_score = get_f64(G, "pet.plato_lr.lrc_sf_score"), L.sf_scale = get_f64(G, "pet.plato_lr.lrc_sf_scale");
+      L.qeq_eta = get_f64(G, "pet.plato_lr.lrc_qeq_eta");
+      L.flow_passes = G.get_int32("pet.plato_lr.lrc_flow_passes", 0);
+      const std::string fk = G.get_string("pet.plato_lr.lrc_flow_kernel", "local");
+      if (fk != "local" && fk != "coulomb") throw std::runtime_error("lrc graph: lrc_flow_kernel must be local or coulomb");
+      L.flow_coulomb = fk == "coulomb";
+      L.flow_kappa = get_f64(G, "pet.plato_lr.lrc_flow_kappa");
+      L.readout = G.get_int32("pet.plato_lr.lrc_readout", 0) != 0;
+      L.combo_check();
+    }
     return L;
   }
   const size_t E = S.Z.size();
@@ -205,7 +228,7 @@ void LrcSpec::to_gguf(gguf_context *g) const {
   scalar("a_on", a_on), scalar("a_off", a_off), scalar("T", T), scalar("D", D), scalar("tau", tau);
   scalar("merge_w", merge_w);
   gguf_set_val_str(g, "pet.plato_lr.lrc_q0_mode", graph ? "graph" : round ? "round" : head_only ? "head" : "fermi2");
-  gguf_set_val_str(g, "pet.plato_lr.lrc_cond", cond_global ? "global" : "cluster");
+  gguf_set_val_str(g, "pet.plato_lr.lrc_cond", cond_global ? "global" : cond_neutral ? "neutral" : "cluster");
   scalar("cond_w", cond_w);
   gguf_set_val_i32(g, "pet.plato_lr.lrc_qproj", qproj ? 1 : 0);
   scalar("qproj_w", qproj_w);
@@ -237,6 +260,22 @@ void LrcSpec::to_gguf(gguf_context *g) const {
       std::vector<double> pz(pol_Z.begin(), pol_Z.end());
       arr("pol_Z", pz), arr("pol_alpha", pol_alpha);
     }
+    if (q0_ref != Q0Ref::Fukui) { // absent = fukui (earlier GGUFs unchanged)
+      static const char *refs[] = {"fukui", "fermi", "threshold", "species_fill", "qeq"};
+      gguf_set_val_str(g, "pet.plato_lr.lrc_q0_ref", refs[static_cast<int>(q0_ref)]);
+      gguf_set_val_i32(g, "pet.plato_lr.lrc_fermi_K", fermi_K);
+      scalar("fermi_T", fermi_T), scalar("smear", smear);
+      if (!smodel.empty()) gguf_set_val_str(g, "pet.plato_lr.lrc_smodel", smodel.c_str());
+      if (!thr_theta.empty()) arr("thr_theta", thr_theta);
+      if (!sf_score.empty()) arr("sf_score", sf_score), arr("sf_scale", sf_scale);
+      if (!qeq_eta.empty()) arr("qeq_eta", qeq_eta);
+    }
+    if (flow_passes > 0) {
+      gguf_set_val_i32(g, "pet.plato_lr.lrc_flow_passes", flow_passes);
+      gguf_set_val_str(g, "pet.plato_lr.lrc_flow_kernel", flow_coulomb ? "coulomb" : "local");
+      scalar("flow_rc", flow_rc), scalar("smear", smear), arr("flow_kappa", flow_kappa);
+    }
+    if (readout) gguf_set_val_i32(g, "pet.plato_lr.lrc_readout", 1);
     return;
   }
   if (round || head_only) return;
@@ -565,6 +604,28 @@ void LrcSpec::fukui_check() const {
     throw std::runtime_error("lrc graph: lrc_fukui_cluster_w must be in (0, 1]");
 }
 
+int LrcSpec::elem(int z) const {
+  for (size_t k = 0; k < fukui_Z.size(); k++)
+    if (fukui_Z[k] == z) return static_cast<int>(k);
+  throw std::runtime_error("lrc graph: no combo parameters for atomic number " + std::to_string(z));
+}
+
+void LrcSpec::combo_check() const {
+  const size_t E = fukui_Z.size();
+  if (!combo() && !readout && !cond_neutral) return;
+  if (combo() && fukui_cluster) throw std::runtime_error("lrc combo: the Fukui scope cluster (AC) cannot be combined with lrc_q0_ref / flows");
+  if (!(fermi_K >= 1) || !(fermi_T > 0) || !(smear > 0)) throw std::runtime_error("lrc combo: needs lrc_fermi_K >= 1, lrc_fermi_T > 0, lrc_smear > 0");
+  if ((q0_ref == Q0Ref::Fermi || q0_ref == Q0Ref::Threshold) && smodel.empty() && !ssrc)
+    throw std::runtime_error("lrc combo: lrc_q0_ref fermi / threshold needs the score pass lrc_smodel");
+  if (q0_ref == Q0Ref::Threshold && (thr_theta.size() != E || fukui_mode == FukuiMode::AtomPM))
+    throw std::runtime_error("lrc combo: threshold needs lrc_thr_theta per lrc_fukui_Z and uniform / element / atom weights");
+  if (q0_ref == Q0Ref::SpeciesFill && (sf_score.size() != E || sf_scale.size() != E))
+    throw std::runtime_error("lrc combo: species_fill needs lrc_sf_score / lrc_sf_scale per lrc_fukui_Z");
+  if (q0_ref == Q0Ref::Qeq && qeq_eta.size() != E) throw std::runtime_error("lrc combo: qeq needs lrc_qeq_eta per lrc_fukui_Z");
+  if (flow_passes < 0 || (flow_passes > 0 && (flow_kappa.size() != E * E || !(flow_rc > 1))))
+    throw std::runtime_error("lrc combo: flows need lrc_flow_kappa (E x E) and lrc_flow_rc > 1");
+}
+
 // ---- atomic multipoles (graph mode, lrc_mp) ---------------------------------------------------------------------------
 void LrcSpec::mp_build() {
   const size_t E = mp_Z.size(), K = mp_centers.size();
@@ -817,12 +878,15 @@ LrcCondition lrc_condition(const LrcSpec &L, const SqeSpec &S, int n, const int3
   c.Q0.assign(s, 0.0), c.Qloc.assign(s, 0.0), c.S.assign(s, 0.0), c.dS.assign(s, 0.0), c.k.assign(s, 0);
   if (s == 1) {
     c.Q0[0] = c.Qloc[0] = Q;
+    if (L.graph && L.needs_q_always()) c.q0 = lrc_q0(L, S, n, Z, x, Q, spin); // the readout's charges
+    if (L.cond_neutral) c.Qloc[0] = 0.0;
   } else {
     c.q0 = lrc_q0(L, S, n, Z, x, Q, spin);
     for (int i = 0; i < n; i++) c.Q0[c.cl.sn[i]] += c.q0.q0[i];
     for (int a = 0; a < s; a++)
       for (int b = 0; b < s; b++) c.Qloc[a] += c.cl.R[size_t(a) * s + b] * c.Q0[b];
     if (L.cond_global) c.Qloc.assign(s, Q); // global conditioning: no position dependence (dS = 0)
+    if (L.cond_neutral) c.Qloc.assign(s, 0.0); // neutral: every atom on the Q = 0 row (dS = 0)
   }
   for (int a = 0; a < s; a++) {
     double v = c.Qloc[a];
@@ -844,7 +908,7 @@ LrcCondition lrc_condition(const LrcSpec &L, const SqeSpec &S, int n, const int3
 void lrc_condition_forces(const LrcSpec &L, const SqeSpec &S, const LrcCondition &c, int n, const int32_t *Z,
                           const double *x, const std::vector<double> &G, double *F) {
   const int s = c.cl.s;
-  if (s == 1 || L.cond_global) return;
+  if (s == 1 || L.cond_global || L.cond_neutral) return;
   std::vector<double> g(3 * size_t(n), 0.0), W(size_t(s) * s, 0.0), cq(n, 0.0);
   std::vector<double> gs(s);
   for (int a = 0; a < s; a++) gs[a] = G[a] * c.dS[a]; // dE/dQloc_a
@@ -1071,7 +1135,7 @@ void fukui_channel(const LrcSpec &L, int n, const int32_t *Z, const double *x, d
 
 // graph mode: q0 = q_raw + w (Q - sum q_raw), w = f / sum f (A+-: blend of f+ / F+ and f- / F- by the residual's sign);
 // Fukui scope "cluster": the residual-routing soft-cluster projection of q_raw instead
-LrcQ0 q0_graph(const LrcSpec &L, int n, const int32_t *Z, const double *x, double Q, int spin) {
+LrcQ0 q0_graph_fukui(const LrcSpec &L, int n, const int32_t *Z, const double *x, double Q, int spin) {
   if (!L.qsrc) throw std::runtime_error("lrc graph: the charge pass (lrc_qmodel) is not loaded");
   LrcQ0 o;
   o.Q = Q, o.spin = spin;
@@ -1104,7 +1168,8 @@ LrcQ0 q0_graph(const LrcSpec &L, int n, const int32_t *Z, const double *x, doubl
 }
 
 // dE/dx of sum_i c_i q0_i: the raw-charge pass with weights c_j - dE/dr, the Fukui pass(es) with r d(f / F)/da
-void vjp_graph(const LrcSpec &L, int n, const int32_t *Z, const double *x, const LrcQ0 &o, const double *c, double *g) {
+void vjp_graph_fukui(const LrcSpec &L, int n, const int32_t *Z, const double *x, const LrcQ0 &o, const double *c,
+                     double *g) {
   const double Qp = L.qpass_neutral ? 0.0 : o.Q;
   std::vector<double> w(n), u(n, 0.0);
   bool any = false;
@@ -1140,6 +1205,319 @@ void vjp_graph(const LrcSpec &L, int n, const int32_t *Z, const double *x, const
   if (!pm) return;
   for (int i = 0; i < n; i++) u[i] = o.r * o.s / o.Fm * (c[i] - cm);
   fpass(L.fsrc_minus.get(), o.dfm);
+}
+
+// ---- combo components (feat/plato-lr-combo; after M. Langer, ipsum/PET-LR; combo/SPEC.md) ----------------------------
+constexpr double kKE = 14.399645;
+inline double softplus(double u) { return u > 30 ? u : std::log1p(std::exp(u)); }
+
+// staircase occupation n(x) = sum_{k=-K}^{K-1} sigmoid((x - k - 1/2) / T) - K and n'(x)
+inline void stair(int K, double T, double x, double &v, double &d) {
+  v = -K, d = 0;
+  for (int k = -K; k < K; k++) {
+    const double sg = sig((x - k - 0.5) / T);
+    v += sg, d += sg * (1.0 - sg) / T;
+  }
+}
+
+// mu with sum_i c_i n(s_i - mu) = target (c = 1 when null): bisection, then safeguarded Newton to 1e-13
+double solve_mu(const LrcSpec &L, const std::vector<double> &s, const std::vector<double> *c, double target) {
+  const int n = static_cast<int>(s.size());
+  double cs = 0;
+  for (int i = 0; i < n; i++) cs += c ? (*c)[i] : 1.0;
+  if (!(std::abs(target) < L.fermi_K * cs - 1e-9))
+    throw std::runtime_error("lrc combo: the residual " + std::to_string(target) + " is outside the fill's range");
+  auto res = [&](double mu, double &dres) {
+    double v = 0;
+    dres = 0;
+    for (int i = 0; i < n; i++) {
+      double o, d;
+      stair(L.fermi_K, L.fermi_T, s[i] - mu, o, d);
+      const double w = c ? (*c)[i] : 1.0;
+      v += w * o, dres -= w * d;
+    }
+    return v - target;
+  };
+  double lo = *std::min_element(s.begin(), s.end()) - L.fermi_K - 1 - 40 * L.fermi_T;
+  double hi = *std::max_element(s.begin(), s.end()) + L.fermi_K + 1 + 40 * L.fermi_T, d;
+  for (int it = 0; it < 200 && hi - lo > 1e-12; it++) {
+    const double mid = 0.5 * (lo + hi);
+    (res(mid, d) > 0 ? lo : hi) = mid; // residual decreases with mu
+  }
+  double mu = 0.5 * (lo + hi);
+  for (int it = 0; it < 60; it++) { // Newton to round-off (the FD tests see a root error / h)
+    const double v = res(mu, d);
+    if (v == 0 || d == 0) break;
+    const double nm = mu - v / d;
+    if (!(nm > lo - 1e-9 && nm < hi + 1e-9)) break;
+    const double step = std::abs(nm - mu);
+    mu = nm;
+    if (step < 1e-15 * std::max(1.0, std::abs(mu))) break;
+  }
+  return mu;
+}
+
+// Gaussian-charge kernel K(r) = KE erf(r / sqrt2 sigma) / r and dK/dr (KE = 1: the coulomb flow weight)
+inline void gkernel(double sigma, double r, double ke, double &k, double &dk) {
+  const double a = 1.0 / (std::sqrt(2.0) * sigma), er = std::erf(a * r);
+  k = ke * er / r;
+  dk = ke * (2.0 * a / std::sqrt(M_PI) * std::exp(-a * a * r * r) / r - er / (r * r));
+}
+// flow coupling kappa_ij(r) and d kappa / dr
+inline void flow_kappa(const LrcSpec &L, int ei, int ej, double r, double &kap, double &dkap) {
+  const size_t E = L.fukui_Z.size();
+  const double sp = softplus(0.5 * (L.flow_kappa[size_t(ei) * E + ej] + L.flow_kappa[size_t(ej) * E + ei]));
+  double w, dw;
+  if (L.flow_coulomb) gkernel(L.smear, r, 1.0, w, dw);
+  else {
+    const double t = r - L.flow_rc + 1.0;
+    w = 1.0 - sstep(t), dw = -dsstep(t);
+  }
+  kap = sp * w, dkap = sp * dw;
+}
+
+// dense Cholesky of an SPD matrix (in place, lower) and the solve
+void chol(std::vector<double> &A, int n) {
+  for (int j = 0; j < n; j++) {
+    double d = A[size_t(j) * n + j];
+    for (int k = 0; k < j; k++) d -= A[size_t(j) * n + k] * A[size_t(j) * n + k];
+    if (!(d > 0)) throw std::runtime_error("lrc combo qeq: J + K is not positive definite");
+    A[size_t(j) * n + j] = std::sqrt(d);
+    for (int i = j + 1; i < n; i++) {
+      double v = A[size_t(i) * n + j];
+      for (int k = 0; k < j; k++) v -= A[size_t(i) * n + k] * A[size_t(j) * n + k];
+      A[size_t(i) * n + j] = v / A[size_t(j) * n + j];
+    }
+  }
+}
+std::vector<double> chol_solve(const std::vector<double> &Lc, int n, std::vector<double> b) {
+  for (int i = 0; i < n; i++) {
+    for (int k = 0; k < i; k++) b[i] -= Lc[size_t(i) * n + k] * b[k];
+    b[i] /= Lc[size_t(i) * n + i];
+  }
+  for (int i = n - 1; i >= 0; i--) {
+    for (int k = i + 1; k < n; k++) b[i] -= Lc[size_t(k) * n + i] * b[k];
+    b[i] /= Lc[size_t(i) * n + i];
+  }
+  return b;
+}
+// QEq matrix A = diag(J) + K (Cholesky factor) and J
+void qeq_matrix(const LrcSpec &L, int n, const int32_t *Z, const double *x, std::vector<double> &Lc, std::vector<double> &J) {
+  if (n > 2000) throw std::runtime_error("lrc combo qeq: dense solve limited to 2000 atoms");
+  Lc.assign(size_t(n) * n, 0.0), J.resize(n);
+  const double self = kKE * std::sqrt(2.0 / M_PI) / L.smear;
+  for (int i = 0; i < n; i++) {
+    J[i] = softplus(L.qeq_eta[L.elem(Z[i])]);
+    Lc[size_t(i) * n + i] = J[i] + self;
+    for (int j = 0; j < i; j++) {
+      double k, dk;
+      gkernel(L.smear, dist(x, i, j), kKE, k, dk);
+      Lc[size_t(i) * n + j] = Lc[size_t(j) * n + i] = k;
+    }
+  }
+  chol(Lc, n);
+}
+
+// flow pass on q: dq (out), phi (out)
+void flow_step(const LrcSpec &L, int n, const int32_t *Z, const double *x, const std::vector<double> &q,
+               std::vector<double> &dq, std::vector<double> &phi) {
+  phi.assign(n, 0.0), dq.assign(n, 0.0);
+  std::vector<int> e(n);
+  for (int i = 0; i < n; i++) e[i] = L.elem(Z[i]);
+  for (int i = 0; i < n; i++)
+    for (int j = 0; j < i; j++) {
+      double k, dk;
+      gkernel(L.smear, dist(x, i, j), kKE, k, dk);
+      phi[i] += k * q[j], phi[j] += k * q[i];
+    }
+  for (int i = 0; i < n; i++)
+    for (int j = 0; j < i; j++) {
+      const double r = dist(x, i, j);
+      if (!L.flow_coulomb && r >= L.flow_rc) continue;
+      double kap, dkap;
+      flow_kappa(L, e[i], e[j], r, kap, dkap);
+      const double t = kap * (phi[j] - phi[i]);
+      dq[i] += t, dq[j] -= t;
+    }
+}
+
+LrcQ0 q0_graph(const LrcSpec &L, int n, const int32_t *Z, const double *x, double Q, int spin) {
+  if (!L.combo()) return q0_graph_fukui(L, n, Z, x, Q, spin);
+  LrcQ0 o;
+  if (L.q0_ref == LrcSpec::Q0Ref::Fukui) o = q0_graph_fukui(L, n, Z, x, Q, spin);
+  else {
+    if (!L.qsrc) throw std::runtime_error("lrc graph: the charge pass (lrc_qmodel) is not loaded");
+    o.Q = Q, o.spin = spin;
+    if (n == 0) return o;
+    const double Qp = L.qpass_neutral ? 0.0 : Q, B = L.fermi_K + 2.0;
+    o.qraw = L.qsrc->raw(n, Z, x, Qp, spin);
+    double sq = 0;
+    for (int i = 0; i < n; i++) sq += o.qraw[i];
+    o.r = Q - sq, o.q0 = o.qraw;
+    o.occ.assign(n, 0.0), o.docc.assign(n, 0.0);
+    auto scores = [&]() {
+      if (!L.ssrc) throw std::runtime_error("lrc combo: the score pass (lrc_smodel) is not loaded");
+      const std::vector<double> sr = L.ssrc->raw(n, Z, x, Qp, spin);
+      o.score.resize(n);
+      for (int i = 0; i < n; i++) o.score[i] = B * std::tanh(sr[i] / B);
+    };
+    switch (L.q0_ref) {
+    case LrcSpec::Q0Ref::Fermi: {
+      scores();
+      o.mu = solve_mu(L, o.score, nullptr, o.r);
+      for (int i = 0; i < n; i++) stair(L.fermi_K, L.fermi_T, o.score[i] - o.mu, o.occ[i], o.docc[i]), o.M += o.docc[i];
+      for (int i = 0; i < n; i++) o.q0[i] += o.occ[i];
+      break;
+    }
+    case LrcSpec::Q0Ref::Threshold: {
+      scores();
+      fukui_channel(L, n, Z, x, Qp, spin, false, o.fp, o.dfp);
+      for (int i = 0; i < n; i++) {
+        stair(L.fermi_K, L.fermi_T, o.score[i] - L.thr_theta[L.elem(Z[i])], o.occ[i], o.docc[i]);
+        o.M += o.docc[i], o.sum_p += o.occ[i], o.Fp += o.fp[i];
+      }
+      o.wt.resize(n);
+      for (int i = 0; i < n; i++) o.wt[i] = o.fp[i] / o.Fp, o.q0[i] += o.occ[i] + o.wt[i] * (o.r - o.sum_p);
+      break;
+    }
+    case LrcSpec::Q0Ref::SpeciesFill: {
+      o.score.resize(n), o.fp.resize(n); // fp: c_Z
+      for (int i = 0; i < n; i++) {
+        const int e = L.elem(Z[i]);
+        o.score[i] = B * std::tanh(L.sf_score[e] / B), o.fp[i] = softplus(L.sf_scale[e]);
+      }
+      o.mu = solve_mu(L, o.score, &o.fp, o.r);
+      for (int i = 0; i < n; i++) {
+        stair(L.fermi_K, L.fermi_T, o.score[i] - o.mu, o.occ[i], o.docc[i]);
+        o.M += o.fp[i] * o.docc[i], o.q0[i] += o.fp[i] * o.occ[i];
+      }
+      break;
+    }
+    case LrcSpec::Q0Ref::Qeq: {
+      std::vector<double> Lc, J;
+      qeq_matrix(L, n, Z, x, Lc, J);
+      std::vector<double> b(n), one(n, 1.0);
+      for (int i = 0; i < n; i++) b[i] = J[i] * o.qraw[i];
+      const std::vector<double> y = chol_solve(Lc, n, b), z = chol_solve(Lc, n, one);
+      double sy = 0, sz = 0;
+      for (int i = 0; i < n; i++) sy += y[i], sz += z[i];
+      const double lam = (Q - sy) / sz;
+      for (int i = 0; i < n; i++) o.q0[i] = y[i] + lam * z[i];
+      o.fp = J;
+      break;
+    }
+    default: break;
+    }
+  }
+  o.qref = o.q0;
+  o.qflow.clear();
+  for (int p = 0; p < L.flow_passes; p++) {
+    std::vector<double> dq, phi;
+    o.qflow.push_back(o.q0);
+    flow_step(L, n, Z, x, o.q0, dq, phi);
+    for (int i = 0; i < n; i++) o.q0[i] += dq[i];
+  }
+  return o;
+}
+
+// dE/dx of sum_i c_i q_i through the flows: c (in: dE/dq after the flows, out: dE/dq of the reference), g += positions
+void flows_vjp(const LrcSpec &L, int n, const int32_t *Z, const double *x, const LrcQ0 &o, std::vector<double> &c,
+               double *g) {
+  std::vector<int> e(n);
+  for (int i = 0; i < n; i++) e[i] = L.elem(Z[i]);
+  for (int p = static_cast<int>(o.qflow.size()) - 1; p >= 0; p--) {
+    const std::vector<double> &q = o.qflow[p];
+    std::vector<double> dq, phi, psi(n, 0.0);
+    flow_step(L, n, Z, x, q, dq, phi);
+    // psi_j = dE/dphi_j = sum_i kappa_ij (c_i - c_j); the kappa(r) part of the position gradient
+    for (int i = 0; i < n; i++)
+      for (int j = 0; j < i; j++) {
+        const double r = dist(x, i, j);
+        if (!L.flow_coulomb && r >= L.flow_rc) continue;
+        double kap, dkap;
+        flow_kappa(L, e[i], e[j], r, kap, dkap);
+        psi[j] += kap * (c[i] - c[j]), psi[i] += kap * (c[j] - c[i]);
+        add_pair(g, x, i, j, r, (c[i] - c[j]) * (phi[j] - phi[i]) * dkap);
+      }
+    // phi = K0 q: dE/dq += K0 psi; the K(r) part
+    std::vector<double> cn(c);
+    for (int i = 0; i < n; i++)
+      for (int j = 0; j < i; j++) {
+        const double r = dist(x, i, j);
+        double k, dk;
+        gkernel(L.smear, r, kKE, k, dk);
+        cn[i] += k * psi[j], cn[j] += k * psi[i];
+        add_pair(g, x, i, j, r, (psi[i] * q[j] + psi[j] * q[i]) * dk);
+      }
+    c = cn;
+  }
+}
+
+void vjp_graph(const LrcSpec &L, int n, const int32_t *Z, const double *x, const LrcQ0 &o, const double *c0, double *g) {
+  if (!L.combo()) return vjp_graph_fukui(L, n, Z, x, o, c0, g);
+  if (n == 0) return;
+  std::vector<double> c(c0, c0 + n);
+  if (!o.qflow.empty()) flows_vjp(L, n, Z, x, o, c, g);
+  if (L.q0_ref == LrcSpec::Q0Ref::Fukui) return vjp_graph_fukui(L, n, Z, x, o, c.data(), g);
+  const double Qp = L.qpass_neutral ? 0.0 : o.Q, B = L.fermi_K + 2.0;
+  std::vector<double> w(n), u(n, 0.0);
+  double cb = 0;
+  auto raw = [&]() {
+    bool any = false;
+    for (int i = 0; i < n; i++) any |= w[i] != 0;
+    if (any) L.qsrc->raw_vjp(n, Z, x, Qp, o.spin, w.data(), g);
+  };
+  auto score = [&]() { // dE/ds_raw_j = n'_j (c_j - cb) (1 - (s_j / B)^2)
+    bool any = false;
+    for (int j = 0; j < n; j++) u[j] = o.docc[j] * (c[j] - cb) * (1.0 - (o.score[j] / B) * (o.score[j] / B)), any |= u[j] != 0;
+    if (any) L.ssrc->raw_vjp(n, Z, x, Qp, o.spin, u.data(), g);
+  };
+  switch (L.q0_ref) {
+  case LrcSpec::Q0Ref::Fermi:
+    for (int i = 0; i < n; i++) cb += c[i] * o.docc[i];
+    cb /= std::max(o.M, 1e-300);
+    for (int i = 0; i < n; i++) w[i] = c[i] - cb;
+    raw(), score();
+    break;
+  case LrcSpec::Q0Ref::Threshold: {
+    for (int i = 0; i < n; i++) cb += c[i] * o.wt[i];
+    for (int i = 0; i < n; i++) w[i] = c[i] - cb;
+    raw(), score();
+    const double rr = o.r - o.sum_p;
+    if (L.fukui_atom() && rr != 0 && L.fsrc) { // r' d(f_i / F)/da, as the Fukui atom mode
+      for (int i = 0; i < n; i++) u[i] = rr / o.Fp * (c[i] - cb) * o.dfp[i];
+      L.fsrc->raw_vjp(n, Z, x, Qp, o.spin, u.data(), g);
+    }
+    break;
+  }
+  case LrcSpec::Q0Ref::SpeciesFill:
+    for (int i = 0; i < n; i++) cb += c[i] * o.fp[i] * o.docc[i];
+    cb /= std::max(o.M, 1e-300);
+    for (int i = 0; i < n; i++) w[i] = c[i] - cb;
+    raw();
+    break;
+  case LrcSpec::Q0Ref::Qeq: {
+    std::vector<double> Lc, J, one(n, 1.0);
+    qeq_matrix(L, n, Z, x, Lc, J);
+    std::vector<double> v = chol_solve(Lc, n, c), z = chol_solve(Lc, n, one);
+    double sv = 0, sz = 0;
+    for (int i = 0; i < n; i++) sv += v[i], sz += z[i];
+    for (int i = 0; i < n; i++) v[i] -= sv / sz * z[i];
+    const std::vector<double> &q = o.qref;
+    for (int i = 0; i < n; i++) {
+      w[i] = J[i] * v[i];
+      for (int j = 0; j < i; j++) {
+        const double r = dist(x, i, j);
+        double k, dk;
+        gkernel(L.smear, r, kKE, k, dk);
+        add_pair(g, x, i, j, r, -(v[i] * q[j] + v[j] * q[i]) * dk);
+      }
+    }
+    raw();
+    break;
+  }
+  default: break;
+  }
 }
 
 LrcEnergy energy_fixed(const LrcSpec &L, const SqeSpec &S, const LrcCondition &c, int n, const int32_t *Z,
@@ -1329,6 +1707,18 @@ LrcEnergy lrc_energy(const LrcSpec &L, const SqeSpec &S, const LrcCondition &c, 
   lrc_q0_vjp(L, S, n, Z, x, c.q0, so.dE_dq0.data(), g.data());
   lrc_clusters_vjp(L, c.cl, n, x, so.dE_dR, g.data());
   for (size_t k = 0; k < g.size(); k++) out.forces[k] = so.forces[k] - g[k];
+  return out;
+}
+
+std::vector<double> lrc_bec(const LrcSpec &L, const SqeSpec &S, const LrcQ0 &q, int n, const int32_t *Z, const double *x) {
+  std::vector<double> out(9 * size_t(n), 0.0), c(n), g;
+  for (int a = 0; a < 3; a++) {
+    for (int k = 0; k < n; k++) c[k] = x[3 * k + a];
+    g.assign(3 * size_t(n), 0.0);
+    lrc_q0_vjp(L, S, n, Z, x, q, c.data(), g.data());
+    for (int i = 0; i < n; i++)
+      for (int b = 0; b < 3; b++) out[9 * size_t(i) + 3 * a + b] = g[3 * size_t(i) + b] + (a == b ? q.q0[i] : 0.0);
+  }
   return out;
 }
 
