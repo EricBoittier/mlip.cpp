@@ -327,8 +327,14 @@ ggml_tensor *GraphInterpreter::build(ggml_context *ctx) {
 
 ggml_tensor *GraphInterpreter::rebuild_substituted(ggml_context *ctx, int target_id, const std::string &from,
                                                   const std::string &to) {
+  return rebuild_substituted(ctx, target_id, std::map<std::string, std::string>{{from, to}});
+}
+
+ggml_tensor *GraphInterpreter::rebuild_substituted(ggml_context *ctx, int target_id,
+                                                  const std::map<std::string, std::string> &subs) {
   const std::map<int, ggml_tensor *> saved = node_outputs_;
-  std::set<std::string> dirty = {from};
+  std::set<std::string> dirty;
+  for (const auto &[from, to] : subs) dirty.insert(from);
   ggml_tensor *out = nullptr;
   try {
     for (const auto &node : graph_.nodes) {
@@ -337,7 +343,7 @@ ggml_tensor *GraphInterpreter::rebuild_substituted(ggml_context *ctx, int target
       if (hit) {
         GIRNode copy = node;
         for (auto &r : copy.inputs)
-          if (r == from) r = to;
+          if (auto it = subs.find(r); it != subs.end()) r = it->second;
         ggml_tensor *t = build_node(ctx, copy);
         node_outputs_[node.id] = t;
         dirty.insert("node:" + std::to_string(node.id));
@@ -350,7 +356,8 @@ ggml_tensor *GraphInterpreter::rebuild_substituted(ggml_context *ctx, int target
     throw;
   }
   node_outputs_ = saved;
-  if (!out) throw std::runtime_error("rebuild_substituted: node " + std::to_string(target_id) + " does not depend on " + from);
+  if (!out) throw std::runtime_error("rebuild_substituted: node " + std::to_string(target_id) + " does not depend on " +
+                                     (subs.empty() ? std::string("(nothing)") : subs.begin()->first));
   return out;
 }
 

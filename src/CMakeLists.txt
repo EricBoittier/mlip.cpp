@@ -38,6 +38,7 @@ set(MLIPCPP_RUNTIME_SOURCES
     runtime/plato_graph.cpp
     runtime/pet_plato_lr.cpp
     runtime/frag_charges.cpp
+    runtime/energy_heads.cpp
     runtime/sqe.cpp
 )
 

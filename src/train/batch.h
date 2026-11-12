@@ -2,6 +2,7 @@
 
 #include "train/dataset.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <map>
@@ -14,10 +15,13 @@ namespace mlipcpp::train {
 /// metatrain does: energy E -> (E - Σ_i c_{Z_i}) / s_E, force F_i -> F_i / s_{Z_i}.
 struct TargetScaling {
   std::map<int, double> composition; // Z -> eV, least-squares fit
+  // multi-head models: head h's composition (h >= 1; head 0 = composition); empty: one head
+  std::vector<std::map<int, double>> head_composition;
+  int n_heads() const { return std::max<int>(1, static_cast<int>(head_composition.size())); }
   double energy_scale = 1.0;         // RMS of (E - comp) / N
   std::map<int, double> force_scale; // Z -> RMS of force components
 
-  double comp(const int32_t *Z, int n) const;
+  double comp(const int32_t *Z, int n, int head = 0) const;
   double fscale(int Z) const {
     auto it = force_scale.find(Z);
     return it == force_scale.end() ? 1.0 : it->second;
@@ -54,6 +58,13 @@ struct Batch {
   std::vector<float> force_target;  // [n_atoms, 3]: R F / s_Z
   std::vector<float> force_scale;   // [n_atoms]: s_Z, for physical metrics (0: padding)
   std::vector<float> force_mask;    // [n_atoms]: 1 real atom, 0 padding atom
+  // multi-head models (TargetScaling::n_heads() > 1): one-hot energy head of each atom's structure,
+  // [n_heads, n_atoms] (padding atoms: head 0), and each real structure's head
+  int n_heads = 1;
+  std::vector<float> head_mask;
+  std::vector<int32_t> system_head; // [n_real_systems]
+  // weight of each structure's energy label, [n_systems] (MemmapSplit::energy_weight; padding: 0); 0 = forces only
+  std::vector<float> energy_mask;
   std::vector<int32_t> n_per_system;
   // charge and spin multiplicity of each atom's structure (padding atoms: 0, 1),
   // the conditioned model's table rows are made from them at upload

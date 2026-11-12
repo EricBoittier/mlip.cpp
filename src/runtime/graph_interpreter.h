@@ -55,6 +55,8 @@ public:
   // replaced by `to`, through the nodes that depend on it (the others keep their built outputs).
   // For use inside post_node / custom_op while building; the built outputs are left unchanged.
   ggml_tensor *rebuild_substituted(ggml_context *ctx, int target_id, const std::string &from, const std::string &to);
+  // The same with several references replaced at once (from -> to).
+  ggml_tensor *rebuild_substituted(ggml_context *ctx, int target_id, const std::map<std::string, std::string> &subs);
 
   // A registered weight, or nullptr
   ggml_tensor *find_weight(const std::string &name) const {

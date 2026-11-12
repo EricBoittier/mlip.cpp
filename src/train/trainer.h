@@ -8,6 +8,7 @@
 #include <ggml-alloc.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <functional>
 #include <map>
@@ -21,6 +22,10 @@ namespace mlipcpp::train {
 /// metatrain PET defaults, with the batch size counted per GPU as in DDP.
 struct TrainOptions {
   std::string data_dir;   // holds train/ val/ test/ (metatrain MemmapDataset)
+  // streamed training data: epoch k trains on the split in fmt::format(data_chunks, k) (e.g. "DIR/chunk{:05d}")
+  // instead of data_dir/train; every chunk must give at least as many steps as data_dir/train; the next chunk is
+  // loaded (and its neighbour lists built) while the current one trains. "" = data_dir/train every epoch
+  std::string data_chunks;
   std::string init_gguf;  // PET exported with --nc-forces (forces mode)
   std::string output;     // trained GGUF; <output>.epoch<k> after each epoch
   std::string cache_dir;  // neighbour-list cache ("" = none)
@@ -159,6 +164,12 @@ struct StepStats {
   double loss_frag = 0, se_frag = 0; // fragment-sum charge loss: loss term, sum of squared fragment errors (e^2)
   int64_t n_frag = 0;
   double se_energy_per_atom = 0; // Σ_s (ΔE_s / N_s)^2, eV^2
+  int64_t n_energy_masked = 0;   // structures without an energy label (energy_weight 0): not in the energy metrics
+  // per energy head (multi-head models; conservative mode): structures with an energy label, |ΔE|/N and ΔE^2/N^2 sums
+  // (eV), force components, |ΔF| and ΔF^2 sums
+  static constexpr int kHeads = 4;
+  std::array<int64_t, kHeads> h_ne{}, h_nf{};
+  std::array<double, kHeads> h_ae_e{}, h_se_e{}, h_ae_f{}, h_se_f{};
   double se_force = 0;           // Σ_i,k ΔF_ik^2, (eV/Å)^2 (conservative mode: of -dE/dx)
   // MAE and R^2 = 1 - SSE / SST (energies per atom after the composition,
   // force components pooled): Σ|ΔE_s / N_s|, Σ|ΔF_ik| (conservative mode
@@ -242,6 +253,9 @@ public:
     double weight = 0.0, r_min = 1.0;
   } charge_corr;
   bool frag_cond_gate = false; // gated unit conditioning (input charge_index_unit)
+  /// energy label weights (Batch::energy_mask) multiply the energy residuals; on for multi-head models and data
+  /// with energy_weight.bin
+  bool energy_mask = false;
   // split-charge equilibration: the shared spec (updated between steps) and this worker's gradient
   // accumulator (summed over its micro-batches); sqe_energy_sum: sum of the SQE energies seen (eV), for the log
   const runtime::SqeSpec *sqe = nullptr;
@@ -325,6 +339,8 @@ private:
     // fragment-sum charge loss: inputs (column one-hot [n, F], targets [F], weight x norm), error per column [F]
     ggml_tensor *fonehot = nullptr, *ftarget = nullptr, *fw = nullptr, *frag_d = nullptr;
     ggml_tensor *ecot = nullptr; // tail loss: dL/d(d_energy) per structure [S, 1]
+    ggml_tensor *head_mask = nullptr;   // multi-head: one-hot head per atom {n, H}
+    ggml_tensor *emask = nullptr;       // energy label weight per structure {S, 1}
     ~StepGraph();
   };
   /// graph kinds: the loss (FORWARD / BACKWARD to the weights); conservative
