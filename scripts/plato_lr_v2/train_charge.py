@@ -132,12 +132,17 @@ def loader(sp, chunks, nl_opts, rotate, seed, workers):
                                        persistent_workers=False)
 
 
+FUKUI = "element"  # --fukui: uniform (f = 1) or element (f = softplus(phi_Z)); the per-atom modes (atom, atom_pm,
+# atom_cluster) of feat/plato-lr-fukui are fitted on frozen backbone features by scripts/plato_lr_fukui/fit_fukui.py
+# (the head_q0 route the fine-tunes use); this scratch network has one per-atom output and no Fukui channel
+
+
 def forward(model, phi, systems, Q, sid, dev):
     from metatomic.torch import ModelOutput
     out = model(systems, {"energy": ModelOutput(per_atom=True)})
     raw = out["energy"].block().values[:, 0]
     Z = torch.cat([s.types for s in systems]).long()
-    f = torch.nn.functional.softplus(phi[Z])
+    f = torch.ones_like(raw) if FUKUI == "uniform" else torch.nn.functional.softplus(phi[Z])
     G = len(systems)
     sraw = torch.zeros(G, device=dev).index_add_(0, sid, raw)
     sf = torch.zeros(G, device=dev).index_add_(0, sid, f)
@@ -173,7 +178,11 @@ def main():
     ap.add_argument("--d-pet", type=int, default=128)
     ap.add_argument("--gnn", type=int, default=2)
     ap.add_argument("--att", type=int, default=2)
+    ap.add_argument("--fukui", choices=["uniform", "element"], default="element",
+                    help="Fukui weights (per-atom modes: scripts/plato_lr_fukui/fit_fukui.py)")
     a = ap.parse_args()
+    global FUKUI
+    FUKUI = a.fukui
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     rng = np.random.default_rng(a.seed)
     ns = argparse.Namespace(d_pet=a.d_pet, heads=8, gnn=a.gnn, att=a.att, cutoff=8.0, adaptive=16.0, seed=a.seed)
@@ -246,7 +255,7 @@ def save(model, phi, hyp, out):
     m = copy.deepcopy(model).cpu().eval()
     torch.save({"model": m, "hypers": m.hypers}, out + ".pt")
     torch.save(m.get_checkpoint(), out + ".ckpt")
-    json.dump({"Z": list(range(1, 84)), "phi": phi.detach().cpu()[1:84].tolist()}, open(out + "_fukui.json", "w"))
+    json.dump({"Z": list(range(1, 84)), "phi": phi.detach().cpu()[1:84].tolist(), "mode": FUKUI}, open(out + "_fukui.json", "w"))
 
 
 if __name__ == "__main__":

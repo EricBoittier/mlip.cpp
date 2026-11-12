@@ -12,6 +12,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <vector>
 
 using namespace mlipcpp::runtime;
@@ -656,4 +657,296 @@ TEST_CASE("lrc qproj: soft charge projection keeps sum q = Q, separated / merged
     CHECK(eb.energy == Approx(ea.energy).epsilon(1e-12));
     for (int i = 0; i < 5; i++) CHECK(eb.q[i] == Approx(ea.q[4 - i]).margin(1e-12));
   }
+}
+
+// ---- Fukui equilibration modes (feat/plato-lr-fukui): U / E / A / A+- / AC --------------------------------------------
+namespace {
+// raw charges with a spin dependence (ToyQ + 0.03 (spin - 1))
+struct ToyQS final : LrcQSource {
+  ToyQ q;
+  std::vector<double> raw(int n, const int32_t *Z, const double *x, double Q, int spin) override {
+    auto v = q.raw(n, Z, x, Q, spin);
+    for (double &e : v) e += 0.03 * (spin - 1);
+    return v;
+  }
+  void raw_vjp(int n, const int32_t *Z, const double *x, double Q, int spin, const double *w, double *g) override {
+    q.raw_vjp(n, Z, x, Q, spin, w, g);
+  }
+};
+// stand-in for a per-atom Fukui pass: a_i = c_Z + sum_j d_ZZ' exp(-r_ij / 3) + 0.05 Q + 0.02 (spin - 1) (+ k for f-)
+struct ToyA final : LrcQSource {
+  double k = 0;
+  explicit ToyA(double k_ = 0) : k(k_) {}
+  static double c(int z) { return z == 11 ? 0.9 : z == 17 ? -0.4 : z == 8 ? 0.3 : -0.6; }
+  double d(int zi, int zj) const { return 0.3 * ((zi * 5 + zj * 11) % 7) / 7.0 - 0.1 + k; }
+  std::vector<double> raw(int n, const int32_t *Z, const double *x, double Q, int spin) override {
+    std::vector<double> a(n);
+    for (int i = 0; i < n; i++) {
+      a[i] = c(Z[i]) + 0.05 * Q + 0.02 * (spin - 1) + k;
+      for (int j = 0; j < n; j++)
+        if (j != i) a[i] += d(Z[i], Z[j]) * std::exp(-ToyQ::r(x, i, j) / 3);
+    }
+    return a;
+  }
+  void raw_vjp(int n, const int32_t *Z, const double *x, double, int, const double *w, double *g) override {
+    for (int i = 0; i < n; i++)
+      for (int j = 0; j < n; j++) {
+        if (j == i) continue;
+        const double r = ToyQ::r(x, i, j), da = -w[i] * d(Z[i], Z[j]) * std::exp(-r / 3) / 3;
+        for (int q = 0; q < 3; q++) {
+          const double u = (x[3 * i + q] - x[3 * j + q]) / r;
+          g[3 * i + q] += da * u, g[3 * j + q] -= da * u;
+        }
+      }
+  }
+};
+struct FukuiArm {
+  const char *name;
+  LrcSpec::FukuiMode mode;
+  bool cluster;
+  double pm_width;
+};
+const FukuiArm kArms[] = {{"U", LrcSpec::FukuiMode::Uniform, false, 0.05},   {"E", LrcSpec::FukuiMode::Element, false, 0.05},
+                          {"A", LrcSpec::FukuiMode::Atom, false, 0.05},      {"A+-", LrcSpec::FukuiMode::AtomPM, false, 0.05},
+                          {"A+-hard", LrcSpec::FukuiMode::AtomPM, false, 0.0}, {"UC", LrcSpec::FukuiMode::Uniform, true, 0.05},
+                          {"EC", LrcSpec::FukuiMode::Element, true, 0.05},   {"AC", LrcSpec::FukuiMode::Atom, true, 0.05}};
+// FTq-like settings: per-cluster conditioning (link window a_on / a_off), plateau projection 0.6, Coulomb 8 -> 10 A
+LrcSpec fukui_spec(const FukuiArm &arm, double a_on = 8.0, double a_off = 10.0) {
+  LrcSpec L = graph_spec();
+  L.qsrc = std::make_shared<ToyQS>();
+  L.qpass_neutral = true;
+  L.a_on = a_on, L.a_off = a_off;
+  L.qproj = true, L.qproj_w = 0.6, L.cond_w = 0.6;
+  L.fukui_mode = arm.mode, L.fukui_cluster = arm.cluster, L.fukui_pm_width = arm.pm_width;
+  if (L.fukui_atom()) L.fsrc = std::make_shared<ToyA>(0.0);
+  if (arm.mode == LrcSpec::FukuiMode::AtomPM) L.fsrc_minus = std::make_shared<ToyA>(0.35), L.fukui_phi_minus = {0.1, 0.4, 0.2, -0.3};
+  L.fukui_check();
+  return L;
+}
+// Na+ (0), water (3.4 A) in one cluster; Cl- 8.7 A from a water H (in the 8-10 A link window) and 13 A from Na
+const std::vector<double> kX8 = {0, 0, 0, 3.4, 0.1, 0.2, 4.3, 0.3, 0.1, 3.1, 1.0, -0.2, 13.0, 1.4, 0.6};
+} // namespace
+
+TEST_CASE("lrc fukui: E mode is the per-element equilibration of bin4 bit for bit", "[lrc][fukui]") {
+  const LrcSpec L = graph_spec();
+  const SqeSpec S = sqe_spec();
+  for (double Q : {0.0, 1.0, -1.0}) {
+    const LrcQ0 o = lrc_q0(L, S, 5, ZG, kX8.data(), Q, 1);
+    // the bin4 formula
+    std::vector<double> q = L.qsrc->raw(5, ZG, kX8.data(), Q, 1), wt(5);
+    double sq = 0, sf = 0;
+    for (int i = 0; i < 5; i++) sq += q[i], wt[i] = L.fukui(ZG[i]), sf += wt[i];
+    for (int i = 0; i < 5; i++) wt[i] /= sf, q[i] += wt[i] * (Q - sq);
+    for (int i = 0; i < 5; i++) CHECK(o.q0[i] == q[i]);
+  }
+}
+
+TEST_CASE("lrc fukui: sum q = Q for every mode (neutral, cation, anion, spin), per cluster for AC", "[lrc][fukui]") {
+  const SqeSpec S = sqe_spec();
+  for (const auto &arm : kArms) {
+    const LrcSpec L = fukui_spec(arm);
+    for (auto [Q, spin] : std::vector<std::pair<double, int>>{{0, 1}, {1, 2}, {-1, 2}, {2, 1}, {0, 3}}) {
+      const LrcQ0 o = lrc_q0(L, S, 5, ZG, kX8.data(), Q, spin);
+      double sum = 0;
+      for (double v : o.q0) sum += v;
+      INFO(arm.name << " Q " << Q << " spin " << spin);
+      CHECK(sum == Approx(Q).margin(1e-12));
+    }
+  }
+  // AC, separated clusters (no link): every cluster ends on its plateaued total when those sum to Q, so a neutral
+  // partner keeps exactly zero; global A leaks the residual onto it
+  const int32_t Zs[] = {11, 8, 1, 1, 17};
+  const std::vector<double> xs = {0, 0, 0, 30.0, 0, 0, 30.96, 0, 0, 29.76, 0.93, 0, 60.0, 0, 0};
+  for (const auto &arm : kArms) {
+    if (!arm.cluster) continue;
+    LrcSpec L = fukui_spec(arm);
+    const LrcQ0 raw = lrc_q0(fukui_spec(kArms[2]), S, 5, Zs, xs.data(), 0.0, 1);
+    const double rn = raw.qraw[0], rw = raw.qraw[1] + raw.qraw[2] + raw.qraw[3], rc = raw.qraw[4];
+    for (double Q : {0.0, 1.0, -1.0}) {
+      const LrcQ0 o = lrc_q0(L, S, 5, Zs, xs.data(), Q, 1);
+      const double qn = o.q0[0], qw = o.q0[1] + o.q0[2] + o.q0[3], qc = o.q0[4];
+      INFO(arm.name << " Q " << Q << ": raw cluster sums " << rn << " " << rw << " " << rc << " -> " << qn << " " << qw << " "
+                    << qc);
+      CHECK(qn + qw + qc == Approx(Q).margin(1e-12));
+      const bool plateau_sum = std::round(rn) + std::round(rw) + std::round(rc) == Q &&
+                               std::abs(rn - std::round(rn)) < 0.2 && std::abs(rw - std::round(rw)) < 0.2 &&
+                               std::abs(rc - std::round(rc)) < 0.2;
+      if (plateau_sum) {
+        CHECK(qn == Approx(std::round(rn)).margin(1e-9));
+        CHECK(qw == Approx(std::round(rw)).margin(1e-9));
+        CHECK(qc == Approx(std::round(rc)).margin(1e-9));
+      }
+    }
+  }
+}
+
+TEST_CASE("lrc fukui: q0 VJP, long-range and conditioning forces match central differences in every mode", "[lrc][fukui]") {
+  SqeSpec S = sqe_spec();
+  S.lr_R = 10.0, S.lr_t = 2.0;
+  const double cw[5] = {0.7, -0.3, 0.2, 0.5, -1.1};
+  for (const auto &arm : kArms) {
+    const LrcSpec L = fukui_spec(arm);
+    for (auto [Q, spin] : std::vector<std::pair<double, int>>{{0, 1}, {1, 2}, {-1, 2}}) {
+      // q0 VJP alone: d(sum c_i q0_i)/dx
+      auto cq = [&](const std::vector<double> &x) {
+        const LrcQ0 o = lrc_q0(L, S, 5, ZG, x.data(), Q, spin);
+        double v = 0;
+        for (int i = 0; i < 5; i++) v += cw[i] * o.q0[i];
+        return v;
+      };
+      const LrcQ0 o0 = lrc_q0(L, S, 5, ZG, kX8.data(), Q, spin);
+      std::vector<double> g(15, 0.0);
+      lrc_q0_vjp(L, S, 5, ZG, kX8.data(), o0, cw, g.data());
+      double gmax = 0, gerr = 0;
+      for (size_t k = 0; k < 15; k++) {
+        const double num = fd(cq, kX8, k, 1e-5);
+        gmax = std::max(gmax, std::abs(num)), gerr = std::max(gerr, std::abs(num - g[k]));
+      }
+      // long-range energy
+      auto energy = [&](const std::vector<double> &x) {
+        const LrcCondition c = lrc_condition(L, S, 5, ZG, x.data(), Q, 10, spin);
+        return lrc_energy(L, S, c, 5, ZG, x.data(), Q, false).energy;
+      };
+      const LrcCondition c0 = lrc_condition(L, S, 5, ZG, kX8.data(), Q, 10, spin);
+      REQUIRE(c0.cl.s == 2);
+      REQUIRE(!c0.cl.trivial());
+      const LrcEnergy e0 = lrc_energy(L, S, c0, 5, ZG, kX8.data(), Q, true);
+      double fmax = 0, err = 0;
+      for (size_t k = 0; k < 15; k++) {
+        const double num = -fd(energy, kX8, k, 1e-5);
+        fmax = std::max(fmax, std::abs(num)), err = std::max(err, std::abs(num - e0.forces[k]));
+      }
+      // conditioning (dS/dx through the reference charges), direct and via the blend rows
+      auto fS = [&](const std::vector<double> &x) {
+        const LrcCondition c = lrc_condition(L, S, 5, ZG, x.data(), Q, 10, spin);
+        double v = 0;
+        for (int i = 0; i < 5; i++) v += cw[i] * (c.k[c.cl.sn[i]] + c.S[c.cl.sn[i]]);
+        return v;
+      };
+      std::vector<double> G(c0.cl.s, 0.0), F(15, 0.0);
+      for (int i = 0; i < 5; i++) G[c0.cl.sn[i]] += cw[i];
+      lrc_condition_forces(L, S, c0, 5, ZG, kX8.data(), G, F.data());
+      const std::vector<double> rows = lrc_blend_rows(L, S, c0, 5, ZG, kX8.data());
+      double cmax = 0, cerr = 0, rerr = 0;
+      for (size_t k = 0; k < 15; k++) {
+        const double num = -fd(fS, kX8, k, 1e-5);
+        double fr = 0;
+        for (int a = 0; a < c0.cl.s; a++) fr -= G[a] * rows[size_t(a) * 15 + k];
+        cmax = std::max(cmax, std::abs(num)), cerr = std::max(cerr, std::abs(num - F[k])), rerr = std::max(rerr, std::abs(num - fr));
+      }
+      INFO(arm.name << " Q " << Q << " spin " << spin << " residual r " << o0.r << ": q0 VJP max " << gmax << " err " << gerr
+                    << "; long range max |F| " << fmax << " err " << err << "; conditioning max " << cmax << " err " << cerr
+                    << " rows " << rerr);
+      std::printf("FD %-8s Q %+.0f spin %d r %+.3f | q0-VJP max %.3e err %.2e | E_lr %.4e F max %.3e err %.2e | cond max %.3e err %.2e rows %.2e\n",
+                  arm.name, Q, spin, o0.r, gmax, gerr, e0.energy, fmax, err, cmax, cerr, rerr);
+      CHECK(gmax > 1e-3);
+      CHECK(gerr < 1e-7 * std::max(1.0, gmax));
+      CHECK(err < 1e-7 * std::max(1.0, fmax));
+      CHECK(cerr < 1e-6 * std::max(1.0, cmax));
+      CHECK(rerr < 1e-6 * std::max(1.0, cmax));
+    }
+  }
+}
+
+TEST_CASE("lrc fukui: the per-atom term matters (A differs from E), rotation and permutation invariance", "[lrc][fukui]") {
+  SqeSpec S = sqe_spec();
+  S.lr_R = 10.0, S.lr_t = 2.0;
+  {
+    const LrcSpec La = fukui_spec(kArms[2]), Le = fukui_spec(kArms[1]);
+    std::vector<double> ga(15, 0.0), ge(15, 0.0);
+    const double cw[5] = {0.7, -0.3, 0.2, 0.5, -1.1};
+    const LrcQ0 oa = lrc_q0(La, S, 5, ZG, kX8.data(), 1.0, 1), oe = lrc_q0(Le, S, 5, ZG, kX8.data(), 1.0, 1);
+    lrc_q0_vjp(La, S, 5, ZG, kX8.data(), oa, cw, ga.data());
+    lrc_q0_vjp(Le, S, 5, ZG, kX8.data(), oe, cw, ge.data());
+    double d = 0;
+    for (int k = 0; k < 15; k++) d = std::max(d, std::abs(ga[k] - ge[k]));
+    CHECK(d > 1e-3);
+  }
+  for (const auto &arm : kArms) {
+    const LrcSpec L = fukui_spec(arm);
+    for (double Q : {1.0, -1.0}) {
+      const LrcCondition c = lrc_condition(L, S, 5, ZG, kX8.data(), Q, 10, 2);
+      const LrcEnergy e = lrc_energy(L, S, c, 5, ZG, kX8.data(), Q, true);
+      // rotation: energy invariant, forces rotate
+      const double t = 0.9;
+      const auto xr = rot(kX8, t);
+      const LrcCondition cr = lrc_condition(L, S, 5, ZG, xr.data(), Q, 10, 2);
+      const LrcEnergy er = lrc_energy(L, S, cr, 5, ZG, xr.data(), Q, true);
+      CHECK(er.energy == Approx(e.energy).epsilon(1e-12).margin(1e-14));
+      const auto fr = rot(e.forces, t);
+      for (int k = 0; k < 15; k++) CHECK(er.forces[k] == Approx(fr[k]).margin(1e-11));
+      for (int i = 0; i < 5; i++) CHECK(cr.q0.q0[i] == Approx(c.q0.q0[i]).margin(1e-12));
+      // permutation: reversed atom order
+      std::vector<double> xp(15);
+      int32_t Zp[5];
+      for (int i = 0; i < 5; i++) {
+        Zp[i] = ZG[4 - i];
+        for (int k = 0; k < 3; k++) xp[3 * i + k] = kX8[3 * (4 - i) + k];
+      }
+      const LrcCondition cp = lrc_condition(L, S, 5, Zp, xp.data(), Q, 10, 2);
+      const LrcEnergy ep = lrc_energy(L, S, cp, 5, Zp, xp.data(), Q, true);
+      INFO(arm.name << " Q " << Q);
+      CHECK(ep.energy == Approx(e.energy).epsilon(1e-12).margin(1e-14));
+      for (int i = 0; i < 5; i++) {
+        CHECK(cp.q0.q0[i] == Approx(c.q0.q0[4 - i]).margin(1e-12));
+        for (int k = 0; k < 3; k++) CHECK(ep.forces[3 * i + k] == Approx(e.forces[3 * (4 - i) + k]).margin(1e-11));
+      }
+    }
+  }
+}
+
+TEST_CASE("lrc fukui: A+- kink at zero residual (hard switch) and its smoothing", "[lrc][fukui]") {
+  const SqeSpec S = sqe_spec();
+  const double cw[5] = {0.7, -0.3, 0.2, 0.5, -1.1};
+  for (const FukuiArm &arm : {kArms[3], kArms[4]}) {
+    const LrcSpec L = fukui_spec(arm);
+    const LrcQ0 r0 = lrc_q0(L, S, 5, ZG, kX8.data(), 0.0, 1);
+    const double sq = std::accumulate(r0.qraw.begin(), r0.qraw.end(), 0.0); // q pass at 0: q_raw independent of Q
+    std::vector<double> gp(15, 0.0), gm(15, 0.0);
+    const LrcQ0 op = lrc_q0(L, S, 5, ZG, kX8.data(), sq + 1e-7, 1), om = lrc_q0(L, S, 5, ZG, kX8.data(), sq - 1e-7, 1);
+    lrc_q0_vjp(L, S, 5, ZG, kX8.data(), op, cw, gp.data());
+    lrc_q0_vjp(L, S, 5, ZG, kX8.data(), om, cw, gm.data());
+    double jump = 0, gmax = 0;
+    for (int k = 0; k < 15; k++) jump = std::max(jump, std::abs(gp[k] - gm[k])), gmax = std::max(gmax, std::abs(gp[k]));
+    std::printf("KINK %-8s |d(sum c q0)/dx| max %.3e, jump across r = 0: %.3e\n", arm.name, gmax, jump);
+    if (arm.pm_width == 0) CHECK(jump > 1e-3);
+    else CHECK(jump < 1e-5);
+  }
+}
+
+TEST_CASE("lrc fukui: dump for the torch parity check (MLIPCPP_FUKUI_PARITY=out.json)", "[lrc][fukui]") {
+  const char *out = std::getenv("MLIPCPP_FUKUI_PARITY");
+  if (!out) return;
+  SqeSpec S = sqe_spec();
+  S.lr_R = 10.0, S.lr_t = 2.0;
+  // no weak link (window 5 / 6 A), Cl- 8-9 A from the water (inside the Coulomb switch), 12.4 A from Na+
+  const std::vector<double> x = {0, 0, 0, 3.4, 0.1, 0.2, 4.3, 0.3, 0.1, 3.1, 1.0, -0.2, 12.3, 1.4, 0.6};
+  FILE *f = std::fopen(out, "w");
+  std::fprintf(f, "{\"x\": [");
+  for (size_t k = 0; k < x.size(); k++) std::fprintf(f, "%s%.17g", k ? ", " : "", x[k]);
+  std::fprintf(f, "], \"Z\": [11, 8, 1, 1, 17], \"cases\": [");
+  bool first = true;
+  for (const auto &arm : kArms) {
+    const LrcSpec L = fukui_spec(arm, 5.0, 6.0);
+    for (auto [Q, spin] : std::vector<std::pair<double, int>>{{0, 1}, {1, 2}, {-1, 2}, {2, 1}}) {
+      const LrcCondition c = lrc_condition(L, S, 5, ZG, x.data(), Q, 10, spin);
+      REQUIRE(c.cl.s == 2);
+      REQUIRE(c.cl.trivial());
+      const LrcEnergy e = lrc_energy(L, S, c, 5, ZG, x.data(), Q, true);
+      auto arr = [&](const std::vector<double> &v) {
+        std::string s = "[";
+        for (size_t k = 0; k < v.size(); k++) s += (k ? ", " : "") + std::to_string(v[k]).substr(0, 0) + [&] {
+          char b[32];
+          std::snprintf(b, 32, "%.17g", v[k]);
+          return std::string(b);
+        }();
+        return s + "]";
+      };
+      std::fprintf(f, "%s{\"arm\": \"%s\", \"Q\": %g, \"spin\": %d, \"q0\": %s, \"q\": %s, \"E\": %.17g, \"F\": %s}", first ? "" : ", ",
+                   arm.name, Q, spin, arr(e.q0).c_str(), arr(e.q).c_str(), e.energy, arr(e.forces).c_str());
+      first = false;
+    }
+  }
+  std::fprintf(f, "]}\n");
+  std::fclose(f);
 }

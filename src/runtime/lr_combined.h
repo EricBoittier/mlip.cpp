@@ -72,7 +72,34 @@ struct LrcSpec {
   std::vector<int32_t> fukui_Z;
   std::vector<double> fukui_phi;
   std::shared_ptr<LrcQSource> qsrc;
-  double fukui(int z) const; // softplus(phi_Z)
+  double fukui(int z) const; // softplus(phi_Z) (1 in fukui_mode "uniform")
+  // Fukui weights of the graph-mode equilibration (pet.plato_lr.lrc_fukui_mode; feat/plato-lr-fukui), absent key =
+  // "element" (bit-identical to the per-element model above):
+  //   "uniform"  f_i = 1 (U: the uniform shift, (Q - sum q_raw) / N)
+  //   "element"  f_i = softplus(phi_Z) + 1e-6 (E)
+  //   "atom"     f_i = softplus(phi_Z + a_i) + 1e-6, a_i the per-atom output of a second frozen pass (lrc_fmodel: a GGUF
+  //              copy of the charge-pass backbone whose energy head is the fitted Fukui head; same R, Q, spin inputs)
+  //              (A: MACE-POLAR-1-style environment-dependent Fukui weights). f depends on positions: the equilibration's
+  //              VJP carries (Q - sum q_raw) d(f_i / sum f)/dx through the f pass.
+  //   "atom_pm"  two such passes, f+ (electron addition, lrc_fmodel, phi) and f- (removal, lrc_fmodel_minus,
+  //              lrc_fukui_phi_minus), blended by the residual r = Q - sum q_raw: w = (1 - s) f+ / F+ + s f- / F-,
+  //              s = smootherstep(r / d + 1/2), d = lrc_fukui_pm_width (e, default 0.05; 0 = the hard switch, whose
+  //              q is continuous but dq/dx jumps by (w- - w+) dr/dx at r = 0) (A+-)
+  // lrc_fukui_scope "cluster" (AC; with uniform / element / atom): no global step; the raw charges are projected per
+  // soft cluster onto plateaued totals and the residual Q - sum P is routed by the plateau slope (lrc_qproj's
+  // machinery with per-atom shares f_i and width lrc_fukui_cluster_w), so sum q = Q exactly and a near-integer neutral
+  // cluster keeps its integer whatever the other clusters' residual. These charges are the reference charges: the
+  // conditioning sees them too, and lrc_qproj is not applied again on top (AC replaces it).
+  enum class FukuiMode { Element, Uniform, Atom, AtomPM };
+  FukuiMode fukui_mode = FukuiMode::Element;
+  bool fukui_cluster = false;
+  double fukui_cluster_w = 0.6, fukui_pm_width = 0.05;
+  std::string fmodel, fmodel_minus;
+  std::vector<double> fukui_phi_minus;
+  std::shared_ptr<LrcQSource> fsrc, fsrc_minus;
+  double fukui_phi_of(int z, bool minus = false) const; // phi_Z
+  void fukui_check() const;                              // throws on an inconsistent Fukui configuration
+  bool fukui_atom() const { return fukui_mode == FukuiMode::Atom || fukui_mode == FukuiMode::AtomPM; }
   // per element in SqeSpec::Z order
   std::vector<double> ip, ea, h, l, ap, am, bp, bm; // bp, bm: E x E (row: the atom's element)
   // graph mode, atomic multipoles (pet.plato_lr.lrc_mp*, feat/plato-lr-v2): a prefitted (frozen) atomic dipole and
@@ -134,6 +161,10 @@ struct LrcQ0 {
   // graph: the structure's charge and spin (the charge pass is evaluated again for the vector-Jacobian products)
   double Q = 0;
   int spin = 1;
+  // graph Fukui equilibration: raw charges, per-atom weights f (+ / -) and df/da, their sums, the residual
+  // r = Q - sum q_raw, the +/- blend s and ds/dr
+  std::vector<double> qraw, fp, fm, dfp, dfm;
+  double Fp = 0, Fm = 0, r = 0, s = 0, ds = 0;
 };
 
 struct LrcClusters {
