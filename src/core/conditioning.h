@@ -17,6 +17,10 @@ namespace mlipcpp {
 struct Conditioning {
   bool enabled = false;
   int max_charge = 10, max_spin_multiplicity = 10;
+  // GGUF pet.conditioning_keys (iris PET-LR, after M. Langer): the keys the trunk is conditioned on; an absent
+  // key takes its default row (charge 0, multiplicity 1), as pet-jax does for inputs it is not given. Both by
+  // default (metatrain: always both).
+  bool use_charge = true, use_spin = true;
 
   void check(int charge, int spin_multiplicity) const {
     if (charge < -max_charge || charge > max_charge)
@@ -30,6 +34,8 @@ struct Conditioning {
   }
   /// (charge table row, spin table row), checked
   std::pair<int32_t, int32_t> rows(int charge, int spin_multiplicity) const {
+    if (!use_charge) charge = 0;
+    if (!use_spin) spin_multiplicity = 1;
     check(charge, spin_multiplicity);
     return {charge + max_charge, spin_multiplicity - 1};
   }

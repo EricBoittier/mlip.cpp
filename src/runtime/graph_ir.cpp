@@ -67,7 +67,9 @@ double parse_number(const std::string &s, size_t &pos) {
     ++pos;
   }
   while (pos < s.size() && (std::isdigit(s[pos]) || s[pos] == '.' ||
-                            s[pos] == 'e' || s[pos] == 'E' || s[pos] == '-')) {
+                            s[pos] == 'e' || s[pos] == 'E' || s[pos] == '-' ||
+                            // the exponent's sign (Python writes 1e+30)
+                            (s[pos] == '+' && (s[pos - 1] == 'e' || s[pos - 1] == 'E')))) {
     ++pos;
   }
   return std::stod(s.substr(start, pos - start));
@@ -116,6 +118,20 @@ constexpr int64_t DIM_SEQ_LEN = -1000003;       // n_atoms * (max_neighbors + 1)
 constexpr int64_t DIM_N_EDGES = -1000004;       // n_atoms * max_neighbors
 constexpr int64_t DIM_MN_PLUS_ONE = -1000005;   // max_neighbors + 1
 
+std::vector<std::string> &named_dims() {
+  static std::vector<std::string> names;
+  return names;
+}
+
+int64_t named_dim_code(const std::string &name) {
+  if (name.empty()) return -1;
+  auto &names = named_dims();
+  for (size_t i = 0; i < names.size(); i++)
+    if (names[i] == name) return DIM_NAMED_BASE - int64_t(i);
+  names.push_back(name);
+  return DIM_NAMED_BASE - int64_t(names.size() - 1);
+}
+
 // Convert symbolic dimension name to special value
 int64_t symbolic_dim_to_value(const std::string &name) {
   if (name == "n_atoms") return DIM_N_ATOMS;
@@ -123,8 +139,7 @@ int64_t symbolic_dim_to_value(const std::string &name) {
   if (name == "seq_len") return DIM_SEQ_LEN;
   if (name == "n_edges") return DIM_N_EDGES;
   if (name == "max_neighbors_plus_one") return DIM_MN_PLUS_ONE;
-  // Unknown symbolic name - return -1
-  return -1;
+  return named_dim_code(name);
 }
 
 // Parse an array that may contain integers or symbolic dimension strings
@@ -434,6 +449,12 @@ GIRNode parse_node(const std::string &s, size_t &pos) {
 }
 
 } // namespace
+
+const std::string *named_dim(int64_t code) {
+  const auto &names = named_dims();
+  const int64_t i = DIM_NAMED_BASE - code;
+  return (code <= DIM_NAMED_BASE && i < int64_t(names.size())) ? &names[size_t(i)] : nullptr;
+}
 
 GIRGraph parse_gir_json(const std::string &json_str) {
   GIRGraph graph;

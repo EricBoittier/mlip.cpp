@@ -1,0 +1,64 @@
+diff -ru a/src/ggml-cuda/binbcast.cu b/src/ggml-cuda/binbcast.cu
+--- a/src/ggml-cuda/binbcast.cu	2026-11-11 07:21:27.568598895 +0100
++++ b/src/ggml-cuda/binbcast.cu	2026-11-11 07:22:03.545983413 +0100
+@@ -24,6 +24,12 @@
+     return a / b;
+ }
+ 
++// mlip.cpp: under -use_fast_math a / b is the approximate (2 ulp) division; __fdiv_rn is IEEE round-to-nearest
++// whatever the flags (the CPU's division). Used when the op carries the precise flag (op_params[last] = 1)
++static __device__ __forceinline__ float op_div_rn(const float a, const float b) {
++    return __fdiv_rn(a, b);
++}
++
+ template <float (*bin_op)(const float, const float),
+           typename src0_t,
+           typename src1_t,
+@@ -469,6 +475,10 @@
+ }
+ 
+ void ggml_cuda_op_div(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    if (dst->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] == 1) {
++        ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_div_rn>>(dst->src[0], dst->src[1], dst, dst->src[0]->data, dst->src[1]->data, dst->data, ctx.stream());
++        return;
++    }
+     ggml_cuda_op_bin_bcast<bin_bcast_cuda<op_div>>(dst->src[0], dst->src[1], dst, dst->src[0]->data, dst->src[1]->data, dst->data, ctx.stream());
+ }
+ 
+diff -ru a/src/ggml-cuda/unary.cu b/src/ggml-cuda/unary.cu
+--- a/src/ggml-cuda/unary.cu	2026-11-11 07:21:23.029550382 +0100
++++ b/src/ggml-cuda/unary.cu	2026-11-11 07:22:03.544983403 +0100
+@@ -104,6 +104,11 @@
+     return (float) log((double) x);
+ }
+ 
++// sigmoid of the Fermi occupations (T = 0.02-0.1: arguments ~10-50): __expf's error grows with |x|
++static __device__ __forceinline__ float op_sigmoid_precise(float x) {
++    return (float) (1.0 / (1.0 + exp(-(double) x)));
++}
++
+ static __device__ __forceinline__ float op_expm1(float x) {
+     return expm1f(x);
+ }
+@@ -210,6 +215,10 @@
+ }
+ 
+ void ggml_cuda_op_sigmoid(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    if (dst->op_params[GGML_CUDA_PRECISE_SLOT] == 1) {
++        ggml_cuda_op_unary<op_sigmoid_precise>(ctx, dst);
++        return;
++    }
+     ggml_cuda_op_unary<op_sigmoid>(ctx, dst);
+ }
+ 
+@@ -658,6 +667,10 @@
+             ggml_cuda_op_unary_mul_impl<op_silu>(ctx, unary_node, mul_node);
+             break;
+         case GGML_UNARY_OP_SIGMOID:
++            if (unary_node->op_params[GGML_CUDA_PRECISE_SLOT] == 1) {
++                ggml_cuda_op_unary_mul_impl<op_sigmoid_precise>(ctx, unary_node, mul_node);
++                break;
++            }
+             ggml_cuda_op_unary_mul_impl<op_sigmoid>(ctx, unary_node, mul_node);
+             break;
+         case GGML_UNARY_OP_SOFTPLUS:

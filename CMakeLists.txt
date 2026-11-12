@@ -297,6 +297,21 @@ else()
         # energy of a half spectrum with its gradient w.r.t. the spectrum and the cell metric
         # (GGML_OP_PLATO_PME / _BACK); CPU + CUDA
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-plato-pme.patch"
+        # CUDA LOG / SIN / COS / EXP in double precision when the op carries the precise flag
+        # (op_params[last] = 1, set for iris PET-LR graphs: runtime/iris_lr.h mark_precise_math);
+        # default: the -use_fast_math kernels, unchanged
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-precise-unary.patch"
+        # and SIGMOID in double / DIV as __fdiv_rn under the same flag (the Fermi occupations of iris PET-LR)
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-precise-sigmoid-div.patch"
+        # and SUM / SUM_ROWS accumulating in double under the same flag (as ggml-cpu's ggml_float sums)
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-precise-sum.patch"
+        # and F32 MUL_MAT accumulating in double under the same flag (diagnostic: MLIPCPP_PRECISE_MATMUL[_K])
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-precise-mulmat.patch"
+        # and SQRT as __fsqrt_rn under the same flag (the iris trunks' edge lengths)
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-precise-sqrt.patch"
+        # and the precise MUL_MAT's tiled kernels (MLIPCPP_PRECISE_MATMUL_KERNEL=tiled (default)|naive|chunk|dot2;
+        # naive = the one-thread-per-output kernel above, same per-element sum as tiled)
+        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches/ggml-cuda-precise-mulmat-kernels.patch"
     )
     # the source cache is keyed by the ggml tag and the patches' contents:
     # CPM's default key hashes the arguments, i.e. the patch paths, so every

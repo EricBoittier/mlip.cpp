@@ -1,0 +1,86 @@
+diff -ru a/src/ggml-cuda/sum.cu b/src/ggml-cuda/sum.cu
+--- a/src/ggml-cuda/sum.cu	2026-11-11 08:00:54.009321773 +0100
++++ b/src/ggml-cuda/sum.cu	2026-11-11 08:00:54.037909553 +0100
+@@ -37,5 +37,11 @@
+     ggml_cuda_pool & pool = ctx.pool();
+     cudaStream_t stream = ctx.stream();
+ 
++    // mlip.cpp: flagged precise -> double accumulation, as ggml-cpu (sumrows.cu)
++    if (dst->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] == 1) {
++        sum_rows_f32_f64acc_cuda(src0_d, dst_d, ne, 1, stream);
++        return;
++    }
++
+     sum_f32_cuda(pool, src0_d, dst_d, ne, stream);
+ }
+diff -ru a/src/ggml-cuda/sumrows.cu b/src/ggml-cuda/sumrows.cu
+--- a/src/ggml-cuda/sumrows.cu	2026-11-11 08:00:54.011121810 +0100
++++ b/src/ggml-cuda/sumrows.cu	2026-11-11 08:00:54.036956921 +0100
+@@ -1,6 +1,46 @@
+ #include "reduce_rows.cuh"
+ #include "sumrows.cuh"
+ 
++// mlip.cpp: SUM / SUM_ROWS accumulating in double when flagged precise (op_params[last] = 1, set for iris PET-LR
++// graphs by graph_model.cpp): ggml-cpu accumulates both in double (ggml_float: ggml_vec_sum_f32 / _ggf), the default
++// CUDA kernels in float (the Ewald / Coulomb potential sums of the charge path). One block per row, a strided double
++// sum per thread, a double warp-shuffle tree, one rounding to float at the end.
++static __global__ void reduce_rows_f32_f64acc(const float * __restrict__ x, float * __restrict__ dst, const int64_t ncols) {
++    const int64_t row = blockIdx.x;
++    const int     col = threadIdx.x;
++    double sum = 0.0;
++    for (int64_t i = col; i < ncols; i += blockDim.x) {
++        sum += (double) x[row * ncols + i];
++    }
++#pragma unroll
++    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
++        sum += __shfl_xor_sync(0xffffffff, sum, offset, WARP_SIZE);
++    }
++    __shared__ double shared_vals[32];
++    if (blockDim.x > WARP_SIZE) {
++        const int warp_id = col / WARP_SIZE;
++        const int lane_id = col % WARP_SIZE;
++        if (lane_id == 0) {
++            shared_vals[warp_id] = sum;
++        }
++        __syncthreads();
++        sum = lane_id < (int) (blockDim.x / WARP_SIZE) ? shared_vals[lane_id] : 0.0;
++#pragma unroll
++        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
++            sum += __shfl_xor_sync(0xffffffff, sum, offset, WARP_SIZE);
++        }
++    }
++    if (col == 0) {
++        dst[row] = (float) sum;
++    }
++}
++
++void sum_rows_f32_f64acc_cuda(const float * x, float * dst, const int64_t ncols, const int64_t nrows, cudaStream_t stream) {
++    const dim3 block_nums(nrows, 1, 1);
++    const dim3 block_dims(256, 1, 1);
++    reduce_rows_f32_f64acc<<<block_nums, block_dims, 0, stream>>>(x, dst, ncols);
++}
++
+ void sum_rows_f32_cuda(const float * x, float * dst, const int ncols, const int nrows, cudaStream_t stream) {
+     const int  id  = ggml_cuda_get_device();
+     const int  nsm = ggml_cuda_info().devices[id].nsm;
+@@ -27,6 +67,11 @@
+     const int64_t ncols = src0->ne[0];
+     const int64_t nrows = ggml_nrows(src0);
+ 
++    if (dst->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] == 1) {
++        sum_rows_f32_f64acc_cuda(src0_d, dst_d, ncols, nrows, stream);
++        return;
++    }
++
+     const dim3 block_nums(nrows, 1, 1);
+ 
+     const int id  = ggml_cuda_get_device();
+diff -ru a/src/ggml-cuda/sumrows.cuh b/src/ggml-cuda/sumrows.cuh
+--- a/src/ggml-cuda/sumrows.cuh	2026-11-11 08:00:54.012844271 +0100
++++ b/src/ggml-cuda/sumrows.cuh	2026-11-11 08:00:54.037423608 +0100
+@@ -1,4 +1,5 @@
+ #include "common.cuh"
+ 
+ void sum_rows_f32_cuda(const float * x, float * dst, const int ncols, const int nrows, cudaStream_t stream);
++void sum_rows_f32_f64acc_cuda(const float * x, float * dst, const int64_t ncols, const int64_t nrows, cudaStream_t stream);
+ void ggml_cuda_op_sum_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

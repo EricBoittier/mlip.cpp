@@ -589,6 +589,31 @@ __global__ void virial_kernel(int n, int K, int M, const int32_t *nkept, const i
   for (int c = 0; c < 6; c++) out[6 * k + c] = w[c];
 }
 
+// the full (unsymmetrised) per-atom virial, W_ab = sum r_a dE/dr_b over the slots and the adaptive chain term, [n, 9]
+// (row-major); parity outputs of predict(), not the MD step
+__global__ void virial9_kernel(int n, int K, int M, const int32_t *nkept, const int32_t *off, const float *ev,
+                               const float *G, const int32_t *count, const double *cv, const double *cd, double cutoff,
+                               const double *chain, double *out) {
+  const int k = blockIdx.x * blockDim.x + threadIdx.x;
+  if (k >= n) return;
+  double w[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+  const int64_t a0 = off ? off[k] : int64_t(k) * M;
+  const int ns = off ? nkept[k] : min(nkept[k], M);
+  for (int s = 0; s < ns; s++) {
+    const int64_t a = a0 + s;
+    for (int x = 0; x < 3; x++)
+      for (int y = 0; y < 3; y++) w[3 * x + y] += double(ev[3 * a + x]) * double(G[3 * a + y]);
+  }
+  if (chain)
+    for (int q = 0; q < count[k]; q++) {
+      const int e = k * K + q;
+      if (cd[e] < cutoff)
+        for (int x = 0; x < 3; x++)
+          for (int y = 0; y < 3; y++) w[3 * x + y] += cv[3 * e + x] * chain[3 * e + y];
+    }
+  for (int c = 0; c < 9; c++) out[9 * k + c] = w[c];
+}
+
 __global__ void nc_kernel(int n, const float *nc, const float *scale, double *f) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
@@ -903,6 +928,12 @@ void virial(State &s, const Cutoff &c, const Graph &g, double *w, const int32_t 
   const bool adaptive = c.n_target > 0 && g.grad_cv;
   LAUNCH(virial_kernel, s.n, s.n, s.K, s.M, s.nkept, g.offsets, g.edge_vectors, g.grad_ev, s.count, s.cand_v, s.cand_d,
          c.cutoff, adaptive ? s.chain : nullptr, w, skip);
+}
+
+void virial9(State &s, const Cutoff &c, const Graph &g, double *w) {
+  const bool adaptive = c.n_target > 0 && g.grad_cv;
+  LAUNCH(virial9_kernel, s.n, s.n, s.K, s.M, s.nkept, g.offsets, g.edge_vectors, g.grad_ev, s.count, s.cand_v,
+         s.cand_d, c.cutoff, adaptive ? s.chain : nullptr, w);
 }
 
 // ---- an engine's own device arrays ----

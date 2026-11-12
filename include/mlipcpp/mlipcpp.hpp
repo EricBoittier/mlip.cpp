@@ -52,6 +52,26 @@ struct Result {
   std::vector<float> latent_charges;
   // split-charge equilibration charges (e), pet.plato_lr.sqe models; empty otherwise
   std::vector<float> sqe_charges;
+  /// iris PET-LR (pet.iris_lr): physical charges (e) per atom, dipole (e A) [3], Fermi level and metallicity
+  /// (conserving_charges with the residual allocation: `metallicity` carries his `residual`, |Q - sum_i p_i|)
+  std::vector<float> charges;
+  std::vector<double> dipole;
+  double fermi_level = 0.0, metallicity = 0.0;
+  /// threshold reference: the residual its species spread supplied, R = sum_i (c_Z + f_i) - Q (e)
+  double charge_residual = 0.0;
+  bool has_charge_residual = false;
+  /// conserving charges: the dipole of the edge flows (e A) [3]; empty otherwise
+  std::vector<double> dipole_flow;
+  /// induced dipoles: sum_i mu_i (e A) [3] and alpha_i (A^3) per atom; empty otherwise
+  std::vector<double> dipole_induced;
+  std::vector<float> polarisabilities;
+  /// under a nonzero field: his field force E . Z0 [3 n] (eV/A), already included in `forces`; empty otherwise
+  std::vector<double> field_forces;
+  /// conserving charges on several components: each atom's component and their charges Q_c; empty otherwise
+  std::vector<int> components;
+  std::vector<double> component_charges;
+  // periodic graph models: the full virial dE/d(strain) [9], row-major, eV, before symmetrisation; empty otherwise
+  std::vector<double> virial;
 
   bool has_forces() const { return !forces.empty(); }
   bool has_stress() const { return !stress.empty(); }
@@ -68,6 +88,19 @@ struct Result {
 struct ModelOptions {
   Backend backend = Backend::Auto;
   float cutoff_override = 0.0f; ///< 0 = use model default
+  /// iris PET-LR models only (after M. Langer, ipsum/PET-LR): freeze the Ewald parameters (wavelength, smearing,
+  /// real-space cutoff, k grid, a slab's effective cell) at the first periodic call of a system, as his ASE
+  /// calculator does for a run, until the system (atom count, numbers, pbc) changes or a slab outgrows its margin.
+  /// false (default): re-derived per call, as his oracle (predict on a fresh batch per structure).
+  bool iris_freeze_ewald = false;
+  /// iris models only: raise when an atom has more than this many neighbours within the cutoff, as his calculator
+  /// does. -1 (default): the GGUF's pet.iris.max_neighbors (his to_sample.max_neighbors; absent in GGUFs written
+  /// before 2026-11-11: no check); 0: no check (every neighbour kept, the behaviour of non-iris models).
+  int iris_max_neighbors = -1;
+  /// iris QEq models only (charge_reference qeq): override the GGUF's cg settings (his maxiter 20, tol 1e-5);
+  /// -1: the GGUF's. A converged solve (tol 0, large maxiter) makes the forces -dE/dx of the energy (FD tests)
+  int iris_qeq_maxiter = -1;
+  double iris_qeq_tol = -1.0;
 };
 
 /**
@@ -126,6 +159,10 @@ struct PredictOptions {
   /// (pet.plato_lr.frag_charges; only their sums over each bonded fragment matter); empty: none,
   /// the model is then exactly the plain one. Other models ignore them.
   std::vector<float> formal_charges;
+  /// Dipole origin (A) for models that output a dipole (iris PET-LR); empty: the model's default (centre of mass)
+  std::vector<double> dipole_origin;
+  /// Uniform external field (V/A) for iris PET-LR models with a `field` input; empty: none (zero)
+  std::vector<double> field;
 };
 
 /**

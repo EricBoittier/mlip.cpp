@@ -9,6 +9,7 @@
 // threads. The same layouts as the CUDA MD kernels (src/md/md_kernels.cu).
 
 #include "graph_cache.h"
+#include "iris_fp64.h"
 #include "graph_model.h"
 #include "core/adaptive_cutoff.h"
 #include "core/padding.h"
@@ -232,7 +233,7 @@ void GraphModel::release_cached_resources() {
 }
 
 bool GraphModel::cached_path_supported() const {
-  return forces_mode_ && !long_range_ &&
+  return forces_mode_ && !long_range_ && !iris_lr_.enabled &&
          (num_neighbors_adaptive_ <= 0.0f || adaptive_cutoff_method_ == "solver" ||
           adaptive_cutoff_method_ == "grid");
 }
@@ -362,6 +363,7 @@ void GraphModel::finish_cached_graph(std::unique_ptr<CachedGraph, CachedGraphDel
                                      const std::vector<ggml_tensor *> &inputs,
                                      std::vector<std::pair<ggml_tensor *, float>> constants) {
   const int n = g->n_atoms, M = g->ragged ? g->max_len : g->M;
+  mark_precise(g->graph), mark_precise(g->forward); // CUDA precise-math flags (iris graphs only; see precise_math())
   for (auto &c : constants) ggml_set_input(c.first);
 
   // inputs and constants in a buffer of their own (the allocator skips
@@ -786,6 +788,7 @@ ModelResult GraphModel::predict_cached(const AtomicSystem &system, bool compute_
     nkept[i] = k;
   }
   const int max_kept = n ? *std::max_element(nkept.begin(), nkept.end()) : 0;
+  check_iris_overflow(max_kept);
 
   const bool no_edges = max_kept == 0, forces_requested = compute_forces;
   if (no_edges) compute_forces = false;
@@ -870,12 +873,17 @@ ModelResult GraphModel::predict_cached(const AtomicSystem &system, bool compute_
     // (C[k, s] + C[reverse]) / 2 (each pair cutoff is the mean of two radii)
     std::vector<double> F(3 * size_t(n), 0.0), chain(C.empty() ? 0 : 3 * E, 0.0);
     std::vector<std::array<double, 6>> virial(periodic ? n : 0, std::array<double, 6>{});
+    // the full (unsymmetrised) virial per atom, accumulated separately so the Voigt sums stay bit-identical
+    std::vector<std::array<double, 9>> virial9(periodic ? n : 0, std::array<double, 9>{});
     auto add_virial = [&](int i, const double r[3], const double gr[3]) {
       auto &w = virial[i];
       w[0] += r[0] * gr[0], w[1] += r[1] * gr[1], w[2] += r[2] * gr[2];
       w[3] += 0.5 * (r[1] * gr[2] + r[2] * gr[1]);
       w[4] += 0.5 * (r[0] * gr[2] + r[2] * gr[0]);
       w[5] += 0.5 * (r[0] * gr[1] + r[1] * gr[0]);
+      auto &f = virial9[i];
+      for (int a = 0; a < 3; a++)
+        for (int b = 0; b < 3; b++) f[3 * a + b] += r[a] * gr[b];
     };
 #pragma omp parallel for num_threads(nt) schedule(static)
     for (int k = 0; k < n; k++) {
@@ -909,6 +917,7 @@ ModelResult GraphModel::predict_cached(const AtomicSystem &system, bool compute_
         }
     }
     std::array<double, 6> w_plato{};
+    std::array<double, 9> w9_plato{};
     if (g.grad_pos) { // Plato-PET-LR: -dE/dx and dE/d strain of the long-range ops
       std::vector<float> gp(3 * size_t(n));
       ggml_backend_tensor_get(g.grad_pos, gp.data(), 0, gp.size() * sizeof(float));
@@ -918,6 +927,7 @@ ModelResult GraphModel::predict_cached(const AtomicSystem &system, bool compute_
       float q[9];
       ggml_backend_tensor_get(g.grad_eps, q, 0, sizeof q);
       w_plato = {q[0], q[4], q[8], 0.5 * (q[5] + q[7]), 0.5 * (q[2] + q[6]), 0.5 * (q[1] + q[3])};
+      for (int c = 0; c < 9; c++) w9_plato[c] = q[c];
     }
     result.forces.resize(3 * size_t(n));
     for (size_t k = 0; k < F.size(); k++) result.forces[k] = static_cast<float>(energy_scale_ * F[k]);
@@ -928,6 +938,11 @@ ModelResult GraphModel::predict_cached(const AtomicSystem &system, bool compute_
       for (const auto &v : virial)
         for (int c = 0; c < 6; c++) w[c] += v[c];
       set_stress(*cell, energy_scale_, w, result);
+      std::array<double, 9> w9 = w9_plato;
+      for (const auto &v : virial9)
+        for (int c = 0; c < 9; c++) w9[c] += v[c];
+      result.virial.assign(w9.begin(), w9.end());
+      for (auto &x : result.virial) x *= energy_scale_;
     }
   }
   if (no_edges && forces_requested) { // energy independent of the positions
@@ -1008,6 +1023,7 @@ ModelResult GraphModel::predict_cached_device(const AtomicSystem &system, bool c
     int32_t total = 0;
     download(&total, st.offsets + n, 1);
     download(&max_kept, st.scalars + 1, 1);
+    check_iris_overflow(max_kept);
     fit_ragged_graph(n, total, max_kept);
     gg = device_graph(*cached_);
     md::gpu::pack_ragged(st, cut, gg);
@@ -1020,6 +1036,7 @@ ModelResult GraphModel::predict_cached_device(const AtomicSystem &system, bool c
       gg = device_graph(*cached_);
       md::gpu::prepare_inputs(st, cut, gg);
       download(&max_kept, st.scalars + 1, 1);
+      check_iris_overflow(max_kept);
       if (!fit_cached_graph(n, max_kept)) break;
     }
   }
@@ -1052,6 +1069,7 @@ ModelResult GraphModel::predict_cached_device(const AtomicSystem &system, bool c
     std::vector<double> F(3 * size_t(n));
     download(F.data(), st.f_cons, F.size());
     std::array<double, 6> w_plato{};
+    std::array<double, 9> w9_plato{};
     if (g.grad_pos) { // Plato-PET-LR: -dE/dx and dE/d strain of the long-range ops
       std::vector<float> gp(3 * size_t(n));
       ggml_backend_tensor_get(g.grad_pos, gp.data(), 0, gp.size() * sizeof(float));
@@ -1061,6 +1079,7 @@ ModelResult GraphModel::predict_cached_device(const AtomicSystem &system, bool c
       float q[9];
       ggml_backend_tensor_get(g.grad_eps, q, 0, sizeof q);
       w_plato = {q[0], q[4], q[8], 0.5 * (q[5] + q[7]), 0.5 * (q[2] + q[6]), 0.5 * (q[1] + q[3])};
+      for (int c = 0; c < 9; c++) w9_plato[c] = q[c];
     }
     result.forces.assign(F.begin(), F.end());
     result.has_forces = true;
@@ -1072,6 +1091,18 @@ ModelResult GraphModel::predict_cached_device(const AtomicSystem &system, bool c
       for (int i = 0; i < n; i++)
         for (int c = 0; c < 6; c++) w[c] += v[6 * i + c];
       set_stress(*cell, energy_scale_, w, result);
+      if (!plato_lr_.enabled) { // the full virial (as the host path; Plato's strain term has no 9-component form here)
+        double *w9d = nullptr;
+        cuda_check(cudaMalloc(&w9d, 9 * size_t(n) * sizeof(double)), "virial9 alloc");
+        md::gpu::virial9(st, cut, gg, w9d);
+        std::vector<double> v9(9 * size_t(n));
+        download(v9.data(), w9d, v9.size());
+        cuda_check(cudaFree(w9d), "virial9 free");
+        result.virial.assign(9, 0.0);
+        for (int i = 0; i < n; i++)
+          for (int c = 0; c < 9; c++) result.virial[c] += v9[9 * size_t(i) + c];
+        for (auto &x : result.virial) x *= energy_scale_;
+      }
     }
   }
   if (no_edges && forces_requested) { // energy independent of the positions
@@ -1112,6 +1143,8 @@ GraphModel::DeviceTotals GraphModel::predict_device_step(const DeviceStep &) {
 // again before anything is added into the caller's forces (added by a kernel
 // that reads the same verdict on the device).
 GraphModel::DeviceTotals GraphModel::predict_device_step(const DeviceStep &in) {
+  if (fp64::exec_fp64_requested()) // never a silent fp32 fallback: the fp64 executor is host-only
+    throw std::runtime_error("MLIPCPP_EXEC=fp64: the device MD step has no fp64 executor (host predict only)");
   static const bool full_fp32 = [] { // as predict(): TF32 only with MLIPCPP_TF32
     if (std::getenv("MLIPCPP_TF32")) return false;
     setenv("GGML_CUDA_NO_TF32", "1", 0);

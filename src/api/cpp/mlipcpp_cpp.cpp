@@ -156,6 +156,9 @@ struct Predictor::Impl {
         throw std::runtime_error("Failed to load graph model from: " + path);
       }
 
+      graph_model->set_iris_freeze_ewald(options.iris_freeze_ewald);
+      if (options.iris_max_neighbors >= 0) graph_model->set_iris_max_neighbors(options.iris_max_neighbors);
+      graph_model->set_iris_qeq_solver(options.iris_qeq_maxiter, options.iris_qeq_tol);
       model_type_str = "PET-Graph";
       nc_forces = graph_model->nc_forces();
       model = std::move(graph_model);
@@ -186,6 +189,19 @@ struct Predictor::Impl {
     }
     result.latent_charges = std::move(internal_result.latent_charges);
     result.sqe_charges = std::move(internal_result.sqe_charges);
+    result.charges = std::move(internal_result.charges);
+    result.dipole = std::move(internal_result.dipole);
+    result.fermi_level = internal_result.fermi_level;
+    result.metallicity = internal_result.metallicity;
+    result.charge_residual = internal_result.charge_residual;
+    result.has_charge_residual = internal_result.has_charge_residual;
+    result.dipole_flow = std::move(internal_result.dipole_flow);
+    result.dipole_induced = std::move(internal_result.dipole_induced);
+    result.polarisabilities = std::move(internal_result.polarisabilities);
+    result.field_forces = std::move(internal_result.field_forces);
+    result.components = std::move(internal_result.components);
+    result.component_charges = std::move(internal_result.component_charges);
+    result.virial = std::move(internal_result.virial);
     return result;
   }
 
@@ -283,6 +299,14 @@ struct Predictor::Impl {
     AtomicSystem system = system_in;
     system.set_charge(options.charge);
     system.set_spin_multiplicity(options.spin_multiplicity);
+    if (options.dipole_origin.size() == 3)
+      system.set_dipole_origin({options.dipole_origin[0], options.dipole_origin[1], options.dipole_origin[2]});
+    else if (!options.dipole_origin.empty())
+      throw std::invalid_argument("dipole_origin: three values");
+    if (options.field.size() == 3)
+      system.set_field({options.field[0], options.field[1], options.field[2]});
+    else if (!options.field.empty())
+      throw std::invalid_argument("field: three values");
     if (!options.formal_charges.empty()) {
       if (options.formal_charges.size() != static_cast<size_t>(system.num_atoms()))
         throw std::invalid_argument("formal_charges: one value per atom");

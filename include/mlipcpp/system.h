@@ -4,6 +4,7 @@
 #include <memory>
 #include <optional>
 #include <utility>
+#include <array>
 #include <vector>
 
 namespace mlipcpp {
@@ -66,6 +67,18 @@ public:
   bool has_formal_charges() const { return !formal_charges_.empty(); }
   void set_formal_charges(std::vector<float> q) { formal_charges_ = std::move(q); }
 
+  /// Origin of the dipole (A; extxyz info dipole_origin="x y z"), read by models that output a dipole
+  /// (iris PET-LR, pet.iris_lr). Unset: the model's default (the centre of mass, ASE masses).
+  bool has_dipole_origin() const { return has_dipole_origin_; }
+  const std::array<double, 3> &dipole_origin() const { return dipole_origin_; }
+  void set_dipole_origin(const std::array<double, 3> &r0) { dipole_origin_ = r0, has_dipole_origin_ = true; }
+
+  /// Uniform external electric field (V/A; extxyz info field="x y z"), read by iris PET-LR models with a `field`
+  /// input (pet.iris_lr.field). Unset: zero.
+  bool has_field() const { return has_field_; }
+  const std::array<double, 3> &field() const { return field_; }
+  void set_field(const std::array<double, 3> &E) { field_ = E, has_field_ = true; }
+
 private:
   int n_atoms_ = 0;
   std::vector<float> positions_; // [n_atoms * 3], flattened (x,y,z) per atom
@@ -73,6 +86,10 @@ private:
   std::optional<Cell> cell_;
   int charge_ = 0, spin_multiplicity_ = 1;
   std::vector<float> formal_charges_;
+  std::array<double, 3> dipole_origin_{0, 0, 0};
+  bool has_dipole_origin_ = false;
+  std::array<double, 3> field_{0, 0, 0};
+  bool has_field_ = false;
 };
 
 } // namespace mlipcpp

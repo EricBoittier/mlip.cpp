@@ -39,3 +39,15 @@ TEST_CASE("conditioning: ranges", "[conditioning]") {
   CHECK_THROWS(c.rows(0, 0));
   CHECK_THROWS(c.rows(0, 5));
 }
+
+TEST_CASE("conditioning: keys (iris spin-only trunks)", "[conditioning]") {
+  Conditioning c{true, 3, 4};
+  c.use_charge = false; // pet.conditioning_keys = spin_multiplicity: every charge takes charge 0's row
+  CHECK(c.rows(0, 2) == std::make_pair(3, 1));
+  CHECK(c.rows(-3, 2) == std::make_pair(3, 1));
+  CHECK(c.rows(7, 2) == std::make_pair(3, 1)); // outside the table: never looked up, so no error
+  CHECK_THROWS(c.rows(0, 5));                   // the spin table is still checked
+  c.use_charge = true, c.use_spin = false;
+  CHECK(c.rows(-2, 4) == std::make_pair(1, 0));
+  CHECK(c.rows(-2, 9) == std::make_pair(1, 0));
+}

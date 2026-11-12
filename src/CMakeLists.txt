@@ -40,6 +40,8 @@ set(MLIPCPP_RUNTIME_SOURCES
     runtime/frag_charges.cpp
     runtime/sqe.cpp
     runtime/lr_combined.cpp
+    runtime/gir64.cpp
+    runtime/iris_fp64.cpp
 )
 
 # Utilities
@@ -262,6 +264,8 @@ if(MLIPCPP_BUILD_TRAINING AND UNIX AND NOT EMSCRIPTEN)
     target_link_libraries(mlipcpp-predict PRIVATE mlipcpp_train)
     add_executable(mlipcpp-eval bin/mlipcpp_eval.cpp)
     target_link_libraries(mlipcpp-eval PRIVATE mlipcpp_train)
+    add_executable(mlipcpp-capture bin/mlipcpp_capture.cpp) # per-node forward outputs (parity bisection)
+    target_link_libraries(mlipcpp-capture PRIVATE mlipcpp_train)
 
     add_executable(mlipcpp-feats bin/mlipcpp_feats.cpp)
     target_link_libraries(mlipcpp-feats PRIVATE mlipcpp_train)

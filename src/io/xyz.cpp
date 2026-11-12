@@ -111,6 +111,29 @@ void read_exyz_conditioning(const std::string &comment_line, AtomicSystem &syste
   // ASE / metatomic: spin_multiplicity, else spin (OMol's key, also 2S+1)
   if (parse_exyz_number(comment_line, "spin_multiplicity", v) || parse_exyz_number(comment_line, "spin", v))
     system.set_spin_multiplicity(integer_value(v, "spin_multiplicity"));
+  // dipole_origin="x y z" (iris PET-LR calculators): three numbers, quoted
+  for (size_t pos = comment_line.find("dipole_origin="); pos != std::string::npos;
+       pos = comment_line.find("dipole_origin=", pos + 1)) {
+    if (pos > 0 && !std::isspace(static_cast<unsigned char>(comment_line[pos - 1]))) continue;
+    size_t start = pos + 14;
+    if (start < comment_line.size() && comment_line[start] == '"') start++;
+    std::istringstream iss(comment_line.substr(start));
+    std::array<double, 3> r0{};
+    if (!(iss >> r0[0] >> r0[1] >> r0[2])) throw std::runtime_error("XYZ: cannot parse dipole_origin= in: " + comment_line);
+    system.set_dipole_origin(r0);
+    break;
+  }
+  // field="x y z" (V/A; his iris `field` input, atoms.info["field"]): three numbers, quoted
+  for (size_t pos = comment_line.find("field="); pos != std::string::npos; pos = comment_line.find("field=", pos + 1)) {
+    if (pos > 0 && !std::isspace(static_cast<unsigned char>(comment_line[pos - 1]))) continue;
+    size_t start = pos + 6;
+    if (start < comment_line.size() && comment_line[start] == '"') start++;
+    std::istringstream iss(comment_line.substr(start));
+    std::array<double, 3> E{};
+    if (!(iss >> E[0] >> E[1] >> E[2])) throw std::runtime_error("XYZ: cannot parse field= in: " + comment_line);
+    system.set_field(E);
+    break;
+  }
 }
 
 // the token column of a per-atom extxyz array (Properties=name:type:count:...), -1 if absent

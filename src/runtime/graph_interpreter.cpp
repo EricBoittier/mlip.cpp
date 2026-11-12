@@ -186,6 +186,21 @@ std::vector<int64_t> GraphInterpreter::resolve_shape(
             "'max_neighbors' to be set.");
       }
       resolved.push_back(it_m->second + 1);
+    } else if (const std::string *name = named_dim(dim)) {
+      // a named dimension: the product of its '*' factors (set_dimension names or integers), else -1
+      int64_t v = 1;
+      size_t a = 0;
+      while (v > 0) {
+        const size_t b = name->find('*', a);
+        const std::string f = name->substr(a, b == std::string::npos ? std::string::npos : b - a);
+        auto it = dimensions_.find(f);
+        if (it != dimensions_.end()) v *= it->second;
+        else if (!f.empty() && f.find_first_not_of("0123456789") == std::string::npos) v *= std::stoll(f);
+        else v = -1;
+        if (b == std::string::npos) break;
+        a = b + 1;
+      }
+      resolved.push_back(v);
     } else {
       // Regular concrete dimension
       resolved.push_back(dim);
@@ -287,8 +302,10 @@ ggml_tensor *GraphInterpreter::build(ggml_context *ctx) {
   zeros_.clear();
 
   // Build nodes in order (they should already be topologically sorted)
+  static const bool trace = std::getenv("MLIPCPP_GIR_TRACE") != nullptr; // diagnostics: node by node, to stderr
   for (const auto &node : graph_.nodes) {
     ggml_tensor *output = nullptr;
+    if (trace) fprintf(stderr, "GIR build node %d %s\n", node.id, node.op.c_str());
     try {
       output = build_node(ctx, node);
       if (output && post_node) output = post_node(ctx, node, output);
@@ -411,6 +428,9 @@ ggml_tensor *GraphInterpreter::build_node(ggml_context *ctx,
     return build_unary(ctx, node, GGML_UNARY_OP_RELU);
   } else if (node.op == "UNARY_GELU") {
     return build_unary(ctx, node, GGML_UNARY_OP_GELU);
+  } else if (node.op == "UNARY_ERF") { // torch.erf (iris PET-LR Gaussian charges)
+    if (node.inputs.empty()) throw std::runtime_error("UNARY_ERF requires an input");
+    return ggml_plato_erf(ctx, resolve_input(ctx, node.inputs[0]));
   } else if (node.op == "UNARY_TANH") {
     return build_unary(ctx, node, GGML_UNARY_OP_TANH);
   } else if (node.op == "UNARY_EXP") {
@@ -544,6 +564,9 @@ ggml_tensor *GraphInterpreter::build_sub(ggml_context *ctx,
     throw std::runtime_error("SUB requires 2 inputs (or 1 input with scalar param)");
   }
   ggml_tensor *b = resolve_input(ctx, node.inputs[1]);
+  // a broadcast subtrahend is repeated explicitly: ggml's SUB backward has no repeat_back for src1 (ADD / MUL
+  // have), so dE/db of a broadcast b failed its shape check (iris PET-LR: s - mu). Bitwise the same forward.
+  if (!ggml_are_same_shape(a, b) && ggml_can_repeat(b, a)) b = ggml_repeat(ctx, b, a);
   return ggml_sub(ctx, a, b);
 }
 
@@ -605,6 +628,8 @@ ggml_tensor *GraphInterpreter::build_div(ggml_context *ctx,
     throw std::runtime_error("DIV requires 2 inputs (or 1 input with scalar param)");
   }
   ggml_tensor *b = resolve_input(ctx, node.inputs[1]);
+  // as SUB: GGML_OP_DIV's backward for src1 has no repeat_back either
+  if (!ggml_are_same_shape(a, b) && ggml_can_repeat(b, a)) b = ggml_repeat(ctx, b, a);
   return ggml_div(ctx, a, b);
 }
 
@@ -668,6 +693,12 @@ ggml_tensor *GraphInterpreter::build_matmul(ggml_context *ctx,
   }
   if (!ggml_is_contiguous(b)) {
     b = ggml_cont(ctx, b);
+  }
+  // matrix @ vector, torch [m, k] @ [k] -> [m] (iris PET-LR: the open Coulomb kernel on the charges):
+  // ggml_mul_mat(a [k, m], b [k, 1]) = [m, 1]
+  if (ggml_n_dims(b) == 1 && ggml_n_dims(a) == 2 && node.output_shape.size() == 1) {
+    if (a->ne[0] != b->ne[0]) throw std::runtime_error("MATMUL: matrix-vector size mismatch");
+    return ggml_reshape_1d(ctx, ggml_mul_mat(ctx, a, ggml_reshape_2d(ctx, b, b->ne[0], 1)), a->ne[1]);
   }
 
   // General formula: ggml_mul_mat(transpose(b), a)
@@ -1294,7 +1325,12 @@ ggml_tensor *GraphInterpreter::build_sum_rows(ggml_context *ctx,
 
 ggml_tensor *GraphInterpreter::build_repeat(ggml_context *ctx,
                                             const GIRNode &node) {
-  if (node.inputs.size() < 2) {
+  // torch .expand exported with symbolic sizes carries the inputs those sizes are read from ("input:species",
+  // ...) as extra operands: they are not templates, the node's output_shape is the target
+  bool shape_sources = node.inputs.size() >= 2 && !node.output_shape.empty();
+  for (size_t i = 1; shape_sources && i < node.inputs.size(); i++)
+    shape_sources = node.inputs[i].rfind("input:", 0) == 0;
+  if (node.inputs.size() < 2 || shape_sources) {
     // Need a template tensor for repeat
     // If not provided, create one from output_shape
     ggml_tensor *a = resolve_input(ctx, node.inputs[0]);
@@ -1995,6 +2031,12 @@ ggml_tensor *GraphInterpreter::build_index(ggml_context *ctx,
   ggml_tensor *a = resolve_input(ctx, node.inputs[0]);
   ggml_tensor *indices = resolve_input(ctx, node.inputs[1]);
 
+  // a 1-D source x[idx] (iris PET-LR: per-atom and per-slot gathers): ggml_get_rows takes rows of ne0
+  // elements, so gather [1, N] rows and flatten (a plain get_rows would give [N, M])
+  if (ggml_n_dims(a) == 1 && ggml_n_dims(indices) == 1) {
+    ggml_tensor *rows = ggml_get_rows(ctx, ggml_reshape_2d(ctx, a, 1, a->ne[0]), indices);
+    return ggml_reshape_1d(ctx, rows, indices->ne[0]);
+  }
   // Use get_rows for simple 1D index case
   return ggml_get_rows(ctx, a, indices);
 }

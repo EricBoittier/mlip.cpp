@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+"""ref_branch.py output (his branches: predict's outputs only) -> the ref_petlr.py layout lr_parity.py reads:
+atom/energy (the structure energy on its first atom: the per-structure sums are exact), forces, atom/charges,
+struct/metallicity, struct/dipole (NaN: not emitted by predict), atom_ptr, and virial [S, 3, 3] on periodic frames
+(his predict's stress, dU/d eps).
+
+    python branch_to_ref.py IN.npz OUT.npz
+"""
+import sys
+
+import numpy as np
+
+r = np.load(sys.argv[1])
+ap = r["atom_ptr"]
+S = len(ap) - 1
+e = np.zeros(ap[-1])
+e[ap[:-1]] = np.asarray(r["energy"]).reshape(-1)[:S]
+out = {"atom_ptr": ap, "atom/energy": e, "forces": r["forces"], "struct/dipole": np.full((S, 3), np.nan)}
+if "field_forces" in r.files:  # under a field: his forces = -dE/dr + E . Z0 (kept); the conservative part on its own
+    out["forces_conservative"] = r["forces"] - r["field_forces"]
+    out["field_forces"] = r["field_forces"]
+if "dipole_flow" in r.files and np.asarray(r["dipole_flow"]).size == 3 * S:  # [S, 3] (older refs: x only)
+    out["struct/dipole_flow"] = np.asarray(r["dipole_flow"]).reshape(S, 3)
+if "dipole_induced" in r.files and np.asarray(r["dipole_induced"]).size == 3 * S:  # induced dipoles: sum_i mu_i [S, 3]
+    out["struct/dipole_induced"] = np.asarray(r["dipole_induced"]).reshape(S, 3)
+if "polarisability_atoms" in r.files:  # alpha_i [N] (A^3)
+    out["atom/polarisability"] = r["polarisability_atoms"]
+if "charges" in r.files:
+    out["atom/charges"] = r["charges"]
+if "metallicity" in r.files:
+    out["struct/metallicity"] = np.asarray(r["metallicity"]).reshape(-1)[:S]
+elif "residual" in r.files:  # conserving_charges, residual allocation: his residual [S] (mlip.cpp's metallicity slot)
+    out["struct/metallicity"] = np.asarray(r["residual"]).reshape(-1)[:S]
+if "charge_residual" in r.files:  # threshold reference (feat/threshold-reference): R = sum_i (c_Z + f_i) - Q [S]
+    out["struct/charge_residual"] = np.asarray(r["charge_residual"]).reshape(-1)[:S]
+if "virial" in r.files:
+    out["virial"] = np.asarray(r["virial"]).reshape(S, 3, 3)
+np.savez(sys.argv[2], **out)

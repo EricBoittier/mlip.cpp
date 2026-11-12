@@ -23,6 +23,8 @@ typedef struct ggml_backend *ggml_backend_t;
 typedef struct ggml_backend_buffer *ggml_backend_buffer_t;
 typedef struct ggml_gallocr *ggml_gallocr_t;
 
+namespace mlipcpp::runtime::fp64 { class IrisFp64; }
+
 namespace mlipcpp::runtime {
 
 struct CachedGraph;
@@ -165,6 +167,72 @@ public:
   const CoulombParameters &coulomb_parameters() const { return coulomb_parameters_; }
   bool long_range() const { return long_range_; }
   bool nc_forces() const { return nc_forces_; }
+  /// iris PET-LR (GGUF pet.iris_lr, scripts/pet_lr_port/iris_to_gguf.py --lr): trunk + LR branch in one graph with
+  /// the extra inputs neighbor_index, positions (a gradient input), total_charge, dipole_origin and the host side
+  /// of his fermi_level (mu_bisect, gapped, m_round, top, bottom); output [n, n_out] = energy | charge | dipole
+  /// contribution (3) | mu | score | f'(s - mu). The scores graph (graph_scores.json) is the first pass of mu.
+  struct IrisLRSpec {
+    bool enabled = false;
+    int n_out = 8;
+    // output columns after the first 8 (GGUF pet.iris_lr.columns "name:width,..."): per-atom terms the host sums over
+    // the structure (charge_residual: the threshold reference's R = sum_i (c_Z + f_i) - Q; dipole_flow (3))
+    std::vector<std::pair<std::string, int>> columns;
+    std::string reference;          // fermi / species / both
+    int m_min = -3, m_max = 3;
+    double temperature = 0.1;
+    int iterations = 40;
+    double eps = 1e-6;
+    // periodic cells (his jax-pme tiled Ewald at the calculator's frozen parameters; graph_pbc.json)
+    int num_k = 0;                  // 0: no periodic graph
+    double smearing = 0;            // 0: 2 wavelength
+    double slab_margin = 2.0;
+    bool long_range_transfer = false; // his feat/long-range-transfer: refused on a slab (his ToSample raises)
+    bool conserving_charges = false;  // his feat/conserving-charges: one component per structure (else raises)
+    // his `field` input (conserving charges): graph input field [3]; forces under a nonzero field need his E . Z0
+    // (the Born charges of the pass-1 charges, added outside the energy): not ported, so they raise
+    bool field = false;
+    // QEq (reference "qeq", his qeq_reference, a2658e3): the host cg's settings and its operator graphs
+    // (graph_qeq_apply{,_pbc}.json: [n, 2] = (J x + 2 phi(x) + self x, J + self)); the scores graph returns chi
+    int qeq_maxiter = 20;
+    double qeq_tol = 1e-5;
+    std::string graph_qeq_open, graph_qeq_pbc;
+    int qeq_loaded = -1; // which operator graph qeq_interp_ holds (0 open, 1 pbc, -1 none)
+    std::string graph_open, graph_pbc; // the two GIR graphs (same weights); interp_ holds one at a time
+    bool pbc_loaded = false;
+    // conserving charges on several components (graph_multi{,_pbc}.json, IrisPETLRGraphMulti): the connected
+    // components of the neighbour graph and mlip.cpp's R-only Q_c rule; which of the four graphs interp_ holds
+    std::string graph_multi_open, graph_multi_pbc;
+    int loaded_kind = -1; // 0 open, 1 pbc, 2 multi open, 3 multi pbc
+    bool freeze_ewald = false;      // his calculator's per-run Ewald parameters (ModelOptions::iris_freeze_ewald)
+    struct Frozen {                 // the frozen parameters and the system they belong to
+      bool valid = false;
+      int n = 0;
+      std::vector<int32_t> numbers;
+      bool pbc[3] = {false, false, false};
+      std::vector<double> params; // iris::EwaldFrozen, flattened (iris_lr.h)
+    } frozen;
+  };
+  const IrisLRSpec &iris_lr() const { return iris_lr_; }
+  /// iris models: his calculator raises when an atom has more than max_neighbors neighbours within the cutoff
+  /// (GGUF pet.iris.max_neighbors, his training pipeline's to_sample.max_neighbors; 0 / absent: no check, as for
+  /// non-iris models, which keep every neighbour)
+  int iris_max_neighbors() const { return iris_max_neighbors_; }
+  void set_iris_max_neighbors(int m) { iris_max_neighbors_ = m; }
+  /// iris PET-LR: freeze the Ewald parameters per run (see ModelOptions::iris_freeze_ewald); resets the frozen set
+  void set_iris_freeze_ewald(bool on) { iris_lr_.freeze_ewald = on; iris_lr_.frozen = {}; }
+  /// iris QEq: override the GGUF's cg settings (maxiter < 0 / tol < 0: keep the GGUF's); tests run converged solves
+  void set_iris_qeq_solver(int maxiter, double tol) {
+    if (maxiter >= 0) iris_lr_.qeq_maxiter = maxiter;
+    if (tol >= 0) iris_lr_.qeq_tol = tol;
+  }
+  /// iris QEq: the last call's cg iteration counts (forward, cotangent; -1: not run) and |r|^2 / atol^2 at the stop
+  struct QEqStats {
+    int forward_iterations = -1, cotangent_iterations = -1;
+    double forward_ratio = 0, cotangent_ratio = 0;
+  };
+  const QEqStats &iris_qeq_stats() const { return iris_qeq_stats_; }
+  /// the frozen Ewald parameters (iris::EwaldFrozen::to_vec; empty before the first periodic call)
+  const std::vector<double> &iris_frozen_ewald() const { return iris_lr_.frozen.params; }
   /// Plato-PET-LR components (GGUF pet.plato_lr.*; enabled false: a plain PET)
   const PetPlatoLRSpec &plato_lr() const { return plato_lr_; }
   const std::string &gguf_path() const { return gguf_path_; }
@@ -199,6 +267,21 @@ private:
   std::string cutoff_function_ = "cosine";
   bool forces_mode_ = false;
   bool nc_forces_ = false;
+  IrisLRSpec iris_lr_;
+  int iris_max_neighbors_ = 0;
+  bool precise_math_gguf_ = false; // GGUF pet.precise_math (iris trunks): CUDA precise-math flags on its graphs
+public:
+  /// the CUDA precise-math flags (LOG / SIN / COS / EXP / SIGMOID / DIV, see graph_model.cpp) apply to this model's
+  /// graphs: iris PET-LR, iris GGUFs with pet.precise_math = 1, or MLIPCPP_PRECISE_MATH=1 (0: never)
+  bool precise_math() const;
+  void mark_precise(ggml_cgraph *g) const;
+  /// raises his calculator's overflow error when an atom's selected neighbours exceed pet.iris.max_neighbors
+  void check_iris_overflow(int max_selected) const;
+private:
+  GraphInterpreter scores_interp_; // iris PET-LR: trunk + score head (fermi / both references; QEq: chi)
+  std::shared_ptr<fp64::IrisFp64> fp64_; // MLIPCPP_EXEC=fp64: the fp64 executor (runtime/iris_fp64.h)
+  GraphInterpreter qeq_interp_;    // iris QEq: the host cg's operator graph (no trunk)
+  QEqStats iris_qeq_stats_;
   PetPlatoLRSpec plato_lr_;
   std::vector<PetPlatoLRStructure> plato_st_; // the cached path's structure (set before fit_cached_graph)
   float plato_charge_unit_ = 0.0f;             // plato_les_charge_unit (read on first use)
