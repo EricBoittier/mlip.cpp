@@ -316,6 +316,10 @@ private:
   std::vector<int32_t> lrc_drop_;
   // combined model: dE/d(blend) per atom of the last predict_single_impl with forces (scaled to eV), when asked
   bool lrc_want_blend_grad_ = false;
+  // the previous lrc call was the plain model on a periodic cell (one bulk cluster): the next one of the same size computes
+  // the plain graph while its cluster search runs on another thread (MLIPCPP_LRC_OVERLAP=0: off)
+  bool lrc_last_plain_ = false;
+  int lrc_last_plain_n_ = -1; // its atom count (the overlap only follows a periodic plain call of the same size)
   std::vector<double> lrc_blend_grad_;
   // per-atom weights w of the differentiated energy sum_i w_i e_i (forces then -d/dx of it; the energy stays the plain
   // sum); empty: all 1. Used by the lrc charge pass (LrcGraphCharges), whose per-atom outputs are charges.

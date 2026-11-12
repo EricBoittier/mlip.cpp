@@ -376,6 +376,9 @@ LrcQ0 lrc_q0(const LrcSpec &L, const SqeSpec &sqe, int n, const int32_t *Z, cons
 void lrc_q0_vjp(const LrcSpec &L, const SqeSpec &sqe, int n, const int32_t *Z, const double *x, const LrcQ0 &q,
                 const double *c, double *g, double *vir = nullptr);
 
+/// host threads of the cluster search (the per-atom backbone radii and the open-structure neighbour search; 1 by
+/// default, GraphModel sets its backend's thread count). Results do not depend on it: each atom's work is unchanged.
+void lrc_set_threads(int n);
 LrcClusters lrc_clusters(const LrcSpec &L, int n, const double *x, const double *cell = nullptr);
 /// dE/dx (added into g) of sum_{a != b} W_ab R_ab(x); W s x s
 void lrc_clusters_vjp(const LrcSpec &L, const LrcClusters &c, int n, const double *x, const std::vector<double> &W,

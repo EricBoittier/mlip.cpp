@@ -20,6 +20,7 @@
 #include <numeric>
 #include <cmath>
 #include <cstring>
+#include <future>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -201,7 +202,8 @@ void compute_adaptive_cutoffs_with_state(
     float max_cutoff,
     AdaptiveCutoffCache &out,
     float min_cutoff = 0.5f,
-    float effective_width = 1.0f) {
+    float effective_width = 1.0f,
+    int n_threads = 1) {
   out = {};
   const float probe_spacing = effective_width / 4.0f;
   for (float pc = min_cutoff; pc < max_cutoff; pc += probe_spacing) {
@@ -215,16 +217,28 @@ void compute_adaptive_cutoffs_with_state(
 
   // diff[a*n_probes + p] starts as effective_num_neighbors, then we subtract
   // target and add baseline (kept as in compute_adaptive_cutoffs).
+  // (per atom in parallel: each diff[a, p] still sums atom a's edges in increasing e, the order of the edge loop)
   out.diff.assign(static_cast<size_t>(n_atoms) * n_probes, 0.0);
   const size_t n_edges = distances.size();
-  for (int p = 0; p < n_probes; p++) {
-    const float pc = out.probes[p];
-    for (size_t e = 0; e < n_edges; e++) {
-      const int a = centers[e];
-      out.diff[static_cast<size_t>(a) * n_probes + p] +=
-          static_cast<double>(cutoff_func_bump(distances[e], pc, effective_width));
+  std::vector<int64_t> first(n_atoms + 1, 0);
+  for (size_t e = 0; e < n_edges; e++) first[centers[e] + 1]++;
+  for (int a = 0; a < n_atoms; a++) first[a + 1] += first[a];
+  std::vector<int64_t> edge_of(n_edges);
+  {
+    std::vector<int64_t> fill(first.begin(), first.end() - 1);
+    for (size_t e = 0; e < n_edges; e++) edge_of[fill[centers[e]]++] = static_cast<int64_t>(e);
+  }
+  const int nt = std::max(1, n_threads);
+#pragma omp parallel for num_threads(nt) schedule(dynamic, 16) if (n_atoms >= 128)
+  for (int a = 0; a < n_atoms; a++) {
+    double *row = &out.diff[static_cast<size_t>(a) * n_probes];
+    for (int p = 0; p < n_probes; p++) {
+      const float pc = out.probes[p];
+      for (int64_t q = first[a]; q < first[a + 1]; q++)
+        row[p] += static_cast<double>(cutoff_func_bump(distances[edge_of[q]], pc, effective_width));
     }
   }
+#pragma omp parallel for num_threads(nt) schedule(static) if (n_atoms >= 128)
   for (int a = 0; a < n_atoms; a++) {
     for (int p = 0; p < n_probes; p++) {
       double x = (n_probes > 1)
@@ -243,6 +257,7 @@ void compute_adaptive_cutoffs_with_state(
   std::vector<double> grad(out.diff.size(), 0.0);
   std::vector<double> grad_sign(out.diff.size(), 0.0);
   const double eps = 1e-12;
+#pragma omp parallel for num_threads(nt) schedule(static) if (n_atoms >= 128)
   for (int a = 0; a < n_atoms; a++) {
     const double *d = &out.diff[static_cast<size_t>(a) * n_probes];
     double *g = &grad[static_cast<size_t>(a) * n_probes];
@@ -264,6 +279,7 @@ void compute_adaptive_cutoffs_with_state(
 
   // Softmax weights and atomic_cutoffs.
   out.weights.assign(out.diff.size(), 0.0);
+#pragma omp parallel for num_threads(nt) schedule(static) if (n_atoms >= 128)
   for (int a = 0; a < n_atoms; a++) {
     const double *d = &out.diff[static_cast<size_t>(a) * n_probes];
     const double *w = &out.width[static_cast<size_t>(a) * n_probes];
@@ -299,6 +315,7 @@ void compute_adaptive_cutoffs_with_state(
   // logits_r = -0.5 * (diff_r / width_r)^2; width_r is a numerical gradient
   // of diff and so depends on diff_{r-1}, diff_{r+1} (or endpoints).
   out.diff_jacobian.assign(out.diff.size(), 0.0);
+#pragma omp parallel for num_threads(nt) schedule(static) if (n_atoms >= 128)
   for (int a = 0; a < n_atoms; a++) {
     const double *d = &out.diff[static_cast<size_t>(a) * n_probes];
     const double *w_arr = &out.width[static_cast<size_t>(a) * n_probes];
@@ -806,6 +823,33 @@ ModelResult GraphModel::predict_single_lrc(const AtomicSystem &system, bool comp
   }
   const int n = system.num_atoms();
   std::vector<double> x(system.positions(), system.positions() + 3 * size_t(n));
+  lrc_set_threads(backend_provider_ ? backend_provider_->n_threads() : 1); // the cluster search's host threads
+  // Overlap: after a plain call on a periodic cell (one bulk cluster: the structure's charge, no long range, no states) and
+  // for a cell of the same size (MD in a condensed phase), the cluster search runs on a host thread while this thread
+  // computes the plain graph. If the search finds the plain case
+  // again, that graph is this call's result exactly (the same predict_single_impl call as below with no per-atom
+  // conditioning); otherwise it is dropped and the call continues as without the overlap. (lrc_clusters is pure host
+  // code; lrc_condition, whose charge pass may use a device, is not run on the other thread.)
+  static const bool overlap = [] { const char *e = std::getenv("MLIPCPP_LRC_OVERLAP"); return !(e && *e == '0'); }();
+  if (overlap && lrc_last_plain_ && lrc_last_plain_n_ == n && !cell.empty() && !L.intra && !post_compute_hook &&
+      !parameter_gradients) {
+    std::future<LrcClusters> fc = std::async(std::launch::async, [&] {
+      return lrc_clusters(L, n, x.data(), cell.empty() ? nullptr : cell.data());
+    });
+    std::optional<ModelResult> spec;
+    std::exception_ptr err;
+    try {
+      spec.emplace(predict_single_impl(system, compute_forces, nullptr, nullptr));
+    } catch (...) {
+      err = std::current_exception();
+    }
+    const LrcClusters cl = fc.get(); // (rethrows the search's exception)
+    if (cl.s == 1 && !cl.images()) {
+      if (err) std::rethrow_exception(err);
+      return std::move(*spec);
+    }
+    lrc_last_plain_ = false; // a transition: the call as without the overlap
+  }
   const LrcCondition cond = lrc_condition(L, sq, n, system.atomic_numbers(), x.data(), double(system.charge()),
                                           conditioning_.max_charge, system.spin_multiplicity(),
                                           cell.empty() ? nullptr : cell.data());
@@ -919,6 +963,7 @@ ModelResult GraphModel::predict_single_lrc(const AtomicSystem &system, bool comp
   lrc_want_blend_grad_ = false;
   const std::vector<double> blend_grad = lrc_blend_grad_;
   // one open cluster or a bulk cell: the plain model (lrc_intra: the long range still acts inside)
+  lrc_last_plain_ = cond.cl.s == 1 && !cond.cl.images() && !L.intra && !cell.empty(), lrc_last_plain_n_ = n;
   if (cond.cl.s == 1 && !cond.cl.images() && !L.intra) return r;
   LrcEnergy le = lrc_energy(L, sq, cond, n, system.atomic_numbers(), x.data(), double(system.charge()), compute_forces);
   // MLIPCPP_LRC_NO_LR=1: drop the long-range energy and forces (diagnostics only: ablations on fixed weights)
@@ -1147,7 +1192,8 @@ ModelResult GraphModel::predict_single_impl(
         nlist.centers, nlist.distances,
         num_neighbors_adaptive_, n_atoms, cutoff_, adapt_cache,
         /*min_cutoff=*/0.5f,
-        /*effective_width=*/cutoff_width_adaptive_);
+        /*effective_width=*/cutoff_width_adaptive_,
+        /*n_threads=*/backend_provider_ ? backend_provider_->n_threads() : 1);
     atomic_cutoffs = adapt_cache.atomic_cutoffs;
 
     // Compact nlist in place: keep edge e iff distances[e] <= pair_cutoff
@@ -1864,7 +1910,18 @@ ModelResult GraphModel::predict_single_impl(
     }
   }
 
-  // Sum and scale
+  // Sum and scale in double, as the cached path (read_cached_outputs) does. The earlier fp32 sum (MLIPCPP_ENERGY_SUM_F64=0)
+  // differs from it by up to ~0.1 meV/atom at a few thousand atoms (0.19 eV at 3000), which an MD run sees as a jump of
+  // E_tot whenever a structure moves between the cached path (one cluster) and this one (split clusters).
+  static const bool sum_f64 = [] { const char *e = std::getenv("MLIPCPP_ENERGY_SUM_F64"); return !(e && *e == '0'); }();
+  if (sum_f64) {
+    double model = 0, composition = 0;
+    for (int i = 0; i < n_atoms; i++) {
+      model += atomic_energies[i];
+      if (auto c = composition_energies_.find(atomic_numbers[i]); c != composition_energies_.end()) composition += c->second;
+    }
+    result.energy = static_cast<float>(energy_scale_ * model + composition);
+  } else {
   float model_energy = 0.0f;
   for (int i = 0; i < n_atoms; i++) {
     model_energy += atomic_energies[i];
@@ -1881,6 +1938,7 @@ ModelResult GraphModel::predict_single_impl(
   }
 
   result.energy = scaled_energy + composition_energy;
+  }
 
   if (nc_output) {
     result.nc_forces.resize(n_atoms * 3);
