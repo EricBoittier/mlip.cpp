@@ -229,7 +229,7 @@ void compute_adaptive_cutoffs_with_state(
     for (size_t e = 0; e < n_edges; e++) edge_of[fill[centers[e]]++] = static_cast<int64_t>(e);
   }
   const int nt = std::max(1, n_threads);
-#pragma omp parallel for num_threads(nt) schedule(dynamic, 16)
+#pragma omp parallel for num_threads(nt) schedule(dynamic, 16) if (n_atoms >= 128)
   for (int a = 0; a < n_atoms; a++) {
     double *row = &out.diff[static_cast<size_t>(a) * n_probes];
     for (int p = 0; p < n_probes; p++) {
@@ -238,7 +238,7 @@ void compute_adaptive_cutoffs_with_state(
         row[p] += static_cast<double>(cutoff_func_bump(distances[edge_of[q]], pc, effective_width));
     }
   }
-#pragma omp parallel for num_threads(nt) schedule(static)
+#pragma omp parallel for num_threads(nt) schedule(static) if (n_atoms >= 128)
   for (int a = 0; a < n_atoms; a++) {
     for (int p = 0; p < n_probes; p++) {
       double x = (n_probes > 1)
@@ -257,7 +257,7 @@ void compute_adaptive_cutoffs_with_state(
   std::vector<double> grad(out.diff.size(), 0.0);
   std::vector<double> grad_sign(out.diff.size(), 0.0);
   const double eps = 1e-12;
-#pragma omp parallel for num_threads(nt) schedule(static)
+#pragma omp parallel for num_threads(nt) schedule(static) if (n_atoms >= 128)
   for (int a = 0; a < n_atoms; a++) {
     const double *d = &out.diff[static_cast<size_t>(a) * n_probes];
     double *g = &grad[static_cast<size_t>(a) * n_probes];
@@ -279,7 +279,7 @@ void compute_adaptive_cutoffs_with_state(
 
   // Softmax weights and atomic_cutoffs.
   out.weights.assign(out.diff.size(), 0.0);
-#pragma omp parallel for num_threads(nt) schedule(static)
+#pragma omp parallel for num_threads(nt) schedule(static) if (n_atoms >= 128)
   for (int a = 0; a < n_atoms; a++) {
     const double *d = &out.diff[static_cast<size_t>(a) * n_probes];
     const double *w = &out.width[static_cast<size_t>(a) * n_probes];
@@ -315,7 +315,7 @@ void compute_adaptive_cutoffs_with_state(
   // logits_r = -0.5 * (diff_r / width_r)^2; width_r is a numerical gradient
   // of diff and so depends on diff_{r-1}, diff_{r+1} (or endpoints).
   out.diff_jacobian.assign(out.diff.size(), 0.0);
-#pragma omp parallel for num_threads(nt) schedule(static)
+#pragma omp parallel for num_threads(nt) schedule(static) if (n_atoms >= 128)
   for (int a = 0; a < n_atoms; a++) {
     const double *d = &out.diff[static_cast<size_t>(a) * n_probes];
     const double *w_arr = &out.width[static_cast<size_t>(a) * n_probes];

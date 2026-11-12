@@ -78,7 +78,7 @@ OpenNeighbors open_neighbors(int n, const double *x, double rc) {
   }
   std::vector<std::vector<std::pair<int, double>>> nbr(n);
   const int nt = std::max(1, g_lrc_threads.load());
-#pragma omp parallel for num_threads(nt) schedule(dynamic, 64)
+#pragma omp parallel for num_threads(nt) schedule(dynamic, 64) if (n >= 128)
   for (int i = 0; i < n; i++) {
     auto &v = nbr[i];
     for (int d0 = -1; d0 <= 1; d0++)
@@ -1064,7 +1064,7 @@ void backbone_radii(const LrcSpec &L, int n, LrcClusters &c, const OpenNeighbors
   c.nb_j.assign(nb.j.begin(), nb.j.end());
   c.nb_jac.resize(nb.j.size());
   const int nt = std::max(1, g_lrc_threads.load());
-#pragma omp parallel for num_threads(nt) schedule(dynamic, 16)
+#pragma omp parallel for num_threads(nt) schedule(dynamic, 16) if (n >= 128)
   for (int i = 0; i < n; i++) {
     const double *d = nb.r.data() + nb.start[i];
     c.rad[i] = adaptive::radius(L.bb_grid, static_cast<int>(nb.start[i + 1] - nb.start[i]), [&](int k) { return d[k]; },
@@ -1241,7 +1241,7 @@ LrcClusters clusters_periodic_bb(const LrcSpec &L, int n, const double *x, const
     const size_t ne = size_t(c.nb_start[n]);
     c.nb_j.resize(ne), c.nb_d.resize(3 * ne), c.nb_jac.resize(ne);
     const int nt = std::max(1, g_lrc_threads.load());
-#pragma omp parallel for num_threads(nt) schedule(dynamic, 16)
+#pragma omp parallel for num_threads(nt) schedule(dynamic, 16) if (n >= 128)
     for (int i = 0; i < n; i++) {
       thread_local std::vector<double> d;
       d.clear();
